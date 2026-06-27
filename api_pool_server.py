@@ -22,7 +22,6 @@ from collections import deque
 
 LATENCY_OK_MAX = 2000     
 LATENCY_SLOW_MAX = 5000   
-HEALTH_CHECK_INTERVAL = 120  
 
 class LogManager:
     def __init__(self, max_history=300):
@@ -369,6 +368,7 @@ class Endpoint:
     _today_used: int = field(default=0, repr=False)
     _today_date: str = field(default="", repr=False)
     health_mode: str = field(default="models")
+    billing_mode: str = field(default="subscription")
 
     _health: str = field(default="unknown", repr=False) 
     _health_latency_ms: int = field(default=-1, repr=False)
@@ -401,10 +401,12 @@ class APIPool:
             ep_dict = {k: v for k, v in ep.items() if k in Endpoint.__dataclass_fields__}
             # 新增时按组别自动设置健康检测模式（未显式指定时生效）
             if "health_mode" not in ep_dict:
-                ep_dict["health_mode"] = "chat" if ep_dict.get("in_pool", False) else "models"
+                ep_dict["health_mode"] = "models" if ep_dict.get("billing_mode", "subscription") == "pay_per_use" else ("chat" if ep_dict.get("in_pool", False) else "models")
+            if "billing_mode" not in ep_dict:
+                ep_dict["billing_mode"] = "subscription"
             ep = Endpoint(**ep_dict)
         elif not ep.health_mode:
-            ep.health_mode = "chat" if ep.in_pool else "models"
+            ep.health_mode = "models" if ep.billing_mode == "pay_per_use" else ("chat" if ep.in_pool else "models")
         if not ep.id:
             import uuid
             ep.id = str(uuid.uuid4())
@@ -470,6 +472,7 @@ class APIPool:
             "use_proxy": ep.use_proxy,
             "protocol": ep.protocol,
             "health_mode": ep.health_mode,
+            "billing_mode": ep.billing_mode,
             "is_vision": ep.is_vision,
             "in_pool": ep.in_pool,
             "is_rpm_limited": self._is_rpm_limited(ep),
@@ -532,7 +535,11 @@ class APIPool:
             return ep.id, "unknown", -1, "已禁用健康检测"
 
         # 按所在组别自动决定检测模式：池内用chat（验证真实可用），池外用models（零消耗探测）
-        effective_mode = "chat" if ep.in_pool else "models"
+        # 按次计费的端点强制使用 models 检测，避免产生费用
+        if ep.billing_mode == "pay_per_use":
+            effective_mode = "models"
+        else:
+            effective_mode = "chat" if ep.in_pool else "models"
 
         if effective_mode == "models":
             t0 = time.time()
@@ -715,13 +722,18 @@ class APIPool:
                 return ep
         return min(active, key=lambda e: e._cooldown_until) if active else None
 
-    def _rotate(self, failed_ep, error_msg):
+    def _rotate(self, failed_ep, error_msg, probe_failed=False):
         failed_ep._fail_count += 1
         failed_ep._total_failures += 1
         failed_ep._last_error = error_msg
         failed_ep._last_error_ts = time.time()
-        self._set_cooldown(failed_ep)
-        sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {failed_ep.cooldown_minutes} 分钟后", "WARN")
+        if probe_failed:
+            # 探活失败：只设短冷却（30秒），避免误杀冷启动端点
+            failed_ep._cooldown_until = time.time() + 30
+            sys_log(f"端点 '{failed_ep.name}' 探活失败，短冷却 30 秒", "WARN")
+        else:
+            self._set_cooldown(failed_ep)
+            sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {failed_ep.cooldown_minutes} 分钟后", "WARN")
         active = self._active_endpoints()
         if active:
             for i, ep in enumerate(active):
@@ -747,6 +759,23 @@ class APIPool:
             if e is ep:
                 self._current_idx = i
                 return
+
+    def _probe_endpoint(self, ep):
+        """对单个端点做快速探活，成功返回 True，失败返回 False。按 billing_mode 选择检测方式。"""
+        if ep.health_mode == "none":
+            return True  # 关闭检测视为可用
+        if ep.billing_mode == "pay_per_use" or not ep.in_pool:
+            # 按次计费或池外端点：用 models 探活（零成本）
+            try:
+                models = self.fetch_models(ep.base_url, ep.api_key, timeout=10, use_proxy=ep.use_proxy, protocol=ep.protocol)
+                return bool(models)
+            except Exception:
+                return False
+        else:
+            # 包月池内端点：用 chat ping
+            payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3}
+            reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True)
+            return reply is not None
 
     def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False):
         active = self._active_endpoints()
@@ -810,6 +839,7 @@ class APIPool:
                 total = len(active)
                 if total == 0:
                     break
+                # 按优先级逐个探活下一个候选端点
                 next_ep = None
                 for i, e in enumerate(active):
                     if e is not ep and not self._is_in_cooldown(e):
@@ -821,6 +851,31 @@ class APIPool:
                         if e is ep:
                             idx = (i + 1) % len(active)
                             break
+                else:
+                    # 对候选端点做探活
+                    sys_log(f"对候选端点 '{next_ep.name}' 进行探活...", "INFO")
+                    if self._probe_endpoint(next_ep):
+                        sys_log(f"候选端点 '{next_ep.name}' 探活通过，准备重试请求", "INFO")
+                    else:
+                        sys_log(f"候选端点 '{next_ep.name}' 探活失败，跳过", "WARN")
+                        self._rotate(next_ep, "探活失败", probe_failed=True)
+                        # 重新获取可用端点列表，继续找下一个
+                        active = self._active_endpoints()
+                        total = len(active)
+                        if total == 0:
+                            break
+                        next_ep2 = None
+                        for i, e in enumerate(active):
+                            if e is not ep and e is not next_ep and not self._is_in_cooldown(e):
+                                next_ep2 = e
+                                idx = i
+                                break
+                        if next_ep2 is None:
+                            # 没有更多候选了，尝试任何非当前端点
+                            for i, e in enumerate(active):
+                                if e is ep:
+                                    idx = (i + 1) % len(active)
+                                    break
                 tried += 1
         raise AllEndpointsFailed(errors)
 
@@ -1002,7 +1057,7 @@ class APIPool:
                         reply = ""
                         for c in body.get("content", []):
                             if c.get("type") == "text": reply += c.get("text", "")
-                        u = body.get("usage", {})
+                        content = body["choices"][0]["message"].get("content", "")
                         if u:
                             prompt_t = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
                             tot = prompt_t + u.get("output_tokens", 0)
@@ -1014,6 +1069,7 @@ class APIPool:
                         return reply.strip(), ""
                     else:
                         u = body.get("usage", {})
+                        content = body["choices"][0]["message"].get("content", "")
                         if u:
                             tot = u.get("total_tokens", 0)
                             cached = 0
@@ -1152,20 +1208,10 @@ def ensure_config():
 
 ensure_config()
 
-def _health_check_loop():
-    while True:
-        time.sleep(HEALTH_CHECK_INTERVAL)
-        try: pool.check_all_health()
-        except Exception: pass
-
-pool = APIPool(default_payload={"temperature": 0.7})
+pool = APIPool(default_payload={"temperature": 0.7, "thinking": {"type": "disabled"}})
 for ep_data in load_config():
     if "in_pool" not in ep_data: ep_data["in_pool"] = True
     pool.add_endpoint(ep_data)
-
-_health_thread = threading.Thread(target=_health_check_loop, daemon=True)
-_health_thread.start()
-threading.Thread(target=pool.check_all_health, daemon=True).start()
 
 
 def api_handler(method, path, body):
@@ -1261,6 +1307,7 @@ def api_handler(method, path, body):
                 "use_proxy": item.get("use_proxy", base.get("use_proxy", True)),
                 "protocol": item.get("protocol", base.get("protocol", "openai")),
                 "health_mode": item.get("health_mode", base.get("health_mode", "chat")),
+                  "billing_mode": item.get("billing_mode", base.get("billing_mode", "subscription")),
                   "is_vision": item.get("is_vision", base.get("is_vision", True)),
                   "in_pool": item.get("in_pool", base.get("in_pool", False)),
                   "enabled": item.get("enabled", True),
@@ -1301,7 +1348,7 @@ def api_handler(method, path, body):
         for ep in pool.list_endpoints():
             if ep["id"] == ep_id: target_ep = ep; break
         if not target_ep: return 404, {"error": "端点不存在"}, False
-        test_pool = APIPool(default_payload={"temperature": 0.7})
+        test_pool = APIPool(default_payload={"temperature": 0.7, "thinking": {"type": "disabled"}})
         test_pool.add_endpoint({"name": target_ep["name"], "base_url": target_ep["base_url"], "api_key": target_ep["api_key_full"], "model": target_ep["model"], "priority": 1, "timeout": target_ep["timeout"], "max_retries": target_ep["max_retries"], "enabled": True, "use_proxy": target_ep.get("use_proxy", True), "protocol": target_ep.get("protocol", "openai"), "is_vision": target_ep.get("is_vision", True)})
         
         img = body.get("image")
@@ -1329,7 +1376,7 @@ def api_handler(method, path, body):
     return 404, {"error": "Not found"}, False
 
 def _sync_to_config():
-    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "health_mode": ep.get("health_mode", "chat"), "is_vision": ep.get("is_vision", True),
+    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "is_vision": ep.get("is_vision", True),
             "in_pool": ep.get("in_pool", False)} for ep in pool.list_endpoints()])
 
 
@@ -1382,14 +1429,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
   border: 1px solid var(--border);
 }
 
-.grid{display:grid;grid-template-columns:1fr 360px;gap:20px;align-items:start}
+.grid{display:grid;grid-template-columns:7fr 3fr;gap:20px;align-items:start}
 @media(max-width:920px){.grid{grid-template-columns:1fr}}
 
 .card{background:var(--card);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow)}
 .card-title{font-size:13px;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:7px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px}
 .card-title .icon{font-size:15px}
 
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px}
 .stat-item{background:rgba(255,255,255,.02);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border:1px solid var(--border);border-radius:12px;padding:12px 10px;text-align:center;transition:transform .2s,box-shadow .2s;box-shadow:0 2px 8px rgba(0,0,0,.1)}
 .stat-item:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.2)}
 .stat-item .num{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
@@ -1751,6 +1798,13 @@ select option { background: var(--bg); color: var(--text); }
       <div class="form-group"><label>启用</label><select id="fEnabled"><option value="true">是</option><option value="false">否</option></select></div>
       <div class="form-group"><label>加入聚合池</label><select id="fPool"><option value="false">否（仅保存）</option><option value="true">是（参与轮换）</option></select></div>
       <div class="form-group"><label title="达到额度后挂起，0为不限制">每日额度 (0不限)</label><input type="number" id="fDailyLimit" value="0" min="0"></div>
+      <div class="form-group">
+        <label title="按次计费的端点健康检查将自动使用零成本 Models 探针，避免产生费用">计费方式</label>
+        <select id="fBillingMode">
+          <option value="subscription">按量计费</option>
+          <option value="pay_per_use">按次计费</option>
+        </select>
+      </div>
     </div>
     <div class="form-row" style="grid-template-columns: 1fr 1fr 1fr;">
       <div class="form-group"><label title="每分钟最高请求次数，超限自动切换，0为不限制">并发 (0不限)</label><input type="number" id="fRpmLimit" value="0" min="0"></div>
@@ -1765,6 +1819,7 @@ select option { background: var(--bg); color: var(--text); }
         <option value="none">关闭检测</option>
       </select>
     </div>
+
     <div class="form-actions">
       <button class="btn btn-ghost" onclick="closeModal()">取消</button>
       <button class="btn btn-green" id="batchAddBtn" style="display:none" onclick="batchAddEndpoints()">📦 批量添加</button>
@@ -1853,6 +1908,7 @@ function renderEndpoints(eps){
     if(!ep.use_proxy)b+=`<span class="badge badge-priority" title="绕过系统全局代理，强制直连">🌐直连</span>`;
     if(ep.health_mode==='none')b+=`<span class="badge" style="background:rgba(255,255,255,.05);color:var(--text-dim)" title="已关闭后台健康监测">🔕免扰</span>`;
     else if(ep.health_mode==='models')b+=`<span class="badge" style="background:rgba(50,215,75,.1);color:var(--green)" title="零成本 Models 探针">☘️无感测</span>`;
+    if(ep.billing_mode==='pay_per_use')b+=`<span class="badge" style="background:rgba(255,159,10,.15);color:#ff9f0a" title="按次计费，健康检查使用零成本探针">💰按次</span>`;
     if(ep.daily_limit>0)b+=`<span class="badge" style="background:rgba(255,255,255,.05);color:var(--text-dim)" title="每日消耗进度">📊${fmtNum(ep.today_used)} / ${fmtNum(ep.daily_limit)}</span>`;
     if(ep.rpm_limit>0)b+=`<span class="badge" style="background:rgba(255,255,255,.05);color:var(--text-dim)" title="每分钟最高并发请求限制">🚀${ep.rpm_limit} RPM</span>`;
     const last=ep.last_success?timeAgo(ep.last_success):'—';
@@ -1883,6 +1939,41 @@ function renderPoolList(eps){
   const cnt=document.getElementById('poolCount');
   if(cnt)cnt.textContent=poolEps.length+' 个成员';
   if(!poolEps.length){el.innerHTML='<div class="empty">聚合池为空，从左侧添加端点</div>';return;}
+  el.innerHTML=poolEps.map(ep=>{
+    let cls='ep-item';
+    if(!ep.enabled)cls+=' disabled';
+    if(ep.is_current)cls+=' current';
+    if(ep.in_cooldown)cls+=' in-cooldown';
+    if(ep.in_pool)cls+=' in-pool';
+    let h=ep.health,lat=ep.health_latency_ms;
+    let rh='';
+    if(h==='ok')rh='<span style="color:var(--green);font-size:11px">✓'+(lat>=0?' '+lat+'ms':'')+'</span>';
+    else if(h==='slow')rh='<span style="color:var(--yellow);font-size:11px">🐢'+(lat>=0?' '+lat+'ms':'')+'</span>';
+    else if(h==='bad')rh='<span style="color:var(--red);font-size:11px">✗'+(lat>=0?' '+lat+'ms':'')+'</span>';
+    else rh='<span style="color:var(--text-dim);font-size:11px">-</span>';
+    // 生成优先级选项
+    let options = Array.from({length:poolEps.length}, (_,i)=>{
+      const p = i+1;
+      return `<option value="${p}" ${p===ep.priority?'selected':''}>#${p}</option>`;
+    }).join('');
+    return `<div class="${cls}" style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px">
+      <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1">
+        <span class="badge badge-priority">#${ep.priority}</span>
+        <span style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(ep.name)}</span>
+        <span style="font-size:10px;color:var(--text-dim);white-space:nowrap">${esc(ep.model||'')}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+        ${rh}
+        ${ep.is_current?'<span class="badge badge-current">● 当前</span>':''}
+        ${ep.in_cooldown?'<span class="badge badge-cooldown">⏳'+fmtTime(ep.cooldown_remaining)+'</span>':''}
+        <select class="btn btn-ghost btn-sm" style="padding:3px 6px;cursor:pointer" onchange="setPriority('${ep.id}', this.value)" title="修改优先级">
+          ${options}
+        </select>
+        <button class="btn btn-ghost btn-sm" title="移出聚合池" onclick="removeFromPool('${ep.id}')">📤</button>
+      </div>
+    </div>`;
+  }).join('');
+}
   el.innerHTML=poolEps.map(ep=>{
     let cls='ep-item';
     if(!ep.enabled)cls+=' disabled';
@@ -1937,6 +2028,106 @@ async function runHealthCheck(){toast('正在检测...','info');const r=await ap
 async function toggleEndpoint(id){await api('POST',`/api/endpoints/${encodeURIComponent(id)}/toggle`);refresh();}
 async function addToPool(id){await api('POST',`/api/pool/${encodeURIComponent(id)}`);refresh();}
 async function removeFromPool(id){await api('DELETE',`/api/pool/${encodeURIComponent(id)}`);refresh();}
+async function setPriority(targetId, newPrio){
+  newPrio = parseInt(newPrio);
+  // 获取所有端点，筛选聚合池内的，按当前优先级排序
+  const all = await api('GET', '/api/endpoints');
+  const poolEps = all.endpoints.filter(e => e.in_pool).sort((a,b) => a.priority - b.priority);
+  const target = poolEps.find(e => e.id === targetId);
+  if(!target){console.error('Target not found');return;}
+  
+  const oldPrio = target.priority;
+  if(oldPrio === newPrio){return;} // 没有变化
+  
+  // 重新计算所有受影响端点的优先级
+  const updates = [];
+  
+  if(newPrio < oldPrio){
+    // 提升优先级：原位置 和 新位置 之间的所有端点优先级 +1
+    for(const ep of poolEps){
+      if(ep.priority >= newPrio && ep.priority < oldPrio){
+        updates.push({
+          id: ep.id,
+          name: ep.name,
+          base_url: ep.base_url,
+          api_key: ep.api_key,
+          model: ep.model,
+          priority: ep.priority + 1,
+          timeout: ep.timeout,
+          max_retries: ep.max_retries,
+          enabled: ep.enabled,
+          cooldown_minutes: ep.cooldown_minutes,
+          daily_limit: ep.daily_limit || 0,
+          rpm_limit: ep.rpm_limit || 0,
+          use_proxy: ep.use_proxy !== false ? ep.use_proxy : true,
+          protocol: ep.protocol || 'openai',
+          health_mode: ep.health_mode || 'chat',
+          billing_mode: ep.billing_mode || 'subscription',
+          is_vision: ep.is_vision !== false ? ep.is_vision : true,
+          in_pool: ep.in_pool
+        });
+      }
+    }
+  } else {
+    // 降低优先级：新位置 和 原位置 之间的所有端点优先级 -1
+    for(const ep of poolEps){
+      if(ep.priority > oldPrio && ep.priority <= newPrio){
+        updates.push({
+          id: ep.id,
+          name: ep.name,
+          base_url: ep.base_url,
+          api_key: ep.api_key,
+          model: ep.model,
+          priority: ep.priority - 1,
+          timeout: ep.timeout,
+          max_retries: ep.max_retries,
+          enabled: ep.enabled,
+          cooldown_minutes: ep.cooldown_minutes,
+          daily_limit: ep.daily_limit || 0,
+          rpm_limit: ep.rpm_limit || 0,
+          use_proxy: ep.use_proxy !== false ? ep.use_proxy : true,
+          protocol: ep.protocol || 'openai',
+          health_mode: ep.health_mode || 'chat',
+          billing_mode: ep.billing_mode || 'subscription',
+          is_vision: ep.is_vision !== false ? ep.is_vision : true,
+          in_pool: ep.in_pool
+        });
+      }
+    }
+  }
+  
+  // 更新目标端点自身
+  updates.push({
+    id: target.id,
+    name: target.name,
+    base_url: target.base_url,
+    api_key: target.api_key,
+    model: target.model,
+    priority: newPrio,
+    timeout: target.timeout,
+    max_retries: target.max_retries,
+    enabled: target.enabled,
+    cooldown_minutes: target.cooldown_minutes,
+    daily_limit: target.daily_limit || 0,
+    rpm_limit: target.rpm_limit || 0,
+    use_proxy: target.use_proxy !== false ? target.use_proxy : true,
+    protocol: target.protocol || 'openai',
+    health_mode: target.health_mode || 'chat',
+    billing_mode: target.billing_mode || 'subscription',
+    is_vision: target.is_vision !== false ? target.is_vision : true,
+    in_pool: target.in_pool
+  });
+  
+  // 批量提交更新
+  toast('正在更新优先级...', 'info');
+  const r = await api('POST', '/api/endpoints/batch', {endpoints: updates});
+  if(r.ok){
+    toast('✅ 优先级已更新', 'success');
+    refresh();
+  } else {
+    toast('❌ 更新失败: ' + (r.error || '未知错误'), 'error');
+  }
+}
 async function deleteEndpoint(id, n){if(!confirm(`删除「${n}」？`))return;await api('DELETE',`/api/endpoints/${encodeURIComponent(id)}`);toast('已删除','success');refresh();}
 async function clearCooldown(id){await api('PUT',`/api/endpoints/${encodeURIComponent(id)}`,{cooldown_minutes:0});await api('POST','/api/reset');setTimeout(async()=>{await api('PUT',`/api/endpoints/${encodeURIComponent(id)}`,{cooldown_minutes:5});refresh();},200);toast('已解除冷却','success');refresh();}
 let testImageBase64 = null;
@@ -2148,7 +2339,7 @@ async function testSelectedVision(){
 function openAddModal(){
     document.getElementById('editName').value='';document.getElementById('modalTitle').textContent='添加端点';
     ['fName','fUrl','fKey','fModel'].forEach(id=>document.getElementById(id).value='');
-    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fPool').value='false';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='true';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fVision').value='true';
+    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fPool').value='false';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='true';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';
     document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';
     document.getElementById('fetchModelsBtn').disabled=true;document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
     allModels=[];selectedModels=new Set();latencyResults={};visionResults={};
@@ -2158,7 +2349,7 @@ function editEndpoint(id){
     api('GET','/api/endpoints').then(eps=>{const ep=eps.find(e=>e.id===id);if(!ep)return;
         document.getElementById('editName').value=id;document.getElementById('modalTitle').textContent='编辑端点';
         document.getElementById('fName').value=ep.name;document.getElementById('fUrl').value=ep.base_url;document.getElementById('fKey').value=ep.api_key_full||'';document.getElementById('fModel').value=ep.model;
-        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fPool').value=String(ep.in_pool!==false);document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fVision').value=String(ep.is_vision!==false);
+        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fPool').value=String(ep.in_pool!==false);document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);
         document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
         allModels=[];selectedModels=new Set();latencyResults={};visionResults={};checkFetchBtn();document.getElementById('modal').classList.add('show');
     });
@@ -2167,7 +2358,7 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 
 async function saveEndpoint(){
     const ep_id=document.getElementById('editName').value;
-    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:parseInt(document.getElementById('fCooldown').value)||0,enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true'};
+    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:parseInt(document.getElementById('fCooldown').value)||0,enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true'};
     if(!d.name||!d.base_url||!d.api_key){toast('填写名称/URL/Key','error');return;}
     if(!d.model){toast('选择模型','error');return;}
     if(ep_id){await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d);toast('已更新','success');}
@@ -2178,11 +2369,11 @@ async function saveEndpoint(){
 async function batchAddEndpoints(){
     const fn=document.getElementById('fName').value.trim();
     const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
-    const sp=parseInt(document.getElementById('fPriority').value)||1,to=parseInt(document.getElementById('fTimeout').value)||60,re=parseInt(document.getElementById('fRetries').value)||0,cd=parseInt(document.getElementById('fCooldown').value)||5,dl=parseInt(document.getElementById('fDailyLimit').value)||0,rl=parseInt(document.getElementById('fRpmLimit').value)||0,up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',hm=document.getElementById('fHealthMode').value||'chat';
+    const sp=parseInt(document.getElementById('fPriority').value)||1,to=parseInt(document.getElementById('fTimeout').value)||60,re=parseInt(document.getElementById('fRetries').value)||0,cd=parseInt(document.getElementById('fCooldown').value)||5,dl=parseInt(document.getElementById('fDailyLimit').value)||0,rl=parseInt(document.getElementById('fRpmLimit').value)||0,up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',hm=document.getElementById('fHealthMode').value||'chat',bm=document.getElementById('fBillingMode').value||'subscription';
     if(!u||!k){toast('填写 URL 和 Key','error');return;}
     if(!selectedModels.size){toast('选择模型','error');return;}
     const ms=[...selectedModels];toast(`添加 ${ms.length} 个...`,'info');
-    const r=await api('POST','/api/endpoints/batch',{endpoints:ms.map((m,i)=>({name:fn?fn:m,model:m,priority:sp+i,is_vision:visionResults[m]?visionResults[m].supports_vision:true})),base:{base_url:u,api_key:k,timeout:to,max_retries:re,cooldown_minutes:cd,daily_limit:dl,rpm_limit:rl,use_proxy:up,protocol:pt,start_priority:sp,health_mode:hm}});
+    const r=await api('POST','/api/endpoints/batch',{endpoints:ms.map((m,i)=>({name:fn?fn:m,model:m,priority:sp+i,is_vision:visionResults[m]?visionResults[m].supports_vision:true})),base:{base_url:u,api_key:k,timeout:to,max_retries:re,cooldown_minutes:cd,daily_limit:dl,rpm_limit:rl,use_proxy:up,protocol:pt,start_priority:sp,health_mode:hm,billing_mode:bm}});
     if(r.ok){toast(`✅ ${r.added} 个`,'success');closeModal();refresh();}else toast('失败','error');
 }
 
@@ -2759,7 +2950,7 @@ def main():
     print(f"  🌐 管理面板访问: http://localhost:{port}")
     print(f"  🔗 客户端 Base URL: http://localhost:{port}/v1")
     print(f"  📋 已加载 {len(pool._endpoints)} 个端点")
-    print(f"  🩺 健康检测: 启动时自动检测 + 每 {HEALTH_CHECK_INTERVAL}秒 复检\n")
+    print(f"  🩺 健康检测: 失败时按优先级逐个探活候选端点")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
