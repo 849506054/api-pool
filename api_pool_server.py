@@ -620,6 +620,10 @@ class APIPool:
                 continue
                 
             description = result if isinstance(result, str) else result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not description.strip():
+                reasoning = result.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
+                if reasoning:
+                    description = reasoning
             if description:
                 break
                 
@@ -1018,9 +1022,17 @@ class APIPool:
                             if log_usage and not ep.name.startswith("test_"):
                                 token_tracker.add_usage(ep.name, ep.model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), tot, cached)
                                 content = body["choices"][0]["message"].get("content", "")
+                        if not content.strip():
+                            reasoning = body["choices"][0]["message"].get("reasoning_content", "")
+                            if reasoning:
+                                content = reasoning
                                 chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, content.strip(), tot, int((time.time() - req_t0) * 1000))
                                 ep._today_used += tot
                         content = body["choices"][0]["message"].get("content", "")
+                        if not content.strip():
+                            reasoning = body["choices"][0]["message"].get("reasoning_content", "")
+                            if reasoning:
+                                content = reasoning
                         return (content.strip() if content else ""), ""
                     
                     
