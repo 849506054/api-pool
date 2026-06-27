@@ -461,7 +461,10 @@ class APIPool:
     def list_endpoints(self):
         now = time.time()
         with self._lock:
-            active = [ep for ep in self._endpoints if ep.enabled]
+            active = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
+                      and not self._is_in_cooldown(ep)
+                      and not self._is_quota_exceeded(ep)
+                      and not self._is_rpm_limited(ep)]
             current_ep = active[self._current_idx] if active and self._current_idx < len(active) else None
             return [self._ep_to_dict(ep, ep is current_ep, now) for ep in self._endpoints]
 
@@ -1234,6 +1237,9 @@ def api_handler(method, path, body):
                 body["stream_options"]["include_usage"] = True
                 
         extra_payload = {k: v for k, v in body.items() if k not in ("messages", "model")}
+        extra_payload.pop("thinking", None)
+        if isinstance(extra_payload.get("extra_body"), dict):
+            extra_payload["extra_body"].pop("thinking", None)
         
         try:
             result = pool.chat(messages, extra_payload=extra_payload)
