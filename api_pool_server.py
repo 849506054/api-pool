@@ -368,7 +368,7 @@ class Endpoint:
     
     _today_used: int = field(default=0, repr=False)
     _today_date: str = field(default="", repr=False)
-    health_mode: str = field(default="models")
+    health_mode: str = field(default="chat")
 
     _health: str = field(default="unknown", repr=False) 
     _health_latency_ms: int = field(default=-1, repr=False)
