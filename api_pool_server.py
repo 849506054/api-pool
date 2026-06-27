@@ -1794,6 +1794,7 @@ function renderFilterBar(eps){
     <button class="filter-btn ${epFilter==='all'?'active':''}" onclick="setFilter('all')">全部 ${eps.length}</button>
     <button class="filter-btn ${epFilter==='enabled'?'active':''}" onclick="setFilter('enabled')">启用 ${en}</button>
     <button class="filter-btn ${epFilter==='disabled'?'active':''}" onclick="setFilter('disabled')">禁用 ${eps.length-en}</button>
+    <button class="filter-btn ${epFilter==='pooled'?'active':''}" onclick="setFilter('pooled')">已聚合 ${eps.filter(e=>e.in_pool).length}</button>
 
     <span class="filter-count" id="filterCount"></span>`;
 }
@@ -1808,6 +1809,7 @@ function hBadge(h,lat){
 function renderEndpoints(eps){
   if(epFilter==='enabled')eps=eps.filter(e=>e.enabled);
   else if(epFilter==='disabled')eps=eps.filter(e=>!e.enabled);
+  else if(epFilter==='pooled')eps=eps.filter(e=>e.in_pool);
 
   const c=document.getElementById('filterCount');if(c)c.textContent=`${eps.length} 个`;
   const el=document.getElementById('epList');
