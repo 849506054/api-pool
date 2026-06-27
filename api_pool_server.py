@@ -1980,6 +1980,7 @@ function renderPoolList(eps){
         ${rh}
         ${ep.is_current?'<span class="badge badge-current">● 当前</span>':''}
         ${ep.in_cooldown?'<span class="badge badge-cooldown">⏳'+fmtTime(ep.cooldown_remaining)+'</span>':''}
+        ${ep.in_cooldown?`<button class="btn btn-yellow btn-sm" title="立刻解除冷却" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
         <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:12px;min-width:45px;" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority('${ep.id}', this.value)" title="修改优先级">
           ${options}
         </select>
