@@ -1,0 +1,16 @@
+[Unit]
+Description=API Pool - 聚合 API 自动切换管理面板
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/vol1/1000/tool/api-pool
+ExecStart=/usr/bin/python3 /vol1/1000/tool/api-pool/api_pool_server.py
+Restart=always
+RestartSec=10
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

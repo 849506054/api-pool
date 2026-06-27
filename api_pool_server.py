@@ -354,6 +354,7 @@ class Endpoint:
     protocol: str = "openai"
     extra_headers: dict = field(default_factory=dict)
     is_vision: bool = True
+    in_pool: bool = False  # 是否加入聚合池（默认不加入）
 
     _fail_count: int = field(default=0, repr=False)
     _req_timestamps: deque = field(default_factory=deque, repr=False)
@@ -418,6 +419,13 @@ class APIPool:
             for ep in self._endpoints:
                 if ep.id == ep_id:
                     ep.enabled = enabled
+
+    def set_pool(self, ep_id, in_pool):
+        with self._lock:
+            for ep in self._endpoints:
+                if ep.id == ep_id:
+                    ep.in_pool = in_pool
+                    break
                     break
 
     def update_endpoint(self, ep_id, updates: dict):
@@ -457,6 +465,7 @@ class APIPool:
             "protocol": ep.protocol,
             "health_mode": ep.health_mode,
             "is_vision": ep.is_vision,
+            "in_pool": ep.in_pool,
             "is_rpm_limited": self._is_rpm_limited(ep),
             "fail_count": ep._fail_count,
             "last_error": ep._last_error,
@@ -493,6 +502,7 @@ class APIPool:
                     "use_proxy": ep.use_proxy,
                     "is_rpm_limited": self._is_rpm_limited(ep),
                     "is_vision": ep.is_vision,
+            "in_pool": ep.in_pool,
                     "health": ep._health,
                     "health_latency_ms": ep._health_latency_ms,
                     "health_error": ep._health_error,
@@ -627,7 +637,7 @@ class APIPool:
 
     def check_all_health(self):
         with self._lock:
-            endpoints = [ep for ep in self._endpoints if ep.enabled]
+            endpoints = [ep for ep in self._endpoints if ep.enabled and ep.in_pool]
             for ep in endpoints:
                 ep._health = "testing"
         if not endpoints:
@@ -681,10 +691,10 @@ class APIPool:
         ep._cooldown_until = 0
 
     def _active_endpoints(self):
-        available = [ep for ep in self._endpoints if ep.enabled and not self._is_in_cooldown(ep) and not self._is_quota_exceeded(ep) and not self._is_rpm_limited(ep)]
+        available = [ep for ep in self._endpoints if ep.enabled and ep.in_pool and not self._is_in_cooldown(ep) and not self._is_quota_exceeded(ep) and not self._is_rpm_limited(ep)]
         if available:
             return available
-        return [ep for ep in self._endpoints if ep.enabled and not self._is_quota_exceeded(ep)]
+        return [ep for ep in self._endpoints if ep.enabled and ep.in_pool and not self._is_quota_exceeded(ep)]
 
     def _pick_best(self, active):
         for ep in active:
@@ -1124,7 +1134,9 @@ def _health_check_loop():
         except Exception: pass
 
 pool = APIPool(default_payload={"temperature": 0.7})
-for ep_data in load_config(): pool.add_endpoint(ep_data)
+for ep_data in load_config():
+    if "in_pool" not in ep_data: ep_data["in_pool"] = True
+    pool.add_endpoint(ep_data)
 
 _health_thread = threading.Thread(target=_health_check_loop, daemon=True)
 _health_thread.start()
@@ -1199,6 +1211,17 @@ def api_handler(method, path, body):
 
     if method == "GET" and cp == "/api/endpoints": return 200, pool.list_endpoints(), False
     if method == "GET" and cp == "/api/chain": return 200, pool.get_active_chain(), False
+    # ================= 聚合池管理 =================
+    if method == "GET" and cp == "/api/pool":
+        return 200, [ep for ep in pool.list_endpoints() if ep.get("in_pool")], False
+    if method == "POST" and cp.startswith("/api/pool/"):
+        ep_id = unquote(cp.split("/")[-1])
+        pool.set_pool(ep_id, True); _sync_to_config()
+        return 200, {"ok": True}, False
+    if method == "DELETE" and cp.startswith("/api/pool/"):
+        ep_id = unquote(cp.split("/")[-1])
+        pool.set_pool(ep_id, False); _sync_to_config()
+        return 200, {"ok": True}, False
     if method == "POST" and cp == "/api/endpoints":
         pool.add_endpoint(body); _sync_to_config(); return 201, {"ok": True}, False
     if method == "POST" and cp == "/api/endpoints/batch":
@@ -1214,6 +1237,7 @@ def api_handler(method, path, body):
                 "protocol": item.get("protocol", base.get("protocol", "openai")),
                 "health_mode": item.get("health_mode", base.get("health_mode", "chat")),
                   "is_vision": item.get("is_vision", base.get("is_vision", True)),
+                  "in_pool": item.get("in_pool", base.get("in_pool", False)),
                   "enabled": item.get("enabled", True),
             }
             if ep["model"]: pool.add_endpoint(ep); added += 1
@@ -1280,7 +1304,8 @@ def api_handler(method, path, body):
     return 404, {"error": "Not found"}, False
 
 def _sync_to_config():
-    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "health_mode": ep.get("health_mode", "chat"), "is_vision": ep.get("is_vision", True)} for ep in pool.list_endpoints()])
+    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "health_mode": ep.get("health_mode", "chat"), "is_vision": ep.get("is_vision", True),
+            "in_pool": ep.get("in_pool", False)} for ep in pool.list_endpoints()])
 
 
 GUI_HTML = r"""<!DOCTYPE html>
@@ -1372,12 +1397,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .ep-item.disabled{opacity:.4}
 .ep-item.current{border-color:var(--green);background:var(--green-dim)}
 .ep-item.in-cooldown{border-color:var(--yellow);background:var(--yellow-dim)}
+.ep-item.in-pool{border-left:3px solid var(--accent);background:rgba(0,122,255,.08)}
 .ep-item.has-error{border-color:var(--red);background:var(--red-dim)}
 .ep-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;gap:6px;flex-wrap:wrap}
 .ep-name{font-weight:700;font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .badge{font-size:9px;padding:2px 7px;border-radius:12px;font-weight:700;display:inline-flex;align-items:center;gap:3px;text-transform:uppercase;letter-spacing:.3px}
 .badge-current{background:var(--green-dim);color:var(--green)}
 .badge-disabled{background:var(--red-dim);color:var(--red)}
+.badge-pool{background:var(--accent);color:#fff}
+.badge-not-pool{background:var(--yellow-dim);color:var(--yellow)}
 .badge-cooldown{background:var(--yellow-dim);color:var(--yellow)}
 .badge-priority{background:var(--accent);color:#fff;min-width:20px;justify-content:center}
 .badge-h-ok{background:var(--green-dim);color:var(--green)}
@@ -1540,6 +1568,14 @@ select option { background: var(--bg); color: var(--text); }
   </div>
   <div>
     <div class="card" style="margin-bottom:16px">
+      <div class="card-title">
+        <span class="icon">🏊</span> 聚合池管理
+        <span style="font-size:11px;color:var(--text-dim);margin-left:auto" id="poolCount"></span>
+      </div>
+      <div style="font-size:10px;color:var(--text-dim);margin-bottom:10px">从左侧端点列表添加，参与 API 调用轮换</div>
+      <div id="poolList"></div>
+    </div>
+    <div class="card" style="margin-bottom:16px">
       <div class="card-title"><span class="icon">🔗</span> 聚合链</div>
       <div style="font-size:10px;color:var(--text-dim);margin-bottom:10px">遇 429/超时自动切换 · 冷却到期自动切回</div>
       <div class="chain-list" id="chainList"></div>
@@ -1688,6 +1724,7 @@ select option { background: var(--bg); color: var(--text); }
       </div>
     <div class="form-row">
       <div class="form-group"><label>启用</label><select id="fEnabled"><option value="true">是</option><option value="false">否</option></select></div>
+      <div class="form-group"><label>加入聚合池</label><select id="fPool"><option value="false">否（仅保存）</option><option value="true">是（参与轮换）</option></select></div>
       <div class="form-group"><label title="达到额度后挂起，0为不限制">每日额度 (0不限)</label><input type="number" id="fDailyLimit" value="0" min="0"></div>
     </div>
     <div class="form-row" style="grid-template-columns: 1fr 1fr 1fr;">
@@ -1726,7 +1763,7 @@ let epFilter='all',modelPage=1,PP=50;
 
 async function refresh(){
   const[eps,chain]=await Promise.all([api('GET','/api/endpoints'),api('GET','/api/chain')]);
-  renderStats(eps);renderFilterBar(eps);renderEndpoints(eps);renderChain(chain);
+  renderStats(eps);renderFilterBar(eps);renderEndpoints(eps);renderPoolList(eps);renderChain(chain);
 }
 
 function renderStats(eps){
@@ -1748,6 +1785,7 @@ function renderFilterBar(eps){
     <button class="filter-btn ${epFilter==='all'?'active':''}" onclick="setFilter('all')">全部 ${eps.length}</button>
     <button class="filter-btn ${epFilter==='enabled'?'active':''}" onclick="setFilter('enabled')">启用 ${en}</button>
     <button class="filter-btn ${epFilter==='disabled'?'active':''}" onclick="setFilter('disabled')">禁用 ${eps.length-en}</button>
+
     <span class="filter-count" id="filterCount"></span>`;
 }
 function setFilter(f){epFilter=f;refresh();}
@@ -1761,6 +1799,7 @@ function hBadge(h,lat){
 function renderEndpoints(eps){
   if(epFilter==='enabled')eps=eps.filter(e=>e.enabled);
   else if(epFilter==='disabled')eps=eps.filter(e=>!e.enabled);
+
   const c=document.getElementById('filterCount');if(c)c.textContent=`${eps.length} 个`;
   const el=document.getElementById('epList');
   if(!eps.length){el.innerHTML='<div class="empty">暂无端点</div>';return;}
@@ -1769,14 +1808,17 @@ function renderEndpoints(eps){
     if(!ep.enabled)cls+=' disabled';
     if(ep.is_current)cls+=' current';
     if(ep.in_cooldown)cls+=' in-cooldown';
+    if(ep.in_pool)cls+=' in-pool';
     if(ep.last_error&&!ep.in_cooldown)cls+=' has-error';
     if(ep.daily_limit>0&&ep.today_used>=ep.daily_limit)cls+=' in-cooldown';
     if(ep.is_rpm_limited)cls+=' in-cooldown';
     let b=`<span class="badge badge-priority">#${ep.priority}</span>${hBadge(ep.health,ep.health_latency_ms)}`;
+    if(ep.in_pool)b+='<span style="display:inline-flex;align-items:center;gap:4px">🏊</span>';
     if(ep.protocol==='anthropic')b+=`<span class="badge" style="background:rgba(217,119,87,0.2);color:#ff9e7a;border:1px solid rgba(217,119,87,0.3)" title="Anthropic 原生协议翻译">🧠Anthropic</span>`;
     else b+=`<span class="badge badge-priority" style="background:rgba(16,163,127,0.2);color:#2ecc71" title="OpenAI 兼容协议">🟢OpenAI</span>`;
     if(ep.is_current)b+='<span class="badge badge-current">● 当前</span>';
     if(!ep.enabled)b+='<span class="badge badge-disabled">禁用</span>';
+
       if(ep.is_vision!==false)b+=`<span class=\"badge\" style=\"background:rgba(0,122,255,.15);color:#0a84ff\" title=\"原生支持视觉能力\">👁️视觉</span>`;
     if(ep.is_rpm_limited)b+=`<span class="badge badge-cooldown" title="每分钟并发已满，限流降级中">🚧限流中</span>`;
     else if(ep.daily_limit>0&&ep.today_used>=ep.daily_limit)b+=`<span class="badge badge-cooldown" title="今日额度已满，挂起至明日">🛑额度耗尽</span>`;
@@ -1794,6 +1836,7 @@ function renderEndpoints(eps){
           <button class="btn btn-ghost btn-sm" title="连通性测试" onclick="openTestDrawer('${ep.id}', '${esc(ep.name)} (${esc(ep.model)})')">🧪</button>
           ${ep.in_cooldown?`<button class="btn btn-yellow btn-sm" title="立刻解除冷却" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
           <button class="btn btn-ghost btn-sm" title="${ep.enabled?'禁用端点':'启用端点'}" onclick="toggleEndpoint('${ep.id}')">${ep.enabled?'⏸':'▶'}</button>
+          ${!ep.in_pool?'<button class="btn btn-ghost btn-sm" title="加入聚合池" onclick="addToPool(\''+ep.id+'\')">📥</button>':''}
           <button class="btn btn-ghost btn-sm" title="编辑端点" onclick="editEndpoint('${ep.id}')">✏️</button>
           <button class="btn btn-ghost btn-sm" title="删除端点" onclick="deleteEndpoint('${ep.id}', '${esc(ep.name)}')" style="color:var(--red)">🗑</button>
         </div>
@@ -1802,6 +1845,41 @@ function renderEndpoints(eps){
         <span title="绑定的模型名称">🤖${esc(ep.model)}</span><span title="单次请求超时时间">⏱${ep.timeout}s</span><span title="失败后最大重试次数">🔁${ep.max_retries}次</span><span title="请求失败后的冷却惩罚时间">❄️${ep.cooldown_minutes}分</span><span title="累计成功响应次数">📞${ep.total_calls}次</span><span title="最后一次成功响应时间">🕐${last}</span>
       </div>
       ${ep.last_error?`<div class="ep-error">⚠ ${esc(ep.last_error)}</div>`:''}
+    </div>`;
+  }).join('');
+}
+
+
+function renderPoolList(eps){
+  const poolEps=eps.filter(e=>e.in_pool).sort((a,b)=>a.priority-b.priority);
+  const el=document.getElementById('poolList');
+  const cnt=document.getElementById('poolCount');
+  if(cnt)cnt.textContent=poolEps.length+' 个成员';
+  if(!poolEps.length){el.innerHTML='<div class="empty">聚合池为空，从左侧添加端点</div>';return;}
+  el.innerHTML=poolEps.map(ep=>{
+    let cls='ep-item';
+    if(!ep.enabled)cls+=' disabled';
+    if(ep.is_current)cls+=' current';
+    if(ep.in_cooldown)cls+=' in-cooldown';
+    if(ep.in_pool)cls+=' in-pool';
+    let h=ep.health,lat=ep.health_latency_ms;
+    let rh='';
+    if(h==='ok')rh='<span style="color:var(--green);font-size:11px">✓'+(lat>=0?' '+lat+'ms':'')+'</span>';
+    else if(h==='slow')rh='<span style="color:var(--yellow);font-size:11px">🐢'+(lat>=0?' '+lat+'ms':'')+'</span>';
+    else if(h==='bad')rh='<span style="color:var(--red);font-size:11px">✗'+(lat>=0?' '+lat+'ms':'')+'</span>';
+    else rh='<span style="color:var(--text-dim);font-size:11px">-</span>';
+    return `<div class="${cls}" style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px">
+      <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1">
+        <span class="badge badge-priority">#${ep.priority}</span>
+        <span style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(ep.name)}</span>
+        <span style="font-size:10px;color:var(--text-dim);white-space:nowrap">${esc(ep.model||'')}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+        ${rh}
+        ${ep.is_current?'<span class="badge badge-current">● 当前</span>':''}
+        ${ep.in_cooldown?'<span class="badge badge-cooldown">⏳'+fmtTime(ep.cooldown_remaining)+'</span>':''}
+        <button class="btn btn-ghost btn-sm" title="移出聚合池" onclick="removeFromPool('${ep.id}')">📤</button>
+      </div>
     </div>`;
   }).join('');
 }
@@ -1830,6 +1908,8 @@ function renderChain(chain){
 
 async function runHealthCheck(){toast('正在检测...','info');const r=await api('POST','/api/health-check');if(r.ok){const o=r.results.filter(x=>x.health==='ok').length,s=r.results.filter(x=>x.health==='slow').length,b=r.results.filter(x=>x.health==='bad').length;toast(`✅${o} 🐢${s} ❌${b}`,'success');}refresh();}
 async function toggleEndpoint(id){await api('POST',`/api/endpoints/${encodeURIComponent(id)}/toggle`);refresh();}
+async function addToPool(id){await api('POST',`/api/pool/${encodeURIComponent(id)}`);refresh();}
+async function removeFromPool(id){await api('DELETE',`/api/pool/${encodeURIComponent(id)}`);refresh();}
 async function deleteEndpoint(id, n){if(!confirm(`删除「${n}」？`))return;await api('DELETE',`/api/endpoints/${encodeURIComponent(id)}`);toast('已删除','success');refresh();}
 async function clearCooldown(id){await api('PUT',`/api/endpoints/${encodeURIComponent(id)}`,{cooldown_minutes:0});await api('POST','/api/reset');setTimeout(async()=>{await api('PUT',`/api/endpoints/${encodeURIComponent(id)}`,{cooldown_minutes:5});refresh();},200);toast('已解除冷却','success');refresh();}
 let testImageBase64 = null;
@@ -2041,7 +2121,7 @@ async function testSelectedVision(){
 function openAddModal(){
     document.getElementById('editName').value='';document.getElementById('modalTitle').textContent='添加端点';
     ['fName','fUrl','fKey','fModel'].forEach(id=>document.getElementById(id).value='');
-    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='true';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fVision').value='true';
+    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fPool').value='false';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='true';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fVision').value='true';
     document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';
     document.getElementById('fetchModelsBtn').disabled=true;document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
     allModels=[];selectedModels=new Set();latencyResults={};visionResults={};
@@ -2051,7 +2131,7 @@ function editEndpoint(id){
     api('GET','/api/endpoints').then(eps=>{const ep=eps.find(e=>e.id===id);if(!ep)return;
         document.getElementById('editName').value=id;document.getElementById('modalTitle').textContent='编辑端点';
         document.getElementById('fName').value=ep.name;document.getElementById('fUrl').value=ep.base_url;document.getElementById('fKey').value=ep.api_key_full||'';document.getElementById('fModel').value=ep.model;
-        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fVision').value=String(ep.is_vision!==false);
+        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fPool').value=String(ep.in_pool!==false);document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fVision').value=String(ep.is_vision!==false);
         document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
         allModels=[];selectedModels=new Set();latencyResults={};visionResults={};checkFetchBtn();document.getElementById('modal').classList.add('show');
     });
@@ -2060,7 +2140,7 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 
 async function saveEndpoint(){
     const ep_id=document.getElementById('editName').value;
-    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:parseInt(document.getElementById('fCooldown').value)||0,enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',is_vision:document.getElementById('fVision').value==='true'};
+    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:parseInt(document.getElementById('fCooldown').value)||0,enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true'};
     if(!d.name||!d.base_url||!d.api_key){toast('填写名称/URL/Key','error');return;}
     if(!d.model){toast('选择模型','error');return;}
     if(ep_id){await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d);toast('已更新','success');}
