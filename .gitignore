@@ -16,3 +16,5 @@ chat_logs.db-journal
 
 # 临时脚本
 test_suite.py
+*.bak*
+*.backup

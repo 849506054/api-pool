@@ -899,6 +899,9 @@ class APIPool:
                 return result
             errors.append(f"[{ep.name}] {error}")
             sys_log(f"端点 '{ep.name}' 请求失败: {error}", "ERROR")
+            # 4xx 客户端错误：只记日志，不切端点、不探活、不重试
+            if error and error.startswith("HTTP 4"):
+                raise AllEndpointsFailed(errors)
             with self._lock:
                 self._rotate(ep, error)
                 active = self._active_endpoints()
@@ -1634,7 +1637,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .log-card { background: var(--card); backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; box-shadow: var(--shadow); display: flex; flex-direction: column; }
 .log-container { height: 280px; overflow-y: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 11px; display: flex; flex-direction: column; gap: 6px; scroll-behavior: smooth; }
 .log-line { display: flex; gap: 8px; line-height: 1.5; word-break: break-all; }
-.log-time { color: var(--text-dim); flex-shrink: 0; user-select: none; }
+.log-time { color: var(--text-dim); flex-shrink: 0; }
 .log-INFO { color: var(--blue); flex-shrink: 0; min-width: 48px; text-align: center; }
 .log-WARN { color: var(--yellow); flex-shrink: 0; min-width: 48px; text-align: center; }
 .log-ERROR { color: var(--red); flex-shrink: 0; min-width: 48px; text-align: center; }
