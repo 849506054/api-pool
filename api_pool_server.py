@@ -391,7 +391,8 @@ class APIPool:
         self._lock = threading.Lock()
         self.default_payload = default_payload or {}
         self._endpoints: list[Endpoint] = []
-        self._current_idx = 0
+        self._current_endpoint_id = None  # 用端点ID追踪当前端点，而非位置索引
+        self._last_reasoning_content = None  # 缓存上一轮返回的 reasoning_content，用于多轮对话补全
         if endpoints:
             for ep in endpoints:
                 self.add_endpoint(ep)
@@ -415,12 +416,12 @@ class APIPool:
         with self._lock:
             self._endpoints.append(ep)
             self._endpoints.sort(key=lambda e: e.priority)
-            self._current_idx = 0
 
     def remove_endpoint(self, ep_id):
         with self._lock:
             self._endpoints = [e for e in self._endpoints if e.id != ep_id]
-            self._current_idx = 0
+            if self._current_endpoint_id == ep_id:
+                self._current_endpoint_id = None
 
     def set_enabled(self, ep_id, enabled):
         with self._lock:
@@ -434,7 +435,12 @@ class APIPool:
                 if ep.id == ep_id:
                     ep.in_pool = in_pool
                     break
-                    break
+            # 移除出池时，重排池内剩余端点的优先级为连续值
+            if not in_pool:
+                pool_eps = sorted([ep for ep in self._endpoints if ep.in_pool], key=lambda e: e.priority)
+                for i, ep in enumerate(pool_eps):
+                    ep.priority = i + 1
+                self._endpoints.sort(key=lambda e: e.priority)
 
     def update_endpoint(self, ep_id, updates: dict):
         with self._lock:
@@ -448,24 +454,18 @@ class APIPool:
 
     def switch_to_endpoint(self, ep_id):
         with self._lock:
-            active = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
-                      and not self._is_in_cooldown(ep)
-                      and not self._is_quota_exceeded(ep)
-                      and not self._is_rpm_limited(ep)]
-            for i, ep in enumerate(active):
+            for ep in self._endpoints:
                 if ep.id == ep_id:
-                    self._current_idx = i
+                    self._current_endpoint_id = ep_id
                     return True
         return False
 
     def list_endpoints(self):
         now = time.time()
         with self._lock:
-            active = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
-                      and not self._is_in_cooldown(ep)
-                      and not self._is_quota_exceeded(ep)
-                      and not self._is_rpm_limited(ep)]
-            current_ep = active[self._current_idx] if active and self._current_idx < len(active) else None
+            current_ep = None
+            if self._current_endpoint_id:
+                current_ep = next((ep for ep in self._endpoints if ep.id == self._current_endpoint_id), None)
             return [self._ep_to_dict(ep, ep is current_ep, now) for ep in self._endpoints]
 
     def _ep_to_dict(self, ep, is_current, now):
@@ -510,7 +510,9 @@ class APIPool:
         now = time.time()
         with self._lock:
             active = self._active_endpoints()
-            current_ep = active[self._current_idx] if active and self._current_idx < len(active) else None
+            current_ep = None
+            if self._current_endpoint_id:
+                current_ep = next((ep for ep in active if ep.id == self._current_endpoint_id), None)
             return [
                 {
                     "name": ep.name,
@@ -543,7 +545,19 @@ class APIPool:
                 ep._cooldown_until = 0
                 with ep._rpm_lock:
                     ep._req_timestamps.clear()
-            self._current_idx = 0
+            self._current_endpoint_id = None
+
+    def reset_to_priority_mode(self):
+        with self._lock:
+            active = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
+                      and not self._is_in_cooldown(ep)
+                      and not self._is_quota_exceeded(ep)
+                      and not self._is_rpm_limited(ep)]
+            if not active:
+                return False
+            best = min(active, key=lambda ep: ep.priority)
+            self._current_endpoint_id = best.id
+            return True
 
     def _check_one_health(self, ep):
         if ep.health_mode == "none":
@@ -753,27 +767,27 @@ class APIPool:
         if active:
             for i, ep in enumerate(active):
                 if ep is failed_ep:
-                    self._current_idx = (i + 1) % len(active)
+                    next_idx = (i + 1) % len(active)
+                    self._current_endpoint_id = active[next_idx].id
                     return
-            self._current_idx = 0
+            self._current_endpoint_id = active[0].id if active else None
 
-    def _on_success(self, ep):
+    def _on_success(self, ep, result=None):
         ep._total_calls += 1
         ep._last_success_ts = time.time()
         ep._fail_count = 0
         ep._last_error = ""
         self._clear_cooldown(ep)
-        active = self._active_endpoints()
-        best = self._pick_best(active)
-        if best and best.priority < ep.priority:
-            for i, e in enumerate(active):
-                if e is best:
-                    self._current_idx = i
-                    return
-        for i, e in enumerate(active):
-            if e is ep:
-                self._current_idx = i
-                return
+        self._current_endpoint_id = ep.id
+        # 缓存 reasoning_content 用于多轮对话
+        if result and isinstance(result, dict):
+            try:
+                msg = result.get("choices", [{}])[0].get("message", {})
+                rc = msg.get("reasoning_content")
+                if rc:
+                    self._last_reasoning_content = rc
+            except (IndexError, KeyError):
+                pass
 
     def _probe_endpoint(self, ep):
         """对单个端点做快速探活，成功返回 True，失败返回 False。按 billing_mode 选择检测方式。"""
@@ -799,18 +813,55 @@ class APIPool:
         errors = []
         tried = 0
         total = len(active)
+        
+        # 补全 reasoning_content：找到最后一个 assistant 消息，如果没有则注入缓存值
+        # DeepSeek thinking 模式要求多轮对话时必须传回 reasoning_content，而 OpenAI 客户端不会存这个字段
+        processed_messages = messages
+        has_assistant = any(m.get("role") == "assistant" for m in messages)
+        has_reasoning_content = any("reasoning_content" in m for m in messages if m.get("role") == "assistant")
+        
+        # 如果有 assistant 消息但没有 reasoning_content，说明可能是跨端点/跨会话切换，禁用 thinking 避免 400
+        disable_thinking = has_assistant and not has_reasoning_content
+        
+        if self._last_reasoning_content and has_assistant:
+            assistant_idx = None
+            for i, m in enumerate(messages):
+                if m.get("role") == "assistant":
+                    assistant_idx = i
+            if assistant_idx is not None and "reasoning_content" not in messages[assistant_idx]:
+                processed_messages = list(messages)
+                processed_messages[assistant_idx] = dict(processed_messages[assistant_idx])
+                processed_messages[assistant_idx]["reasoning_content"] = self._last_reasoning_content
+                disable_thinking = False  # 成功注入，不需要禁用
+        
         with self._lock:
-            if self._current_idx >= total:
-                self._current_idx = 0
-            idx = self._current_idx
+            # 从当前端点的位置开始尝试，找不到则从 0 开始
+            start_idx = 0
+            if self._current_endpoint_id:
+                for i, ep in enumerate(active):
+                    if ep.id == self._current_endpoint_id:
+                        start_idx = i
+                        break
+            idx = start_idx
         while tried < total:
             ep = active[idx]
             ep_timeout = timeout or ep.timeout
             ep_model = model or ep.model
             payload = {
-                "model": ep_model, "messages": messages,
+                "model": ep_model, "messages": processed_messages,
                 **self.default_payload, **(extra_payload or {}),
             }
+            
+            # 多轮对话缺失 reasoning_content 时，注入空字符串骗过 DeepSeek 校验
+            # DeepSeek 只检查字段是否存在，不关心内容是否为空
+            if disable_thinking:
+                # 找到最后一个 assistant 消息注入空值
+                for i in reversed(range(len(processed_messages))):
+                    if processed_messages[i].get("role") == "assistant" and "reasoning_content" not in processed_messages[i]:
+                        processed_messages = list(processed_messages)
+                        processed_messages[i] = dict(processed_messages[i])
+                        processed_messages[i]["reasoning_content"] = ""
+                        break
             
             # [VISION TRANSLATION INTERCEPT]
             if self._has_images(payload["messages"]) and getattr(ep, "is_vision", True) is False:
@@ -842,7 +893,7 @@ class APIPool:
             result, error = self._try_endpoint(ep, payload, ep_timeout)
             if result is not None:
                 with self._lock:
-                    self._on_success(ep)
+                    self._on_success(ep, result)
                 sys_log(f"端点 '{ep.name}' 请求成功 (延迟: 正常)", "INFO")
                 if return_endpoint: return result, ep
                 return result
@@ -1240,6 +1291,10 @@ def api_handler(method, path, body):
         extra_payload.pop("thinking", None)
         if isinstance(extra_payload.get("extra_body"), dict):
             extra_payload["extra_body"].pop("thinking", None)
+        # DeepSeek 不支持 response_format，过滤掉避免 400
+        extra_payload.pop("response_format", None)
+        if isinstance(extra_payload.get("extra_body"), dict):
+            extra_payload["extra_body"].pop("response_format", None)
         
         try:
             result = pool.chat(messages, extra_payload=extra_payload)
@@ -1247,7 +1302,9 @@ def api_handler(method, path, body):
             
             # result is the full upstream response body (preserves reasoning_content etc.)
             response = dict(result)  # shallow copy
-            response["model"] = "api-pool-aggregated"
+            # 保留真实模型名称，让 Hermes 能识别 DeepSeek 并应用对应 provider 逻辑
+            # 原来的 api-pool-aggregated 会导致 Hermes 用通用 OpenAI 客户端，丢失 reasoning_content 处理
+            # response["model"] = "api-pool-aggregated"
             return 200, response, False
             
         except AllEndpointsFailed as e:
@@ -1381,6 +1438,7 @@ def api_handler(method, path, body):
         except AllEndpointsFailed as e: return 200, {"ok": False, "errors": e.errors}, False
         except Exception as e: return 200, {"ok": False, "error": str(e)}, False
     if method == "POST" and cp == "/api/reset": pool.reset(); return 200, {"ok": True}, False
+    if method == "POST" and cp == "/api/reset-priority": pool.reset_to_priority_mode(); return 200, {"ok": True}, False
 
     return 404, {"error": "Not found"}, False
 
@@ -1653,7 +1711,10 @@ select option { background: var(--bg); color: var(--text); }
         <span class="icon">🏊</span> 聚合池管理
         <span style="font-size:11px;color:var(--text-dim);margin-left:auto" id="poolCount"></span>
       </div>
-      <div style="font-size:10px;color:var(--text-dim);margin-bottom:10px">从左侧端点列表添加，参与 API 调用轮换</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <div style="font-size:10px;color:var(--text-dim);">从左侧端点列表添加，参与 API 调用轮换</div>
+        <button class="btn btn-ghost btn-sm" onclick="resetPriority()" title="忽略手动切换，按优先级自动选择最优端点">⬆️ 按优先级</button>
+      </div>
       <div id="poolList"></div>
     </div>
     <div class="card" style="margin-bottom:16px">
@@ -2136,6 +2197,7 @@ async function sendTest() {
   refresh();
 }
 async function resetPool(){await api('POST','/api/reset');toast('已重置','success');refresh();}
+async function resetPriority(){await api('POST','/api/reset-priority');toast('✅ 已切换为按优先级运行','success');refresh();}
 
 function checkFetchBtn(){
     const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
