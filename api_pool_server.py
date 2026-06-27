@@ -887,10 +887,12 @@ class APIPool:
                 safe_api_key = ep.api_key.encode('ascii', 'ignore').decode('ascii').strip()
                 req.add_header("x-api-key", safe_api_key)
                 req.add_header("Authorization", f"Bearer {safe_api_key}")
+                req.add_header("User-Agent", "OpenAI/Python 2.33.0")
                 req.add_header("anthropic-version", "2023-06-01")
             else:
                 safe_api_key = ep.api_key.encode('ascii', 'ignore').decode('ascii').strip()
                 req.add_header("Authorization", f"Bearer {safe_api_key}")
+                req.add_header("User-Agent", "OpenAI/Python 2.33.0")
                 
             for k, v in ep.extra_headers.items():
                 req.add_header(k, v)
@@ -1053,9 +1055,11 @@ class APIPool:
         if protocol == "anthropic":
             req.add_header("x-api-key", safe_api_key)
             req.add_header("Authorization", f"Bearer {safe_api_key}")
+            req.add_header("User-Agent", "OpenAI/Python 2.33.0")
             req.add_header("anthropic-version", "2023-06-01")
         else:
             req.add_header("Authorization", f"Bearer {safe_api_key}")
+            req.add_header("User-Agent", "OpenAI/Python 2.33.0")
             
         try:
             if not use_proxy:
