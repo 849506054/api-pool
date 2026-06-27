@@ -1972,6 +1972,7 @@ function renderPoolList(eps){
     return `<div class="${cls}" style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px">
       <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1">
         <span class="badge badge-priority">#${ep.priority}</span>
+        ${ep.billing_mode==='pay_per_use'?'<span class="badge" style="background:rgba(255,159,10,.15);color:#ff9f0a" title="按次计费，健康检查使用零成本探针">💰按次</span>':''}
         <span style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(ep.name)}</span>
         <span style="font-size:10px;color:var(--text-dim);white-space:nowrap">${esc(ep.model||'')}</span>
       </div>
