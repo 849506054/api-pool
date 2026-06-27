@@ -1082,6 +1082,7 @@ class APIPool:
                     else:
                         u = body.get("usage", {})
                         content = body["choices"][0]["message"].get("content", "")
+                        reasoning = body["choices"][0]["message"].get("reasoning_content", "")
                         if u:
                             tot = u.get("total_tokens", 0)
                             cached = 0
@@ -1089,19 +1090,10 @@ class APIPool:
                                 cached = u["prompt_tokens_details"].get("cached_tokens", 0)
                             if log_usage and not ep.name.startswith("test_"):
                                 token_tracker.add_usage(ep.name, ep.model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), tot, cached)
-                                content = body["choices"][0]["message"].get("content", "")
-                        if not content.strip():
-                            reasoning = body["choices"][0]["message"].get("reasoning_content", "")
-                            if reasoning:
-                                content = reasoning
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, content.strip(), tot, int((time.time() - req_t0) * 1000))
+                                log_text = content.strip() or reasoning.strip() or ""
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000))
                                 ep._today_used += tot
-                        content = body["choices"][0]["message"].get("content", "")
-                        if not content.strip():
-                            reasoning = body["choices"][0]["message"].get("reasoning_content", "")
-                            if reasoning:
-                                content = reasoning
-                        return (content.strip() if content else ""), ""
+                        return body, ""
                     
                     
             except urllib.error.HTTPError as e:
@@ -1220,7 +1212,7 @@ def ensure_config():
 
 ensure_config()
 
-pool = APIPool(default_payload={"temperature": 0.7, "thinking": {"type": "disabled"}})
+pool = APIPool(default_payload={"temperature": 0.7})
 for ep_data in load_config():
     if "in_pool" not in ep_data: ep_data["in_pool"] = True
     pool.add_endpoint(ep_data)
@@ -1247,14 +1239,9 @@ def api_handler(method, path, body):
             result = pool.chat(messages, extra_payload=extra_payload)
             if is_stream: return 200, result, True 
             
-            response = {
-                "id": f"chatcmpl-{int(time.time()*1000)}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": "api-pool-aggregated",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": result}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            }
+            # result is the full upstream response body (preserves reasoning_content etc.)
+            response = dict(result)  # shallow copy
+            response["model"] = "api-pool-aggregated"
             return 200, response, False
             
         except AllEndpointsFailed as e:
@@ -1364,7 +1351,7 @@ def api_handler(method, path, body):
         for ep in pool.list_endpoints():
             if ep["id"] == ep_id: target_ep = ep; break
         if not target_ep: return 404, {"error": "端点不存在"}, False
-        test_pool = APIPool(default_payload={"temperature": 0.7, "thinking": {"type": "disabled"}})
+        test_pool = APIPool(default_payload={"temperature": 0.7})
         test_pool.add_endpoint({"name": target_ep["name"], "base_url": target_ep["base_url"], "api_key": target_ep["api_key_full"], "model": target_ep["model"], "priority": 1, "timeout": target_ep["timeout"], "max_retries": target_ep["max_retries"], "enabled": True, "in_pool": True, "use_proxy": target_ep.get("use_proxy", True), "protocol": target_ep.get("protocol", "openai"), "is_vision": target_ep.get("is_vision", True)})
         
         img = body.get("image")
