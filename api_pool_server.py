@@ -368,7 +368,7 @@ class Endpoint:
     
     _today_used: int = field(default=0, repr=False)
     _today_date: str = field(default="", repr=False)
-    health_mode: str = field(default="chat")
+    health_mode: str = field(default="models")
 
     _health: str = field(default="unknown", repr=False) 
     _health_latency_ms: int = field(default=-1, repr=False)
@@ -398,7 +398,13 @@ class APIPool:
 
     def add_endpoint(self, ep):
         if isinstance(ep, dict):
-            ep = Endpoint(**{k: v for k, v in ep.items() if k in Endpoint.__dataclass_fields__})
+            ep_dict = {k: v for k, v in ep.items() if k in Endpoint.__dataclass_fields__}
+            # 新增时按组别自动设置健康检测模式（未显式指定时生效）
+            if "health_mode" not in ep_dict:
+                ep_dict["health_mode"] = "chat" if ep_dict.get("in_pool", False) else "models"
+            ep = Endpoint(**ep_dict)
+        elif not ep.health_mode:
+            ep.health_mode = "chat" if ep.in_pool else "models"
         if not ep.id:
             import uuid
             ep.id = str(uuid.uuid4())
@@ -524,8 +530,11 @@ class APIPool:
     def _check_one_health(self, ep):
         if ep.health_mode == "none":
             return ep.id, "unknown", -1, "已禁用健康检测"
-            
-        if ep.health_mode == "models":
+
+        # 按所在组别自动决定检测模式：池内用chat（验证真实可用），池外用models（零消耗探测）
+        effective_mode = "chat" if ep.in_pool else "models"
+
+        if effective_mode == "models":
             t0 = time.time()
             try:
                 models = self.fetch_models(ep.base_url, ep.api_key, timeout=10, use_proxy=ep.use_proxy, protocol=ep.protocol)
