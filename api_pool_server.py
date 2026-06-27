@@ -446,6 +446,18 @@ class APIPool:
                     self._endpoints.sort(key=lambda e: e.priority)
                     break
 
+    def switch_to_endpoint(self, ep_id):
+        with self._lock:
+            active = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
+                      and not self._is_in_cooldown(ep)
+                      and not self._is_quota_exceeded(ep)
+                      and not self._is_rpm_limited(ep)]
+            for i, ep in enumerate(active):
+                if ep.id == ep_id:
+                    self._current_idx = i
+                    return True
+        return False
+
     def list_endpoints(self):
         now = time.time()
         with self._lock:
@@ -1293,6 +1305,10 @@ def api_handler(method, path, body):
         ep_id = unquote(cp.split("/")[-1])
         pool.set_pool(ep_id, False); _sync_to_config()
         return 200, {"ok": True}, False
+    if method == "POST" and cp.startswith("/api/switch-endpoint/"):
+        ep_id = unquote(cp.split("/")[-1])
+        ok = pool.switch_to_endpoint(ep_id)
+        return 200, {"ok": ok}, False
     if method == "POST" and cp == "/api/endpoints":
         pool.add_endpoint(body); _sync_to_config(); return 201, {"ok": True}, False
     if method == "POST" and cp == "/api/endpoints/batch":
@@ -1349,7 +1365,7 @@ def api_handler(method, path, body):
             if ep["id"] == ep_id: target_ep = ep; break
         if not target_ep: return 404, {"error": "端点不存在"}, False
         test_pool = APIPool(default_payload={"temperature": 0.7, "thinking": {"type": "disabled"}})
-        test_pool.add_endpoint({"name": target_ep["name"], "base_url": target_ep["base_url"], "api_key": target_ep["api_key_full"], "model": target_ep["model"], "priority": 1, "timeout": target_ep["timeout"], "max_retries": target_ep["max_retries"], "enabled": True, "use_proxy": target_ep.get("use_proxy", True), "protocol": target_ep.get("protocol", "openai"), "is_vision": target_ep.get("is_vision", True)})
+        test_pool.add_endpoint({"name": target_ep["name"], "base_url": target_ep["base_url"], "api_key": target_ep["api_key_full"], "model": target_ep["model"], "priority": 1, "timeout": target_ep["timeout"], "max_retries": target_ep["max_retries"], "enabled": True, "in_pool": True, "use_proxy": target_ep.get("use_proxy", True), "protocol": target_ep.get("protocol", "openai"), "is_vision": target_ep.get("is_vision", True)})
         
         img = body.get("image")
         if img:
@@ -1861,11 +1877,15 @@ function renderStats(eps){
 
 function renderFilterBar(eps){
   const en=eps.filter(e=>e.enabled).length;
+  const vision=eps.filter(e=>e.is_vision!==false).length;
+  const payperuse=eps.filter(e=>e.billing_mode==='pay_per_use').length;
   document.getElementById('filterBar').innerHTML=`
     <button class="filter-btn ${epFilter==='all'?'active':''}" onclick="setFilter('all')">全部 ${eps.length}</button>
     <button class="filter-btn ${epFilter==='enabled'?'active':''}" onclick="setFilter('enabled')">启用 ${en}</button>
     <button class="filter-btn ${epFilter==='disabled'?'active':''}" onclick="setFilter('disabled')">禁用 ${eps.length-en}</button>
     <button class="filter-btn ${epFilter==='pooled'?'active':''}" onclick="setFilter('pooled')">已聚合 ${eps.filter(e=>e.in_pool).length}</button>
+    <button class="filter-btn ${epFilter==='vision'?'active':''}" onclick="setFilter('vision')">视觉 ${vision}</button>
+    <button class="filter-btn ${epFilter==='payperuse'?'active':''}" onclick="setFilter('payperuse')">按次 ${payperuse}</button>
 
     <span class="filter-count" id="filterCount"></span>`;
 }
@@ -1881,6 +1901,8 @@ function renderEndpoints(eps){
   if(epFilter==='enabled')eps=eps.filter(e=>e.enabled);
   else if(epFilter==='disabled')eps=eps.filter(e=>!e.enabled);
   else if(epFilter==='pooled')eps=eps.filter(e=>e.in_pool);
+  else if(epFilter==='vision')eps=eps.filter(e=>e.is_vision!==false);
+  else if(epFilter==='payperuse')eps=eps.filter(e=>e.billing_mode==='pay_per_use');
 
   const c=document.getElementById('filterCount');if(c)c.textContent=`${eps.length} 个`;
   const el=document.getElementById('epList');
@@ -1895,7 +1917,7 @@ function renderEndpoints(eps){
     if(ep.daily_limit>0&&ep.today_used>=ep.daily_limit)cls+=' in-cooldown';
     if(ep.is_rpm_limited)cls+=' in-cooldown';
     let b=`<span class="badge badge-priority">#${ep.priority}</span>${hBadge(ep.health,ep.health_latency_ms)}`;
-    if(ep.in_pool)b+='<span style="display:inline-flex;align-items:center;gap:4px">🏊</span>';
+    if(ep.in_pool)b+='<span class="badge" style="background:rgba(16,163,127,0.2);color:#2ecc71;border:1px solid rgba(16,163,127,0.3)" title="已加入聚合池">🏊</span>';
     if(ep.protocol==='anthropic')b+=`<span class="badge" style="background:rgba(217,119,87,0.2);color:#ff9e7a;border:1px solid rgba(217,119,87,0.3)" title="Anthropic 原生协议翻译">🧠Anthropic</span>`;
     else b+=`<span class="badge badge-priority" style="background:rgba(16,163,127,0.2);color:#2ecc71" title="OpenAI 兼容协议">🟢OpenAI</span>`;
     if(ep.is_current)b+='<span class="badge badge-current">● 当前</span>';
@@ -1920,6 +1942,7 @@ function renderEndpoints(eps){
           ${ep.in_cooldown?`<button class="btn btn-yellow btn-sm" title="立刻解除冷却" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
           <button class="btn btn-ghost btn-sm" title="${ep.enabled?'禁用端点':'启用端点'}" onclick="toggleEndpoint('${ep.id}')">${ep.enabled?'⏸':'▶'}</button>
           ${!ep.in_pool?'<button class="btn btn-ghost btn-sm" title="加入聚合池" onclick="addToPool(\''+ep.id+'\')">📥</button>':''}
+          ${ep.enabled && ep.in_pool && !ep.is_current?'<button class="btn btn-ghost btn-sm" title="切换为当前端点" onclick="switchEndpoint(\''+ep.id+'\')">⚡</button>':''}
           <button class="btn btn-ghost btn-sm" title="编辑端点" onclick="editEndpoint('${ep.id}')">✏️</button>
           <button class="btn btn-ghost btn-sm" title="删除端点" onclick="deleteEndpoint('${ep.id}', '${esc(ep.name)}')" style="color:var(--red)">🗑</button>
         </div>
@@ -1951,11 +1974,14 @@ function renderPoolList(eps){
     else if(h==='slow')rh='<span style="color:var(--yellow);font-size:11px">🐢'+(lat>=0?' '+lat+'ms':'')+'</span>';
     else if(h==='bad')rh='<span style="color:var(--red);font-size:11px">✗'+(lat>=0?' '+lat+'ms':'')+'</span>';
     else rh='<span style="color:var(--text-dim);font-size:11px">-</span>';
-    // 生成优先级选项
-    let options = Array.from({length:poolEps.length}, (_,i)=>{
-      const p = i+1;
-      return `<option value="${p}" ${p===ep.priority?'selected':''}>#${p}</option>`;
-    }).join('');
+    // 生成优先级选项：只到当前聚合池成员数（优先级本来就应该是 1~N）
+    // 如果有已存在的优先级大于 N，也一并加上保持选项完整
+    const maxP = Math.max(poolEps.length, Math.max(...poolEps.map(e => e.priority)));
+    let options = [];
+    for(let p = 1; p <= maxP; p++){
+      options.push(`<option value="${p}" ${p===ep.priority?'selected':''}>#${p}</option>`);
+    }
+    options = options.join('');
     return `<div class="${cls}" style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px">
       <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1">
         <span class="badge badge-priority">#${ep.priority}</span>
@@ -1966,36 +1992,10 @@ function renderPoolList(eps){
         ${rh}
         ${ep.is_current?'<span class="badge badge-current">● 当前</span>':''}
         ${ep.in_cooldown?'<span class="badge badge-cooldown">⏳'+fmtTime(ep.cooldown_remaining)+'</span>':''}
-        <select class="btn btn-ghost btn-sm" style="padding:3px 6px;cursor:pointer" onchange="setPriority('${ep.id}', this.value)" title="修改优先级">
+        <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:12px;min-width:45px;" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority('${ep.id}', this.value)" title="修改优先级">
           ${options}
         </select>
-        <button class="btn btn-ghost btn-sm" title="移出聚合池" onclick="removeFromPool('${ep.id}')">📤</button>
-      </div>
-    </div>`;
-  }).join('');
-}
-  el.innerHTML=poolEps.map(ep=>{
-    let cls='ep-item';
-    if(!ep.enabled)cls+=' disabled';
-    if(ep.is_current)cls+=' current';
-    if(ep.in_cooldown)cls+=' in-cooldown';
-    if(ep.in_pool)cls+=' in-pool';
-    let h=ep.health,lat=ep.health_latency_ms;
-    let rh='';
-    if(h==='ok')rh='<span style="color:var(--green);font-size:11px">✓'+(lat>=0?' '+lat+'ms':'')+'</span>';
-    else if(h==='slow')rh='<span style="color:var(--yellow);font-size:11px">🐢'+(lat>=0?' '+lat+'ms':'')+'</span>';
-    else if(h==='bad')rh='<span style="color:var(--red);font-size:11px">✗'+(lat>=0?' '+lat+'ms':'')+'</span>';
-    else rh='<span style="color:var(--text-dim);font-size:11px">-</span>';
-    return `<div class="${cls}" style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px">
-      <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1">
-        <span class="badge badge-priority">#${ep.priority}</span>
-        <span style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(ep.name)}</span>
-        <span style="font-size:10px;color:var(--text-dim);white-space:nowrap">${esc(ep.model||'')}</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
-        ${rh}
-        ${ep.is_current?'<span class="badge badge-current">● 当前</span>':''}
-        ${ep.in_cooldown?'<span class="badge badge-cooldown">⏳'+fmtTime(ep.cooldown_remaining)+'</span>':''}
+        ${!ep.is_current?'<button class="btn btn-ghost btn-sm" title="切换为当前端点" onclick="switchEndpoint(\''+ep.id+'\')">⚡</button>':''}
         <button class="btn btn-ghost btn-sm" title="移出聚合池" onclick="removeFromPool('${ep.id}')">📤</button>
       </div>
     </div>`;
@@ -2032,104 +2032,59 @@ async function setPriority(targetId, newPrio){
   newPrio = parseInt(newPrio);
   // 获取所有端点，筛选聚合池内的，按当前优先级排序
   const all = await api('GET', '/api/endpoints');
-  const poolEps = all.endpoints.filter(e => e.in_pool).sort((a,b) => a.priority - b.priority);
+  const poolEps = all.filter(e => e.in_pool).sort((a,b) => a.priority - b.priority);
   const target = poolEps.find(e => e.id === targetId);
   if(!target){console.error('Target not found');return;}
   
   const oldPrio = target.priority;
   if(oldPrio === newPrio){return;} // 没有变化
   
-  // 重新计算所有受影响端点的优先级
+  // 只收集需要改 priority 的端点，不传其他字段（避免覆盖 API key 等敏感字段）
   const updates = [];
   
   if(newPrio < oldPrio){
     // 提升优先级：原位置 和 新位置 之间的所有端点优先级 +1
     for(const ep of poolEps){
       if(ep.priority >= newPrio && ep.priority < oldPrio){
-        updates.push({
-          id: ep.id,
-          name: ep.name,
-          base_url: ep.base_url,
-          api_key: ep.api_key,
-          model: ep.model,
-          priority: ep.priority + 1,
-          timeout: ep.timeout,
-          max_retries: ep.max_retries,
-          enabled: ep.enabled,
-          cooldown_minutes: ep.cooldown_minutes,
-          daily_limit: ep.daily_limit || 0,
-          rpm_limit: ep.rpm_limit || 0,
-          use_proxy: ep.use_proxy !== false ? ep.use_proxy : true,
-          protocol: ep.protocol || 'openai',
-          health_mode: ep.health_mode || 'chat',
-          billing_mode: ep.billing_mode || 'subscription',
-          is_vision: ep.is_vision !== false ? ep.is_vision : true,
-          in_pool: ep.in_pool
-        });
+        updates.push({id: ep.id, priority: ep.priority + 1});
       }
     }
   } else {
     // 降低优先级：新位置 和 原位置 之间的所有端点优先级 -1
     for(const ep of poolEps){
       if(ep.priority > oldPrio && ep.priority <= newPrio){
-        updates.push({
-          id: ep.id,
-          name: ep.name,
-          base_url: ep.base_url,
-          api_key: ep.api_key,
-          model: ep.model,
-          priority: ep.priority - 1,
-          timeout: ep.timeout,
-          max_retries: ep.max_retries,
-          enabled: ep.enabled,
-          cooldown_minutes: ep.cooldown_minutes,
-          daily_limit: ep.daily_limit || 0,
-          rpm_limit: ep.rpm_limit || 0,
-          use_proxy: ep.use_proxy !== false ? ep.use_proxy : true,
-          protocol: ep.protocol || 'openai',
-          health_mode: ep.health_mode || 'chat',
-          billing_mode: ep.billing_mode || 'subscription',
-          is_vision: ep.is_vision !== false ? ep.is_vision : true,
-          in_pool: ep.in_pool
-        });
+        updates.push({id: ep.id, priority: ep.priority - 1});
       }
     }
   }
   
   // 更新目标端点自身
-  updates.push({
-    id: target.id,
-    name: target.name,
-    base_url: target.base_url,
-    api_key: target.api_key,
-    model: target.model,
-    priority: newPrio,
-    timeout: target.timeout,
-    max_retries: target.max_retries,
-    enabled: target.enabled,
-    cooldown_minutes: target.cooldown_minutes,
-    daily_limit: target.daily_limit || 0,
-    rpm_limit: target.rpm_limit || 0,
-    use_proxy: target.use_proxy !== false ? target.use_proxy : true,
-    protocol: target.protocol || 'openai',
-    health_mode: target.health_mode || 'chat',
-    billing_mode: target.billing_mode || 'subscription',
-    is_vision: target.is_vision !== false ? target.is_vision : true,
-    in_pool: target.in_pool
-  });
+  updates.push({id: target.id, priority: newPrio});
   
-  // 批量提交更新
+  // 逐个PUT更新（只传priority字段，不碰其他字段）
   toast('正在更新优先级...', 'info');
-  const r = await api('POST', '/api/endpoints/batch', {endpoints: updates});
-  if(r.ok){
+  let success = true;
+  for(const update of updates){
+    const r = await api('PUT', `/api/endpoints/${encodeURIComponent(update.id)}`, {priority: update.priority});
+    if(!r.ok){
+      success = false;
+      break;
+    }
+  }
+  if(success){
     toast('✅ 优先级已更新', 'success');
     refresh();
   } else {
-    toast('❌ 更新失败: ' + (r.error || '未知错误'), 'error');
+    toast('❌ 更新失败', 'error');
   }
 }
 async function deleteEndpoint(id, n){if(!confirm(`删除「${n}」？`))return;await api('DELETE',`/api/endpoints/${encodeURIComponent(id)}`);toast('已删除','success');refresh();}
 async function clearCooldown(id){await api('PUT',`/api/endpoints/${encodeURIComponent(id)}`,{cooldown_minutes:0});await api('POST','/api/reset');setTimeout(async()=>{await api('PUT',`/api/endpoints/${encodeURIComponent(id)}`,{cooldown_minutes:5});refresh();},200);toast('已解除冷却','success');refresh();}
+async function switchEndpoint(id){
+  const r = await api('POST', `/api/switch-endpoint/${encodeURIComponent(id)}`);
+  if(r.ok){ toast('✅ 已切换','success'); refresh(); }
+  else { toast('❌ 切换失败','error'); }
+}
 let testImageBase64 = null;
 function previewTestImage(input) {
   if (input.files && input.files[0]) {
@@ -2735,8 +2690,9 @@ async function pollLogs() {
 pollLogs();
 
 refresh();
+// 移除全局定时刷新 — 只在需要时手动刷新，日志单独轮询
+// 日志保持单独轮询
 setInterval(() => {
-    refresh();
     loadChatLogs(chatLogsPage);
 }, 3000);
 let chatLogsPage = 0;
