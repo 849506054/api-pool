@@ -22,6 +22,7 @@ from collections import deque
 
 LATENCY_OK_MAX = 2000     
 LATENCY_SLOW_MAX = 5000   
+HEALTH_CHECK_INTERVAL = 120  
 
 class LogManager:
     def __init__(self, max_history=300):
@@ -353,7 +354,6 @@ class Endpoint:
     protocol: str = "openai"
     extra_headers: dict = field(default_factory=dict)
     is_vision: bool = True
-    in_pool: bool = False  # 是否加入聚合池（默认不加入）
 
     _fail_count: int = field(default=0, repr=False)
     _req_timestamps: deque = field(default_factory=deque, repr=False)
@@ -367,8 +367,7 @@ class Endpoint:
     
     _today_used: int = field(default=0, repr=False)
     _today_date: str = field(default="", repr=False)
-    health_mode: str = field(default="models")
-    billing_mode: str = field(default="subscription")
+    health_mode: str = field(default="chat")
 
     _health: str = field(default="unknown", repr=False) 
     _health_latency_ms: int = field(default=-1, repr=False)
@@ -391,23 +390,14 @@ class APIPool:
         self._lock = threading.Lock()
         self.default_payload = default_payload or {}
         self._endpoints: list[Endpoint] = []
-        self._current_endpoint_id = None  # 用端点ID追踪当前端点，而非位置索引
-        self._last_reasoning_content = None  # 缓存上一轮返回的 reasoning_content，用于多轮对话补全
+        self._current_idx = 0
         if endpoints:
             for ep in endpoints:
                 self.add_endpoint(ep)
 
     def add_endpoint(self, ep):
         if isinstance(ep, dict):
-            ep_dict = {k: v for k, v in ep.items() if k in Endpoint.__dataclass_fields__}
-            # 新增时按组别自动设置健康检测模式（未显式指定时生效）
-            if "health_mode" not in ep_dict:
-                ep_dict["health_mode"] = "models" if ep_dict.get("billing_mode", "subscription") == "pay_per_use" else ("chat" if ep_dict.get("in_pool", False) else "models")
-            if "billing_mode" not in ep_dict:
-                ep_dict["billing_mode"] = "subscription"
-            ep = Endpoint(**ep_dict)
-        elif not ep.health_mode:
-            ep.health_mode = "models" if ep.billing_mode == "pay_per_use" else ("chat" if ep.in_pool else "models")
+            ep = Endpoint(**{k: v for k, v in ep.items() if k in Endpoint.__dataclass_fields__})
         if not ep.id:
             import uuid
             ep.id = str(uuid.uuid4())
@@ -416,31 +406,19 @@ class APIPool:
         with self._lock:
             self._endpoints.append(ep)
             self._endpoints.sort(key=lambda e: e.priority)
+            self._current_idx = 0
 
     def remove_endpoint(self, ep_id):
         with self._lock:
             self._endpoints = [e for e in self._endpoints if e.id != ep_id]
-            if self._current_endpoint_id == ep_id:
-                self._current_endpoint_id = None
+            self._current_idx = 0
 
     def set_enabled(self, ep_id, enabled):
         with self._lock:
             for ep in self._endpoints:
                 if ep.id == ep_id:
                     ep.enabled = enabled
-
-    def set_pool(self, ep_id, in_pool):
-        with self._lock:
-            for ep in self._endpoints:
-                if ep.id == ep_id:
-                    ep.in_pool = in_pool
                     break
-            # 移除出池时，重排池内剩余端点的优先级为连续值
-            if not in_pool:
-                pool_eps = sorted([ep for ep in self._endpoints if ep.in_pool], key=lambda e: e.priority)
-                for i, ep in enumerate(pool_eps):
-                    ep.priority = i + 1
-                self._endpoints.sort(key=lambda e: e.priority)
 
     def update_endpoint(self, ep_id, updates: dict):
         with self._lock:
@@ -452,20 +430,11 @@ class APIPool:
                     self._endpoints.sort(key=lambda e: e.priority)
                     break
 
-    def switch_to_endpoint(self, ep_id):
-        with self._lock:
-            for ep in self._endpoints:
-                if ep.id == ep_id:
-                    self._current_endpoint_id = ep_id
-                    return True
-        return False
-
     def list_endpoints(self):
         now = time.time()
         with self._lock:
-            current_ep = None
-            if self._current_endpoint_id:
-                current_ep = next((ep for ep in self._endpoints if ep.id == self._current_endpoint_id), None)
+            active = [ep for ep in self._endpoints if ep.enabled]
+            current_ep = active[self._current_idx] if active and self._current_idx < len(active) else None
             return [self._ep_to_dict(ep, ep is current_ep, now) for ep in self._endpoints]
 
     def _ep_to_dict(self, ep, is_current, now):
@@ -487,9 +456,7 @@ class APIPool:
             "use_proxy": ep.use_proxy,
             "protocol": ep.protocol,
             "health_mode": ep.health_mode,
-            "billing_mode": ep.billing_mode,
             "is_vision": ep.is_vision,
-            "in_pool": ep.in_pool,
             "is_rpm_limited": self._is_rpm_limited(ep),
             "fail_count": ep._fail_count,
             "last_error": ep._last_error,
@@ -510,9 +477,7 @@ class APIPool:
         now = time.time()
         with self._lock:
             active = self._active_endpoints()
-            current_ep = None
-            if self._current_endpoint_id:
-                current_ep = next((ep for ep in active if ep.id == self._current_endpoint_id), None)
+            current_ep = active[self._current_idx] if active and self._current_idx < len(active) else None
             return [
                 {
                     "name": ep.name,
@@ -528,7 +493,6 @@ class APIPool:
                     "use_proxy": ep.use_proxy,
                     "is_rpm_limited": self._is_rpm_limited(ep),
                     "is_vision": ep.is_vision,
-            "in_pool": ep.in_pool,
                     "health": ep._health,
                     "health_latency_ms": ep._health_latency_ms,
                     "health_error": ep._health_error,
@@ -545,32 +509,13 @@ class APIPool:
                 ep._cooldown_until = 0
                 with ep._rpm_lock:
                     ep._req_timestamps.clear()
-            self._current_endpoint_id = None
-
-    def reset_to_priority_mode(self):
-        with self._lock:
-            active = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
-                      and not self._is_in_cooldown(ep)
-                      and not self._is_quota_exceeded(ep)
-                      and not self._is_rpm_limited(ep)]
-            if not active:
-                return False
-            best = min(active, key=lambda ep: ep.priority)
-            self._current_endpoint_id = best.id
-            return True
+            self._current_idx = 0
 
     def _check_one_health(self, ep):
         if ep.health_mode == "none":
             return ep.id, "unknown", -1, "已禁用健康检测"
-
-        # 按所在组别自动决定检测模式：池内用chat（验证真实可用），池外用models（零消耗探测）
-        # 按次计费的端点强制使用 models 检测，避免产生费用
-        if ep.billing_mode == "pay_per_use":
-            effective_mode = "models"
-        else:
-            effective_mode = "chat" if ep.in_pool else "models"
-
-        if effective_mode == "models":
+            
+        if ep.health_mode == "models":
             t0 = time.time()
             try:
                 models = self.fetch_models(ep.base_url, ep.api_key, timeout=10, use_proxy=ep.use_proxy, protocol=ep.protocol)
@@ -656,10 +601,6 @@ class APIPool:
                 continue
                 
             description = result if isinstance(result, str) else result.get("choices", [{}])[0].get("message", {}).get("content", "")
-            if not description.strip():
-                reasoning = result.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
-                if reasoning:
-                    description = reasoning
             if description:
                 break
                 
@@ -686,7 +627,7 @@ class APIPool:
 
     def check_all_health(self):
         with self._lock:
-            endpoints = [ep for ep in self._endpoints if ep.enabled and ep.in_pool]
+            endpoints = [ep for ep in self._endpoints if ep.enabled]
             for ep in endpoints:
                 ep._health = "testing"
         if not endpoints:
@@ -740,10 +681,10 @@ class APIPool:
         ep._cooldown_until = 0
 
     def _active_endpoints(self):
-        available = [ep for ep in self._endpoints if ep.enabled and ep.in_pool and not self._is_in_cooldown(ep) and not self._is_quota_exceeded(ep) and not self._is_rpm_limited(ep)]
+        available = [ep for ep in self._endpoints if ep.enabled and not self._is_in_cooldown(ep) and not self._is_quota_exceeded(ep) and not self._is_rpm_limited(ep)]
         if available:
             return available
-        return [ep for ep in self._endpoints if ep.enabled and ep.in_pool and not self._is_quota_exceeded(ep)]
+        return [ep for ep in self._endpoints if ep.enabled and not self._is_quota_exceeded(ep)]
 
     def _pick_best(self, active):
         for ep in active:
@@ -751,60 +692,38 @@ class APIPool:
                 return ep
         return min(active, key=lambda e: e._cooldown_until) if active else None
 
-    def _rotate(self, failed_ep, error_msg, probe_failed=False):
+    def _rotate(self, failed_ep, error_msg):
         failed_ep._fail_count += 1
         failed_ep._total_failures += 1
         failed_ep._last_error = error_msg
         failed_ep._last_error_ts = time.time()
-        if probe_failed:
-            # 探活失败：只设短冷却（30秒），避免误杀冷启动端点
-            failed_ep._cooldown_until = time.time() + 30
-            sys_log(f"端点 '{failed_ep.name}' 探活失败，短冷却 30 秒", "WARN")
-        else:
-            self._set_cooldown(failed_ep)
-            sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {failed_ep.cooldown_minutes} 分钟后", "WARN")
+        self._set_cooldown(failed_ep)
+        sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {failed_ep.cooldown_minutes} 分钟后", "WARN")
         active = self._active_endpoints()
         if active:
             for i, ep in enumerate(active):
                 if ep is failed_ep:
-                    next_idx = (i + 1) % len(active)
-                    self._current_endpoint_id = active[next_idx].id
+                    self._current_idx = (i + 1) % len(active)
                     return
-            self._current_endpoint_id = active[0].id if active else None
+            self._current_idx = 0
 
-    def _on_success(self, ep, result=None):
+    def _on_success(self, ep):
         ep._total_calls += 1
         ep._last_success_ts = time.time()
         ep._fail_count = 0
         ep._last_error = ""
         self._clear_cooldown(ep)
-        self._current_endpoint_id = ep.id
-        # 缓存 reasoning_content 用于多轮对话
-        if result and isinstance(result, dict):
-            try:
-                msg = result.get("choices", [{}])[0].get("message", {})
-                rc = msg.get("reasoning_content")
-                if rc:
-                    self._last_reasoning_content = rc
-            except (IndexError, KeyError):
-                pass
-
-    def _probe_endpoint(self, ep):
-        """对单个端点做快速探活，成功返回 True，失败返回 False。按 billing_mode 选择检测方式。"""
-        if ep.health_mode == "none":
-            return True  # 关闭检测视为可用
-        if ep.billing_mode == "pay_per_use" or not ep.in_pool:
-            # 按次计费或池外端点：用 models 探活（零成本）
-            try:
-                models = self.fetch_models(ep.base_url, ep.api_key, timeout=10, use_proxy=ep.use_proxy, protocol=ep.protocol)
-                return bool(models)
-            except Exception:
-                return False
-        else:
-            # 按量计费池内端点：用 chat ping
-            payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3}
-            reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True)
-            return reply is not None
+        active = self._active_endpoints()
+        best = self._pick_best(active)
+        if best and best.priority < ep.priority:
+            for i, e in enumerate(active):
+                if e is best:
+                    self._current_idx = i
+                    return
+        for i, e in enumerate(active):
+            if e is ep:
+                self._current_idx = i
+                return
 
     def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False):
         active = self._active_endpoints()
@@ -813,55 +732,18 @@ class APIPool:
         errors = []
         tried = 0
         total = len(active)
-        
-        # 补全 reasoning_content：找到最后一个 assistant 消息，如果没有则注入缓存值
-        # DeepSeek thinking 模式要求多轮对话时必须传回 reasoning_content，而 OpenAI 客户端不会存这个字段
-        processed_messages = messages
-        has_assistant = any(m.get("role") == "assistant" for m in messages)
-        has_reasoning_content = any("reasoning_content" in m for m in messages if m.get("role") == "assistant")
-        
-        # 如果有 assistant 消息但没有 reasoning_content，说明可能是跨端点/跨会话切换，禁用 thinking 避免 400
-        disable_thinking = has_assistant and not has_reasoning_content
-        
-        if self._last_reasoning_content and has_assistant:
-            assistant_idx = None
-            for i, m in enumerate(messages):
-                if m.get("role") == "assistant":
-                    assistant_idx = i
-            if assistant_idx is not None and "reasoning_content" not in messages[assistant_idx]:
-                processed_messages = list(messages)
-                processed_messages[assistant_idx] = dict(processed_messages[assistant_idx])
-                processed_messages[assistant_idx]["reasoning_content"] = self._last_reasoning_content
-                disable_thinking = False  # 成功注入，不需要禁用
-        
         with self._lock:
-            # 从当前端点的位置开始尝试，找不到则从 0 开始
-            start_idx = 0
-            if self._current_endpoint_id:
-                for i, ep in enumerate(active):
-                    if ep.id == self._current_endpoint_id:
-                        start_idx = i
-                        break
-            idx = start_idx
+            if self._current_idx >= total:
+                self._current_idx = 0
+            idx = self._current_idx
         while tried < total:
             ep = active[idx]
             ep_timeout = timeout or ep.timeout
             ep_model = model or ep.model
             payload = {
-                "model": ep_model, "messages": processed_messages,
+                "model": ep_model, "messages": messages,
                 **self.default_payload, **(extra_payload or {}),
             }
-            
-            # 多轮对话缺失 reasoning_content 时，注入空字符串骗过 DeepSeek 校验
-            # DeepSeek 只检查字段是否存在，不关心内容是否为空
-            if disable_thinking:
-                # 找到最后一个 assistant 消息注入空值
-                for i in reversed(range(len(processed_messages))):
-                    if processed_messages[i].get("role") == "assistant" and "reasoning_content" not in processed_messages[i]:
-                        processed_messages = list(processed_messages)
-                        processed_messages[i] = dict(processed_messages[i])
-                        processed_messages[i]["reasoning_content"] = ""
-                        break
             
             # [VISION TRANSLATION INTERCEPT]
             if self._has_images(payload["messages"]) and getattr(ep, "is_vision", True) is False:
@@ -893,35 +775,18 @@ class APIPool:
             result, error = self._try_endpoint(ep, payload, ep_timeout)
             if result is not None:
                 with self._lock:
-                    self._on_success(ep, result)
+                    self._on_success(ep)
                 sys_log(f"端点 '{ep.name}' 请求成功 (延迟: 正常)", "INFO")
                 if return_endpoint: return result, ep
                 return result
             errors.append(f"[{ep.name}] {error}")
             sys_log(f"端点 '{ep.name}' 请求失败: {error}", "ERROR")
-            # 统一探活：探活通过视为瞬态故障，原地重试；探活失败则旋转冷却
-            time.sleep(1.5)  # 短暂等待，给瞬态故障自愈时间
-            try:
-                if self._probe_endpoint(ep):
-                    sys_log(f"端点 '{ep.name}' 请求失败但探活通过，视为瞬态故障，跳过冷却，原地重试", "INFO")
-                    with self._lock:
-                        ep._fail_count += 1
-                        ep._total_failures += 1
-                        ep._last_error = error
-                        ep._last_error_ts = time.time()
-                        ep._cooldown_until = 0
-                    tried += 1
-                    continue
-            except Exception:
-                pass
-            sys_log(f"端点 '{ep.name}' 请求失败且探活未通过，进入冷却旋转", "WARN")
             with self._lock:
                 self._rotate(ep, error)
                 active = self._active_endpoints()
                 total = len(active)
                 if total == 0:
                     break
-                # 按优先级逐个探活下一个候选端点
                 next_ep = None
                 for i, e in enumerate(active):
                     if e is not ep and not self._is_in_cooldown(e):
@@ -933,31 +798,6 @@ class APIPool:
                         if e is ep:
                             idx = (i + 1) % len(active)
                             break
-                else:
-                    # 对候选端点做探活
-                    sys_log(f"对候选端点 '{next_ep.name}' 进行探活...", "INFO")
-                    if self._probe_endpoint(next_ep):
-                        sys_log(f"候选端点 '{next_ep.name}' 探活通过，准备重试请求", "INFO")
-                    else:
-                        sys_log(f"候选端点 '{next_ep.name}' 探活失败，跳过", "WARN")
-                        self._rotate(next_ep, "探活失败", probe_failed=True)
-                        # 重新获取可用端点列表，继续找下一个
-                        active = self._active_endpoints()
-                        total = len(active)
-                        if total == 0:
-                            break
-                        next_ep2 = None
-                        for i, e in enumerate(active):
-                            if e is not ep and e is not next_ep and not self._is_in_cooldown(e):
-                                next_ep2 = e
-                                idx = i
-                                break
-                        if next_ep2 is None:
-                            # 没有更多候选了，尝试任何非当前端点
-                            for i, e in enumerate(active):
-                                if e is ep:
-                                    idx = (i + 1) % len(active)
-                                    break
                 tried += 1
         raise AllEndpointsFailed(errors)
 
@@ -1028,12 +868,10 @@ class APIPool:
                 safe_api_key = ep.api_key.encode('ascii', 'ignore').decode('ascii').strip()
                 req.add_header("x-api-key", safe_api_key)
                 req.add_header("Authorization", f"Bearer {safe_api_key}")
-                req.add_header("User-Agent", "OpenAI/Python 2.33.0")
                 req.add_header("anthropic-version", "2023-06-01")
             else:
                 safe_api_key = ep.api_key.encode('ascii', 'ignore').decode('ascii').strip()
                 req.add_header("Authorization", f"Bearer {safe_api_key}")
-                req.add_header("User-Agent", "OpenAI/Python 2.33.0")
                 
             for k, v in ep.extra_headers.items():
                 req.add_header(k, v)
@@ -1139,7 +977,7 @@ class APIPool:
                         reply = ""
                         for c in body.get("content", []):
                             if c.get("type") == "text": reply += c.get("text", "")
-                        content = body["choices"][0]["message"].get("content", "")
+                        u = body.get("usage", {})
                         if u:
                             prompt_t = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
                             tot = prompt_t + u.get("output_tokens", 0)
@@ -1151,8 +989,6 @@ class APIPool:
                         return reply.strip(), ""
                     else:
                         u = body.get("usage", {})
-                        content = body["choices"][0]["message"].get("content", "")
-                        reasoning = body["choices"][0]["message"].get("reasoning_content", "")
                         if u:
                             tot = u.get("total_tokens", 0)
                             cached = 0
@@ -1160,10 +996,11 @@ class APIPool:
                                 cached = u["prompt_tokens_details"].get("cached_tokens", 0)
                             if log_usage and not ep.name.startswith("test_"):
                                 token_tracker.add_usage(ep.name, ep.model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), tot, cached)
-                                log_text = content.strip() or reasoning.strip() or ""
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000))
+                                content = body["choices"][0]["message"].get("content", "")
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, content.strip(), tot, int((time.time() - req_t0) * 1000))
                                 ep._today_used += tot
-                        return body, ""
+                        content = body["choices"][0]["message"].get("content", "")
+                        return (content.strip() if content else ""), ""
                     
                     
             except urllib.error.HTTPError as e:
@@ -1197,11 +1034,9 @@ class APIPool:
         if protocol == "anthropic":
             req.add_header("x-api-key", safe_api_key)
             req.add_header("Authorization", f"Bearer {safe_api_key}")
-            req.add_header("User-Agent", "OpenAI/Python 2.33.0")
             req.add_header("anthropic-version", "2023-06-01")
         else:
             req.add_header("Authorization", f"Bearer {safe_api_key}")
-            req.add_header("User-Agent", "OpenAI/Python 2.33.0")
             
         try:
             if not use_proxy:
@@ -1282,10 +1117,18 @@ def ensure_config():
 
 ensure_config()
 
+def _health_check_loop():
+    while True:
+        time.sleep(HEALTH_CHECK_INTERVAL)
+        try: pool.check_all_health()
+        except Exception: pass
+
 pool = APIPool(default_payload={"temperature": 0.7})
-for ep_data in load_config():
-    if "in_pool" not in ep_data: ep_data["in_pool"] = True
-    pool.add_endpoint(ep_data)
+for ep_data in load_config(): pool.add_endpoint(ep_data)
+
+_health_thread = threading.Thread(target=_health_check_loop, daemon=True)
+_health_thread.start()
+threading.Thread(target=pool.check_all_health, daemon=True).start()
 
 
 def api_handler(method, path, body):
@@ -1304,23 +1147,19 @@ def api_handler(method, path, body):
                 body["stream_options"]["include_usage"] = True
                 
         extra_payload = {k: v for k, v in body.items() if k not in ("messages", "model")}
-        extra_payload.pop("thinking", None)
-        if isinstance(extra_payload.get("extra_body"), dict):
-            extra_payload["extra_body"].pop("thinking", None)
-        # DeepSeek 不支持 response_format，过滤掉避免 400
-        extra_payload.pop("response_format", None)
-        if isinstance(extra_payload.get("extra_body"), dict):
-            extra_payload["extra_body"].pop("response_format", None)
         
         try:
             result = pool.chat(messages, extra_payload=extra_payload)
             if is_stream: return 200, result, True 
             
-            # result is the full upstream response body (preserves reasoning_content etc.)
-            response = dict(result)  # shallow copy
-            # 保留真实模型名称，让 Hermes 能识别 DeepSeek 并应用对应 provider 逻辑
-            # 原来的 api-pool-aggregated 会导致 Hermes 用通用 OpenAI 客户端，丢失 reasoning_content 处理
-            # response["model"] = "api-pool-aggregated"
+            response = {
+                "id": f"chatcmpl-{int(time.time()*1000)}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "api-pool-aggregated",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": result}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            }
             return 200, response, False
             
         except AllEndpointsFailed as e:
@@ -1360,21 +1199,6 @@ def api_handler(method, path, body):
 
     if method == "GET" and cp == "/api/endpoints": return 200, pool.list_endpoints(), False
     if method == "GET" and cp == "/api/chain": return 200, pool.get_active_chain(), False
-    # ================= 聚合池管理 =================
-    if method == "GET" and cp == "/api/pool":
-        return 200, [ep for ep in pool.list_endpoints() if ep.get("in_pool")], False
-    if method == "POST" and cp.startswith("/api/pool/"):
-        ep_id = unquote(cp.split("/")[-1])
-        pool.set_pool(ep_id, True); _sync_to_config()
-        return 200, {"ok": True}, False
-    if method == "DELETE" and cp.startswith("/api/pool/"):
-        ep_id = unquote(cp.split("/")[-1])
-        pool.set_pool(ep_id, False); _sync_to_config()
-        return 200, {"ok": True}, False
-    if method == "POST" and cp.startswith("/api/switch-endpoint/"):
-        ep_id = unquote(cp.split("/")[-1])
-        ok = pool.switch_to_endpoint(ep_id)
-        return 200, {"ok": ok}, False
     if method == "POST" and cp == "/api/endpoints":
         pool.add_endpoint(body); _sync_to_config(); return 201, {"ok": True}, False
     if method == "POST" and cp == "/api/endpoints/batch":
@@ -1389,9 +1213,7 @@ def api_handler(method, path, body):
                 "use_proxy": item.get("use_proxy", base.get("use_proxy", True)),
                 "protocol": item.get("protocol", base.get("protocol", "openai")),
                 "health_mode": item.get("health_mode", base.get("health_mode", "chat")),
-                  "billing_mode": item.get("billing_mode", base.get("billing_mode", "subscription")),
                   "is_vision": item.get("is_vision", base.get("is_vision", True)),
-                  "in_pool": item.get("in_pool", base.get("in_pool", False)),
                   "enabled": item.get("enabled", True),
             }
             if ep["model"]: pool.add_endpoint(ep); added += 1
@@ -1431,7 +1253,7 @@ def api_handler(method, path, body):
             if ep["id"] == ep_id: target_ep = ep; break
         if not target_ep: return 404, {"error": "端点不存在"}, False
         test_pool = APIPool(default_payload={"temperature": 0.7})
-        test_pool.add_endpoint({"name": target_ep["name"], "base_url": target_ep["base_url"], "api_key": target_ep["api_key_full"], "model": target_ep["model"], "priority": 1, "timeout": target_ep["timeout"], "max_retries": target_ep["max_retries"], "enabled": True, "in_pool": True, "use_proxy": target_ep.get("use_proxy", True), "protocol": target_ep.get("protocol", "openai"), "is_vision": target_ep.get("is_vision", True)})
+        test_pool.add_endpoint({"name": target_ep["name"], "base_url": target_ep["base_url"], "api_key": target_ep["api_key_full"], "model": target_ep["model"], "priority": 1, "timeout": target_ep["timeout"], "max_retries": target_ep["max_retries"], "enabled": True, "use_proxy": target_ep.get("use_proxy", True), "protocol": target_ep.get("protocol", "openai"), "is_vision": target_ep.get("is_vision", True)})
         
         img = body.get("image")
         if img:
@@ -1454,13 +1276,11 @@ def api_handler(method, path, body):
         except AllEndpointsFailed as e: return 200, {"ok": False, "errors": e.errors}, False
         except Exception as e: return 200, {"ok": False, "error": str(e)}, False
     if method == "POST" and cp == "/api/reset": pool.reset(); return 200, {"ok": True}, False
-    if method == "POST" and cp == "/api/reset-priority": pool.reset_to_priority_mode(); return 200, {"ok": True}, False
 
     return 404, {"error": "Not found"}, False
 
 def _sync_to_config():
-    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "is_vision": ep.get("is_vision", True),
-            "in_pool": ep.get("in_pool", False)} for ep in pool.list_endpoints()])
+    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "health_mode": ep.get("health_mode", "chat"), "is_vision": ep.get("is_vision", True)} for ep in pool.list_endpoints()])
 
 
 GUI_HTML = r"""<!DOCTYPE html>
@@ -1512,14 +1332,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
   border: 1px solid var(--border);
 }
 
-.grid{display:grid;grid-template-columns:7fr 3fr;gap:20px;align-items:start}
+.grid{display:grid;grid-template-columns:1fr 360px;gap:20px;align-items:start}
 @media(max-width:920px){.grid{grid-template-columns:1fr}}
 
 .card{background:var(--card);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow)}
 .card-title{font-size:13px;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:7px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px}
 .card-title .icon{font-size:15px}
 
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px}
 .stat-item{background:rgba(255,255,255,.02);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border:1px solid var(--border);border-radius:12px;padding:12px 10px;text-align:center;transition:transform .2s,box-shadow .2s;box-shadow:0 2px 8px rgba(0,0,0,.1)}
 .stat-item:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.2)}
 .stat-item .num{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
@@ -1552,15 +1372,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .ep-item.disabled{opacity:.4}
 .ep-item.current{border-color:var(--green);background:var(--green-dim)}
 .ep-item.in-cooldown{border-color:var(--yellow);background:var(--yellow-dim)}
-.ep-item.in-pool{border-left:3px solid var(--accent);background:rgba(0,122,255,.08)}
 .ep-item.has-error{border-color:var(--red);background:var(--red-dim)}
 .ep-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;gap:6px;flex-wrap:wrap}
 .ep-name{font-weight:700;font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .badge{font-size:9px;padding:2px 7px;border-radius:12px;font-weight:700;display:inline-flex;align-items:center;gap:3px;text-transform:uppercase;letter-spacing:.3px}
 .badge-current{background:var(--green-dim);color:var(--green)}
 .badge-disabled{background:var(--red-dim);color:var(--red)}
-.badge-pool{background:var(--accent);color:#fff}
-.badge-not-pool{background:var(--yellow-dim);color:var(--yellow)}
 .badge-cooldown{background:var(--yellow-dim);color:var(--yellow)}
 .badge-priority{background:var(--accent);color:#fff;min-width:20px;justify-content:center}
 .badge-h-ok{background:var(--green-dim);color:var(--green)}
@@ -1650,7 +1467,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .log-card { background: var(--card); backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; box-shadow: var(--shadow); display: flex; flex-direction: column; }
 .log-container { height: 280px; overflow-y: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 11px; display: flex; flex-direction: column; gap: 6px; scroll-behavior: smooth; }
 .log-line { display: flex; gap: 8px; line-height: 1.5; word-break: break-all; }
-.log-time { color: var(--text-dim); flex-shrink: 0; }
+.log-time { color: var(--text-dim); flex-shrink: 0; user-select: none; }
 .log-INFO { color: var(--blue); flex-shrink: 0; min-width: 48px; text-align: center; }
 .log-WARN { color: var(--yellow); flex-shrink: 0; min-width: 48px; text-align: center; }
 .log-ERROR { color: var(--red); flex-shrink: 0; min-width: 48px; text-align: center; }
@@ -1722,17 +1539,6 @@ select option { background: var(--bg); color: var(--text); }
     </div>
   </div>
   <div>
-    <div class="card" style="margin-bottom:16px">
-      <div class="card-title">
-        <span class="icon">🏊</span> 聚合池管理
-        <span style="font-size:11px;color:var(--text-dim);margin-left:auto" id="poolCount"></span>
-      </div>
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-        <div style="font-size:10px;color:var(--text-dim);">从左侧端点列表添加，参与 API 调用轮换</div>
-        <button class="btn btn-ghost btn-sm" onclick="resetPriority()" title="忽略手动切换，按优先级自动选择最优端点">⬆️ 按优先级</button>
-      </div>
-      <div id="poolList"></div>
-    </div>
     <div class="card" style="margin-bottom:16px">
       <div class="card-title"><span class="icon">🔗</span> 聚合链</div>
       <div style="font-size:10px;color:var(--text-dim);margin-bottom:10px">遇 429/超时自动切换 · 冷却到期自动切回</div>
@@ -1858,7 +1664,7 @@ select option { background: var(--bg); color: var(--text); }
     <input type="hidden" id="editName">
     <div class="form-group"><label>名称</label><input type="text" id="fName" placeholder="如 OpenAI 或 DeepSeek" oninput="this.dataset.autofilled='false'"></div>
     <div class="form-group"><label>Base URL</label><input type="text" id="fUrl" placeholder="https://api.openai.com/v1" oninput="checkFetchBtn()"></div>
-    <div class="form-group"><label>API Key</label><input type="text" id="fKey" placeholder="sk-..." oninput="checkFetchBtn()"></div>
+    <div class="form-group"><label>API Key</label><input type="password" id="fKey" placeholder="sk-..." oninput="checkFetchBtn()"></div>
     <div class="form-group">
       <label>模型</label>
       <div class="model-row">
@@ -1873,7 +1679,7 @@ select option { background: var(--bg); color: var(--text); }
       <div class="form-group"><label>超时 (秒)</label><input type="number" id="fTimeout" value="60" min="1"></div>
     </div>
     <div class="form-row">
-      <div class="form-group"><label>重试次数</label><input type="number" id="fRetries" value="1" min="0"></div>
+      <div class="form-group"><label>重试次数</label><input type="number" id="fRetries" value="0" min="0"></div>
       <div class="form-group"><label>冷却 (分钟)</label><input type="number" id="fCooldown" value="5" min="0"></div>
     </div>
       <div class="form-group">
@@ -1882,15 +1688,7 @@ select option { background: var(--bg); color: var(--text); }
       </div>
     <div class="form-row">
       <div class="form-group"><label>启用</label><select id="fEnabled"><option value="true">是</option><option value="false">否</option></select></div>
-      <div class="form-group"><label>加入聚合池</label><select id="fPool"><option value="false">否（仅保存）</option><option value="true">是（参与轮换）</option></select></div>
       <div class="form-group"><label title="达到额度后挂起，0为不限制">每日额度 (0不限)</label><input type="number" id="fDailyLimit" value="0" min="0"></div>
-      <div class="form-group">
-        <label title="按次计费的端点健康检查将自动使用零成本 Models 探针，避免产生费用">计费方式</label>
-        <select id="fBillingMode">
-          <option value="subscription">按量计费</option>
-          <option value="pay_per_use">按次计费</option>
-        </select>
-      </div>
     </div>
     <div class="form-row" style="grid-template-columns: 1fr 1fr 1fr;">
       <div class="form-group"><label title="每分钟最高请求次数，超限自动切换，0为不限制">并发 (0不限)</label><input type="number" id="fRpmLimit" value="0" min="0"></div>
@@ -1905,7 +1703,6 @@ select option { background: var(--bg); color: var(--text); }
         <option value="none">关闭检测</option>
       </select>
     </div>
-
     <div class="form-actions">
       <button class="btn btn-ghost" onclick="closeModal()">取消</button>
       <button class="btn btn-green" id="batchAddBtn" style="display:none" onclick="batchAddEndpoints()">📦 批量添加</button>
@@ -1929,7 +1726,7 @@ let epFilter='all',modelPage=1,PP=50;
 
 async function refresh(){
   const[eps,chain]=await Promise.all([api('GET','/api/endpoints'),api('GET','/api/chain')]);
-  renderStats(eps);renderFilterBar(eps);renderEndpoints(eps);renderPoolList(eps);renderChain(chain);
+  renderStats(eps);renderFilterBar(eps);renderEndpoints(eps);renderChain(chain);
 }
 
 function renderStats(eps){
@@ -1947,16 +1744,10 @@ function renderStats(eps){
 
 function renderFilterBar(eps){
   const en=eps.filter(e=>e.enabled).length;
-  const vision=eps.filter(e=>e.is_vision!==false).length;
-  const payperuse=eps.filter(e=>e.billing_mode==='pay_per_use').length;
   document.getElementById('filterBar').innerHTML=`
     <button class="filter-btn ${epFilter==='all'?'active':''}" onclick="setFilter('all')">全部 ${eps.length}</button>
     <button class="filter-btn ${epFilter==='enabled'?'active':''}" onclick="setFilter('enabled')">启用 ${en}</button>
     <button class="filter-btn ${epFilter==='disabled'?'active':''}" onclick="setFilter('disabled')">禁用 ${eps.length-en}</button>
-    <button class="filter-btn ${epFilter==='pooled'?'active':''}" onclick="setFilter('pooled')">已聚合 ${eps.filter(e=>e.in_pool).length}</button>
-    <button class="filter-btn ${epFilter==='vision'?'active':''}" onclick="setFilter('vision')">视觉 ${vision}</button>
-    <button class="filter-btn ${epFilter==='payperuse'?'active':''}" onclick="setFilter('payperuse')">按次 ${payperuse}</button>
-
     <span class="filter-count" id="filterCount"></span>`;
 }
 function setFilter(f){epFilter=f;refresh();}
@@ -1970,10 +1761,6 @@ function hBadge(h,lat){
 function renderEndpoints(eps){
   if(epFilter==='enabled')eps=eps.filter(e=>e.enabled);
   else if(epFilter==='disabled')eps=eps.filter(e=>!e.enabled);
-  else if(epFilter==='pooled')eps=eps.filter(e=>e.in_pool);
-  else if(epFilter==='vision')eps=eps.filter(e=>e.is_vision!==false);
-  else if(epFilter==='payperuse')eps=eps.filter(e=>e.billing_mode==='pay_per_use');
-
   const c=document.getElementById('filterCount');if(c)c.textContent=`${eps.length} 个`;
   const el=document.getElementById('epList');
   if(!eps.length){el.innerHTML='<div class="empty">暂无端点</div>';return;}
@@ -1982,17 +1769,14 @@ function renderEndpoints(eps){
     if(!ep.enabled)cls+=' disabled';
     if(ep.is_current)cls+=' current';
     if(ep.in_cooldown)cls+=' in-cooldown';
-    if(ep.in_pool)cls+=' in-pool';
     if(ep.last_error&&!ep.in_cooldown)cls+=' has-error';
     if(ep.daily_limit>0&&ep.today_used>=ep.daily_limit)cls+=' in-cooldown';
     if(ep.is_rpm_limited)cls+=' in-cooldown';
     let b=`<span class="badge badge-priority">#${ep.priority}</span>${hBadge(ep.health,ep.health_latency_ms)}`;
-    if(ep.in_pool)b+='<span class="badge" style="background:rgba(16,163,127,0.2);color:#2ecc71;border:1px solid rgba(16,163,127,0.3)" title="已加入聚合池">🏊</span>';
     if(ep.protocol==='anthropic')b+=`<span class="badge" style="background:rgba(217,119,87,0.2);color:#ff9e7a;border:1px solid rgba(217,119,87,0.3)" title="Anthropic 原生协议翻译">🧠Anthropic</span>`;
     else b+=`<span class="badge badge-priority" style="background:rgba(16,163,127,0.2);color:#2ecc71" title="OpenAI 兼容协议">🟢OpenAI</span>`;
     if(ep.is_current)b+='<span class="badge badge-current">● 当前</span>';
     if(!ep.enabled)b+='<span class="badge badge-disabled">禁用</span>';
-
       if(ep.is_vision!==false)b+=`<span class=\"badge\" style=\"background:rgba(0,122,255,.15);color:#0a84ff\" title=\"原生支持视觉能力\">👁️视觉</span>`;
     if(ep.is_rpm_limited)b+=`<span class="badge badge-cooldown" title="每分钟并发已满，限流降级中">🚧限流中</span>`;
     else if(ep.daily_limit>0&&ep.today_used>=ep.daily_limit)b+=`<span class="badge badge-cooldown" title="今日额度已满，挂起至明日">🛑额度耗尽</span>`;
@@ -2000,7 +1784,6 @@ function renderEndpoints(eps){
     if(!ep.use_proxy)b+=`<span class="badge badge-priority" title="绕过系统全局代理，强制直连">🌐直连</span>`;
     if(ep.health_mode==='none')b+=`<span class="badge" style="background:rgba(255,255,255,.05);color:var(--text-dim)" title="已关闭后台健康监测">🔕免扰</span>`;
     else if(ep.health_mode==='models')b+=`<span class="badge" style="background:rgba(50,215,75,.1);color:var(--green)" title="零成本 Models 探针">☘️无感测</span>`;
-    if(ep.billing_mode==='pay_per_use')b+=`<span class="badge" style="background:rgba(255,159,10,.15);color:#ff9f0a" title="按次计费，健康检查使用零成本探针">💰按次</span>`;
     if(ep.daily_limit>0)b+=`<span class="badge" style="background:rgba(255,255,255,.05);color:var(--text-dim)" title="每日消耗进度">📊${fmtNum(ep.today_used)} / ${fmtNum(ep.daily_limit)}</span>`;
     if(ep.rpm_limit>0)b+=`<span class="badge" style="background:rgba(255,255,255,.05);color:var(--text-dim)" title="每分钟最高并发请求限制">🚀${ep.rpm_limit} RPM</span>`;
     const last=ep.last_success?timeAgo(ep.last_success):'—';
@@ -2011,8 +1794,6 @@ function renderEndpoints(eps){
           <button class="btn btn-ghost btn-sm" title="连通性测试" onclick="openTestDrawer('${ep.id}', '${esc(ep.name)} (${esc(ep.model)})')">🧪</button>
           ${ep.in_cooldown?`<button class="btn btn-yellow btn-sm" title="立刻解除冷却" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
           <button class="btn btn-ghost btn-sm" title="${ep.enabled?'禁用端点':'启用端点'}" onclick="toggleEndpoint('${ep.id}')">${ep.enabled?'⏸':'▶'}</button>
-          ${!ep.in_pool?'<button class="btn btn-ghost btn-sm" title="加入聚合池" onclick="addToPool(\''+ep.id+'\')">📥</button>':''}
-          ${ep.enabled && ep.in_pool && !ep.is_current?'<button class="btn btn-ghost btn-sm" title="切换为当前端点" onclick="switchEndpoint(\''+ep.id+'\')">⚡</button>':''}
           <button class="btn btn-ghost btn-sm" title="编辑端点" onclick="editEndpoint('${ep.id}')">✏️</button>
           <button class="btn btn-ghost btn-sm" title="删除端点" onclick="deleteEndpoint('${ep.id}', '${esc(ep.name)}')" style="color:var(--red)">🗑</button>
         </div>
@@ -2021,55 +1802,6 @@ function renderEndpoints(eps){
         <span title="绑定的模型名称">🤖${esc(ep.model)}</span><span title="单次请求超时时间">⏱${ep.timeout}s</span><span title="失败后最大重试次数">🔁${ep.max_retries}次</span><span title="请求失败后的冷却惩罚时间">❄️${ep.cooldown_minutes}分</span><span title="累计成功响应次数">📞${ep.total_calls}次</span><span title="最后一次成功响应时间">🕐${last}</span>
       </div>
       ${ep.last_error?`<div class="ep-error">⚠ ${esc(ep.last_error)}</div>`:''}
-    </div>`;
-  }).join('');
-}
-
-
-function renderPoolList(eps){
-  const poolEps=eps.filter(e=>e.in_pool).sort((a,b)=>a.priority-b.priority);
-  const el=document.getElementById('poolList');
-  const cnt=document.getElementById('poolCount');
-  if(cnt)cnt.textContent=poolEps.length+' 个成员';
-  if(!poolEps.length){el.innerHTML='<div class="empty">聚合池为空，从左侧添加端点</div>';return;}
-  el.innerHTML=poolEps.map(ep=>{
-    let cls='ep-item';
-    if(!ep.enabled)cls+=' disabled';
-    if(ep.is_current)cls+=' current';
-    if(ep.in_cooldown)cls+=' in-cooldown';
-    if(ep.in_pool)cls+=' in-pool';
-    let h=ep.health,lat=ep.health_latency_ms;
-    let rh='';
-    if(h==='ok')rh='<span style="color:var(--green);font-size:11px">✓'+(lat>=0?' '+lat+'ms':'')+'</span>';
-    else if(h==='slow')rh='<span style="color:var(--yellow);font-size:11px">🐢'+(lat>=0?' '+lat+'ms':'')+'</span>';
-    else if(h==='bad')rh='<span style="color:var(--red);font-size:11px">✗'+(lat>=0?' '+lat+'ms':'')+'</span>';
-    else rh='<span style="color:var(--text-dim);font-size:11px">-</span>';
-    // 生成优先级选项：只到当前聚合池成员数（优先级本来就应该是 1~N）
-    // 如果有已存在的优先级大于 N，也一并加上保持选项完整
-    const maxP = Math.max(poolEps.length, Math.max(...poolEps.map(e => e.priority)));
-    let options = [];
-    for(let p = 1; p <= maxP; p++){
-      options.push(`<option value="${p}" ${p===ep.priority?'selected':''}>#${p}</option>`);
-    }
-    options = options.join('');
-    return `<div class="${cls}" style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px">
-      <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1">
-        <span class="badge badge-priority">#${ep.priority}</span>
-        ${ep.billing_mode==='pay_per_use'?'<span class="badge" style="background:rgba(255,159,10,.15);color:#ff9f0a" title="按次计费，健康检查使用零成本探针">💰按次</span>':''}
-        <span style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(ep.name)}</span>
-        <span style="font-size:10px;color:var(--text-dim);white-space:nowrap">${esc(ep.model||'')}</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
-        ${rh}
-        ${ep.is_current?'<span class="badge badge-current">● 当前</span>':''}
-        ${ep.in_cooldown?'<span class="badge badge-cooldown">⏳'+fmtTime(ep.cooldown_remaining)+'</span>':''}
-        ${ep.in_cooldown?`<button class="btn btn-yellow btn-sm" title="立刻解除冷却" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
-        <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:12px;min-width:45px;" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority('${ep.id}', this.value)" title="修改优先级">
-          ${options}
-        </select>
-        ${!ep.is_current?'<button class="btn btn-ghost btn-sm" title="切换为当前端点" onclick="switchEndpoint(\''+ep.id+'\')">⚡</button>':''}
-        <button class="btn btn-ghost btn-sm" title="移出聚合池" onclick="removeFromPool('${ep.id}')">📤</button>
-      </div>
     </div>`;
   }).join('');
 }
@@ -2098,65 +1830,8 @@ function renderChain(chain){
 
 async function runHealthCheck(){toast('正在检测...','info');const r=await api('POST','/api/health-check');if(r.ok){const o=r.results.filter(x=>x.health==='ok').length,s=r.results.filter(x=>x.health==='slow').length,b=r.results.filter(x=>x.health==='bad').length;toast(`✅${o} 🐢${s} ❌${b}`,'success');}refresh();}
 async function toggleEndpoint(id){await api('POST',`/api/endpoints/${encodeURIComponent(id)}/toggle`);refresh();}
-async function addToPool(id){await api('POST',`/api/pool/${encodeURIComponent(id)}`);refresh();}
-async function removeFromPool(id){await api('DELETE',`/api/pool/${encodeURIComponent(id)}`);refresh();}
-async function setPriority(targetId, newPrio){
-  newPrio = parseInt(newPrio);
-  // 获取所有端点，筛选聚合池内的，按当前优先级排序
-  const all = await api('GET', '/api/endpoints');
-  const poolEps = all.filter(e => e.in_pool).sort((a,b) => a.priority - b.priority);
-  const target = poolEps.find(e => e.id === targetId);
-  if(!target){console.error('Target not found');return;}
-  
-  const oldPrio = target.priority;
-  if(oldPrio === newPrio){return;} // 没有变化
-  
-  // 只收集需要改 priority 的端点，不传其他字段（避免覆盖 API key 等敏感字段）
-  const updates = [];
-  
-  if(newPrio < oldPrio){
-    // 提升优先级：原位置 和 新位置 之间的所有端点优先级 +1
-    for(const ep of poolEps){
-      if(ep.priority >= newPrio && ep.priority < oldPrio){
-        updates.push({id: ep.id, priority: ep.priority + 1});
-      }
-    }
-  } else {
-    // 降低优先级：新位置 和 原位置 之间的所有端点优先级 -1
-    for(const ep of poolEps){
-      if(ep.priority > oldPrio && ep.priority <= newPrio){
-        updates.push({id: ep.id, priority: ep.priority - 1});
-      }
-    }
-  }
-  
-  // 更新目标端点自身
-  updates.push({id: target.id, priority: newPrio});
-  
-  // 逐个PUT更新（只传priority字段，不碰其他字段）
-  toast('正在更新优先级...', 'info');
-  let success = true;
-  for(const update of updates){
-    const r = await api('PUT', `/api/endpoints/${encodeURIComponent(update.id)}`, {priority: update.priority});
-    if(!r.ok){
-      success = false;
-      break;
-    }
-  }
-  if(success){
-    toast('✅ 优先级已更新', 'success');
-    refresh();
-  } else {
-    toast('❌ 更新失败', 'error');
-  }
-}
 async function deleteEndpoint(id, n){if(!confirm(`删除「${n}」？`))return;await api('DELETE',`/api/endpoints/${encodeURIComponent(id)}`);toast('已删除','success');refresh();}
 async function clearCooldown(id){await api('PUT',`/api/endpoints/${encodeURIComponent(id)}`,{cooldown_minutes:0});await api('POST','/api/reset');setTimeout(async()=>{await api('PUT',`/api/endpoints/${encodeURIComponent(id)}`,{cooldown_minutes:5});refresh();},200);toast('已解除冷却','success');refresh();}
-async function switchEndpoint(id){
-  const r = await api('POST', `/api/switch-endpoint/${encodeURIComponent(id)}`);
-  if(r.ok){ toast('✅ 已切换','success'); refresh(); }
-  else { toast('❌ 切换失败','error'); }
-}
 let testImageBase64 = null;
 function previewTestImage(input) {
   if (input.files && input.files[0]) {
@@ -2213,7 +1888,6 @@ async function sendTest() {
   refresh();
 }
 async function resetPool(){await api('POST','/api/reset');toast('已重置','success');refresh();}
-async function resetPriority(){await api('POST','/api/reset-priority');toast('✅ 已切换为按优先级运行','success');refresh();}
 
 function checkFetchBtn(){
     const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
@@ -2367,7 +2041,7 @@ async function testSelectedVision(){
 function openAddModal(){
     document.getElementById('editName').value='';document.getElementById('modalTitle').textContent='添加端点';
     ['fName','fUrl','fKey','fModel'].forEach(id=>document.getElementById(id).value='');
-    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById("fRetries").value=1;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fPool').value='false';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='true';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';
+    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='true';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fVision').value='true';
     document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';
     document.getElementById('fetchModelsBtn').disabled=true;document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
     allModels=[];selectedModels=new Set();latencyResults={};visionResults={};
@@ -2377,7 +2051,7 @@ function editEndpoint(id){
     api('GET','/api/endpoints').then(eps=>{const ep=eps.find(e=>e.id===id);if(!ep)return;
         document.getElementById('editName').value=id;document.getElementById('modalTitle').textContent='编辑端点';
         document.getElementById('fName').value=ep.name;document.getElementById('fUrl').value=ep.base_url;document.getElementById('fKey').value=ep.api_key_full||'';document.getElementById('fModel').value=ep.model;
-        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fPool').value=String(ep.in_pool!==false);document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);
+        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fVision').value=String(ep.is_vision!==false);
         document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
         allModels=[];selectedModels=new Set();latencyResults={};visionResults={};checkFetchBtn();document.getElementById('modal').classList.add('show');
     });
@@ -2386,7 +2060,7 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 
 async function saveEndpoint(){
     const ep_id=document.getElementById('editName').value;
-    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:parseInt(document.getElementById('fCooldown').value)||0,enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true'};
+    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:parseInt(document.getElementById('fCooldown').value)||0,enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',is_vision:document.getElementById('fVision').value==='true'};
     if(!d.name||!d.base_url||!d.api_key){toast('填写名称/URL/Key','error');return;}
     if(!d.model){toast('选择模型','error');return;}
     if(ep_id){await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d);toast('已更新','success');}
@@ -2397,11 +2071,11 @@ async function saveEndpoint(){
 async function batchAddEndpoints(){
     const fn=document.getElementById('fName').value.trim();
     const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
-    const sp=parseInt(document.getElementById('fPriority').value)||1,to=parseInt(document.getElementById('fTimeout').value)||60,re=parseInt(document.getElementById('fRetries').value)||0,cd=parseInt(document.getElementById('fCooldown').value)||5,dl=parseInt(document.getElementById('fDailyLimit').value)||0,rl=parseInt(document.getElementById('fRpmLimit').value)||0,up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',hm=document.getElementById('fHealthMode').value||'chat',bm=document.getElementById('fBillingMode').value||'subscription';
+    const sp=parseInt(document.getElementById('fPriority').value)||1,to=parseInt(document.getElementById('fTimeout').value)||60,re=parseInt(document.getElementById('fRetries').value)||0,cd=parseInt(document.getElementById('fCooldown').value)||5,dl=parseInt(document.getElementById('fDailyLimit').value)||0,rl=parseInt(document.getElementById('fRpmLimit').value)||0,up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',hm=document.getElementById('fHealthMode').value||'chat';
     if(!u||!k){toast('填写 URL 和 Key','error');return;}
     if(!selectedModels.size){toast('选择模型','error');return;}
     const ms=[...selectedModels];toast(`添加 ${ms.length} 个...`,'info');
-    const r=await api('POST','/api/endpoints/batch',{endpoints:ms.map((m,i)=>({name:fn?fn:m,model:m,priority:sp+i,is_vision:visionResults[m]?visionResults[m].supports_vision:true})),base:{base_url:u,api_key:k,timeout:to,max_retries:re,cooldown_minutes:cd,daily_limit:dl,rpm_limit:rl,use_proxy:up,protocol:pt,start_priority:sp,health_mode:hm,billing_mode:bm}});
+    const r=await api('POST','/api/endpoints/batch',{endpoints:ms.map((m,i)=>({name:fn?fn:m,model:m,priority:sp+i,is_vision:visionResults[m]?visionResults[m].supports_vision:true})),base:{base_url:u,api_key:k,timeout:to,max_retries:re,cooldown_minutes:cd,daily_limit:dl,rpm_limit:rl,use_proxy:up,protocol:pt,start_priority:sp,health_mode:hm}});
     if(r.ok){toast(`✅ ${r.added} 个`,'success');closeModal();refresh();}else toast('失败','error');
 }
 
@@ -2763,9 +2437,8 @@ async function pollLogs() {
 pollLogs();
 
 refresh();
-// 移除全局定时刷新 — 只在需要时手动刷新，日志单独轮询
-// 日志保持单独轮询
 setInterval(() => {
+    refresh();
     loadChatLogs(chatLogsPage);
 }, 3000);
 let chatLogsPage = 0;
@@ -2979,7 +2652,7 @@ def main():
     print(f"  🌐 管理面板访问: http://localhost:{port}")
     print(f"  🔗 客户端 Base URL: http://localhost:{port}/v1")
     print(f"  📋 已加载 {len(pool._endpoints)} 个端点")
-    print(f"  🩺 健康检测: 失败时按优先级逐个探活候选端点")
+    print(f"  🩺 健康检测: 启动时自动检测 + 每 {HEALTH_CHECK_INTERVAL}秒 复检\n")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
