@@ -813,6 +813,8 @@ class APIPool:
         errors = []
         tried = 0
         total = len(active)
+        # 按优先级排序：每次从最高优先级端点开始尝试，故障自动降级，恢复后自动回迁
+        active.sort(key=lambda e: e.priority)
         
         # 补全 reasoning_content：找到最后一个 assistant 消息，如果没有则注入缓存值
         # DeepSeek thinking 模式要求多轮对话时必须传回 reasoning_content，而 OpenAI 客户端不会存这个字段
@@ -834,15 +836,7 @@ class APIPool:
                 processed_messages[assistant_idx]["reasoning_content"] = self._last_reasoning_content
                 disable_thinking = False  # 成功注入，不需要禁用
         
-        with self._lock:
-            # 从当前端点的位置开始尝试，找不到则从 0 开始
-            start_idx = 0
-            if self._current_endpoint_id:
-                for i, ep in enumerate(active):
-                    if ep.id == self._current_endpoint_id:
-                        start_idx = i
-                        break
-            idx = start_idx
+        idx = 0
         while tried < total:
             ep = active[idx]
             ep_timeout = timeout or ep.timeout
@@ -918,6 +912,7 @@ class APIPool:
             with self._lock:
                 self._rotate(ep, error)
                 active = self._active_endpoints()
+                active.sort(key=lambda e: e.priority)
                 total = len(active)
                 if total == 0:
                     break
@@ -943,6 +938,7 @@ class APIPool:
                         self._rotate(next_ep, "探活失败", probe_failed=True)
                         # 重新获取可用端点列表，继续找下一个
                         active = self._active_endpoints()
+                        active.sort(key=lambda e: e.priority)
                         total = len(active)
                         if total == 0:
                             break
