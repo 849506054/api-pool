@@ -801,7 +801,7 @@ class APIPool:
             except Exception:
                 return False
         else:
-            # 包月池内端点：用 chat ping
+            # 按量计费池内端点：用 chat ping
             payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3}
             reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True)
             return reply is not None
@@ -899,9 +899,24 @@ class APIPool:
                 return result
             errors.append(f"[{ep.name}] {error}")
             sys_log(f"端点 '{ep.name}' 请求失败: {error}", "ERROR")
-            # 4xx 客户端错误：只记日志，不切端点、不探活、不重试
-            if error and error.startswith("HTTP 4"):
+            # 4xx 客户端错误：400/404 是客户端参数问题，不切端点；401/403/429 是端点自身问题，走旋转冷却
+            if error and (error.startswith("HTTP 400") or error.startswith("HTTP 404")):
                 raise AllEndpointsFailed(errors)
+            # 超时/连接错误：先探活验证，通过则原地重试（瞬态故障不误杀）
+            if error and ("超时" in error or "连接" in error):
+                try:
+                    if self._probe_endpoint(ep):
+                        sys_log(f"端点 '{ep.name}' 超时但探活通过，跳过冷却，原地重试", "INFO")
+                        with self._lock:
+                            ep._fail_count += 1
+                            ep._total_failures += 1
+                            ep._last_error = error
+                            ep._last_error_ts = time.time()
+                            ep._cooldown_until = 0
+                        tried += 1
+                        continue
+                except Exception:
+                    pass
             with self._lock:
                 self._rotate(ep, error)
                 active = self._active_endpoints()
@@ -1845,7 +1860,7 @@ select option { background: var(--bg); color: var(--text); }
     <input type="hidden" id="editName">
     <div class="form-group"><label>名称</label><input type="text" id="fName" placeholder="如 OpenAI 或 DeepSeek" oninput="this.dataset.autofilled='false'"></div>
     <div class="form-group"><label>Base URL</label><input type="text" id="fUrl" placeholder="https://api.openai.com/v1" oninput="checkFetchBtn()"></div>
-    <div class="form-group"><label>API Key</label><input type="password" id="fKey" placeholder="sk-..." oninput="checkFetchBtn()"></div>
+    <div class="form-group"><label>API Key</label><input type="text" id="fKey" placeholder="sk-..." oninput="checkFetchBtn()"></div>
     <div class="form-group">
       <label>模型</label>
       <div class="model-row">
