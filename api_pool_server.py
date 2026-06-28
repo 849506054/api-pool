@@ -1873,7 +1873,7 @@ select option { background: var(--bg); color: var(--text); }
       <div class="form-group"><label>超时 (秒)</label><input type="number" id="fTimeout" value="60" min="1"></div>
     </div>
     <div class="form-row">
-      <div class="form-group"><label>重试次数</label><input type="number" id="fRetries" value="1" min="0"></div>
+      <div class="form-group"><label>重试次数</label><input type="number" id="fRetries" value="0" min="0"></div>
       <div class="form-group"><label>冷却 (分钟)</label><input type="number" id="fCooldown" value="5" min="0"></div>
     </div>
       <div class="form-group">
@@ -2367,7 +2367,7 @@ async function testSelectedVision(){
 function openAddModal(){
     document.getElementById('editName').value='';document.getElementById('modalTitle').textContent='添加端点';
     ['fName','fUrl','fKey','fModel'].forEach(id=>document.getElementById(id).value='');
-    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById("fRetries").value=1;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fPool').value='false';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='true';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';
+    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fPool').value='false';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='true';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';
     document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';
     document.getElementById('fetchModelsBtn').disabled=true;document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
     allModels=[];selectedModels=new Set();latencyResults={};visionResults={};
