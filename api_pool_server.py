@@ -392,6 +392,7 @@ class APIPool:
         self.default_payload = default_payload or {}
         self._endpoints: list[Endpoint] = []
         self._current_endpoint_id = None  # 用端点ID追踪当前端点，而非位置索引
+        self._manual_override_id = None  # 用户手动指定端点的ID，优先级覆盖路由选择
         self._last_reasoning_content = None  # 缓存上一轮返回的 reasoning_content，用于多轮对话补全
         if endpoints:
             for ep in endpoints:
@@ -422,6 +423,8 @@ class APIPool:
             self._endpoints = [e for e in self._endpoints if e.id != ep_id]
             if self._current_endpoint_id == ep_id:
                 self._current_endpoint_id = None
+            if self._manual_override_id == ep_id:
+                self._manual_override_id = None
 
     def set_enabled(self, ep_id, enabled):
         with self._lock:
@@ -456,7 +459,7 @@ class APIPool:
         with self._lock:
             for ep in self._endpoints:
                 if ep.id == ep_id:
-                    self._current_endpoint_id = ep_id
+                    self._manual_override_id = ep_id
                     return True
         return False
 
@@ -464,8 +467,9 @@ class APIPool:
         now = time.time()
         with self._lock:
             current_ep = None
-            if self._current_endpoint_id:
-                current_ep = next((ep for ep in self._endpoints if ep.id == self._current_endpoint_id), None)
+            current_display_id = self._manual_override_id or self._current_endpoint_id
+            if current_display_id:
+                current_ep = next((ep for ep in self._endpoints if ep.id == current_display_id), None)
             return [self._ep_to_dict(ep, ep is current_ep, now) for ep in self._endpoints]
 
     def _ep_to_dict(self, ep, is_current, now):
@@ -511,8 +515,9 @@ class APIPool:
         with self._lock:
             active = self._active_endpoints()
             current_ep = None
-            if self._current_endpoint_id:
-                current_ep = next((ep for ep in active if ep.id == self._current_endpoint_id), None)
+            current_display_id = self._manual_override_id or self._current_endpoint_id
+            if current_display_id:
+                current_ep = next((ep for ep in active if ep.id == current_display_id), None)
             return [
                 {
                     "name": ep.name,
@@ -546,6 +551,7 @@ class APIPool:
                 with ep._rpm_lock:
                     ep._req_timestamps.clear()
             self._current_endpoint_id = None
+            self._manual_override_id = None
 
     def reset_to_priority_mode(self):
         with self._lock:
@@ -557,6 +563,7 @@ class APIPool:
                 return False
             best = min(active, key=lambda ep: ep.priority)
             self._current_endpoint_id = best.id
+            self._manual_override_id = None
             return True
 
     def _check_one_health(self, ep):
@@ -769,6 +776,7 @@ class APIPool:
                 if ep is failed_ep:
                     next_idx = (i + 1) % len(active)
                     self._current_endpoint_id = active[next_idx].id
+                    self._manual_override_id = None  # 健康检测自动切换时清除手动覆盖
                     return
             self._current_endpoint_id = active[0].id if active else None
 
@@ -779,6 +787,8 @@ class APIPool:
         ep._last_error = ""
         self._clear_cooldown(ep)
         self._current_endpoint_id = ep.id
+        if self._manual_override_id and self._manual_override_id != ep.id:
+            self._manual_override_id = None  # 手动覆盖端点失败后落到其他端点，清除覆盖
         # 缓存 reasoning_content 用于多轮对话
         if result and isinstance(result, dict):
             try:
@@ -817,6 +827,12 @@ class APIPool:
         active.sort(key=lambda e: e.priority)
         
         # 补全 reasoning_content：找到最后一个 assistant 消息，如果没有则注入缓存值
+        # 手动覆盖：如果用户通过UI指定了端点，优先走该端点
+        if self._manual_override_id:
+            override_ep = next((ep for ep in active if ep.id == self._manual_override_id), None)
+            if override_ep:
+                active.remove(override_ep)
+                active.insert(0, override_ep)
         # DeepSeek thinking 模式要求多轮对话时必须传回 reasoning_content，而 OpenAI 客户端不会存这个字段
         processed_messages = messages
         has_assistant = any(m.get("role") == "assistant" for m in messages)
