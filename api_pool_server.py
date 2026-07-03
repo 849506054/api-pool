@@ -349,7 +349,7 @@ class Endpoint:
     cooldown_minutes: int = 5
     daily_limit: int = 0
     rpm_limit: int = 0
-    use_proxy: bool = True
+    use_proxy: bool = False
     protocol: str = "openai"
     extra_headers: dict = field(default_factory=dict)
     is_vision: bool = True
@@ -370,6 +370,8 @@ class Endpoint:
     health_mode: str = field(default="models")
     billing_mode: str = field(default="subscription")
 
+    _transient_count: int = field(default=0, repr=False)
+    _transient_window_start: float = field(default=0, repr=False)
     _health: str = field(default="unknown", repr=False) 
     _health_latency_ms: int = field(default=-1, repr=False)
     _health_last_check: float = field(default=0, repr=False)
@@ -417,12 +419,14 @@ class APIPool:
         with self._lock:
             self._endpoints.append(ep)
             self._endpoints.sort(key=lambda e: e.priority)
+            self._renumber_pool_priorities()
 
     def remove_endpoint(self, ep_id):
         with self._lock:
             self._endpoints = [e for e in self._endpoints if e.id != ep_id]
             if self._current_endpoint_id == ep_id:
                 self._current_endpoint_id = None
+            self._renumber_pool_priorities()
             if self._manual_override_id == ep_id:
                 self._manual_override_id = None
 
@@ -438,22 +442,47 @@ class APIPool:
                 if ep.id == ep_id:
                     ep.in_pool = in_pool
                     break
-            # 移除出池时，重排池内剩余端点的优先级为连续值
-            if not in_pool:
-                pool_eps = sorted([ep for ep in self._endpoints if ep.in_pool], key=lambda e: e.priority)
-                for i, ep in enumerate(pool_eps):
-                    ep.priority = i + 1
-                self._endpoints.sort(key=lambda e: e.priority)
+            self._renumber_pool_priorities()
 
     def update_endpoint(self, ep_id, updates: dict):
         with self._lock:
             for ep in self._endpoints:
                 if ep.id == ep_id:
+                    new_priority = updates.get("priority")
+                    old_priority = ep.priority
+
+                    # 先处理所有字段
                     for k, v in updates.items():
                         if hasattr(ep, k) and not k.startswith("_") and k != "id":
                             setattr(ep, k, v)
+
+                    # 池内端点显式改优先级 → insert-at-position
+                    if new_priority is not None and ep.in_pool:
+                        ep.priority = new_priority  # 确保目标准确
+                        if new_priority < old_priority:
+                            # 提升：[new, old) 区间的其他端点 +1
+                            for other in self._endpoints:
+                                if other is not ep and other.in_pool:
+                                    if new_priority <= other.priority < old_priority:
+                                        other.priority += 1
+                        elif new_priority > old_priority:
+                            # 降级：(old, new] 区间的其他端点 -1
+                            for other in self._endpoints:
+                                if other is not ep and other.in_pool:
+                                    if old_priority < other.priority <= new_priority:
+                                        other.priority -= 1
+                    else:
+                        # 非 priority 变更或池外端点，只保证池内连续
+                        self._renumber_pool_priorities()
+
                     self._endpoints.sort(key=lambda e: e.priority)
                     break
+
+    def _renumber_pool_priorities(self):
+        """对池内端点分配唯一连续优先级，池外端点不动。"""
+        pool_eps = sorted([ep for ep in self._endpoints if ep.in_pool], key=lambda e: e.priority)
+        for i, ep in enumerate(pool_eps):
+            ep.priority = i + 1
 
     def switch_to_endpoint(self, ep_id):
         with self._lock:
@@ -464,6 +493,7 @@ class APIPool:
         return False
 
     def list_endpoints(self):
+        self._cleanup_expired_cooldowns()
         now = time.time()
         with self._lock:
             current_ep = None
@@ -511,6 +541,7 @@ class APIPool:
         }
 
     def get_active_chain(self):
+        self._cleanup_expired_cooldowns()
         now = time.time()
         with self._lock:
             active = self._active_endpoints()
@@ -746,11 +777,50 @@ class APIPool:
     def _clear_cooldown(self, ep):
         ep._cooldown_until = 0
 
+    def _cleanup_expired_cooldowns(self):
+        """冷却过期端点：探活→成功则清洗+切当前指针→失败则继续冻结"""
+        now = time.time()
+        expired = []
+        with self._lock:
+            for ep in self._endpoints:
+                if ep.in_pool and ep._cooldown_until > 0 and ep._cooldown_until <= now:
+                    expired.append(ep)
+
+        if not expired:
+            return
+
+        for ep in expired:
+            if self._probe_endpoint(ep):
+                with self._lock:
+                    ep._fail_count = 0
+                    ep._last_error = ""
+                    ep._last_error_ts = 0
+                    ep._cooldown_until = 0
+                    ep._health = "ok"
+                    ep._transient_count = 0
+                    ep._transient_window_start = 0
+                sys_log(f"端点 '{ep.name}' 冷却过期探活通过，已恢复", "INFO")
+            else:
+                with self._lock:
+                    self._set_cooldown(ep)
+                sys_log(f"端点 '{ep.name}' 冷却过期探活未通过，继续冷却 {ep.cooldown_minutes} 分钟", "WARN")
+
+        # 更新 current 指针（保留手动覆盖）
+        with self._lock:
+            if not self._manual_override_id:
+                active = self._active_endpoints()
+                if active:
+                    best = min(active, key=lambda e: e.priority)
+                    self._current_endpoint_id = best.id
+
     def _active_endpoints(self):
         available = [ep for ep in self._endpoints if ep.enabled and ep.in_pool and not self._is_in_cooldown(ep) and not self._is_quota_exceeded(ep) and not self._is_rpm_limited(ep)]
         if available:
             return available
-        return [ep for ep in self._endpoints if ep.enabled and ep.in_pool and not self._is_quota_exceeded(ep)]
+        # 最后手段：所有端点都在冷却时，按冷却到期时间排序返回（优先选最快解冻的）
+        fallback = [ep for ep in self._endpoints if ep.enabled and ep.in_pool and not self._is_quota_exceeded(ep)]
+        fallback.sort(key=lambda e: e._cooldown_until)
+        return fallback
 
     def _pick_best(self, active):
         for ep in active:
@@ -783,7 +853,10 @@ class APIPool:
     def _on_success(self, ep, result=None):
         ep._total_calls += 1
         ep._last_success_ts = time.time()
+        ep._health = "ok"
         ep._fail_count = 0
+        ep._transient_count = 0
+        ep._transient_window_start = 0
         ep._last_error = ""
         self._clear_cooldown(ep)
         self._current_endpoint_id = ep.id
@@ -800,23 +873,16 @@ class APIPool:
                 pass
 
     def _probe_endpoint(self, ep):
-        """对单个端点做快速探活，成功返回 True，失败返回 False。按 billing_mode 选择检测方式。"""
+        """对单个端点做快速探活，成功返回 True，失败返回 False。统一用 chat ping 检测。"""
         if ep.health_mode == "none":
             return True  # 关闭检测视为可用
-        if ep.billing_mode == "pay_per_use" or not ep.in_pool:
-            # 按次计费或池外端点：用 models 探活（零成本）
-            try:
-                models = self.fetch_models(ep.base_url, ep.api_key, timeout=10, use_proxy=ep.use_proxy, protocol=ep.protocol)
-                return bool(models)
-            except Exception:
-                return False
-        else:
-            # 按量计费池内端点：用 chat ping
-            payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3}
-            reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True)
-            return reply is not None
+        # 统一使用 chat ping 探活：models 接口可访问不代表模型可响应
+        payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3}
+        reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True)
+        return reply is not None
 
     def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False):
+        self._cleanup_expired_cooldowns()
         active = self._active_endpoints()
         if not active:
             raise ValueError("没有可用的 API 端点")
@@ -888,9 +954,10 @@ class APIPool:
                             if err:
                                 yield f"data: {{'choices':[{{'delta':{{'content':'\\n\\n[API Pool Error: 请求最终目标失败: {err}]'}}}}]}}\n\n".replace("'", '"')
                             else:
+                                # 实际请求成功后标记端点成功
+                                with self._lock:
+                                    self._on_success(tgt_ep)
                                 yield from gen
-                        with self._lock:
-                            self._on_success(ep)
                         return vision_wrapper(ep, payload, ep_timeout, active)
                     else:
                         payload["messages"] = self._translate_images_sync(payload["messages"], active)
@@ -913,15 +980,23 @@ class APIPool:
             time.sleep(1.5)  # 短暂等待，给瞬态故障自愈时间
             try:
                 if self._probe_endpoint(ep):
-                    sys_log(f"端点 '{ep.name}' 请求失败但探活通过，视为瞬态故障，跳过冷却，原地重试", "INFO")
+                    now = time.time()
+                    # 瞬态故障频率限流：连续 >3 次则直接冻结，不继续重试
                     with self._lock:
-                        ep._fail_count += 1
-                        ep._total_failures += 1
-                        ep._last_error = error
-                        ep._last_error_ts = time.time()
-                        ep._cooldown_until = 0
-                    tried += 1
-                    continue
+                        ep._transient_count += 1
+                        if ep._transient_count > 3:
+                            sys_log(f"端点 '{ep.name}' 连续 {ep._transient_count} 次瞬态故障超限(>3次)，冻结", "WARN")
+                        else:
+                            ep._fail_count += 1
+                            ep._total_failures += 1
+                            ep._last_error = error
+                            ep._last_error_ts = now
+                            ep._cooldown_until = 0
+                    if ep._transient_count <= 3:
+                        sys_log(f"端点 '{ep.name}' 请求失败但探活通过，视为瞬态故障，跳过冷却，原地重试", "INFO")
+                        tried += 1
+                        continue
+                    # 超限：不 continue，走下方冷却+轮转路径
             except Exception:
                 pass
             sys_log(f"端点 '{ep.name}' 请求失败且探活未通过，进入冷却旋转", "WARN")
@@ -1050,6 +1125,12 @@ class APIPool:
             for k, v in ep.extra_headers.items():
                 req.add_header(k, v)
                 
+            # DEBUG: 抓请求体差异，排查缓存丢失
+            if log_usage and ep.in_pool:
+                import traceback as _tb
+                _tb.print_stack()
+                print(f"[DEBUG] → {ep.name} body({len(data)}b): {data[:200]}")
+                import sys; sys.stdout.flush()
             try:
                 if getattr(ep, "use_proxy", True) is False:
                     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -1077,9 +1158,12 @@ class APIPool:
                                         chunk = json.loads(line[6:].decode("utf-8"))
                                         ctype = chunk.get("type")
                                         if ctype == "content_block_delta":
-                                            text = chunk.get("delta", {}).get("text", "")
-                                            final_completion_text += text
+                                            dt = chunk.get("delta", {})
+                                            dtype = dt.get("type", "")
+                                            text = dt.get("text", "")
+                                            thinking = dt.get("thinking", "")
                                             if text:
+                                                final_completion_text += text
                                                 o_chunk = {
                                                     "id": stream_id,
                                                     "object": "chat.completion.chunk",
@@ -1088,6 +1172,16 @@ class APIPool:
                                                     "choices": [{"index": 0, "delta": {"content": text}}]
                                                 }
                                                 yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
+                                            if dtype == "thinking_delta" and thinking:
+                                                final_completion_text += thinking
+                                                r_chunk = {
+                                                    "id": stream_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": ep.model,
+                                                    "choices": [{"index": 0, "delta": {"reasoning_content": thinking}}]
+                                                }
+                                                yield b"data: " + json.dumps(r_chunk).encode("utf-8") + b"\n\n"
                                         elif ctype == "message_stop":
                                             usage_chunk = {
                                                 "id": stream_id,
@@ -1151,7 +1245,8 @@ class APIPool:
                         reply = ""
                         for c in body.get("content", []):
                             if c.get("type") == "text": reply += c.get("text", "")
-                        content = body["choices"][0]["message"].get("content", "")
+                        # Convert Anthropic response to OpenAI format for Hermes compat
+                        u = body.get("usage", {})
                         if u:
                             prompt_t = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
                             tot = prompt_t + u.get("output_tokens", 0)
@@ -1160,7 +1255,25 @@ class APIPool:
                                 token_tracker.add_usage(ep.name, ep.model, prompt_t, u.get("output_tokens", 0), tot, cached)
                                 chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, reply.strip(), tot, int((time.time() - req_t0) * 1000))
                                 ep._today_used += tot
-                        return reply.strip(), ""
+                        # Build OpenAI-compatible response shape
+                        oai_body = {
+                            "id": body.get("id", ""),
+                            "object": "chat.completion",
+                            "created": int(time.time()),
+                            "model": body.get("model", ep.model),
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": reply.strip()},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0),
+                                "completion_tokens": u.get("output_tokens", 0),
+                                "total_tokens": u.get("input_tokens", 0) + u.get("output_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0),
+                                "prompt_tokens_details": {"cached_tokens": u.get("cache_read_input_tokens", 0)}
+                            }
+                        }
+                        return oai_body, ""
                     else:
                         u = body.get("usage", {})
                         content = body["choices"][0]["message"].get("content", "")
@@ -1398,7 +1511,7 @@ def api_handler(method, path, body):
                 "priority": item.get("priority", start_priority + i), "timeout": item.get("timeout", base.get("timeout", 60)),
                 "max_retries": item.get("max_retries", base.get("max_retries", 1)), "cooldown_minutes": item.get("cooldown_minutes", base.get("cooldown_minutes", 5)),
                 "daily_limit": item.get("daily_limit", base.get("daily_limit", 0)), "rpm_limit": item.get("rpm_limit", base.get("rpm_limit", 0)),
-                "use_proxy": item.get("use_proxy", base.get("use_proxy", True)),
+                "use_proxy": item.get("use_proxy", base.get("use_proxy", False)),
                 "protocol": item.get("protocol", base.get("protocol", "openai")),
                 "health_mode": item.get("health_mode", base.get("health_mode", "chat")),
                   "billing_mode": item.get("billing_mode", base.get("billing_mode", "subscription")),
