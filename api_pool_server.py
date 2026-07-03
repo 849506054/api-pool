@@ -1047,11 +1047,51 @@ class APIPool:
         req_t0 = time.time()
         prompt_text_to_log = extract_prompt_text(payload) if log_usage and not ep.name.startswith("test_") else ""
         
-        # 协议层处理：只改传输层的 URL 路径和鉴权 header，不碰消息体
+        # 协议层处理：Anthropic 端点做完整格式转换以保证 Kcne 缓存 key 一致性
         is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
         if is_anthropic:
             url = ep.base_url.rstrip("/") + "/messages"
-            data = json.dumps(payload).encode("utf-8")
+            anthropic_payload = {
+                "model": payload.get("model", ep.model),
+                "max_tokens": payload.get("max_tokens", 4096),
+            }
+            if "temperature" in payload: anthropic_payload["temperature"] = payload["temperature"]
+            if "top_p" in payload: anthropic_payload["top_p"] = payload["top_p"]
+            if "stream" in payload: anthropic_payload["stream"] = payload["stream"]
+            sys_prompt = ""
+            messages = []
+            for m in payload.get("messages", []):
+                if m.get("role") == "system":
+                    sys_prompt += m.get("content", "") + "\n"
+                else:
+                    role = m.get("role")
+                    content = m.get("content")
+                    if isinstance(content, list):
+                        new_content = []
+                        for c in content:
+                            if c.get("type") == "image_url":
+                                url_val = c.get("image_url", {}).get("url", "")
+                                if url_val.startswith("data:image/"):
+                                    try:
+                                        media_type = url_val.split(";")[0].replace("data:", "")
+                                        b64_data = url_val.split(",")[1]
+                                        new_content.append({
+                                            "type": "image",
+                                            "source": {"type": "base64", "media_type": media_type, "data": b64_data}
+                                        })
+                                    except Exception:
+                                        pass
+                                else:
+                                    new_content.append({"type": "text", "text": f"[Image URL: {url_val}]"})
+                            else:
+                                new_content.append(c)
+                        messages.append({"role": role, "content": new_content})
+                    else:
+                        messages.append(m)
+            if sys_prompt:
+                anthropic_payload["system"] = sys_prompt.strip()
+            anthropic_payload["messages"] = messages
+            data = json.dumps(anthropic_payload).encode("utf-8")
         else:
             url = ep.base_url.rstrip("/") + "/chat/completions"
             data = json.dumps(payload).encode("utf-8")
@@ -1094,24 +1134,74 @@ class APIPool:
                         final_completion_text = ""
                         try:
                             for line in resp:
-                                yield line
-                                if line.strip() and line.startswith(b"data: ") and not line.startswith(b"data: [DONE]"):
+                                if is_anthropic:
+                                    if not line.strip() or not line.startswith(b"data: "):
+                                        continue
+                                    if line.startswith(b"data: [DONE]"):
+                                        continue
                                     try:
                                         chunk = json.loads(line[6:].decode("utf-8"))
-                                        if "choices" in chunk and len(chunk["choices"]) > 0:
-                                            delta = chunk["choices"][0].get("delta", {})
-                                            if "content" in delta:
-                                                final_completion_text += delta.get("content", "")
-                                        if "usage" in chunk and chunk["usage"]:
+                                        ctype = chunk.get("type")
+                                        if ctype == "content_block_delta":
+                                            text = chunk.get("delta", {}).get("text", "")
+                                            final_completion_text += text
+                                            if text:
+                                                o_chunk = {
+                                                    "id": stream_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": ep.model,
+                                                    "choices": [{"index": 0, "delta": {"content": text}}]
+                                                }
+                                                yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
+                                        elif ctype == "message_stop":
+                                            usage_chunk = {
+                                                "id": stream_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": ep.model,
+                                                "choices": [],
+                                                "usage": {
+                                                    "prompt_tokens": final_prompt_tokens,
+                                                    "completion_tokens": final_completion_tokens,
+                                                    "total_tokens": final_total_tokens
+                                                }
+                                            }
+                                            yield b"data: " + json.dumps(usage_chunk).encode("utf-8") + b"\n\n"
+                                            yield b"data: [DONE]\n\n"
+                                        elif ctype == "message_delta" and "usage" in chunk:
                                             u = chunk["usage"]
-                                            final_prompt_tokens = u.get("prompt_tokens", 0)
-                                            final_completion_tokens = u.get("completion_tokens", 0)
-                                            final_total_tokens = u.get("total_tokens", 0)
-                                            if "prompt_tokens_details" in u and isinstance(u["prompt_tokens_details"], dict):
-                                                final_cached_tokens = u["prompt_tokens_details"].get("cached_tokens", 0)
+                                            final_completion_tokens += u.get("output_tokens", 0)
+                                            final_total_tokens += u.get("output_tokens", 0)
+                                            has_usage = True
+                                        elif ctype == "message_start" and "message" in chunk and "usage" in chunk["message"]:
+                                            u = chunk["message"]["usage"]
+                                            prompt_t = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+                                            final_prompt_tokens += prompt_t
+                                            final_total_tokens += prompt_t
+                                            final_cached_tokens += u.get("cache_read_input_tokens", 0)
                                             has_usage = True
                                     except Exception:
                                         pass
+                                else:
+                                    yield line
+                                    if line.strip() and line.startswith(b"data: ") and not line.startswith(b"data: [DONE]"):
+                                        try:
+                                            chunk = json.loads(line[6:].decode("utf-8"))
+                                            if "choices" in chunk and len(chunk["choices"]) > 0:
+                                                delta = chunk["choices"][0].get("delta", {})
+                                                if "content" in delta:
+                                                    final_completion_text += delta.get("content", "")
+                                            if "usage" in chunk and chunk["usage"]:
+                                                u = chunk["usage"]
+                                                final_prompt_tokens = u.get("prompt_tokens", 0)
+                                                final_completion_tokens = u.get("completion_tokens", 0)
+                                                final_total_tokens = u.get("total_tokens", 0)
+                                                if "prompt_tokens_details" in u and isinstance(u["prompt_tokens_details"], dict):
+                                                    final_cached_tokens = u["prompt_tokens_details"].get("cached_tokens", 0)
+                                                has_usage = True
+                                        except Exception:
+                                            pass
                         except Exception:
                             pass
                         finally:
@@ -1123,20 +1213,56 @@ class APIPool:
                     return stream_generator(), ""
                 else:
                     body = json.loads(resp.read().decode("utf-8"))
-                    u = body.get("usage", {})
-                    content = body["choices"][0]["message"].get("content", "")
-                    reasoning = body["choices"][0]["message"].get("reasoning_content", "")
-                    if u:
-                        tot = u.get("total_tokens", 0)
-                        cached = 0
-                        if "prompt_tokens_details" in u and isinstance(u["prompt_tokens_details"], dict):
-                            cached = u["prompt_tokens_details"].get("cached_tokens", 0)
-                        if log_usage and not ep.name.startswith("test_"):
-                            token_tracker.add_usage(ep.name, ep.model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), tot, cached)
-                            log_text = content.strip() or reasoning.strip() or ""
-                            chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000))
-                            ep._today_used += tot
-                    return body, ""
+                    if is_anthropic:
+                        reply = ""
+                        for c in body.get("content", []):
+                            if c.get("type") == "text": reply += c.get("text", "")
+                        u = body.get("usage", {})
+                        prompt_t = 0; cached = 0; tot = 0
+                        if u:
+                            prompt_t = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+                            tot = prompt_t + u.get("output_tokens", 0)
+                            cached = u.get("cache_read_input_tokens", 0)
+                            if log_usage and not ep.name.startswith("test_"):
+                                token_tracker.add_usage(ep.name, ep.model, prompt_t, u.get("output_tokens", 0), tot, cached)
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, reply.strip(), tot, int((time.time() - req_t0) * 1000))
+                                ep._today_used += tot
+                        o_body = {
+                            "id": f"chatcmpl-{int(time.time())}",
+                            "object": "chat.completion",
+                            "created": int(time.time()),
+                            "model": ep.model,
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": reply.strip()
+                                },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": prompt_t,
+                                "completion_tokens": u.get("output_tokens", 0) if u else 0,
+                                "total_tokens": tot,
+                                "prompt_tokens_details": {"cached_tokens": cached} if cached else {}
+                            }
+                        }
+                        return o_body, ""
+                    else:
+                        u = body.get("usage", {})
+                        content = body["choices"][0]["message"].get("content", "")
+                        reasoning = body["choices"][0]["message"].get("reasoning_content", "")
+                        if u:
+                            tot = u.get("total_tokens", 0)
+                            cached = 0
+                            if "prompt_tokens_details" in u and isinstance(u["prompt_tokens_details"], dict):
+                                cached = u["prompt_tokens_details"].get("cached_tokens", 0)
+                            if log_usage and not ep.name.startswith("test_"):
+                                token_tracker.add_usage(ep.name, ep.model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), tot, cached)
+                                log_text = content.strip() or reasoning.strip() or ""
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000))
+                                ep._today_used += tot
+                        return body, ""
                     
                     
             except urllib.error.HTTPError as e:
