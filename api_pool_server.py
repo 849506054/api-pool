@@ -389,9 +389,8 @@ class AllEndpointsFailed(Exception):
 # ============================================================
 
 class APIPool:
-    def __init__(self, endpoints=None, default_payload=None):
+    def __init__(self, endpoints=None):
         self._lock = threading.Lock()
-        self.default_payload = default_payload or {}
         self._endpoints: list[Endpoint] = []
         self._current_endpoint_id = None  # 用端点ID追踪当前端点，而非位置索引
         self._manual_override_id = None  # 用户手动指定端点的ID，优先级覆盖路由选择
@@ -899,45 +898,41 @@ class APIPool:
             if override_ep:
                 active.remove(override_ep)
                 active.insert(0, override_ep)
-        # DeepSeek thinking 模式要求多轮对话时必须传回 reasoning_content，而 OpenAI 客户端不会存这个字段
-        processed_messages = messages
-        has_assistant = any(m.get("role") == "assistant" for m in messages)
-        has_reasoning_content = any("reasoning_content" in m for m in messages if m.get("role") == "assistant")
-        
-        # 如果有 assistant 消息但没有 reasoning_content，说明可能是跨端点/跨会话切换，禁用 thinking 避免 400
-        disable_thinking = has_assistant and not has_reasoning_content
-        
-        if self._last_reasoning_content and has_assistant:
-            assistant_idx = None
-            for i, m in enumerate(messages):
-                if m.get("role") == "assistant":
-                    assistant_idx = i
-            if assistant_idx is not None and "reasoning_content" not in messages[assistant_idx]:
-                processed_messages = list(messages)
-                processed_messages[assistant_idx] = dict(processed_messages[assistant_idx])
-                processed_messages[assistant_idx]["reasoning_content"] = self._last_reasoning_content
-                disable_thinking = False  # 成功注入，不需要禁用
-        
         idx = 0
         while tried < total:
             ep = active[idx]
             ep_timeout = timeout or ep.timeout
             ep_model = model or ep.model
-            payload = {
-                "model": ep_model, "messages": processed_messages,
-                **self.default_payload, **(extra_payload or {}),
-            }
             
-            # 多轮对话缺失 reasoning_content 时，注入空字符串骗过 DeepSeek 校验
-            # DeepSeek 只检查字段是否存在，不关心内容是否为空
-            if disable_thinking:
-                # 找到最后一个 assistant 消息注入空值
-                for i in reversed(range(len(processed_messages))):
-                    if processed_messages[i].get("role") == "assistant" and "reasoning_content" not in processed_messages[i]:
-                        processed_messages = list(processed_messages)
-                        processed_messages[i] = dict(processed_messages[i])
-                        processed_messages[i]["reasoning_content"] = ""
-                        break
+            # 按端点协议决定消息体：Anthropic 端点不注入 reasoning_content（避免缓存穿透）
+            loop_messages = messages
+            is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
+            if not is_anthropic:
+                # DeepSeek thinking 模式需要 reasoning_content
+                has_assistant = any(m.get("role") == "assistant" for m in messages)
+                has_reasoning = any("reasoning_content" in m for m in messages if m.get("role") == "assistant")
+                
+                if self._last_reasoning_content and has_assistant:
+                    # 找到最后一个 assistant 消息注入缓存的 reasoning_content
+                    for i in range(len(messages) - 1, -1, -1):
+                        if messages[i].get("role") == "assistant" and "reasoning_content" not in messages[i]:
+                            loop_messages = list(messages)
+                            loop_messages[i] = dict(loop_messages[i])
+                            loop_messages[i]["reasoning_content"] = self._last_reasoning_content
+                            break
+                elif has_assistant and not has_reasoning:
+                    # 跨端点切换，注入空字符串骗过校验
+                    for i in range(len(messages) - 1, -1, -1):
+                        if messages[i].get("role") == "assistant" and "reasoning_content" not in messages[i]:
+                            loop_messages = list(messages)
+                            loop_messages[i] = dict(loop_messages[i])
+                            loop_messages[i]["reasoning_content"] = ""
+                            break
+            
+            payload = {
+                "model": ep_model, "messages": loop_messages,
+                **(extra_payload or {}),
+            }
             
             # [VISION TRANSLATION INTERCEPT]
             if self._has_images(payload["messages"]) and getattr(ep, "is_vision", True) is False:
@@ -1051,52 +1046,12 @@ class APIPool:
     def _try_endpoint(self, ep, payload, timeout, log_usage=True, force_no_retry=False):
         req_t0 = time.time()
         prompt_text_to_log = extract_prompt_text(payload) if log_usage and not ep.name.startswith("test_") else ""
-        is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
         
+        # 协议层处理：只改传输层的 URL 路径和鉴权 header，不碰消息体
+        is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
         if is_anthropic:
             url = ep.base_url.rstrip("/") + "/messages"
-            anthropic_payload = {
-                "model": payload.get("model", ep.model),
-                "max_tokens": payload.get("max_tokens", 4096),
-            }
-            if "temperature" in payload: anthropic_payload["temperature"] = payload["temperature"]
-            if "top_p" in payload: anthropic_payload["top_p"] = payload["top_p"]
-            if "stream" in payload: anthropic_payload["stream"] = payload["stream"]
-            
-            sys_prompt = ""
-            messages = []
-            for m in payload.get("messages", []):
-                if m.get("role") == "system":
-                    sys_prompt += m.get("content", "") + "\n"
-                else:
-                    role = m.get("role")
-                    content = m.get("content")
-                    if isinstance(content, list):
-                        new_content = []
-                        for c in content:
-                            if c.get("type") == "image_url":
-                                url_val = c.get("image_url", {}).get("url", "")
-                                if url_val.startswith("data:image/"):
-                                    try:
-                                        media_type = url_val.split(";")[0].replace("data:", "")
-                                        b64_data = url_val.split(",")[1]
-                                        new_content.append({
-                                            "type": "image",
-                                            "source": {"type": "base64", "media_type": media_type, "data": b64_data}
-                                        })
-                                    except Exception:
-                                        pass
-                                else:
-                                    new_content.append({"type": "text", "text": f"[Image URL: {url_val}]"})
-                            else:
-                                new_content.append(c)
-                        messages.append({"role": role, "content": new_content})
-                    else:
-                        messages.append(m)
-            if sys_prompt:
-                anthropic_payload["system"] = sys_prompt.strip()
-            anthropic_payload["messages"] = messages
-            data = json.dumps(anthropic_payload).encode("utf-8")
+            data = json.dumps(payload).encode("utf-8")
         else:
             url = ep.base_url.rstrip("/") + "/chat/completions"
             data = json.dumps(payload).encode("utf-8")
@@ -1111,26 +1066,16 @@ class APIPool:
                     
             req = urllib.request.Request(url, data=data, method="POST")
             req.add_header("Content-Type", "application/json")
+            safe_api_key = ep.api_key.encode('ascii', 'ignore').decode('ascii').strip()
             if is_anthropic:
-                safe_api_key = ep.api_key.encode('ascii', 'ignore').decode('ascii').strip()
                 req.add_header("x-api-key", safe_api_key)
-                req.add_header("Authorization", f"Bearer {safe_api_key}")
-                req.add_header("User-Agent", "OpenAI/Python 2.33.0")
                 req.add_header("anthropic-version", "2023-06-01")
-            else:
-                safe_api_key = ep.api_key.encode('ascii', 'ignore').decode('ascii').strip()
-                req.add_header("Authorization", f"Bearer {safe_api_key}")
-                req.add_header("User-Agent", "OpenAI/Python 2.33.0")
+            req.add_header("Authorization", f"Bearer {safe_api_key}")
+            req.add_header("User-Agent", "OpenAI/Python 2.33.0")
                 
             for k, v in ep.extra_headers.items():
                 req.add_header(k, v)
                 
-            # DEBUG: 抓请求体差异，排查缓存丢失
-            if log_usage and ep.in_pool:
-                import traceback as _tb
-                _tb.print_stack()
-                print(f"[DEBUG] → {ep.name} body({len(data)}b): {data[:200]}")
-                import sys; sys.stdout.flush()
             try:
                 if getattr(ep, "use_proxy", True) is False:
                     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -1149,87 +1094,24 @@ class APIPool:
                         final_completion_text = ""
                         try:
                             for line in resp:
-                                if is_anthropic:
-                                    if not line.strip() or not line.startswith(b"data: "):
-                                        continue
-                                    if line.startswith(b"data: [DONE]"):
-                                        continue
+                                yield line
+                                if line.strip() and line.startswith(b"data: ") and not line.startswith(b"data: [DONE]"):
                                     try:
                                         chunk = json.loads(line[6:].decode("utf-8"))
-                                        ctype = chunk.get("type")
-                                        if ctype == "content_block_delta":
-                                            dt = chunk.get("delta", {})
-                                            dtype = dt.get("type", "")
-                                            text = dt.get("text", "")
-                                            thinking = dt.get("thinking", "")
-                                            if text:
-                                                final_completion_text += text
-                                                o_chunk = {
-                                                    "id": stream_id,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": int(time.time()),
-                                                    "model": ep.model,
-                                                    "choices": [{"index": 0, "delta": {"content": text}}]
-                                                }
-                                                yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
-                                            if dtype == "thinking_delta" and thinking:
-                                                final_completion_text += thinking
-                                                r_chunk = {
-                                                    "id": stream_id,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": int(time.time()),
-                                                    "model": ep.model,
-                                                    "choices": [{"index": 0, "delta": {"reasoning_content": thinking}}]
-                                                }
-                                                yield b"data: " + json.dumps(r_chunk).encode("utf-8") + b"\n\n"
-                                        elif ctype == "message_stop":
-                                            usage_chunk = {
-                                                "id": stream_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": ep.model,
-                                                "choices": [],
-                                                "usage": {
-                                                    "prompt_tokens": final_prompt_tokens,
-                                                    "completion_tokens": final_completion_tokens,
-                                                    "total_tokens": final_total_tokens
-                                                }
-                                            }
-                                            yield b"data: " + json.dumps(usage_chunk).encode("utf-8") + b"\n\n"
-                                            yield b"data: [DONE]\n\n"
-                                        elif ctype == "message_delta" and "usage" in chunk:
+                                        if "choices" in chunk and len(chunk["choices"]) > 0:
+                                            delta = chunk["choices"][0].get("delta", {})
+                                            if "content" in delta:
+                                                final_completion_text += delta.get("content", "")
+                                        if "usage" in chunk and chunk["usage"]:
                                             u = chunk["usage"]
-                                            final_completion_tokens += u.get("output_tokens", 0)
-                                            final_total_tokens += u.get("output_tokens", 0)
-                                            has_usage = True
-                                        elif ctype == "message_start" and "message" in chunk and "usage" in chunk["message"]:
-                                            u = chunk["message"]["usage"]
-                                            prompt_t = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
-                                            final_prompt_tokens += prompt_t
-                                            final_total_tokens += prompt_t
-                                            final_cached_tokens += u.get("cache_read_input_tokens", 0)
+                                            final_prompt_tokens = u.get("prompt_tokens", 0)
+                                            final_completion_tokens = u.get("completion_tokens", 0)
+                                            final_total_tokens = u.get("total_tokens", 0)
+                                            if "prompt_tokens_details" in u and isinstance(u["prompt_tokens_details"], dict):
+                                                final_cached_tokens = u["prompt_tokens_details"].get("cached_tokens", 0)
                                             has_usage = True
                                     except Exception:
                                         pass
-                                else:
-                                    yield line
-                                    if line.strip() and line.startswith(b"data: ") and not line.startswith(b"data: [DONE]"):
-                                        try:
-                                            chunk = json.loads(line[6:].decode("utf-8"))
-                                            if "choices" in chunk and len(chunk["choices"]) > 0:
-                                                delta = chunk["choices"][0].get("delta", {})
-                                                if "content" in delta:
-                                                    final_completion_text += delta.get("content", "")
-                                            if "usage" in chunk and chunk["usage"]:
-                                                u = chunk["usage"]
-                                                final_prompt_tokens = u.get("prompt_tokens", 0)
-                                                final_completion_tokens = u.get("completion_tokens", 0)
-                                                final_total_tokens = u.get("total_tokens", 0)
-                                                if "prompt_tokens_details" in u and isinstance(u["prompt_tokens_details"], dict):
-                                                    final_cached_tokens = u["prompt_tokens_details"].get("cached_tokens", 0)
-                                                has_usage = True
-                                        except Exception:
-                                            pass
                         except Exception:
                             pass
                         finally:
@@ -1241,54 +1123,20 @@ class APIPool:
                     return stream_generator(), ""
                 else:
                     body = json.loads(resp.read().decode("utf-8"))
-                    if is_anthropic:
-                        reply = ""
-                        for c in body.get("content", []):
-                            if c.get("type") == "text": reply += c.get("text", "")
-                        # Convert Anthropic response to OpenAI format for Hermes compat
-                        u = body.get("usage", {})
-                        if u:
-                            prompt_t = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
-                            tot = prompt_t + u.get("output_tokens", 0)
-                            cached = u.get("cache_read_input_tokens", 0)
-                            if log_usage and not ep.name.startswith("test_"):
-                                token_tracker.add_usage(ep.name, ep.model, prompt_t, u.get("output_tokens", 0), tot, cached)
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, reply.strip(), tot, int((time.time() - req_t0) * 1000))
-                                ep._today_used += tot
-                        # Build OpenAI-compatible response shape
-                        oai_body = {
-                            "id": body.get("id", ""),
-                            "object": "chat.completion",
-                            "created": int(time.time()),
-                            "model": body.get("model", ep.model),
-                            "choices": [{
-                                "index": 0,
-                                "message": {"role": "assistant", "content": reply.strip()},
-                                "finish_reason": "stop"
-                            }],
-                            "usage": {
-                                "prompt_tokens": u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0),
-                                "completion_tokens": u.get("output_tokens", 0),
-                                "total_tokens": u.get("input_tokens", 0) + u.get("output_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0),
-                                "prompt_tokens_details": {"cached_tokens": u.get("cache_read_input_tokens", 0)}
-                            }
-                        }
-                        return oai_body, ""
-                    else:
-                        u = body.get("usage", {})
-                        content = body["choices"][0]["message"].get("content", "")
-                        reasoning = body["choices"][0]["message"].get("reasoning_content", "")
-                        if u:
-                            tot = u.get("total_tokens", 0)
-                            cached = 0
-                            if "prompt_tokens_details" in u and isinstance(u["prompt_tokens_details"], dict):
-                                cached = u["prompt_tokens_details"].get("cached_tokens", 0)
-                            if log_usage and not ep.name.startswith("test_"):
-                                token_tracker.add_usage(ep.name, ep.model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), tot, cached)
-                                log_text = content.strip() or reasoning.strip() or ""
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000))
-                                ep._today_used += tot
-                        return body, ""
+                    u = body.get("usage", {})
+                    content = body["choices"][0]["message"].get("content", "")
+                    reasoning = body["choices"][0]["message"].get("reasoning_content", "")
+                    if u:
+                        tot = u.get("total_tokens", 0)
+                        cached = 0
+                        if "prompt_tokens_details" in u and isinstance(u["prompt_tokens_details"], dict):
+                            cached = u["prompt_tokens_details"].get("cached_tokens", 0)
+                        if log_usage and not ep.name.startswith("test_"):
+                            token_tracker.add_usage(ep.name, ep.model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), tot, cached)
+                            log_text = content.strip() or reasoning.strip() or ""
+                            chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000))
+                            ep._today_used += tot
+                    return body, ""
                     
                     
             except urllib.error.HTTPError as e:
@@ -1318,15 +1166,8 @@ class APIPool:
         url = base_url.rstrip("/") + "/models"
         req = urllib.request.Request(url, method="GET")
         safe_api_key = api_key.encode('ascii', 'ignore').decode('ascii').strip()
-        
-        if protocol == "anthropic":
-            req.add_header("x-api-key", safe_api_key)
-            req.add_header("Authorization", f"Bearer {safe_api_key}")
-            req.add_header("User-Agent", "OpenAI/Python 2.33.0")
-            req.add_header("anthropic-version", "2023-06-01")
-        else:
-            req.add_header("Authorization", f"Bearer {safe_api_key}")
-            req.add_header("User-Agent", "OpenAI/Python 2.33.0")
+        req.add_header("Authorization", f"Bearer {safe_api_key}")
+        req.add_header("User-Agent", "OpenAI/Python 2.33.0")
             
         try:
             if not use_proxy:
@@ -1351,8 +1192,6 @@ class APIPool:
                 models.sort(key=lambda x: x["id"])
                 return models
         except Exception as e:
-            if protocol == "anthropic" and isinstance(e, urllib.error.HTTPError) and e.code == 404:
-                raise Exception("该端点尚未支持获取模型列表 (官方老版协议或部分代理不支持)")
             raise e
 
     def test_vision(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai"):
@@ -1407,7 +1246,7 @@ def ensure_config():
 
 ensure_config()
 
-pool = APIPool(default_payload={"temperature": 0.7})
+pool = APIPool()
 for ep_data in load_config():
     if "in_pool" not in ep_data: ep_data["in_pool"] = True
     pool.add_endpoint(ep_data)
@@ -1422,20 +1261,8 @@ def api_handler(method, path, body):
         messages = body.get("messages", [])
         is_stream = body.get("stream", False)
         
-        if is_stream:
-            if "stream_options" not in body:
-                body["stream_options"] = {"include_usage": True}
-            elif isinstance(body["stream_options"], dict):
-                body["stream_options"]["include_usage"] = True
-                
         extra_payload = {k: v for k, v in body.items() if k not in ("messages", "model")}
-        extra_payload.pop("thinking", None)
-        if isinstance(extra_payload.get("extra_body"), dict):
-            extra_payload["extra_body"].pop("thinking", None)
-        # DeepSeek 不支持 response_format，过滤掉避免 400
-        extra_payload.pop("response_format", None)
-        if isinstance(extra_payload.get("extra_body"), dict):
-            extra_payload["extra_body"].pop("response_format", None)
+        extra_payload.pop("extra_body", None)
         
         try:
             result = pool.chat(messages, extra_payload=extra_payload)
@@ -1555,7 +1382,7 @@ def api_handler(method, path, body):
         for ep in pool.list_endpoints():
             if ep["id"] == ep_id: target_ep = ep; break
         if not target_ep: return 404, {"error": "端点不存在"}, False
-        test_pool = APIPool(default_payload={"temperature": 0.7})
+        test_pool = APIPool()
         test_pool.add_endpoint({"name": target_ep["name"], "base_url": target_ep["base_url"], "api_key": target_ep["api_key_full"], "model": target_ep["model"], "priority": 1, "timeout": target_ep["timeout"], "max_retries": target_ep["max_retries"], "enabled": True, "in_pool": True, "use_proxy": target_ep.get("use_proxy", True), "protocol": target_ep.get("protocol", "openai"), "is_vision": target_ep.get("is_vision", True)})
         
         img = body.get("image")
@@ -2020,7 +1847,7 @@ select option { background: var(--bg); color: var(--text); }
     <div class="form-row" style="grid-template-columns: 1fr 1fr 1fr;">
       <div class="form-group"><label title="每分钟最高请求次数，超限自动切换，0为不限制">并发 (0不限)</label><input type="number" id="fRpmLimit" value="0" min="0"></div>
       <div class="form-group"><label title="是否使用系统代理 (如v2ray)。本地或直连接口请选择否。">代理设置</label><select id="fProxy"><option value="true">随系统</option><option value="false">强制直连</option></select></div>
-      <div class="form-group"><label title="底层协议类型">协议类型</label><select id="fProtocol"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic</option></select></div>
+      <input type="hidden" id="fProtocol" value="openai">
     </div>
     <div class="form-group">
       <label>后台探针</label>
