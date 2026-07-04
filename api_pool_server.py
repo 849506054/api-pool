@@ -1333,7 +1333,10 @@ class APIPool:
         latency = int((time.time() - t0) * 1000)
         
         if reply is not None:
-            reply_text = reply.get("choices", [{}])[0].get("message", {}).get("content", "").lower()
+            if isinstance(reply, dict):
+                reply_text = reply.get("choices", [{}])[0].get("message", {}).get("content", "").lower()
+            else:
+                reply_text = str(reply).lower()
             unsupported_keywords = ["cannot see", "can't see", "not able to see", "unable to see", "text-based", "language model", "无法查看", "无法读取", "无法看到", "不具备", "不支持", "抱歉", "sorry", "没有上传", "没上传"]
             if any(k in reply_text for k in unsupported_keywords):
                 return {"ok": True, "supports_vision": False, "latency_ms": latency, "reply": reply, "error": f"模型疑似无法读图: {reply_text[:50]}..."}
