@@ -976,18 +976,18 @@ class APIPool:
             try:
                 if self._probe_endpoint(ep):
                     now = time.time()
-                    # 瞬态故障频率限流：连续 >3 次则直接冻结，不继续重试
+                    # 瞬态故障频率限流：连续 >1 次则直接冻结，不继续重试
                     with self._lock:
                         ep._transient_count += 1
-                        if ep._transient_count > 3:
-                            sys_log(f"端点 '{ep.name}' 连续 {ep._transient_count} 次瞬态故障超限(>3次)，冻结", "WARN")
+                        if ep._transient_count > 1:
+                            sys_log(f"端点 '{ep.name}' 连续 {ep._transient_count} 次瞬态故障超限(>1次)，冻结", "WARN")
                         else:
                             ep._fail_count += 1
                             ep._total_failures += 1
                             ep._last_error = error
                             ep._last_error_ts = now
                             ep._cooldown_until = 0
-                    if ep._transient_count <= 3:
+                    if ep._transient_count <= 1:
                         sys_log(f"端点 '{ep.name}' 请求失败但探活通过，视为瞬态故障，跳过冷却，原地重试", "INFO")
                         tried += 1
                         continue
@@ -1973,7 +1973,7 @@ select option { background: var(--bg); color: var(--text); }
     <div class="form-row" style="grid-template-columns: 1fr 1fr 1fr;">
       <div class="form-group"><label title="每分钟最高请求次数，超限自动切换，0为不限制">并发 (0不限)</label><input type="number" id="fRpmLimit" value="0" min="0"></div>
       <div class="form-group"><label title="是否使用系统代理 (如v2ray)。本地或直连接口请选择否。">代理设置</label><select id="fProxy"><option value="true">随系统</option><option value="false">强制直连</option></select></div>
-      <input type="hidden" id="fProtocol" value="openai">
+      <div class="form-group"><label title="底层协议类型">协议类型</label><select id="fProtocol"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic</option></select></div>
     </div>
     <div class="form-group">
       <label>后台探针</label>
