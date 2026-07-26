@@ -1308,6 +1308,12 @@ class APIPool:
                 try: err_body = e.read().decode("utf-8", errors="ignore")[:200]
                 except Exception: pass
                 msg = f"HTTP {e.code}: {err_body}"
+                if (e.code == 400 and not force_no_retry
+                        and any(k in payload for k in ("temperature", "top_p"))
+                        and ("temperature" in err_body or "top_p" in err_body)):
+                    cleaned = {k: v for k, v in payload.items() if k not in ("temperature", "top_p")}
+                    sys_log(f"\u7aef\u70b9 '{ep.name}' \u4e0d\u652f\u6301 temperature/top_p\uff0c\u5df2\u81ea\u52a8\u79fb\u9664\u540e\u91cd\u8bd5", "WARNING")
+                    return self._try_endpoint(ep, cleaned, timeout, log_usage=log_usage, force_no_retry=True)
                 if e.code == 429: return None, msg + " (429 rate-limited)"
                 if e.code in (401, 403): return None, msg + " (auth error)"
                 if e.code >= 500:
