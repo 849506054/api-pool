@@ -2967,7 +2967,8 @@ async function pollLogs() {
 pollLogs();
 
 refresh();
-// 移除全局定时刷新 — 只在需要时手动刷新，日志单独轮询
+// 每5秒自动刷新状态（端点、聚合池、切换链），日志单独轮询
+setInterval(refresh, 5000);
 // 日志保持单独轮询
 setInterval(() => {
     loadChatLogs(chatLogsPage);
