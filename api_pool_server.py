@@ -459,6 +459,12 @@ class APIPool:
                     for k, v in updates.items():
                         if hasattr(ep, k) and not k.startswith("_") and k != "id":
                             setattr(ep, k, v)
+                    # cooldown_minutes 被设为 0 时视为解冻，同步清除运行态
+                    if updates.get("cooldown_minutes") == 0:
+                        ep._cooldown_until = 0
+                        ep._fail_count = 0
+                        ep._last_error = ""
+                        ep._last_error_ts = 0
 
                     # 池内端点显式改优先级 → insert-at-position
                     if new_priority is not None and ep.in_pool:
@@ -2355,7 +2361,7 @@ async function setPriority(targetId, newPrio){
   }
 }
 async function deleteEndpoint(id, n){if(!confirm(`删除「${n}」？`))return;await api('DELETE',`/api/endpoints/${encodeURIComponent(id)}`);toast('已删除','success');refresh();}
-async function clearCooldown(id){await api('PUT',`/api/endpoints/${encodeURIComponent(id)}`,{cooldown_minutes:0});await api('POST','/api/reset');setTimeout(async()=>{await api('PUT',`/api/endpoints/${encodeURIComponent(id)}`,{cooldown_minutes:5});refresh();},200);toast('已解除冷却','success');refresh();}
+async function clearCooldown(id){await api('PUT',`/api/endpoints/${encodeURIComponent(id)}`,{cooldown_minutes:0});refresh();toast('已解除冷却','success');}
 async function switchEndpoint(id){
   const r = await api('POST', `/api/switch-endpoint/${encodeURIComponent(id)}`);
   if(r.ok){ toast('✅ 已切换','success'); refresh(); }
