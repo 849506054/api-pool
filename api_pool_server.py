@@ -22,6 +22,9 @@ from collections import deque
 
 LATENCY_OK_MAX = 2000     
 LATENCY_SLOW_MAX = 5000   
+# 假成功检测：上游返回 200 OK 但内容含拒绝/错误信息
+FAKE_SUCCESS_PATTERNS = ["无法给到相关内容"]
+
 
 class LogManager:
     def __init__(self, max_history=300):
@@ -354,6 +357,7 @@ class Endpoint:
     extra_headers: dict = field(default_factory=dict)
     is_vision: bool = True
     in_pool: bool = False  # 是否加入聚合池（默认不加入）
+    check_fake_success: bool = False  # 是否检测假成功（200 OK 但内容含拒绝信息）
 
     _fail_count: int = field(default=0, repr=False)
     _req_timestamps: deque = field(default_factory=deque, repr=False)
@@ -395,6 +399,7 @@ class APIPool:
         self._current_endpoint_id = None  # 用端点ID追踪当前端点，而非位置索引
         self._manual_override_id = None  # 用户手动指定端点的ID，优先级覆盖路由选择
         self._last_reasoning_content = None  # 缓存上一轮返回的 reasoning_content，用于多轮对话补全
+        self._last_reasoning_text = None  # 缓存上一轮返回的 reasoning_text（DeepSeek V4 request 字段名），用于多轮对话补全
         if endpoints:
             for ep in endpoints:
                 self.add_endpoint(ep)
@@ -523,6 +528,7 @@ class APIPool:
             "billing_mode": ep.billing_mode,
             "is_vision": ep.is_vision,
             "in_pool": ep.in_pool,
+            "check_fake_success": ep.check_fake_success,
             "is_rpm_limited": self._is_rpm_limited(ep),
             "fail_count": ep._fail_count,
             "last_error": ep._last_error,
@@ -861,13 +867,17 @@ class APIPool:
         self._current_endpoint_id = ep.id
         if self._manual_override_id and self._manual_override_id != ep.id:
             self._manual_override_id = None  # 手动覆盖端点失败后落到其他端点，清除覆盖
-        # 缓存 reasoning_content 用于多轮对话
+        # 缓存 reasoning_content/reasoning_text 用于多轮对话
         if result and isinstance(result, dict):
             try:
                 msg = result.get("choices", [{}])[0].get("message", {})
                 rc = msg.get("reasoning_content")
                 if rc:
                     self._last_reasoning_content = rc
+                    self._last_reasoning_text = rc
+                rt = msg.get("reasoning_text")
+                if rt:
+                    self._last_reasoning_text = rt
             except (IndexError, KeyError):
                 pass
 
@@ -890,6 +900,30 @@ class APIPool:
         total = len(active)
         # 按优先级排序：每次从最高优先级端点开始尝试，故障自动降级，恢复后自动回迁
         active.sort(key=lambda e: e.priority)
+        # 修复消息顺序：tool 消息前缺少 tool_calls 时自动补 assistant 回复
+        needs_fix = False
+        tool_call_ids = set()
+        for m in messages:
+            for tc in (m.get("tool_calls") or []):
+                tool_call_ids.add(tc.get("id", ""))
+        for m in messages:
+            if m.get("role") == "tool" and m.get("tool_call_id", "") not in tool_call_ids:
+                needs_fix = True
+                break
+        if needs_fix:
+            fixed = []
+            seen_tc_ids = set()
+            for m in messages:
+                if m.get("role") == "tool":
+                    tc_id = m.get("tool_call_id", "")
+                    if tc_id and tc_id not in seen_tc_ids:
+                        fixed.append({"role": "assistant", "content": None, "tool_calls": [{"id": tc_id, "type": "function", "function": {"name": "resolved", "arguments": "{}"}}]})
+                elif m.get("role") == "assistant":
+                    for tc in (m.get("tool_calls") or []):
+                        seen_tc_ids.add(tc.get("id", ""))
+                fixed.append(m)
+            messages = fixed
+
         
         # 补全 reasoning_content：找到最后一个 assistant 消息，如果没有则注入缓存值
         # 手动覆盖：如果用户通过UI指定了端点，优先走该端点
@@ -910,23 +944,24 @@ class APIPool:
             if not is_anthropic:
                 # DeepSeek thinking 模式需要 reasoning_content
                 has_assistant = any(m.get("role") == "assistant" for m in messages)
-                has_reasoning = any("reasoning_content" in m for m in messages if m.get("role") == "assistant")
+                has_reasoning = any("reasoning_content" in m or "reasoning_text" in m for m in messages if m.get("role") == "assistant")
                 
-                if self._last_reasoning_content and has_assistant:
-                    # 找到最后一个 assistant 消息注入缓存的 reasoning_content
+                if (self._last_reasoning_content or self._last_reasoning_text) and has_assistant:
+                    # 找到最后一个 assistant 消息注入缓存的 reasoning_text（DeepSeek V4 request 字段名）
+                    reasoning_val = self._last_reasoning_text or self._last_reasoning_content
                     for i in range(len(messages) - 1, -1, -1):
-                        if messages[i].get("role") == "assistant" and "reasoning_content" not in messages[i]:
+                        if messages[i].get("role") == "assistant" and "reasoning_text" not in messages[i] and "reasoning_content" not in messages[i]:
                             loop_messages = list(messages)
                             loop_messages[i] = dict(loop_messages[i])
-                            loop_messages[i]["reasoning_content"] = self._last_reasoning_content
+                            loop_messages[i]["reasoning_text"] = reasoning_val
                             break
                 elif has_assistant and not has_reasoning:
-                    # 跨端点切换，注入空字符串骗过校验
+                    # 跨端点切换，注入空字符串骗过校验（DeepSeek V4 需要 reasoning_text）
                     for i in range(len(messages) - 1, -1, -1):
-                        if messages[i].get("role") == "assistant" and "reasoning_content" not in messages[i]:
+                        if messages[i].get("role") == "assistant" and "reasoning_text" not in messages[i] and "reasoning_content" not in messages[i]:
                             loop_messages = list(messages)
                             loop_messages[i] = dict(loop_messages[i])
-                            loop_messages[i]["reasoning_content"] = ""
+                            loop_messages[i]["reasoning_text"] = ""
                             break
             
             payload = {
@@ -971,30 +1006,7 @@ class APIPool:
                 return result
             errors.append(f"[{ep.name}] {error}")
             sys_log(f"端点 '{ep.name}' 请求失败: {error}", "ERROR")
-            # 统一探活：探活通过视为瞬态故障，原地重试；探活失败则旋转冷却
-            time.sleep(1.5)  # 短暂等待，给瞬态故障自愈时间
-            try:
-                if self._probe_endpoint(ep):
-                    now = time.time()
-                    # 瞬态故障频率限流：连续 >1 次则直接冻结，不继续重试
-                    with self._lock:
-                        ep._transient_count += 1
-                        if ep._transient_count > 1:
-                            sys_log(f"端点 '{ep.name}' 连续 {ep._transient_count} 次瞬态故障超限(>1次)，冻结", "WARN")
-                        else:
-                            ep._fail_count += 1
-                            ep._total_failures += 1
-                            ep._last_error = error
-                            ep._last_error_ts = now
-                            ep._cooldown_until = 0
-                    if ep._transient_count <= 1:
-                        sys_log(f"端点 '{ep.name}' 请求失败但探活通过，视为瞬态故障，跳过冷却，原地重试", "INFO")
-                        tried += 1
-                        continue
-                    # 超限：不 continue，走下方冷却+轮转路径
-            except Exception:
-                pass
-            sys_log(f"端点 '{ep.name}' 请求失败且探活未通过，进入冷却旋转", "WARN")
+            # _try_endpoint 内部已按 max_retries 重试完毕，直接冻结+轮转
             with self._lock:
                 self._rotate(ep, error)
                 active = self._active_endpoints()
@@ -1002,6 +1014,7 @@ class APIPool:
                 total = len(active)
                 if total == 0:
                     break
+                tried = 0  # 轮转后重置尝试计数，用刷新后的 total 重新计算
                 # 按优先级逐个探活下一个候选端点
                 next_ep = None
                 for i, e in enumerate(active):
@@ -1247,6 +1260,12 @@ class APIPool:
                                 "prompt_tokens_details": {"cached_tokens": cached} if cached else {}
                             }
                         }
+                        # 假成功检测（仅端点启用时）
+                        if ep.check_fake_success:
+                            _reply_text = reply.strip()
+                            if _reply_text and any(p in _reply_text for p in FAKE_SUCCESS_PATTERNS):
+                                sys_log(f"端点 '{ep.name}' 假成功（内容匹配拒绝模式）", "WARNING")
+                                return None, "fake-success: 内容匹配拒绝模式"
                         return o_body, ""
                     else:
                         u = body.get("usage", {})
@@ -1262,6 +1281,12 @@ class APIPool:
                                 log_text = content.strip() or reasoning.strip() or ""
                                 chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000))
                                 ep._today_used += tot
+                        # 假成功检测（仅端点启用时）
+                        if ep.check_fake_success:
+                            _content_text = (content or reasoning or "").strip()
+                            if _content_text and any(p in _content_text for p in FAKE_SUCCESS_PATTERNS):
+                                sys_log(f"端点 '{ep.name}' 假成功（内容匹配拒绝模式）", "WARNING")
+                                return None, "fake-success: 内容匹配拒绝模式"
                         return body, ""
                     
                     
@@ -1392,6 +1417,7 @@ def api_handler(method, path, body):
         
         extra_payload = {k: v for k, v in body.items() if k not in ("messages", "model")}
         extra_payload.pop("extra_body", None)
+        extra_payload.pop("response_format", None)
         
         try:
             result = pool.chat(messages, extra_payload=extra_payload)
@@ -1541,14 +1567,14 @@ def api_handler(method, path, body):
 
 def _sync_to_config():
     save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "is_vision": ep.get("is_vision", True),
-            "in_pool": ep.get("in_pool", False)} for ep in pool.list_endpoints()])
+            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False)} for ep in pool.list_endpoints()])
 
 
 GUI_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>API Pool 聚合管理</title>
 <style>
 :root{
@@ -1566,7 +1592,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .header h1 .logo{width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--blue));display:flex;align-items:center;justify-content:center;font-size:16px}
 .header-actions{display:flex;gap:8px;flex-wrap:wrap}
 
-.btn{padding:7px 14px;border:none;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;transition:all .12s;display:inline-flex;align-items:center;gap:5px;letter-spacing:.2px}
+.btn{padding:7px 14px;border:none;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;transition:all .12s;display:inline-flex;align-items:center;gap:5px;letter-spacing:.2px;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 .btn:hover{transform:translateY(-1px);filter:brightness(1.1)}
 .btn:active{transform:translateY(0)}
 .btn-primary{background:var(--accent);color:#fff}
@@ -1595,6 +1621,102 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 
 .grid{display:grid;grid-template-columns:7fr 3fr;gap:20px;align-items:start}
 @media(max-width:920px){.grid{grid-template-columns:1fr}}
+/* ── 移动端适配 ── */
+@media(max-width:768px){
+  body{padding:12px 10px;font-size:13px}
+  .header h1{font-size:16px}
+  .header h1 .logo{width:26px;height:26px;font-size:13px}
+  .header-actions .btn{font-size:11px;padding:5px 10px}
+  .dash-stats{grid-template-columns:repeat(2,1fr);gap:10px}
+  .dash-stat{padding:14px}
+  .dash-stat .num{font-size:18px}
+  .dash-stat .label{font-size:10px}
+  .stats{grid-template-columns:repeat(3,1fr);gap:6px}
+  .stat-item{padding:10px 6px}
+  .stat-item .num{font-size:16px}
+  .ep-item{padding:10px}
+  .ep-header{flex-direction:column;align-items:flex-start;gap:6px}
+  .ep-actions{flex-wrap:wrap;gap:3px;width:100%}
+  .ep-actions .btn{font-size:10px;padding:3px 7px;min-width:26px;text-align:center}
+  .ep-meta{flex-wrap:wrap;gap:4px;font-size:10px}
+  .ep-meta span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%}
+  .ep-name{font-size:13px;width:100%}
+  .ep-name .badge,.ep-name span.badge{font-size:9px;padding:2px 5px}
+  .ep-error{font-size:10px;padding:4px 6px}
+  .chain-item{padding:10px}
+  .card{padding:12px 14px}
+  .card-title{font-size:12px}
+  .filter-bar{flex-wrap:wrap;gap:4px}
+  .filter-bar .filter-btn{font-size:11px;padding:3px 8px}
+  .form-row{grid-template-columns:1fr!important;gap:8px}
+  .form-group{margin-bottom:0}
+  .form-group label{font-size:11px;margin-bottom:2px}
+  .form-group input,.form-group select{font-size:13px;padding:6px 8px}
+  .modal{width:95%;padding:16px;max-height:90vh;overflow-y:auto}
+  .model-row{flex-direction:column;align-items:stretch;gap:6px}
+  .model-row .btn{width:100%}
+  .api-info-card{padding:10px 12px;font-size:12px}
+  .api-info-card code{font-size:11px}
+  .test-drawer{width:95%;right:2.5%}
+  .test-drawer .drawer-header{flex-direction:column;align-items:flex-start;gap:6px}
+  .test-drawer .drawer-header .btn{width:100%}
+  .log-header{flex-wrap:wrap;gap:6px}
+  .log-header select{width:100%}
+  .log-row{flex-direction:column;gap:4px;padding:8px}
+  .log-row .log-time{font-size:10px;min-width:auto}
+  .log-row .log-msg{font-size:11px}
+  .log-row .log-level{font-size:10px;min-width:30px}
+  .seg-ctrl .seg-btn{font-size:10px;padding:3px 8px}
+  .stats-ttl{font-size:12px;padding:10px 0 6px}
+  .stats-ttl .num{font-size:16px}
+  .stats-ttl .label{font-size:10px}
+  table{font-size:10px!important}
+  table th,table td{padding:4px!important}
+  .chat-log-item{font-size:11px;padding:6px 8px}
+  .chat-log-meta{font-size:10px;flex-wrap:wrap}
+  .toast{font-size:12px;padding:8px 16px;bottom:16px;left:10px;right:10px;width:auto}
+  .modal-overlay .modal .form-actions{flex-direction:column;gap:6px}
+  .modal-overlay .modal .form-actions .btn{width:100%}
+}
+@media(max-width:480px){
+  body{padding:8px 6px;font-size:12px}
+  .dash-stats{grid-template-columns:1fr 1fr;gap:6px}
+  .dash-stat{padding:10px}
+  .dash-stat .num{font-size:16px}
+  .stats{grid-template-columns:repeat(3,1fr);gap:4px}
+  .stat-item{padding:8px 4px;border-radius:8px}
+  .stat-item .num{font-size:14px}
+  .stat-item .label{font-size:9px}
+  .header h1{font-size:14px}
+  .header-actions{gap:4px}
+  .header-actions .btn{font-size:10px;padding:4px 8px}
+  .ep-actions .btn{font-size:9px;padding:2px 5px;min-width:22px}
+  .modal{width:100%;padding:12px;border-radius:12px}
+  .card{padding:10px 12px;border-radius:12px}
+  .ep-meta span{max-width:100%}
+  .filter-bar{gap:3px}
+  .filter-bar .filter-btn{font-size:10px;padding:2px 6px}
+  .api-info-card{padding:8px 10px;font-size:11px}
+  .api-info-card code{font-size:10px}
+  .chain-item{padding:8px;font-size:12px}
+  .chain-item .chain-dot{width:8px;height:8px}
+  .test-drawer{width:98%;right:1%;border-radius:12px;padding:12px}
+  .test-drawer textarea{font-size:12px;min-height:60px}
+  .chat-log-item{font-size:10px;padding:4px 6px}
+  .chat-log-meta{font-size:9px}
+  .log-row{padding:6px}
+  .log-row .log-msg{font-size:10px}
+  .badge{font-size:8px;padding:1px 4px}
+  .ep-name .badge,.ep-name span.badge{font-size:8px;padding:1px 4px}
+  .btn{padding:5px 10px;font-size:11px}
+  .btn-sm{padding:2px 6px;font-size:10px}
+}
+@media(max-width:380px){
+  .dash-stats{grid-template-columns:1fr;gap:4px}
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .ep-actions{gap:2px}
+  .ep-actions .btn{font-size:8px;padding:2px 4px;min-width:20px}
+}
 
 .card{background:var(--card);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow)}
 .card-title{font-size:13px;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:7px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px}
@@ -1906,7 +2028,7 @@ select option { background: var(--bg); color: var(--text); }
                     <div class="seg-btn" id="btnTblTodayCall" onclick="switchTblToday('calls')">请求数</div>
                 </div>
             </div>
-            <div style="max-height: 250px; overflow-y: auto;">
+            <div style="max-height: 250px; overflow-y: auto; -webkit-overflow-scrolling: touch;">
               <table style="width: 100%; border-collapse: collapse; font-size: 11px; text-align: left;">
                 <thead><tr style="border-bottom: 1px solid var(--border); color: var(--text-dim);"><th style="padding: 6px;">模型端点</th><th style="padding: 6px; text-align:right;">数值</th></tr></thead>
                 <tbody id="todayModelsTable"></tbody>
@@ -1922,7 +2044,7 @@ select option { background: var(--bg); color: var(--text); }
                     <div class="seg-btn" id="btnTblMonthCall" onclick="switchTblMonth('calls')">请求数</div>
                 </div>
             </div>
-            <div style="max-height: 250px; overflow-y: auto;">
+            <div style="max-height: 250px; overflow-y: auto; -webkit-overflow-scrolling: touch;">
               <table style="width: 100%; border-collapse: collapse; font-size: 11px; text-align: left;">
                 <thead><tr style="border-bottom: 1px solid var(--border); color: var(--text-dim);"><th style="padding: 6px;">模型端点</th><th style="padding: 6px; text-align:right;">数值</th></tr></thead>
                 <tbody id="monthModelsTable"></tbody>
@@ -1964,6 +2086,7 @@ select option { background: var(--bg); color: var(--text); }
     <div class="form-row">
       <div class="form-group"><label>启用</label><select id="fEnabled"><option value="true">是</option><option value="false">否</option></select></div>
       <div class="form-group"><label>加入聚合池</label><select id="fPool"><option value="false">否（仅保存）</option><option value="true">是（参与轮换）</option></select></div>
+      <div class="form-group"><label title="检测上游返回内容是否含拒绝信息，从而触发自动轮转">假成功检测</label><select id="fFakeCheck"><option value="false">关闭</option><option value="true">开启</option></select></div>
       <div class="form-group"><label title="达到额度后挂起，0为不限制">每日额度 (0不限)</label><input type="number" id="fDailyLimit" value="0" min="0"></div>
       <div class="form-group">
         <label title="按次计费的端点健康检查将自动使用零成本 Models 探针，避免产生费用">计费方式</label>
@@ -1975,7 +2098,7 @@ select option { background: var(--bg); color: var(--text); }
     </div>
     <div class="form-row" style="grid-template-columns: 1fr 1fr 1fr;">
       <div class="form-group"><label title="每分钟最高请求次数，超限自动切换，0为不限制">并发 (0不限)</label><input type="number" id="fRpmLimit" value="0" min="0"></div>
-      <div class="form-group"><label title="是否使用系统代理 (如v2ray)。本地或直连接口请选择否。">代理设置</label><select id="fProxy"><option value="true">随系统</option><option value="false">强制直连</option></select></div>
+      <div class="form-group"><label title="是否使用系统代理 (如v2ray)。本地或直连接口请选择否。">代理设置</label><select id="fProxy"><option value="false">强制直连</option><option value="true">随系统</option></select></div>
       <div class="form-group"><label title="底层协议类型">协议类型</label><select id="fProtocol"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic</option></select></div>
     </div>
     <div class="form-group">
@@ -2448,7 +2571,7 @@ async function testSelectedVision(){
 function openAddModal(){
     document.getElementById('editName').value='';document.getElementById('modalTitle').textContent='添加端点';
     ['fName','fUrl','fKey','fModel'].forEach(id=>document.getElementById(id).value='');
-    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fPool').value='false';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='true';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';
+    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fPool').value='false';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';document.getElementById('fFakeCheck').value='false';
     document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';
     document.getElementById('fetchModelsBtn').disabled=true;document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
     allModels=[];selectedModels=new Set();latencyResults={};visionResults={};
@@ -2458,7 +2581,7 @@ function editEndpoint(id){
     api('GET','/api/endpoints').then(eps=>{const ep=eps.find(e=>e.id===id);if(!ep)return;
         document.getElementById('editName').value=id;document.getElementById('modalTitle').textContent='编辑端点';
         document.getElementById('fName').value=ep.name;document.getElementById('fUrl').value=ep.base_url;document.getElementById('fKey').value=ep.api_key_full||'';document.getElementById('fModel').value=ep.model;
-        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fPool').value=String(ep.in_pool!==false);document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);
+        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fPool').value=String(ep.in_pool!==false);document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);
         document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
         allModels=[];selectedModels=new Set();latencyResults={};visionResults={};checkFetchBtn();document.getElementById('modal').classList.add('show');
     });
@@ -2467,7 +2590,7 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 
 async function saveEndpoint(){
     const ep_id=document.getElementById('editName').value;
-    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:parseInt(document.getElementById('fCooldown').value)||0,enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true'};
+    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:parseInt(document.getElementById('fCooldown').value)||0,enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true'};
     if(!d.name||!d.base_url||!d.api_key){toast('填写名称/URL/Key','error');return;}
     if(!d.model){toast('选择模型','error');return;}
     if(ep_id){await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d);toast('已更新','success');}

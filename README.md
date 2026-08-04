@@ -5,7 +5,7 @@
 > **定位**：本工具专注于 DeepSeek（及兼容）模型端点的集中管理、健康检测、优先级调度，
 > 不再作为通用多模型聚合入口。多模型混合场景建议走 Hermes 原生 fallback 链。
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue)
+![Python](https://img.shields.io/badge/Python-3.13-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Zero Deps](https://img.shields.io/badge/Dependencies-None-brightgreen)
 ![SQLite](https://img.shields.io/badge/Database-SQLite-blue)
@@ -20,7 +20,7 @@
 - **多协议兼容** — 支持 OpenAI 兼容协议与 Anthropic 协议（管理存量端点），对外统一 OpenAI 接口
 - **自动图片预处理** — 目标端点不支持视觉时自动调用视觉模型解析
 - **统计大盘** — Token 消耗、缓存命中、请求数趋势
-- **零依赖** — 只需 Python 3.10+，单文件即可运行
+- **零依赖** — 只需 Python 3.13，单文件即可运行
 
 ## 快速开始
 
