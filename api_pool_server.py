@@ -869,7 +869,9 @@ class APIPool:
         ep._transient_count = 0
         ep._transient_window_start = 0
         ep._last_error = ""
-        self._clear_cooldown(ep)
+        # 仅在非冷却中清除冷却，防止并发请求穿透冷却保护（429→冷却→并发成功→清冷却→再429）
+        if not self._is_in_cooldown(ep):
+            self._clear_cooldown(ep)
         self._current_endpoint_id = ep.id
         if self._manual_override_id and self._manual_override_id != ep.id:
             self._manual_override_id = None  # 手动覆盖端点失败后落到其他端点，清除覆盖
@@ -1819,13 +1821,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .mb-toolbar label{font-size:11px;color:var(--text-dim);cursor:pointer;display:flex;align-items:center;gap:3px;white-space:nowrap}
 .mb-toolbar .count{font-size:10px;color:var(--text-dim);white-space:nowrap}
 .mb-table{max-height:300px;overflow-y:auto}
-.mb-head{display:grid;grid-template-columns:28px 1fr 72px 80px 70px;gap:6px;padding:6px 10px;font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.4px;font-weight:600;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--card);z-index:1}
-.mb-row{display:grid;grid-template-columns:28px 1fr 72px 80px 70px;gap:6px;padding:6px 10px;align-items:center;border-bottom:1px solid rgba(255,255,255,.03);font-size:12px;cursor:pointer;transition:background .08s}
+.mb-head{display:grid;grid-template-columns:20px 1fr 40px 45px 45px;gap:6px;padding:6px 10px;font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.4px;font-weight:600;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--card);z-index:1}
+.mb-row{display:grid;grid-template-columns:20px 1fr 40px 45px 45px;gap:6px;padding:6px 10px;align-items:center;border-bottom:1px solid rgba(255,255,255,.03);font-size:12px;cursor:pointer;transition:background .08s}
 .mb-row:last-child{border-bottom:none}
 .mb-row:hover{background:var(--card-hover)}
 .mb-row.selected{background:var(--accent);color:#fff}
 .mb-row input[type=checkbox]{accent-color:var(--accent);cursor:pointer}
-.mb-row .name-cell{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mb-row .name-cell{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .mb-row .mm-cell{text-align:center;font-size:11px}
 .mm-yes{color:var(--green)}
 .mm-no{color:var(--text-dim)}
