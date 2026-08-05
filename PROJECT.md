@@ -46,7 +46,6 @@
 
 ### 待办
 
-- [ ] **[P2] 清理陈旧备份文件** — 项目目录累积 21 个 `.bak` 文件待清理
 - [ ] **[P3] 提交未 commit 的本地改动** — 代理默认值 + response_format 过滤 + 本文档更新
 - [ ] **[P3] 同步 systemd dropin 配置** — `proxy.conf` 不在版本控制中，建议文档化或提交模板
 
@@ -82,5 +81,4 @@
 
 ## 📌 活跃事项
 
-- [ ] **[P2] 清理陈旧备份文件** — 项目目录当前 2 个 `.bak*` 文件，建议清理
 - [ ] **[P3] 文档化 proxy.conf dropin** — `/etc/systemd/system/api-pool.service.d/proxy.conf` 为系统代理环境变量，建议在仓库中保留模板或注释
