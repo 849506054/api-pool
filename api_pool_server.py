@@ -459,12 +459,9 @@ class APIPool:
                     for k, v in updates.items():
                         if hasattr(ep, k) and not k.startswith("_") and k != "id":
                             setattr(ep, k, v)
-                    # cooldown_minutes 被设为 0 时视为解冻，同步清除运行态
-                    if updates.get("cooldown_minutes") == 0:
-                        ep._cooldown_until = 0
-                        ep._fail_count = 0
-                        ep._last_error = ""
-                        ep._last_error_ts = 0
+                    # cooldown_minutes 最低 1，防止跳过冷却恢复流程
+                    if updates.get("cooldown_minutes") is not None and updates["cooldown_minutes"] < 1:
+                        ep.cooldown_minutes = 1
 
                     # 池内端点显式改优先级 → insert-at-position
                     if new_priority is not None and ep.in_pool:
@@ -782,11 +779,27 @@ class APIPool:
             return len(ep._req_timestamps) >= ep.rpm_limit
 
     def _set_cooldown(self, ep):
-        if ep.cooldown_minutes > 0:
-            ep._cooldown_until = time.time() + ep.cooldown_minutes * 60
+        cd = max(ep.cooldown_minutes, 1)
+        ep._cooldown_until = time.time() + cd * 60
 
     def _clear_cooldown(self, ep):
         ep._cooldown_until = 0
+
+    def clear_error(self, ep_id):
+        """手动清除端点错误状态（解冻），不改配置值"""
+        with self._lock:
+            for ep in self._endpoints:
+                if ep.id == ep_id:
+                    ep._cooldown_until = 0
+                    ep._fail_count = 0
+                    ep._last_error = ""
+                    ep._last_error_ts = 0
+                    ep._health = "ok"
+                    ep._transient_count = 0
+                    ep._transient_window_start = 0
+                    sys_log(f"端点 '{ep.name}' 手动解冻，错误状态已清除", "INFO")
+                    return True
+        return False
 
     def _cleanup_expired_cooldowns(self):
         """冷却过期端点：探活→成功则清洗+切当前指针→失败则继续冻结"""
@@ -949,11 +962,12 @@ class APIPool:
             # 按端点协议决定消息体：Anthropic 端点不注入 reasoning_content（避免缓存穿透）
             loop_messages = messages
             is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
-            if not is_anthropic:
+            if not is_anthropic and "deepseek" in ep_model.lower():
                 # DeepSeek V4 thinking 模式要求每条 assistant 消息带 reasoning_text（request 字段名）
                 # Hermes 历史消息里 assistant 带的是 reasoning_content（response 字段名），
                 # Kcne 只认 reasoning_text，必须逐条补齐：有 reasoning_content 则复制为 reasoning_text，
                 # 都没有则注入缓存值/空格，避免 HTTP 400 "reasoning_text must be passed back"
+                # 非 DeepSeek 模型跳过此逻辑，避免注入无关字段导致兼容性问题
                 reasoning_val = self._last_reasoning_text or self._last_reasoning_content or " "
                 loop_messages = list(messages)  # 浅拷贝一次，遍历时逐条替换为 dict 副本
                 for i in range(len(loop_messages) - 1, -1, -1):
@@ -1516,6 +1530,10 @@ def api_handler(method, path, body):
         for ep in pool.list_endpoints():
             if ep["id"] == ep_id: pool.set_enabled(ep_id, not ep["enabled"]); break
         _sync_to_config(); return 200, {"ok": True}, False
+    if method == "POST" and cp.endswith("/clear-error"):
+        ep_id = unquote(cp.split("/")[3])
+        pool.clear_error(ep_id)
+        return 200, {"ok": True}, False
     if method == "POST" and cp == "/api/health-check": return 200, {"ok": True, "results": pool.check_all_health()}, False
     if method == "POST" and cp == "/api/fetch-models":
         base_url = body.get("base_url", ""); api_key = body.get("api_key", "")
@@ -2354,7 +2372,7 @@ async function setPriority(targetId, newPrio){
   }
 }
 async function deleteEndpoint(id, n){if(!confirm(`删除「${n}」？`))return;await api('DELETE',`/api/endpoints/${encodeURIComponent(id)}`);toast('已删除','success');refresh();}
-async function clearCooldown(id){await api('PUT',`/api/endpoints/${encodeURIComponent(id)}`,{cooldown_minutes:0});refresh();toast('已解除冷却','success');}
+async function clearCooldown(id){await api('POST',`/api/endpoints/${encodeURIComponent(id)}/clear-error`);refresh();toast('已解除冷却','success');}
 async function switchEndpoint(id){
   const r = await api('POST', `/api/switch-endpoint/${encodeURIComponent(id)}`);
   if(r.ok){ toast('✅ 已切换','success'); refresh(); }
@@ -2589,7 +2607,7 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 
 async function saveEndpoint(){
     const ep_id=document.getElementById('editName').value;
-    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:parseInt(document.getElementById('fCooldown').value)||0,enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true'};
+    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true'};
     if(!d.name||!d.base_url||!d.api_key){toast('填写名称/URL/Key','error');return;}
     if(!d.model){toast('选择模型','error');return;}
     if(ep_id){await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d);toast('已更新','success');}
@@ -2600,7 +2618,7 @@ async function saveEndpoint(){
 async function batchAddEndpoints(){
     const fn=document.getElementById('fName').value.trim();
     const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
-    const sp=parseInt(document.getElementById('fPriority').value)||1,to=parseInt(document.getElementById('fTimeout').value)||60,re=parseInt(document.getElementById('fRetries').value)||0,cd=parseInt(document.getElementById('fCooldown').value)||5,dl=parseInt(document.getElementById('fDailyLimit').value)||0,rl=parseInt(document.getElementById('fRpmLimit').value)||0,up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',hm=document.getElementById('fHealthMode').value||'chat',bm=document.getElementById('fBillingMode').value||'subscription';
+    const sp=parseInt(document.getElementById('fPriority').value)||1,to=parseInt(document.getElementById('fTimeout').value)||60,re=parseInt(document.getElementById('fRetries').value)||0,cd=Math.max(1,parseInt(document.getElementById('fCooldown').value)||5),dl=parseInt(document.getElementById('fDailyLimit').value)||0,rl=parseInt(document.getElementById('fRpmLimit').value)||0,up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',hm=document.getElementById('fHealthMode').value||'chat',bm=document.getElementById('fBillingMode').value||'subscription';
     if(!u||!k){toast('填写 URL 和 Key','error');return;}
     if(!selectedModels.size){toast('选择模型','error');return;}
     const ms=[...selectedModels];toast(`添加 ${ms.length} 个...`,'info');
