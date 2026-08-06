@@ -43,6 +43,10 @@
 - [x] **移动端 UI 适配** — 三断点响应式 + 触摸优化
 | 2026-08-05 | _on_success 冷却期间不清除冷却 | 并发请求穿透冷却保护: Ark 429 后冷却被迟到成功请求清除，导致冷却→清冷却→再429 无限循环 |
 - [x] **聚合池自动刷新** — 恢复 5s 间隔状态轮询
+- [x] **cooldown_minutes 最低 1** — 不允许 0/负数，保证出错端点走冷却→探活→清除完整恢复流程 (commit 3264380)
+- [x] **clear-error 独立解冻 API** — `POST /api/endpoints/:id/clear-error` 只清运行态不改配置，前端按钮同步改造 (commit 3264380)
+- [x] **reasoning_text 仅 DeepSeek 模型注入** — 非 DeepSeek 端点跳过，避免无关字段导致兼容性问题 (commit 3264380)
+- [x] **auto-strip temperature/top_p** — 端点报 400 且含 temperature/top_p 时自动移除重试 (cherry-pick 上游 6e7531f, commit 8c58aef)
 
 ### 待办
 
@@ -78,6 +82,9 @@
 | 2026-08-04 | 端点假成功检测（`check_fake_success` 字段，默认关闭） | 上游返回 200 OK 但内容含"无法给到相关内容"等拒绝信息，按端点开关触发轮转+冷却 |
 | 2026-08-04 | 聚合池卡片自动刷新（5s 间隔） | 之前因性能考虑移除全局定时刷新，导致状态需手动刷新页面 |
 | 2026-08-04 | 移动端 UI 适配（768px/480px/380px 三断点） | 手机端操作时布局错乱，按钮溢出，表单无法正常填写 |
+| 2026-08-07 | cooldown_minutes 最低 1 + clear-error 独立 API | cooldown=0 跳过冷却恢复流程导致错误状态残留；解冻不应改配置值 |
+| 2026-08-07 | reasoning_text 注入限定 DeepSeek 模型 | 全局注入会导致非 DeepSeek 端点收到无关字段被拒绝 |
+| 2026-08-07 | 上游 Responses API 暂不合并 | 上游 thvse/api-pool 已支持 Responses API (94c1764+9423819)，当前使用场景无关，标记备用 |
 
 ## 📌 活跃事项
 
