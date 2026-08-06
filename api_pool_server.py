@@ -950,27 +950,17 @@ class APIPool:
             loop_messages = messages
             is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
             if not is_anthropic:
-                # DeepSeek thinking 模式需要 reasoning_content
-                has_assistant = any(m.get("role") == "assistant" for m in messages)
-                has_reasoning = any("reasoning_content" in m or "reasoning_text" in m for m in messages if m.get("role") == "assistant")
-                
-                if (self._last_reasoning_content or self._last_reasoning_text) and has_assistant:
-                    # 找到最后一个 assistant 消息注入缓存的 reasoning_text（DeepSeek V4 request 字段名）
-                    reasoning_val = self._last_reasoning_text or self._last_reasoning_content
-                    for i in range(len(messages) - 1, -1, -1):
-                        if messages[i].get("role") == "assistant" and "reasoning_text" not in messages[i] and "reasoning_content" not in messages[i]:
-                            loop_messages = list(messages)
-                            loop_messages[i] = dict(loop_messages[i])
-                            loop_messages[i]["reasoning_text"] = reasoning_val
-                            break
-                elif has_assistant and not has_reasoning:
-                    # 跨端点切换，注入空字符串骗过校验（DeepSeek V4 需要 reasoning_text）
-                    for i in range(len(messages) - 1, -1, -1):
-                        if messages[i].get("role") == "assistant" and "reasoning_text" not in messages[i] and "reasoning_content" not in messages[i]:
-                            loop_messages = list(messages)
-                            loop_messages[i] = dict(loop_messages[i])
-                            loop_messages[i]["reasoning_text"] = ""
-                            break
+                # DeepSeek V4 thinking 模式要求每条 assistant 消息带 reasoning_text（request 字段名）
+                # Hermes 历史消息里 assistant 带的是 reasoning_content（response 字段名），
+                # Kcne 只认 reasoning_text，必须逐条补齐：有 reasoning_content 则复制为 reasoning_text，
+                # 都没有则注入缓存值/空格，避免 HTTP 400 "reasoning_text must be passed back"
+                reasoning_val = self._last_reasoning_text or self._last_reasoning_content or " "
+                loop_messages = list(messages)  # 浅拷贝一次，遍历时逐条替换为 dict 副本
+                for i in range(len(loop_messages) - 1, -1, -1):
+                    if loop_messages[i].get("role") == "assistant" and "reasoning_text" not in loop_messages[i]:
+                        loop_messages[i] = dict(loop_messages[i])
+                        rc_val = loop_messages[i].get("reasoning_content")
+                        loop_messages[i]["reasoning_text"] = rc_val if rc_val else reasoning_val
             
             payload = {
                 "model": ep_model, "messages": loop_messages,
@@ -1040,6 +1030,7 @@ class APIPool:
                     sys_log(f"对候选端点 '{next_ep.name}' 进行探活...", "INFO")
                     if self._probe_endpoint(next_ep):
                         sys_log(f"候选端点 '{next_ep.name}' 探活通过，准备重试请求", "INFO")
+                        continue  # 探活通过，回到循环顶部用 next_ep 发起实际请求
                     else:
                         sys_log(f"候选端点 '{next_ep.name}' 探活失败，跳过", "WARN")
                         self._rotate(next_ep, "探活失败", probe_failed=True)
