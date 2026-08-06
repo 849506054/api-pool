@@ -1610,6 +1610,21 @@ class APIPool:
                         final_cached_tokens = 0
                         has_usage = False
                         final_completion_text = ""
+                        tool_calls_state = {}
+                        anthropic_tool_blocks = {}
+                        responses_tool_states = {}
+                        done_sent = False
+                        anthropic_stop_reason = None
+
+                        def finish_chunk(reason):
+                            return b"data: " + json.dumps({
+                                "id": stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": ep.model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]
+                            }).encode("utf-8") + b"\n\n"
+
                         stall_timeout = getattr(ep, "stream_stall_timeout", 0)
                         _sock2 = _get_resp_socket(resp)
                         if _sock2 is not None and stall_timeout > 0:
@@ -1662,6 +1677,13 @@ class APIPool:
                                                 }
                                                 yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
                                         elif ctype == "message_stop":
+                                            finish_reason = "tool_calls" if anthropic_tool_blocks else {
+                                                "end_turn": "stop",
+                                                "stop_sequence": "stop",
+                                                "max_tokens": "length",
+                                                "tool_use": "tool_calls",
+                                            }.get(anthropic_stop_reason, "stop")
+                                            yield finish_chunk(finish_reason)
                                             usage_chunk = {
                                                 "id": stream_id,
                                                 "object": "chat.completion.chunk",
@@ -1676,11 +1698,14 @@ class APIPool:
                                             }
                                             yield b"data: " + json.dumps(usage_chunk).encode("utf-8") + b"\n\n"
                                             yield b"data: [DONE]\n\n"
+                                            done_sent = True
                                         elif ctype == "message_delta" and "usage" in chunk:
                                             u = chunk["usage"]
                                             final_completion_tokens += u.get("output_tokens", 0)
                                             final_total_tokens += u.get("output_tokens", 0)
                                             has_usage = True
+                                            if isinstance(chunk.get("delta"), dict) and chunk["delta"].get("stop_reason"):
+                                                anthropic_stop_reason = chunk["delta"]["stop_reason"]
                                         elif ctype == "message_start" and "message" in chunk and "usage" in chunk["message"]:
                                             u = chunk["message"]["usage"]
                                             prompt_t = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
@@ -1690,8 +1715,146 @@ class APIPool:
                                             has_usage = True
                                     except Exception:
                                         pass
+                                elif is_responses:
+                                    if not line.strip() or not line.startswith(b"data: "):
+                                        continue
+                                    payload_line = line[6:].strip()
+                                    if payload_line == b"[DONE]":
+                                        continue
+                                    try:
+                                        evt = json.loads(payload_line.decode("utf-8"))
+                                    except Exception:
+                                        continue
+                                    etype = evt.get("type")
+                                    if etype == "response.output_text.delta":
+                                        text = evt.get("delta", "")
+                                        final_completion_text += text
+                                        if text:
+                                            o_chunk = {
+                                                "id": stream_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": ep.model,
+                                                "choices": [{"index": 0, "delta": {"content": text}}]
+                                            }
+                                            yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
+                                    elif etype == "response.output_item.added":
+                                        item = evt.get("item") or {}
+                                        if item.get("type") == "function_call":
+                                            idx = evt.get("output_index", len(responses_tool_states))
+                                            responses_tool_states[idx] = {
+                                                "id": item.get("call_id", ""),
+                                                "name": item.get("name", ""),
+                                                "arguments": item.get("arguments", "") or "",
+                                                "emitted": False
+                                            }
+                                    elif etype == "response.function_call_arguments.delta":
+                                        idx = evt.get("output_index", len(responses_tool_states))
+                                        state = responses_tool_states.setdefault(idx, {
+                                            "id": "", "name": "", "arguments": "", "emitted": False
+                                        })
+                                        state["arguments"] += evt.get("delta", "")
+                                    elif etype == "response.function_call_arguments.done":
+                                        idx = evt.get("output_index", len(responses_tool_states))
+                                        state = responses_tool_states.setdefault(idx, {
+                                            "id": "", "name": "", "arguments": "", "emitted": False
+                                        })
+                                        state["id"] = evt.get("call_id", state["id"])
+                                        state["name"] = evt.get("name", state["name"])
+                                        state["arguments"] = evt.get("arguments", state["arguments"])
+                                        if not state["emitted"]:
+                                            state["emitted"] = True
+                                            o_chunk = {
+                                                "id": stream_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": ep.model,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "tool_calls": [{
+                                                            "index": idx,
+                                                            "id": state["id"],
+                                                            "type": "function",
+                                                            "function": {
+                                                                "name": state["name"],
+                                                                "arguments": state["arguments"]
+                                                            }
+                                                        }]
+                                                    },
+                                                    "finish_reason": "tool_calls"
+                                                }]
+                                            }
+                                            yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
+                                    elif etype == "response.output_item.done":
+                                        item = evt.get("item") or {}
+                                        if item.get("type") == "function_call":
+                                            idx = evt.get("output_index", len(responses_tool_states))
+                                            state = responses_tool_states.setdefault(idx, {
+                                                "id": "", "name": "", "arguments": "", "emitted": False
+                                            })
+                                            state["id"] = item.get("call_id", state["id"])
+                                            state["name"] = item.get("name", state["name"])
+                                            state["arguments"] = item.get("arguments", state["arguments"])
+                                            if not state["emitted"]:
+                                                state["emitted"] = True
+                                                o_chunk = {
+                                                    "id": stream_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": ep.model,
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {
+                                                            "tool_calls": [{
+                                                                "index": idx,
+                                                                "id": state["id"],
+                                                                "type": "function",
+                                                                "function": {
+                                                                    "name": state["name"],
+                                                                    "arguments": state["arguments"]
+                                                                }
+                                                            }]
+                                                        },
+                                                        "finish_reason": "tool_calls"
+                                                    }]
+                                                }
+                                                yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
+                                    elif etype == "response.completed":
+                                        response_obj = evt.get("response") or {}
+                                        incomplete = response_obj.get("incomplete_details") or {}
+                                        finish_reason = (
+                                            "length"
+                                            if response_obj.get("status") == "incomplete"
+                                            or incomplete.get("reason") == "max_output_tokens"
+                                            else "stop"
+                                        )
+                                        if not responses_tool_states:
+                                            yield finish_chunk(finish_reason)
+                                        u = response_obj.get("usage") or {}
+                                        if u:
+                                            final_prompt_tokens = u.get("input_tokens", 0)
+                                            final_cached_tokens = (u.get("input_tokens_details") or {}).get("cached_tokens", 0)
+                                            final_completion_tokens = u.get("output_tokens", 0)
+                                            final_total_tokens = u.get("total_tokens", 0)
+                                            has_usage = True
+                                            usage_chunk = {
+                                                "id": stream_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": ep.model,
+                                                "choices": [],
+                                                "usage": {
+                                                    "prompt_tokens": final_prompt_tokens,
+                                                    "completion_tokens": final_completion_tokens,
+                                                    "total_tokens": final_total_tokens
+                                                }
+                                            }
+                                            yield b"data: " + json.dumps(usage_chunk).encode("utf-8") + b"\n\n"
+                                        yield b"data: [DONE]\n\n"
+                                        done_sent = True
+                                        break
                                 else:
-                                    yield line
                                     if line.strip() and line.startswith(b"data: ") and not line.startswith(b"data: [DONE]"):
                                         try:
                                             chunk = json.loads(line[6:].decode("utf-8"))
@@ -1720,6 +1883,10 @@ class APIPool:
                             else:
                                 sys_log(f"端点 '{ep.name}' 流式响应异常: {type(e).__name__}: {e}", "ERROR")
                         finally:
+                            if is_responses and not done_sent:
+                                if not responses_tool_states:
+                                    yield finish_chunk("stop")
+                                yield b"data: [DONE]\n\n"
                             if has_usage and log_usage and not ep.name.startswith("test_"):
                                 token_tracker.add_usage(ep.name, ep.model, final_prompt_tokens, final_completion_tokens, final_total_tokens, final_cached_tokens)
                                 chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, final_completion_text, final_total_tokens, int((time.time() - req_t0) * 1000))
