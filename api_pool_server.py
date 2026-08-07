@@ -358,6 +358,7 @@ class Endpoint:
     is_vision: bool = True
     in_pool: bool = False  # 是否加入聚合池（默认不加入）
     check_fake_success: bool = False  # 是否检测假成功（200 OK 但内容含拒绝信息）
+    tool_call_id_prefix: str = ""  # 非空时启用：请求消息里的 tool_call id 重写为该前缀（如 DeepSeek 官方 call_00_ET_），解决跨端点切换时 reasoning_text 400
 
     _fail_count: int = field(default=0, repr=False)
     _req_timestamps: deque = field(default_factory=deque, repr=False)
@@ -532,6 +533,7 @@ class APIPool:
             "is_vision": ep.is_vision,
             "in_pool": ep.in_pool,
             "check_fake_success": ep.check_fake_success,
+            "tool_call_id_prefix": ep.tool_call_id_prefix,
             "is_rpm_limited": self._is_rpm_limited(ep),
             "fail_count": ep._fail_count,
             "last_error": ep._last_error,
@@ -813,7 +815,11 @@ class APIPool:
         if not expired:
             return
 
+        now = time.time()
         for ep in expired:
+            # 去重：30秒内已探活过的跳过，避免并发入口重复探活
+            if now - ep._health_last_check < 30:
+                continue
             if self._probe_endpoint(ep):
                 with self._lock:
                     ep._fail_count = 0
@@ -902,11 +908,35 @@ class APIPool:
             except (IndexError, KeyError):
                 pass
 
+    def _rewrite_tool_call_ids(self, messages, prefix):
+        """确定性重写 tool_call id：原 id → 前缀+md5 后缀，保持 assistant/tool 配对。
+
+        DeepSeek 官方（如 Kcne）校验历史里 tool_call id 必须为其生成的格式（call_00_ET_*），
+        跨端点切换后历史混入其他端点生成的 id 会导致 HTTP 400。重写为统一前缀后，
+        服务端视为新消息跳过校验。md5 保证确定性（跨轮次稳定，不破坏缓存）且配对一致。
+        """
+        import hashlib
+        mapping = {}
+        for m in messages:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    oid = tc.get("id", "")
+                    if oid and not oid.startswith(prefix):
+                        if oid not in mapping:
+                            mapping[oid] = prefix + hashlib.md5(oid.encode()).hexdigest()[:16]
+                        tc["id"] = mapping[oid]
+            elif m.get("role") == "tool" and m.get("tool_call_id"):
+                oid = m.get("tool_call_id")
+                if oid and oid in mapping:
+                    m["tool_call_id"] = mapping[oid]
+        return messages
+
     def _probe_endpoint(self, ep):
         """对单个端点做快速探活，成功返回 True，失败返回 False。统一用 chat ping 检测。"""
         if ep.health_mode == "none":
             return True  # 关闭检测视为可用
         # 统一使用 chat ping 探活：models 接口可访问不代表模型可响应
+        ep._health_last_check = time.time()
         payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3}
         reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True)
         return reply is not None
@@ -975,6 +1005,16 @@ class APIPool:
                         loop_messages[i] = dict(loop_messages[i])
                         rc_val = loop_messages[i].get("reasoning_content")
                         loop_messages[i]["reasoning_text"] = rc_val if rc_val else reasoning_val
+
+            # tool_call id 前缀重写：端点配置 tool_call_id_prefix 非空时，把消息里所有 tool_call id
+            # 重写为该前缀格式（如 DeepSeek 官方 call_00_ET_）。跨端点切换后历史里混入其他端点
+            # 生成的 id（不同前缀/格式），Kcne 等 DeepSeek 官方会校验并报 400
+            # "reasoning_text must be passed back"；重写为统一格式后服务端视为新消息跳过校验。
+            ep_prefix = getattr(ep, "tool_call_id_prefix", "") or ""
+            if ep_prefix and not is_anthropic:
+                if loop_messages is messages:
+                    loop_messages = list(messages)  # 避免原地修改原始消息
+                self._rewrite_tool_call_ids(loop_messages, ep_prefix)
             
             payload = {
                 "model": ep_model, "messages": loop_messages,
@@ -1590,7 +1630,7 @@ def api_handler(method, path, body):
 
 def _sync_to_config():
     save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "is_vision": ep.get("is_vision", True),
-            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False)} for ep in pool.list_endpoints()])
+            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", "")} for ep in pool.list_endpoints()])
 
 
 GUI_HTML = r"""<!DOCTYPE html>
@@ -2110,6 +2150,7 @@ select option { background: var(--bg); color: var(--text); }
       <div class="form-group"><label>启用</label><select id="fEnabled"><option value="true">是</option><option value="false">否</option></select></div>
       <div class="form-group"><label>加入聚合池</label><select id="fPool"><option value="false">否（仅保存）</option><option value="true">是（参与轮换）</option></select></div>
       <div class="form-group"><label title="检测上游返回内容是否含拒绝信息，从而触发自动轮转">假成功检测</label><select id="fFakeCheck"><option value="false">关闭</option><option value="true">开启</option></select></div>
+      <div class="form-group"><label title="非空时启用：请求消息里的 tool_call id 重写为该前缀（如 call_00_ET_），解决跨端点切换后 DeepSeek 官方端点 reasoning_text 400">ToolCall ID 前缀</label><input type="text" id="fToolCallPrefix" placeholder="留空=不重写，如 call_00_ET_" value=""></div>
       <div class="form-group"><label title="达到额度后挂起，0为不限制">每日额度 (0不限)</label><input type="number" id="fDailyLimit" value="0" min="0"></div>
       <div class="form-group">
         <label title="按次计费的端点健康检查将自动使用零成本 Models 探针，避免产生费用">计费方式</label>
@@ -2594,7 +2635,7 @@ async function testSelectedVision(){
 function openAddModal(){
     document.getElementById('editName').value='';document.getElementById('modalTitle').textContent='添加端点';
     ['fName','fUrl','fKey','fModel'].forEach(id=>document.getElementById(id).value='');
-    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fPool').value='false';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';document.getElementById('fFakeCheck').value='false';
+    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fPool').value='false';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';document.getElementById('fFakeCheck').value='false';document.getElementById('fToolCallPrefix').value='';
     document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';
     document.getElementById('fetchModelsBtn').disabled=true;document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
     allModels=[];selectedModels=new Set();latencyResults={};visionResults={};
@@ -2604,7 +2645,7 @@ function editEndpoint(id){
     api('GET','/api/endpoints').then(eps=>{const ep=eps.find(e=>e.id===id);if(!ep)return;
         document.getElementById('editName').value=id;document.getElementById('modalTitle').textContent='编辑端点';
         document.getElementById('fName').value=ep.name;document.getElementById('fUrl').value=ep.base_url;document.getElementById('fKey').value=ep.api_key_full||'';document.getElementById('fModel').value=ep.model;
-        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fPool').value=String(ep.in_pool!==false);document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);
+        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fPool').value=String(ep.in_pool!==false);document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);document.getElementById('fToolCallPrefix').value=ep.tool_call_id_prefix||'';
         document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
         allModels=[];selectedModels=new Set();latencyResults={};visionResults={};checkFetchBtn();document.getElementById('modal').classList.add('show');
     });
@@ -2613,7 +2654,7 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 
 async function saveEndpoint(){
     const ep_id=document.getElementById('editName').value;
-    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true'};
+    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true',tool_call_id_prefix:document.getElementById('fToolCallPrefix').value.trim()};
     if(!d.name||!d.base_url||!d.api_key){toast('填写名称/URL/Key','error');return;}
     if(!d.model){toast('选择模型','error');return;}
     if(ep_id){await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d);toast('已更新','success');}
