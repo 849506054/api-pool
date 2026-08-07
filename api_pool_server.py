@@ -992,20 +992,6 @@ class APIPool:
             # 按端点协议决定消息体：Anthropic 端点不注入 reasoning_content（避免缓存穿透）
             loop_messages = messages
             is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
-            if not is_anthropic and "deepseek" in ep_model.lower():
-                # DeepSeek V4 thinking 模式要求每条 assistant 消息带 reasoning_text（request 字段名）
-                # Hermes 历史消息里 assistant 带的是 reasoning_content（response 字段名），
-                # Kcne 只认 reasoning_text，必须逐条补齐：有 reasoning_content 则复制为 reasoning_text，
-                # 都没有则注入缓存值/空格，避免 HTTP 400 "reasoning_text must be passed back"
-                # 非 DeepSeek 模型跳过此逻辑，避免注入无关字段导致兼容性问题
-                reasoning_val = self._last_reasoning_text or self._last_reasoning_content or " "
-                loop_messages = list(messages)  # 浅拷贝一次，遍历时逐条替换为 dict 副本
-                for i in range(len(loop_messages) - 1, -1, -1):
-                    if loop_messages[i].get("role") == "assistant" and "reasoning_text" not in loop_messages[i]:
-                        loop_messages[i] = dict(loop_messages[i])
-                        rc_val = loop_messages[i].get("reasoning_content")
-                        loop_messages[i]["reasoning_text"] = rc_val if rc_val else reasoning_val
-
             # tool_call id 前缀重写：端点配置 tool_call_id_prefix 非空时，把消息里所有 tool_call id
             # 重写为该前缀格式（如 DeepSeek 官方 call_00_ET_）。跨端点切换后历史里混入其他端点
             # 生成的 id（不同前缀/格式），Kcne 等 DeepSeek 官方会校验并报 400
