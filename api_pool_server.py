@@ -10,8 +10,6 @@ import json
 import time
 import threading
 import sqlite3
-import socket
-import itertools
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
@@ -340,23 +338,6 @@ def extract_prompt_text(payload):
 #  数据结构
 # ============================================================
 
-def _get_resp_socket(resp):
-    """Get the underlying socket of an http.client.HTTPResponse for settimeout()."""
-    try:
-        fp = getattr(resp, "fp", None)
-        if fp is None:
-            return None
-        raw = getattr(fp, "raw", None)
-        if raw is None:
-            raw = fp
-        sock = getattr(raw, "_sock", None)
-        if sock is None:
-            sock = raw
-        return sock
-    except Exception:
-        return None
-
-
 @dataclass
 class Endpoint:
     id: str = ""
@@ -378,8 +359,6 @@ class Endpoint:
     in_pool: bool = False  # 是否加入聚合池（默认不加入）
     check_fake_success: bool = False  # 是否检测假成功（200 OK 但内容含拒绝信息）
     tool_call_id_prefix: str = ""  # 非空时启用：请求消息里的 tool_call id 重写为该前缀（如 DeepSeek 官方 call_00_ET_），解决跨端点切换时 reasoning_text 400
-    stream_first_packet_timeout: int = 120  # 流式首包超时（秒），0=禁用；超时按 max_retries 重试
-    stream_stall_timeout: int = 60      # 流式停滞超时（秒，流中途无数据），0=禁用；超时直接冷却
 
     _fail_count: int = field(default=0, repr=False)
     _req_timestamps: deque = field(default_factory=deque, repr=False)
@@ -1197,27 +1176,6 @@ class APIPool:
                     resp = urllib.request.urlopen(req, timeout=timeout)
                 
                 if is_stream:
-                    # ── 流式首包预读：超时按 max_retries 重试，不直接冻结 ──
-                    first_line = b""
-                    _first_pkt_timeout = getattr(ep, "stream_first_packet_timeout", 0)
-                    if _first_pkt_timeout > 0:
-                        _sock1 = _get_resp_socket(resp)
-                        if _sock1 is not None:
-                            try:
-                                _sock1.settimeout(_first_pkt_timeout)
-                                first_line = resp.readline()
-                            except socket.timeout:
-                                sys_log(f"端点 '{ep.name}' 流式首包超时({_first_pkt_timeout}s) 第{attempt+1}次", "WARN")
-                                try:
-                                    resp.close()
-                                except Exception:
-                                    pass
-                                if attempt < retries:
-                                    time.sleep(1.5 * (attempt + 1))
-                                    continue
-                                return None, f"流式首包超时({_first_pkt_timeout}s)"
-                            except Exception:
-                                pass
                     def stream_generator():
                         stream_id = f"chatcmpl-{int(time.time()*1000)}"
                         final_prompt_tokens = 0
@@ -1226,16 +1184,8 @@ class APIPool:
                         final_cached_tokens = 0
                         has_usage = False
                         final_completion_text = ""
-                        stall_timeout = getattr(ep, "stream_stall_timeout", 0)
-                        _sock2 = _get_resp_socket(resp)
-                        if _sock2 is not None and stall_timeout > 0:
-                            try:
-                                _sock2.settimeout(stall_timeout)
-                            except Exception:
-                                pass
                         try:
-                            lines = itertools.chain([first_line], resp) if first_line else resp
-                            for line in lines:
+                            for line in resp:
                                 if is_anthropic:
                                     if not line.strip() or not line.startswith(b"data: "):
                                         continue
@@ -1304,27 +1254,6 @@ class APIPool:
                                                 has_usage = True
                                         except Exception:
                                             pass
-                            # ── 假成功检测：流正常结束但 content 为空（thinking-only / 空响应）──
-                            # 实测：openai SDK 收到 error chunk 抛 APIError，Hermes classify 为
-                            # retryable=True → 走请求级重试；重试时本端点已冷却，API Pool 轮转健康端点
-                            if not final_completion_text.strip():
-                                _fake_err = "Provider returned an empty response (fake success)"
-                                try:
-                                    with self._lock:
-                                        self._rotate(ep, _fake_err)
-                                    sys_log(f"端点 '{ep.name}' 流结束但 content 为空，判假成功并冷却", "WARN")
-                                except Exception:
-                                    pass
-                                yield b'data: {"error": {"message": "Provider returned an empty response", "type": "server_error", "code": "empty_content"}}\n\n'
-                        except socket.timeout:
-                            _stall_err = f"流式响应停滞({stall_timeout}s)"
-                            try:
-                                with self._lock:
-                                    self._rotate(ep, _stall_err)
-                                sys_log(f"端点 '{ep.name}' {_stall_err}，已冷却", "ERROR")
-                            except Exception as _e:
-                                sys_log(f"端点 '{ep.name}' 停滞冷却处理失败: {_e}", "ERROR")
-                            raise
                         except Exception:
                             pass
                         finally:
