@@ -10,8 +10,6 @@ import json
 import time
 import threading
 import sqlite3
-import socket
-import itertools
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
@@ -340,24 +338,6 @@ def extract_prompt_text(payload):
 #  数据结构
 # ============================================================
 
-
-def _get_resp_socket(resp):
-    """Get the underlying socket of an http.client.HTTPResponse for settimeout()."""
-    try:
-        fp = getattr(resp, "fp", None)
-        if fp is None:
-            return None
-        raw = getattr(fp, "raw", None)
-        if raw is None:
-            raw = fp
-        sock = getattr(raw, "_sock", None)
-        if sock is None:
-            sock = raw
-        return sock
-    except Exception:
-        return None
-
-
 @dataclass
 class Endpoint:
     id: str = ""
@@ -378,11 +358,7 @@ class Endpoint:
     is_vision: bool = True
     in_pool: bool = False  # 是否加入聚合池（默认不加入）
     check_fake_success: bool = False  # 是否检测假成功（200 OK 但内容含拒绝信息）
-    tool_call_id_prefix: str = ""
-    stream_first_packet_timeout: int = 120
-    stream_stall_timeout: int = 60
-    deferrable: bool = True  # 是否可延迟切换（false=上游恢复时立即切回，不保留cache）
-    max_context_k: int = 0  # 最大上下文长度（K=1000 tokens），0=不限
+    tool_call_id_prefix: str = ""  # 非空时启用：请求消息里的 tool_call id 重写为该前缀（如 DeepSeek 官方 call_00_ET_），解决跨端点切换时 reasoning_text 400
 
     _fail_count: int = field(default=0, repr=False)
     _req_timestamps: deque = field(default_factory=deque, repr=False)
@@ -393,7 +369,6 @@ class Endpoint:
     _total_calls: int = field(default=0, repr=False)
     _total_failures: int = field(default=0, repr=False)
     _cooldown_until: float = field(default=0, repr=False)
-    _defer_until: float = field(default=0, repr=False)  # 延迟切换到期时间，在此期间不切回此端点
     
     _today_used: int = field(default=0, repr=False)
     _today_date: str = field(default="", repr=False)
@@ -426,7 +401,6 @@ class APIPool:
         self._manual_override_id = None  # 用户手动指定端点的ID，优先级覆盖路由选择
         self._last_reasoning_content = None  # 缓存上一轮返回的 reasoning_content，用于多轮对话补全
         self._last_reasoning_text = None  # 缓存上一轮返回的 reasoning_text（DeepSeek V4 request 字段名），用于多轮对话补全
-        self._last_pool_activity: float = 0  # 上次池活跃时间（用于 defer 判断）
         if endpoints:
             for ep in endpoints:
                 self.add_endpoint(ep)
@@ -472,9 +446,6 @@ class APIPool:
             for ep in self._endpoints:
                 if ep.id == ep_id:
                     ep.in_pool = in_pool
-                    # 手动移出池再移回 = 显式信任该端点 → 清除延迟切换状态，恢复最高优先级
-                    if in_pool:
-                        ep._defer_until = 0
                     break
             self._renumber_pool_priorities()
 
@@ -573,10 +544,6 @@ class APIPool:
             "in_cooldown": ep._cooldown_until > now,
             "cooldown_remaining": max(0, int(ep._cooldown_until - now)),
             "cooldown_until": ep._cooldown_until,
-            "deferrable": ep.deferrable,
-            "is_deferred": ep._defer_until > now,
-            "defer_remaining": max(0, int(ep._defer_until - now)),
-            "max_context_k": ep.max_context_k,
             "health": ep._health,
             "health_latency_ms": ep._health_latency_ms,
             "health_last_check": ep._health_last_check,
@@ -601,10 +568,6 @@ class APIPool:
                     "fail_count": ep._fail_count,
                     "in_cooldown": ep._cooldown_until > now,
                     "cooldown_remaining": max(0, int(ep._cooldown_until - now)),
-                    "deferrable": ep.deferrable,
-                    "is_deferred": ep._defer_until > now,
-                    "defer_remaining": max(0, int(ep._defer_until - now)),
-            "max_context_k": ep.max_context_k,
                     "daily_limit": ep.daily_limit,
                     "today_used": ep._today_used,
                     "rpm_limit": ep.rpm_limit,
@@ -626,7 +589,6 @@ class APIPool:
                 ep._last_error = ""
                 ep._last_error_ts = 0
                 ep._cooldown_until = 0
-                ep._defer_until = 0
                 with ep._rpm_lock:
                     ep._req_timestamps.clear()
             self._current_endpoint_id = None
@@ -818,9 +780,6 @@ class APIPool:
                 ep._req_timestamps.popleft()
             return len(ep._req_timestamps) >= ep.rpm_limit
 
-    def _is_deferred(self, ep):
-        return ep._defer_until > time.time()
-
     def _set_cooldown(self, ep):
         cd = max(ep.cooldown_minutes, 1)
         ep._cooldown_until = time.time() + cd * 60
@@ -834,7 +793,6 @@ class APIPool:
             for ep in self._endpoints:
                 if ep.id == ep_id:
                     ep._cooldown_until = 0
-                    ep._defer_until = 0
                     ep._fail_count = 0
                     ep._last_error = ""
                     ep._last_error_ts = 0
@@ -848,49 +806,34 @@ class APIPool:
     def _cleanup_expired_cooldowns(self):
         """冷却过期端点：探活→成功则清洗+切当前指针→失败则继续冻结"""
         now = time.time()
-        defer_window = 300  # 5分钟活跃窗口
         expired = []
         with self._lock:
             for ep in self._endpoints:
                 if ep.in_pool and ep._cooldown_until > 0 and ep._cooldown_until <= now:
                     expired.append(ep)
 
-        if expired:
-            now = time.time()
-            for ep in expired:
-                # 去重：30秒内已探活过的跳过，避免并发入口重复探活
-                if now - ep._health_last_check < 30:
-                    continue
-                # 探活前快照当前端点：探活耗时数秒，期间并发请求可能修改 _current_endpoint_id，
-                # 用快照保证 defer 判断基于探活开始时的状态（避免 999554"已恢复"竞态）
-                probe_current_id = self._manual_override_id or self._current_endpoint_id
-                if self._probe_endpoint(ep):
-                    with self._lock:
-                        ep._fail_count = 0
-                        ep._last_error = ""
-                        ep._last_error_ts = 0
-                        ep._cooldown_until = 0
-                        ep._health = "ok"
-                        ep._transient_count = 0
-                        ep._transient_window_start = 0
-                    # 判断是否延迟切换（保护当前端点 cache）
-                    current_ep = None
-                    if probe_current_id:
-                        current_ep = next((e for e in self._endpoints if e.id == probe_current_id), None)
-                    pool_active = self._last_pool_activity > now - defer_window
-                    if current_ep and current_ep is not ep and current_ep.deferrable and pool_active:
-                        ep._defer_until = now + defer_window
-                        sys_log(f"端点 '{ep.name}' 冷却过期探活通过，但池活跃（当前在 '{current_ep.name}'），延迟切换 {defer_window//60} 分钟以保持 cache", "INFO")
-                    else:
-                        ep._defer_until = 0
-                        sys_log(f"端点 '{ep.name}' 冷却过期探活通过，已恢复", "INFO")
-                else:
-                    with self._lock:
-                        self._set_cooldown(ep)
-                    sys_log(f"端点 '{ep.name}' 冷却过期探活未通过，继续冷却 {ep.cooldown_minutes} 分钟", "WARN")
+        if not expired:
+            return
 
-        # 滚动处理已延迟的端点：池仍活跃则延长 defer，池空闲/当前不可 defer 则解除
-        self._reconcile_deferred(now, defer_window)
+        now = time.time()
+        for ep in expired:
+            # 去重：30秒内已探活过的跳过，避免并发入口重复探活
+            if now - ep._health_last_check < 30:
+                continue
+            if self._probe_endpoint(ep):
+                with self._lock:
+                    ep._fail_count = 0
+                    ep._last_error = ""
+                    ep._last_error_ts = 0
+                    ep._cooldown_until = 0
+                    ep._health = "ok"
+                    ep._transient_count = 0
+                    ep._transient_window_start = 0
+                sys_log(f"端点 '{ep.name}' 冷却过期探活通过，已恢复", "INFO")
+            else:
+                with self._lock:
+                    self._set_cooldown(ep)
+                sys_log(f"端点 '{ep.name}' 冷却过期探活未通过，继续冷却 {ep.cooldown_minutes} 分钟", "WARN")
 
         # 更新 current 指针（保留手动覆盖）
         with self._lock:
@@ -900,44 +843,13 @@ class APIPool:
                     best = min(active, key=lambda e: e.priority)
                     self._current_endpoint_id = best.id
 
-    def _reconcile_deferred(self, now=None, defer_window=300):
-        """已延迟切换的端点：池仍活跃且当前端点可 defer → 滚动延长；池空闲/当前不可 defer → 解除。
-
-        实现「直到无响应为止」：活跃会话期间 defer 持续滚动，会话空闲 5 分钟后才解除，
-        下一次请求自然切回最高优先级端点。
-        """
-        if now is None:
-            now = time.time()
-        with self._lock:
-            current_ep = None
-            current_display_id = self._manual_override_id or self._current_endpoint_id
-            if current_display_id:
-                current_ep = next((e for e in self._endpoints if e.id == current_display_id), None)
-            pool_active = self._last_pool_activity > now - defer_window
-            for ep in self._endpoints:
-                if not (ep.in_pool and ep._defer_until > 0):
-                    continue
-                # 注意：不再有 "ep is current_ep → 解除" 分支。
-                # 兜底使用的 defer 清除已由 _on_success(clear_defer=True) 处理；
-                # 这里若用实时 current 判断会误清"defer 前进入的并发请求"产生的 defer
-                # （探活/请求期间 current 被并发修改，如场景9 竞态）。
-                if current_ep and not current_ep.deferrable:
-                    ep._defer_until = 0  # 当前端点不可 defer（昂贵兜底）→ 立即恢复上游
-                    sys_log(f"端点 '{ep.name}' 延迟切换解除（当前端点 '{current_ep.name}' 不可延迟）", "INFO")
-                elif pool_active:
-                    ep._defer_until = now + defer_window  # 滚动延长，保持 cache
-                else:
-                    ep._defer_until = 0  # 池已空闲 → 解除延迟，下次切回
-                    sys_log(f"端点 '{ep.name}' 延迟切换解除（池空闲）", "INFO")
-
     def _active_endpoints(self):
-        available = [ep for ep in self._endpoints if ep.enabled and ep.in_pool and not self._is_in_cooldown(ep) and not self._is_quota_exceeded(ep) and not self._is_rpm_limited(ep) and not self._is_deferred(ep)]
+        available = [ep for ep in self._endpoints if ep.enabled and ep.in_pool and not self._is_in_cooldown(ep) and not self._is_quota_exceeded(ep) and not self._is_rpm_limited(ep)]
         if available:
             return available
         # 最后手段：所有端点都在冷却时，按冷却到期时间排序返回（优先选最快解冻的）
         fallback = [ep for ep in self._endpoints if ep.enabled and ep.in_pool and not self._is_quota_exceeded(ep)]
-        # deferred 端点排最后：仍可兜底（服务可用性优先），但不主动抢流量，保护 defer 窗口
-        fallback.sort(key=lambda e: (e._defer_until > time.time(), e._cooldown_until))
+        fallback.sort(key=lambda e: e._cooldown_until)
         return fallback
 
     def _pick_best(self, active):
@@ -968,16 +880,9 @@ class APIPool:
                     return
             self._current_endpoint_id = active[0].id if active else None
 
-    def _on_success(self, ep, result=None, clear_defer=True):
-        now = time.time()
-        self._last_pool_activity = now  # 记录池活跃时间（用于 defer 判断）
-        # 仅在"请求开始时端点已在 defer（兜底使用）"时清除延迟状态。
-        # 竞态保护：defer 设置前已进入的并发请求（请求开始时不在 defer）成功后
-        # 不清 defer，避免并发请求破坏延迟切换保护窗口。
-        if clear_defer:
-            ep._defer_until = 0
+    def _on_success(self, ep, result=None):
         ep._total_calls += 1
-        ep._last_success_ts = now
+        ep._last_success_ts = time.time()
         ep._health = "ok"
         ep._fail_count = 0
         ep._transient_count = 0
@@ -1025,23 +930,6 @@ class APIPool:
                 if oid and oid in mapping:
                     m["tool_call_id"] = mapping[oid]
         return messages
-
-    def _estimate_context_tokens(self, messages):
-        """粗略估算 prompt 上下文 token 数（1K=1000 tokens），用于 max_context_k 判断。
-
-        从 messages 提取所有文本内容，按 1 token ≈ 3 字符（中英文混合保守估计）。
-        仅用于防护性跳过，不追求精确计数。
-        """
-        total_chars = 0
-        for m in messages:
-            content = m.get("content", "")
-            if isinstance(content, str):
-                total_chars += len(content)
-            elif isinstance(content, list):
-                for c in content:
-                    if isinstance(c, dict) and c.get("type") == "text":
-                        total_chars += len(c.get("text", ""))
-        return total_chars // 3  # 中英文混合平均
 
     def _probe_endpoint(self, ep):
         """对单个端点做快速探活，成功返回 True，失败返回 False。统一用 chat ping 检测。"""
@@ -1098,9 +986,6 @@ class APIPool:
         idx = 0
         while tried < total:
             ep = active[idx]
-            # 快照请求开始时的 defer 状态：用于 _on_success 判断是否"兜底使用"。
-            # 竞态保护：defer 设置前已进入的请求（快照=0）成功后不清 defer。
-            defer_at_request = ep._defer_until
             ep_timeout = timeout or ep.timeout
             ep_model = model or ep.model
             
@@ -1138,9 +1023,8 @@ class APIPool:
                                 yield f"data: {{'choices':[{{'delta':{{'content':'\\n\\n[API Pool Error: 请求最终目标失败: {err}]'}}}}]}}\n\n".replace("'", '"')
                             else:
                                 # 实际请求成功后标记端点成功
-                                # clear_defer：仅当请求开始时端点已在 defer（兜底使用）才清除
                                 with self._lock:
-                                    self._on_success(tgt_ep, clear_defer=defer_at_request > 0)
+                                    self._on_success(tgt_ep)
                                 yield from gen
                         return vision_wrapper(ep, payload, ep_timeout, active)
                     else:
@@ -1151,19 +1035,10 @@ class APIPool:
             else:
                 sys_log(f"重试请求，尝试端点 '{ep.name}' (模型: {ep_model})", "INFO")
 
-            # 上下文长度检查：超过限制时跳过该端点（不冻结、不记失败），轮转到下一个
-            if ep.max_context_k > 0:
-                estimated = self._estimate_context_tokens(loop_messages)
-                if estimated > ep.max_context_k * 1000:
-                    sys_log(f"端点 '{ep.name}' 上下文约 {estimated}t 超过限制 {ep.max_context_k}K，跳过", "INFO")
-                    tried += 1
-                    idx = (idx + 1) % total
-                    continue
-
             result, error = self._try_endpoint(ep, payload, ep_timeout)
             if result is not None:
                 with self._lock:
-                    self._on_success(ep, result, clear_defer=defer_at_request > 0)
+                    self._on_success(ep, result)
                 sys_log(f"端点 '{ep.name}' 请求成功 (延迟: 正常)", "INFO")
                 if return_endpoint: return result, ep
                 return result
@@ -1301,27 +1176,6 @@ class APIPool:
                     resp = urllib.request.urlopen(req, timeout=timeout)
                 
                 if is_stream:
-                    # Stream first-packet pre-read: timeout retries, not freeze
-                    first_line = b""
-                    _first_pkt_timeout = getattr(ep, "stream_first_packet_timeout", 0)
-                    if _first_pkt_timeout > 0:
-                        _sock1 = _get_resp_socket(resp)
-                        if _sock1 is not None:
-                            try:
-                                _sock1.settimeout(_first_pkt_timeout)
-                                first_line = resp.readline()
-                            except socket.timeout:
-                                sys_log(f"endpoint {chr(39)}{ep.name}{chr(39)} stream first packet timeout ({_first_pkt_timeout}s) attempt {attempt+1}", "WARN")
-                                try:
-                                    resp.close()
-                                except Exception:
-                                    pass
-                                if attempt < retries:
-                                    time.sleep(1.5 * (attempt + 1))
-                                    continue
-                                return None, f"stream first packet timeout ({_first_pkt_timeout}s)"
-                            except Exception:
-                                pass
                     def stream_generator():
                         stream_id = f"chatcmpl-{int(time.time()*1000)}"
                         final_prompt_tokens = 0
@@ -1330,16 +1184,8 @@ class APIPool:
                         final_cached_tokens = 0
                         has_usage = False
                         final_completion_text = ""
-                        stall_timeout = getattr(ep, "stream_stall_timeout", 0)
-                        _sock2 = _get_resp_socket(resp)
-                        if _sock2 is not None and stall_timeout > 0:
-                            try:
-                                _sock2.settimeout(stall_timeout)
-                            except Exception:
-                                pass
                         try:
-                            lines = itertools.chain([first_line], resp) if first_line else resp
-                            for line in lines:
+                            for line in resp:
                                 if is_anthropic:
                                     if not line.strip() or not line.startswith(b"data: "):
                                         continue
@@ -1770,7 +1616,7 @@ def api_handler(method, path, body):
 
 def _sync_to_config():
     save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "is_vision": ep.get("is_vision", True),
-            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0)} for ep in pool.list_endpoints()])
+            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", "")} for ep in pool.list_endpoints()])
 
 
 GUI_HTML = r"""<!DOCTYPE html>
@@ -1968,7 +1814,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .badge-pool{background:var(--accent);color:#fff}
 .badge-not-pool{background:var(--yellow-dim);color:var(--yellow)}
 .badge-cooldown{background:var(--yellow-dim);color:var(--yellow)}
-.badge-deferred{background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35)}
 .badge-priority{background:var(--accent);color:#fff;min-width:20px;justify-content:center}
 .badge-h-ok{background:var(--green-dim);color:var(--green)}
 .badge-h-slow{background:var(--yellow-dim);color:var(--yellow)}
@@ -2291,8 +2136,6 @@ select option { background: var(--bg); color: var(--text); }
       <div class="form-group"><label>启用</label><select id="fEnabled"><option value="true">是</option><option value="false">否</option></select></div>
       <div class="form-group"><label>加入聚合池</label><select id="fPool"><option value="false">否（仅保存）</option><option value="true">是（参与轮换）</option></select></div>
       <div class="form-group"><label title="检测上游返回内容是否含拒绝信息，从而触发自动轮转">假成功检测</label><select id="fFakeCheck"><option value="false">关闭</option><option value="true">开启</option></select></div>
-      <div class="form-group"><label title="true=上游恢复后若池活跃则延迟切换以保护当前端点 cache；false=上游恢复立即切回（适用于昂贵兜底端点）">延迟切换</label><select id="fDeferrable"><option value="true">开启（保 cache）</option><option value="false">关闭（立即切回）</option></select></div>
-      <div class="form-group"><label title="最大上下文长度（K=1000 tokens），0=不限。超过此长度时自动跳过该端点，避免账号被限制">上下文限制</label><input type="number" id="fMaxContext" value="0" min="0" placeholder="0=不限, 如 128"></div>
       <div class="form-group"><label title="非空时启用：请求消息里的 tool_call id 重写为该前缀（如 call_00_ET_），解决跨端点切换后 DeepSeek 官方端点 reasoning_text 400">ToolCall ID 前缀</label><input type="text" id="fToolCallPrefix" placeholder="留空=不重写，如 call_00_ET_" value=""></div>
       <div class="form-group"><label title="达到额度后挂起，0为不限制">每日额度 (0不限)</label><input type="number" id="fDailyLimit" value="0" min="0"></div>
       <div class="form-group">
@@ -2408,7 +2251,6 @@ function renderEndpoints(eps){
     if(ep.is_rpm_limited)b+=`<span class="badge badge-cooldown" title="每分钟并发已满，限流降级中">🚧限流中</span>`;
     else if(ep.daily_limit>0&&ep.today_used>=ep.daily_limit)b+=`<span class="badge badge-cooldown" title="今日额度已满，挂起至明日">🛑额度耗尽</span>`;
     else if(ep.in_cooldown)b+=`<span class="badge badge-cooldown">⏳${fmtTime(ep.cooldown_remaining)}</span>`;
-    if(ep.is_deferred)b+=`<span class="badge badge-deferred" title="已恢复但为保持当前端点 cache 延迟切换，剩余 ${fmtTime(ep.defer_remaining)}">⏸延迟切换 ${fmtTime(ep.defer_remaining)}</span>`;
     if(!ep.use_proxy)b+=`<span class="badge badge-priority" title="绕过系统全局代理，强制直连">🌐直连</span>`;
     if(ep.health_mode==='none')b+=`<span class="badge" style="background:rgba(255,255,255,.05);color:var(--text-dim)" title="已关闭后台健康监测">🔕免扰</span>`;
     else if(ep.health_mode==='models')b+=`<span class="badge" style="background:rgba(50,215,75,.1);color:var(--green)" title="零成本 Models 探针">☘️无感测</span>`;
@@ -2430,7 +2272,7 @@ function renderEndpoints(eps){
         </div>
       </div>
       <div class="ep-meta">
-        <span title="绑定的模型名称">🤖${esc(ep.model)}</span><span title="单次请求超时时间">⏱${ep.timeout}s</span><span title="失败后最大重试次数">🔁${ep.max_retries}次</span><span title="请求失败后的冷却惩罚时间">❄️${ep.cooldown_minutes}分</span>${ep.max_context_k>0?`<span title="最大上下文长度限制">📏${ep.max_context_k}K</span>`:''}<span title="累计成功响应次数">📞${ep.total_calls}次</span><span title="最后一次成功响应时间">🕐${last}</span>
+        <span title="绑定的模型名称">🤖${esc(ep.model)}</span><span title="单次请求超时时间">⏱${ep.timeout}s</span><span title="失败后最大重试次数">🔁${ep.max_retries}次</span><span title="请求失败后的冷却惩罚时间">❄️${ep.cooldown_minutes}分</span><span title="累计成功响应次数">📞${ep.total_calls}次</span><span title="最后一次成功响应时间">🕐${last}</span>
       </div>
       ${ep.last_error?`<div class="ep-error">⚠ ${esc(ep.last_error)}</div>`:''}
     </div>`;
@@ -2456,38 +2298,33 @@ function renderPoolList(eps){
     else if(h==='slow')rh='<span style="color:var(--yellow);font-size:11px">🐢'+(lat>=0?' '+lat+'ms':'')+'</span>';
     else if(h==='bad')rh='<span style="color:var(--red);font-size:11px">✗'+(lat>=0?' '+lat+'ms':'')+'</span>';
     else rh='<span style="color:var(--text-dim);font-size:11px">-</span>';
+    // 生成优先级选项：只到当前聚合池成员数（优先级本来就应该是 1~N）
+    // 如果有已存在的优先级大于 N，也一并加上保持选项完整
     const maxP = Math.max(poolEps.length, Math.max(...poolEps.map(e => e.priority)));
     let options = [];
     for(let p = 1; p <= maxP; p++){
-      options.push('<option value="'+p+'" '+(p===ep.priority?'selected':'')+'>#'+p+'</option>');
+      options.push(`<option value="${p}" ${p===ep.priority?'selected':''}>#${p}</option>`);
     }
     options = options.join('');
-    return '<div class="'+cls+'" style="display:flex;flex-direction:column;gap:6px;padding:10px 12px">'
-      +'<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">'
-        +'<div style="display:flex;align-items:center;gap:6px;min-width:0">'
-          +'<span class="badge badge-priority">#'+ep.priority+'</span>'
-          +'<span style="font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(ep.name)+'</span>'
-          +(ep.billing_mode==='pay_per_use'?'<span class="badge" style="background:rgba(255,159,10,.15);color:#ff9f0a;font-size:10px;padding:1px 5px" title="按次计费">💰按次</span>':'')
-        +'</div>'
-        +'<div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">'
-          +rh
-          +(ep.is_current?'<span class="badge badge-current" style="font-size:10px;padding:1px 6px">● 当前</span>':'')
-          +(ep.in_cooldown?'<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px">⏳'+fmtTime(ep.cooldown_remaining)+'</span>':'')
-          +(ep.in_cooldown?'<button class="btn btn-yellow btn-sm" style="padding:2px 5px;font-size:11px" title="解除冷却" onclick="clearCooldown(\''+ep.id+'\')">⏰</button>':'')
-        +'</div>'
-      +'</div>'
-      +'<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">'
-        +'<span style="color:var(--text-dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(ep.model||'')+'</span>'
-        +'<div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">'
-          +'<select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority(\''+ep.id+'\', this.value)" title="修改优先级">'
-            +options
-          +'</select>'
-          +'<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="编辑端点" onclick="editEndpoint(\''+ep.id+'\')">✏️</button>'
-          +(!ep.is_current?'<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="切换为当前端点" onclick="switchEndpoint(\''+ep.id+'\')">⚡</button>':'')
-          +'<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="移出聚合池" onclick="removeFromPool(\''+ep.id+'\')">📤</button>'
-        +'</div>'
-      +'</div>'
-    +'</div>';
+    return `<div class="${cls}" style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px">
+      <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1">
+        <span class="badge badge-priority">#${ep.priority}</span>
+        ${ep.billing_mode==='pay_per_use'?'<span class="badge" style="background:rgba(255,159,10,.15);color:#ff9f0a" title="按次计费，健康检查使用零成本探针">💰按次</span>':''}
+        <span style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(ep.name)}</span>
+        <span style="font-size:10px;color:var(--text-dim);white-space:nowrap">${esc(ep.model||'')}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+        ${rh}
+        ${ep.is_current?'<span class="badge badge-current">● 当前</span>':''}
+        ${ep.in_cooldown?'<span class="badge badge-cooldown">⏳'+fmtTime(ep.cooldown_remaining)+'</span>':''}
+        ${ep.in_cooldown?`<button class="btn btn-yellow btn-sm" title="立刻解除冷却" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
+        <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:12px;min-width:45px;" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority('${ep.id}', this.value)" title="修改优先级">
+          ${options}
+        </select>
+        ${!ep.is_current?'<button class="btn btn-ghost btn-sm" title="切换为当前端点" onclick="switchEndpoint(\''+ep.id+'\')">⚡</button>':''}
+        <button class="btn btn-ghost btn-sm" title="移出聚合池" onclick="removeFromPool('${ep.id}')">📤</button>
+      </div>
+    </div>`;
   }).join('');
 }
 
@@ -2784,7 +2621,7 @@ async function testSelectedVision(){
 function openAddModal(){
     document.getElementById('editName').value='';document.getElementById('modalTitle').textContent='添加端点';
     ['fName','fUrl','fKey','fModel'].forEach(id=>document.getElementById(id).value='');
-    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fPool').value='false';document.getElementById('fDeferrable').value='true';document.getElementById('fMaxContext').value=0;document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';document.getElementById('fFakeCheck').value='false';document.getElementById('fToolCallPrefix').value='';
+    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fPool').value='false';document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';document.getElementById('fFakeCheck').value='false';document.getElementById('fToolCallPrefix').value='';
     document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';
     document.getElementById('fetchModelsBtn').disabled=true;document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
     allModels=[];selectedModels=new Set();latencyResults={};visionResults={};
@@ -2794,7 +2631,7 @@ function editEndpoint(id){
     api('GET','/api/endpoints').then(eps=>{const ep=eps.find(e=>e.id===id);if(!ep)return;
         document.getElementById('editName').value=id;document.getElementById('modalTitle').textContent='编辑端点';
         document.getElementById('fName').value=ep.name;document.getElementById('fUrl').value=ep.base_url;document.getElementById('fKey').value=ep.api_key_full||'';document.getElementById('fModel').value=ep.model;
-        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fPool').value=String(ep.in_pool!==false);document.getElementById('fDeferrable').value=String(ep.deferrable!==false);document.getElementById('fMaxContext').value=ep.max_context_k||0;document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);document.getElementById('fToolCallPrefix').value=ep.tool_call_id_prefix||'';
+        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fPool').value=String(ep.in_pool!==false);document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);document.getElementById('fToolCallPrefix').value=ep.tool_call_id_prefix||'';
         document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
         allModels=[];selectedModels=new Set();latencyResults={};visionResults={};checkFetchBtn();document.getElementById('modal').classList.add('show');
     });
@@ -2803,7 +2640,7 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 
 async function saveEndpoint(){
     const ep_id=document.getElementById('editName').value;
-    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),enabled:document.getElementById('fEnabled').value==='true',deferrable:document.getElementById('fDeferrable').value==='true',max_context_k:parseInt(document.getElementById('fMaxContext').value)||0,daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true',tool_call_id_prefix:document.getElementById('fToolCallPrefix').value.trim()};
+    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),enabled:document.getElementById('fEnabled').value==='true',daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true',tool_call_id_prefix:document.getElementById('fToolCallPrefix').value.trim()};
     if(!d.name||!d.base_url||!d.api_key){toast('填写名称/URL/Key','error');return;}
     if(!d.model){toast('选择模型','error');return;}
     if(ep_id){await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d);toast('已更新','success');}
