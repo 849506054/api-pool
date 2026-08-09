@@ -17,6 +17,8 @@
 - **集中管理** — 统一维护多个 DeepSeek API 端点，UI 可视化管理
 - **自动健康检测** — 内置周期性连通性检测，支持零成本 Models 探针
 - **优先级调度 + 故障恢复回迁** — 按 priority 自动轮选，故障熔断冷却，恢复后自动回迁
+- **延迟切换（Deferred Failback）** — 端点冷却到期探活通过后，不立即切回（避免破坏当前端点 prompt cache），仅在会话空闲 5 分钟后才自动切回；支持端点级开关（`deferrable`），适用于昂贵兜底端点
+- **上下文长度限制（端点可选）** — 配置 `max_context_k` 后，超过长度限制的请求自动跳过该端点，避免账号被限制
 - **多协议兼容** — 支持 OpenAI 兼容协议与 Anthropic 协议（管理存量端点），对外统一 OpenAI 接口
 - **自动图片预处理** — 目标端点不支持视觉时自动调用视觉模型解析
 - **ToolCall ID 前缀重写（端点可选）** — 端点配置 `tool_call_id_prefix` 时，请求中 tool_call id 确定性重写为该前缀（如 DeepSeek 官方 `call_00_ET_`），解决跨端点切换后历史混入其他端点格式 id 导致的 400（Kcne 场景）
@@ -43,6 +45,13 @@ cp api-pool.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now api-pool.service
 ```
+
+## 端点配置字段
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `deferrable` | bool | `true` | 冷却到期后是否延迟切换（保 cache）。false=上游恢复立即切回（适用于昂贵兜底端点） |
+| `max_context_k` | int | `0` | 最大上下文长度（K=1000 tokens），0=不限。超过时自动跳过该端点 |
 
 ## 堆栈
 
