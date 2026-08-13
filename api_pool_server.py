@@ -3,6 +3,13 @@ API Pool — 聚合 API 自动切换模块（GUI 版）
 
 启动: python api_pool_server.py
 访问: http://localhost:5100
+
+⚠️ EXPERIMENTAL (2026-08-13): 极端情况处理实验版本，观察期。
+  1. 幂等冻结：并发请求二次失败不刷新冷却窗口（_set_cooldown）
+  2. 并发保护：chat 循环顶部跳过已冻结端点，并发请求立即转向
+  3. 并发探活：下一级探活失败后并发探活剩余候选（11s/21s 两阶段）
+  4. 终极兜底：priority=99 端点，全池故障/轮转超 530s 时锁定兜底（60s 容错，5min 滑动窗口）
+  详见 PROJECT.md「实验版本」章节。
 """
 
 import os
@@ -17,7 +24,7 @@ import urllib.error
 from dataclasses import dataclass, field
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 import queue
 from datetime import datetime, timedelta
 from collections import deque
@@ -427,6 +434,7 @@ class APIPool:
         self._last_reasoning_content = None  # 缓存上一轮返回的 reasoning_content，用于多轮对话补全
         self._last_reasoning_text = None  # 缓存上一轮返回的 reasoning_text（DeepSeek V4 request 字段名），用于多轮对话补全
         self._last_pool_activity: float = 0  # 上次池活跃时间（用于 defer 判断）
+        self._fallback_lock_until: float = 0  # 终极兜底锁定截止时间（滑动窗口 300s）
         if endpoints:
             for ep in endpoints:
                 self.add_endpoint(ep)
@@ -802,6 +810,23 @@ class APIPool:
     def _is_in_cooldown(self, ep):
         return ep._cooldown_until > time.time()
 
+    # 终极兜底（priority=99）参数：正常轮转预算 530s，保底容错 60s（530+60=590 < Hermes 600s），
+    # 锁定滑动窗口 300s（5 分钟无新请求视为任务结束，解锁后重新评估故障端点）
+    _FALLBACK_DEADLINE_SECONDS = 530
+    _FALLBACK_TIMEOUT_SECONDS = 60
+    _FALLBACK_LOCK_SECONDS = 300
+
+    def _get_fallback_endpoint(self):
+        """返回优先级 99 的终极兜底端点（启用、在池、未冷却）。"""
+        for ep in self._endpoints:
+            if (ep.enabled and ep.in_pool and ep.priority == 99
+                    and not self._is_in_cooldown(ep) and not self._is_quota_exceeded(ep)):
+                return ep
+        return None
+
+    def _is_fallback_locked(self):
+        return self._fallback_lock_until > time.time()
+
     def _is_quota_exceeded(self, ep):
         if ep.daily_limit <= 0: return False
         now_date = datetime.now().strftime("%Y-%m-%d")
@@ -822,6 +847,10 @@ class APIPool:
         return ep._defer_until > time.time()
 
     def _set_cooldown(self, ep):
+        # 幂等：已在冷却中不刷新冻结时间（并发请求的失败是同一故障的重复观测，
+        # 不延长冷却窗口；fail_count 仍由调用方累加）。窗口过期后的新失败自然触发新冻结。
+        if ep._cooldown_until > time.time():
+            return
         cd = max(ep.cooldown_minutes, 1)
         ep._cooldown_until = time.time() + cd * 60
 
@@ -934,11 +963,10 @@ class APIPool:
         available = [ep for ep in self._endpoints if ep.enabled and ep.in_pool and not self._is_in_cooldown(ep) and not self._is_quota_exceeded(ep) and not self._is_rpm_limited(ep) and not self._is_deferred(ep)]
         if available:
             return available
-        # 最后手段：所有端点都在冷却时，按冷却到期时间排序返回（优先选最快解冻的）
-        fallback = [ep for ep in self._endpoints if ep.enabled and ep.in_pool and not self._is_quota_exceeded(ep)]
-        # deferred 端点排最后：仍可兜底（服务可用性优先），但不主动抢流量，保护 defer 窗口
-        fallback.sort(key=lambda e: (e._defer_until > time.time(), e._cooldown_until))
-        return fallback
+        # 最后手段：全池无可用 → 返回优先级 99 终极兜底端点（若有）；否则空列表 → AllEndpointsFailed → Hermes fallback。
+        # 不再返回冷却中的端点去试错（避免轮转超时 + Hermes 600s 叠加）。
+        fb = self._get_fallback_endpoint()
+        return [fb] if fb else []
 
     def _pick_best(self, active):
         for ep in active:
@@ -1055,7 +1083,19 @@ class APIPool:
 
     def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False):
         self._cleanup_expired_cooldowns()
-        active = self._active_endpoints()
+        _chat_start = time.time()  # 530s 轮转预算计时起点（与 Hermes 600s 超时窗口对齐）
+        # 终极兜底锁定：锁定期间所有请求直连 prio99（全局滑动窗口）
+        if self._is_fallback_locked():
+            fb = self._get_fallback_endpoint()
+            if fb is not None:
+                sys_log(f"终极兜底锁定中，直连端点 '{fb.name}'", "INFO")
+                active = [fb]
+            else:
+                with self._lock:
+                    self._fallback_lock_until = 0  # 兜底不可用，解除锁定
+                active = self._active_endpoints()
+        else:
+            active = self._active_endpoints()
         if not active:
             raise ValueError("没有可用的 API 端点")
         errors = []
@@ -1098,6 +1138,25 @@ class APIPool:
         idx = 0
         while tried < total:
             ep = active[idx]
+            # 并发保护：端点已被其他请求冻结时，跳过它转向下一个可用端点。
+            # 仅当池中还存在非冷却端点时才跳过；全部冷却时走 _active_endpoints 的
+            # fallback（按解冻时间排序尝试），保留"宁可试冷却端点也不报错"的兜底语义。
+            if self._is_in_cooldown(ep) and any(not self._is_in_cooldown(e) for e in active):
+                tried += 1
+                idx = (idx + 1) % total
+                continue
+            # 530s 预算：正常轮转超时 → 立即切终极兜底（不再继续轮转，避免 Hermes 600s 超时并发重试）
+            if (time.time() - _chat_start) >= self._FALLBACK_DEADLINE_SECONDS:
+                fb = self._get_fallback_endpoint()
+                if fb is not None and fb is not ep and not self._is_in_cooldown(fb):
+                    sys_log(f"轮转超 {self._FALLBACK_DEADLINE_SECONDS}s，切换终极兜底 '{fb.name}'", "WARN")
+                    with self._lock:
+                        self._fallback_lock_until = time.time() + self._FALLBACK_LOCK_SECONDS
+                    for i, e in enumerate(active):
+                        if e is fb:
+                            idx = i
+                            break
+                    continue
             # 快照请求开始时的 defer 状态：用于 _on_success 判断是否"兜底使用"。
             # 竞态保护：defer 设置前已进入的请求（快照=0）成功后不清 defer。
             defer_at_request = ep._defer_until
@@ -1160,10 +1219,13 @@ class APIPool:
                     idx = (idx + 1) % total
                     continue
 
-            result, error = self._try_endpoint(ep, payload, ep_timeout)
+            result, error = self._try_endpoint(ep, payload, ep_timeout, force_no_retry=(getattr(ep, "priority", 0) == 99))
             if result is not None:
                 with self._lock:
                     self._on_success(ep, result, clear_defer=defer_at_request > 0)
+                    # 终极兜底成功 → 滑动刷新锁定窗口（5 分钟无新请求视为任务结束）
+                    if getattr(ep, "priority", 0) == 99:
+                        self._fallback_lock_until = time.time() + self._FALLBACK_LOCK_SECONDS
                 sys_log(f"端点 '{ep.name}' 请求成功 (延迟: 正常)", "INFO")
                 if return_endpoint: return result, ep
                 return result
@@ -1199,24 +1261,84 @@ class APIPool:
                     else:
                         sys_log(f"候选端点 '{next_ep.name}' 探活失败，跳过", "WARN")
                         self._rotate(next_ep, "探活失败", probe_failed=True)
-                        # 重新获取可用端点列表，继续找下一个
-                        active = self._active_endpoints()
-                        active.sort(key=lambda e: e.priority)
-                        total = len(active)
-                        if total == 0:
-                            break
-                        next_ep2 = None
-                        for i, e in enumerate(active):
-                            if e is not ep and e is not next_ep and not self._is_in_cooldown(e):
-                                next_ep2 = e
-                                idx = i
-                                break
-                        if next_ep2 is None:
-                            # 没有更多候选了，尝试任何非当前端点
-                            for i, e in enumerate(active):
-                                if e is ep:
-                                    idx = (i + 1) % len(active)
+                        # 下一级探活也失败 → 并发探活剩余所有候选端点。
+                        # 用 _check_one_health（含 Attempt 2 重试，最坏 20s）做参考性探测；
+                        # 两阶段等待：11s 内返回结果的端点直接按优先级使用，最多等 21s。
+                        remaining = [e for e in active if e is not ep and e is not next_ep and not self._is_in_cooldown(e)]
+                        if remaining:
+                            sys_log(f"并发探活剩余 {len(remaining)} 个候选端点...", "INFO")
+                            probe_results = {}
+                            chosen = None
+                            _deadline11 = time.time() + 11
+                            _deadline21 = time.time() + 21
+                            with ThreadPoolExecutor(max_workers=min(len(remaining), 10)) as _pool:
+                                _futures = {_pool.submit(self._check_one_health, e): e for e in remaining}
+                                _pending = set(_futures)
+                                # 阶段1：11s 内谁先返回结果，按优先级取第一个通过的立即使用
+                                while _pending and time.time() < _deadline11:
+                                    _done, _pending = wait(_pending, timeout=max(0.1, _deadline11 - time.time()))
+                                    for _fut in _done:
+                                        _e = _futures[_fut]
+                                        try:
+                                            _eid, _health, _lat, _err = _fut.result()
+                                            probe_results[_e] = _health
+                                        except Exception:
+                                            probe_results[_e] = "bad"
+                                    for _e in sorted(remaining, key=lambda x: x.priority):
+                                        if probe_results.get(_e) in ("ok", "slow") and _e is not ep:
+                                            chosen = _e
+                                            break
+                                    if chosen is not None:
+                                        break
+                                # 阶段2：11s 内没有可用端点，继续等剩余结果，最多到 21s
+                                if chosen is None:
+                                    while _pending and time.time() < _deadline21:
+                                        _done, _pending = wait(_pending, timeout=max(0.1, _deadline21 - time.time()))
+                                        for _fut in _done:
+                                            _e = _futures[_fut]
+                                            try:
+                                                _eid, _health, _lat, _err = _fut.result()
+                                                probe_results[_e] = _health
+                                            except Exception:
+                                                probe_results[_e] = "bad"
+                                    for _e in sorted(remaining, key=lambda x: x.priority):
+                                        if probe_results.get(_e) in ("ok", "slow") and _e is not ep:
+                                            chosen = _e
+                                            break
+                            if chosen is not None:
+                                sys_log(f"候选端点 '{chosen.name}' 并发探活通过，准备重试请求", "INFO")
+                                for i, e in enumerate(active):
+                                    if e is chosen:
+                                        idx = i
+                                        break
+                                # 其余探活失败的端点标记短冷却，避免后续轮转再撞上
+                                for e in remaining:
+                                    if e is not chosen and probe_results.get(e) not in ("ok", "slow") and not self._is_in_cooldown(e):
+                                        self._rotate(e, "并发探活失败", probe_failed=True)
+                                continue
+                            else:
+                                # 全部探活失败：全部短冷却，回到循环顶部走 fallback 兜底
+                                sys_log(f"剩余候选端点全部探活失败", "WARN")
+                                for e in remaining:
+                                    if not self._is_in_cooldown(e):
+                                        self._rotate(e, "并发探活失败", probe_failed=True)
+                                active = self._active_endpoints()
+                                active.sort(key=lambda e: e.priority)
+                                total = len(active)
+                                if total == 0:
                                     break
+                                next_ep2 = None
+                                for i, e in enumerate(active):
+                                    if e is not ep and e is not next_ep and not self._is_in_cooldown(e):
+                                        next_ep2 = e
+                                        idx = i
+                                        break
+                                if next_ep2 is None:
+                                    # 没有更多候选了，尝试任何非当前端点
+                                    for i, e in enumerate(active):
+                                        if e is ep:
+                                            idx = (i + 1) % len(active)
+                                            break
                 tried += 1
         raise AllEndpointsFailed(errors)
 
