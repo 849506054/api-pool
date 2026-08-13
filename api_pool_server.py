@@ -435,6 +435,9 @@ class APIPool:
         self._last_reasoning_text = None  # 缓存上一轮返回的 reasoning_text（DeepSeek V4 request 字段名），用于多轮对话补全
         self._last_pool_activity: float = 0  # 上次池活跃时间（用于 defer 判断）
         self._fallback_lock_until: float = 0  # 终极兜底锁定截止时间（滑动窗口 300s）
+        # 后台探活基础设施：冷却过期端点在后台线程探活，不阻塞请求路径
+        self._probe_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="apipool-probe")
+        self._probe_inflight = set()  # 正在后台探活的端点 id 集合（防重复入队）
         if endpoints:
             for ep in endpoints:
                 self.add_endpoint(ep)
@@ -875,7 +878,10 @@ class APIPool:
         return False
 
     def _cleanup_expired_cooldowns(self):
-        """冷却过期端点：探活→成功则清洗+切当前指针→失败则继续冻结"""
+        """冷却过期端点：收集后丢给后台线程探活，不阻塞请求路径（2026-08-13 后台化改造）。
+
+        探活结果在后台更新端点状态；下次请求自然使用恢复的端点（defer 逻辑兼容保留）。
+        """
         now = time.time()
         defer_window = 300  # 5分钟活跃窗口
         expired = []
@@ -884,50 +890,65 @@ class APIPool:
                 if ep.in_pool and ep._cooldown_until > 0 and ep._cooldown_until <= now:
                     expired.append(ep)
 
-        if expired:
-            now = time.time()
-            for ep in expired:
+        for ep in expired:
+            with self._lock:
                 # 去重：30秒内已探活过的跳过，避免并发入口重复探活
                 if now - ep._health_last_check < 30:
+                    continue
+                # 已在后台探活中的跳过（防重复入队）
+                if ep.id in self._probe_inflight:
                     continue
                 # 探活前快照当前端点：探活耗时数秒，期间并发请求可能修改 _current_endpoint_id，
                 # 用快照保证 defer 判断基于探活开始时的状态（避免 999554"已恢复"竞态）
                 probe_current_id = self._manual_override_id or self._current_endpoint_id
-                if self._probe_endpoint(ep):
-                    with self._lock:
-                        ep._fail_count = 0
-                        ep._last_error = ""
-                        ep._last_error_ts = 0
-                        ep._cooldown_until = 0
-                        ep._health = "ok"
-                        ep._transient_count = 0
-                        ep._transient_window_start = 0
-                    # 判断是否延迟切换（保护当前端点 cache）
-                    current_ep = None
-                    if probe_current_id:
-                        current_ep = next((e for e in self._endpoints if e.id == probe_current_id), None)
-                    pool_active = self._last_pool_activity > now - defer_window
-                    if current_ep and current_ep is not ep and current_ep.deferrable and pool_active:
-                        ep._defer_until = now + defer_window
-                        sys_log(f"端点 '{ep.name}' 冷却过期探活通过，但池活跃（当前在 '{current_ep.name}'），延迟切换 {defer_window//60} 分钟以保持 cache", "INFO")
-                    else:
-                        ep._defer_until = 0
-                        sys_log(f"端点 '{ep.name}' 冷却过期探活通过，已恢复", "INFO")
-                else:
-                    with self._lock:
-                        self._set_cooldown(ep)
-                    sys_log(f"端点 '{ep.name}' 冷却过期探活未通过，继续冷却 {ep.cooldown_minutes} 分钟", "WARN")
+                self._probe_inflight.add(ep.id)
+            self._probe_executor.submit(self._background_probe, ep, probe_current_id)
 
         # 滚动处理已延迟的端点：池仍活跃则延长 defer，池空闲/当前不可 defer 则解除
         self._reconcile_deferred(now, defer_window)
 
-        # 更新 current 指针（保留手动覆盖）
-        with self._lock:
-            if not self._manual_override_id:
-                active = self._active_endpoints()
-                if active:
-                    best = min(active, key=lambda e: e.priority)
-                    self._current_endpoint_id = best.id
+    def _background_probe(self, ep, probe_current_id):
+        """后台探活单个端点：通过→清冷却+defer判断+更新current指针；失败→继续冷却。"""
+        try:
+            if self._probe_endpoint(ep):
+                now = time.time()
+                with self._lock:
+                    ep._fail_count = 0
+                    ep._last_error = ""
+                    ep._last_error_ts = 0
+                    ep._cooldown_until = 0
+                    ep._health = "ok"
+                    ep._transient_count = 0
+                    ep._transient_window_start = 0
+                # 判断是否延迟切换（保护当前端点 cache）
+                current_ep = None
+                if probe_current_id:
+                    current_ep = next((e for e in self._endpoints if e.id == probe_current_id), None)
+                pool_active = self._last_pool_activity > now - 300
+                if current_ep and current_ep is not ep and current_ep.deferrable and pool_active:
+                    with self._lock:
+                        ep._defer_until = now + 300
+                    sys_log(f"端点 '{ep.name}' 冷却过期探活通过，但池活跃（当前在 '{current_ep.name}'），延迟切换 5 分钟以保持 cache", "INFO")
+                else:
+                    with self._lock:
+                        ep._defer_until = 0
+                    sys_log(f"端点 '{ep.name}' 冷却过期探活通过，已恢复", "INFO")
+                # 更新 current 指针（保留手动覆盖）
+                with self._lock:
+                    if not self._manual_override_id:
+                        active = self._active_endpoints()
+                        if active:
+                            best = min(active, key=lambda e: e.priority)
+                            self._current_endpoint_id = best.id
+            else:
+                with self._lock:
+                    self._set_cooldown(ep)
+                sys_log(f"端点 '{ep.name}' 冷却过期探活未通过，继续冷却 {ep.cooldown_minutes} 分钟", "WARN")
+        except Exception as e:
+            sys_log(f"端点 '{ep.name}' 后台探活异常: {e}", "ERROR")
+        finally:
+            with self._lock:
+                self._probe_inflight.discard(ep.id)
 
     def _reconcile_deferred(self, now=None, defer_window=300):
         """已延迟切换的端点：池仍活跃且当前端点可 defer → 滚动延长；池空闲/当前不可 defer → 解除。
