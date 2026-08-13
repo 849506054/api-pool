@@ -388,6 +388,7 @@ class Endpoint:
     tool_call_id_prefix: str = ""
     stream_first_packet_timeout: int = 120
     stream_stall_timeout: int = 60
+    stream_max_duration: int = 300  # 流总时长上限（秒），0=禁用；防 keep-alive 型无限挂起（2026-08-13）
     deferrable: bool = True  # 是否可延迟切换（false=上游恢复时立即切回，不保留cache）
     max_context_k: int = 0  # 最大上下文长度（K=1000 tokens），0=不限
 
@@ -1463,8 +1464,8 @@ class APIPool:
                                     time.sleep(1.5 * (attempt + 1))
                                     continue
                                 return None, f"stream first packet timeout ({_first_pkt_timeout}s)"
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                sys_log(f"端点 '{ep.name}' 首包预读 socket 不可用({e})，依赖请求超时/总时长兜底", "WARN")
                     def stream_generator():
                         stream_id = f"chatcmpl-{int(time.time()*1000)}"
                         final_prompt_tokens = 0
@@ -1480,9 +1481,30 @@ class APIPool:
                                 _sock2.settimeout(stall_timeout)
                             except Exception:
                                 pass
+
+                        def _timeout_abort(reason):
+                            """停滞/超时长统一终止：日志 + 冷却 + error chunk（2026-08-13 修复，不再静默吞）"""
+                            sys_log(f"端点 '{ep.name}' {reason}", "ERROR")
+                            with self._lock:
+                                ep._fail_count += 1
+                                ep._last_error = reason
+                                ep._last_error_ts = time.time()
+                                self._set_cooldown(ep)
+                            yield b'data: {"choices":[{"delta":{"content":"\\n\\n[API Pool Error: ' + reason.encode("utf-8", "ignore") + b']"},"finish_reason":"stop"}]}\n\n'
+                            yield b"data: [DONE]\n\n"
+
+                        # 流总时长上限：循环内绝对时间检查。
+                        # 说明（2026-08-13）：真实停滞场景是 SSE keep-alive（带换行注释行）→
+                        # readline 每行返回、循环体能执行 → 此检查生效；曾试过 watchdog 线程
+                        # 方案，但 http.client 的 readline 是 C 层循环（持 GIL），watchdog 被
+                        # 饿死不可靠，已废弃。完全无数据场景由 stall 超时（socket）兜底。
+                        stream_deadline = time.time() + ep.stream_max_duration if ep.stream_max_duration > 0 else None
                         try:
                             lines = itertools.chain([first_line], resp) if first_line else resp
                             for line in lines:
+                                if stream_deadline is not None and time.time() > stream_deadline:
+                                    yield from _timeout_abort(f"流式总时长超限({ep.stream_max_duration}s)")
+                                    return
                                 if is_anthropic:
                                     if not line.strip() or not line.startswith(b"data: "):
                                         continue
@@ -1551,6 +1573,9 @@ class APIPool:
                                                 has_usage = True
                                         except Exception:
                                             pass
+                        except socket.timeout:
+                            yield from _timeout_abort(f"流式响应停滞({stall_timeout}s)")
+                            return
                         except Exception:
                             pass
                         finally:
