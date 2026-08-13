@@ -349,7 +349,8 @@ def extract_prompt_text(payload):
 
 
 def _get_resp_socket(resp):
-    """Get the underlying socket of an http.client.HTTPResponse for settimeout()."""
+    """Get the underlying socket of an http.client.HTTPResponse for settimeout().
+    Handles SSL-wrapped sockets by unwrapping _sock layers."""
     try:
         fp = getattr(resp, "fp", None)
         if fp is None:
@@ -360,6 +361,9 @@ def _get_resp_socket(resp):
         sock = getattr(raw, "_sock", None)
         if sock is None:
             sock = raw
+        # Unwrap SSL socket layers (SSLSocket._sock → plain socket)
+        while hasattr(sock, '_sock') and sock._sock is not None:
+            sock = sock._sock
         return sock
     except Exception:
         return None
@@ -388,7 +392,7 @@ class Endpoint:
     tool_call_id_prefix: str = ""
     stream_first_packet_timeout: int = 120
     stream_stall_timeout: int = 60
-    stream_max_duration: int = 300  # 流总时长上限（秒），0=禁用；防 keep-alive 型无限挂起（2026-08-13）
+    stream_max_duration: int = 120  # 流总时长上限（秒），0=禁用；防 keep-alive 型无限挂起（2026-08-14 缩短至120s）
     deferrable: bool = True  # 是否可延迟切换（false=上游恢复时立即切回，不保留cache）
     max_context_k: int = 0  # 最大上下文长度（K=1000 tokens），0=不限
 
@@ -1479,8 +1483,8 @@ class APIPool:
                         if _sock2 is not None and stall_timeout > 0:
                             try:
                                 _sock2.settimeout(stall_timeout)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                sys_log(f"端点 '{ep.name}' 设置 stream_stall_timeout 失败({e})，依赖 stream_max_duration 兜底", "WARN")
 
                         def _timeout_abort(reason):
                             """停滞/超时长统一终止：日志 + 冷却 + error chunk（2026-08-13 修复，不再静默吞）"""
