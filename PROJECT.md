@@ -57,6 +57,7 @@
 - [ ] **[P2] 待评估：频繁切换端点导致 cache 命中率骤降、增加成本** — 短暂故障应优先原地重试而不是立刻切换，避免丢缓存。可能方案：降权不冻结、首包超时 120s→30~45s、连续 N 次失败才切换 — `proxy.conf` 不在版本控制中，建议文档化或提交模板
 
 - [x] **前后端分离** — GUI 从 `GUI_HTML` 常量抽离至 `static/index.html`，服务端 mtime 缓存读取（改文件热更新，前端改动免重启）；删除 GUI_HTML 常量（commit 1996320）
+- [x] **日志 flush + 流式超时兜底补洞（2026-08-15，待重启生效）** — ① `sys_log` print 加 `flush=True`：systemd 下 stdout 块缓冲导致 journal 延迟 6-12 分钟落盘（23:53 的日志 23:52:53 才批量落盘，排障严重误导）；② 首包预读 `settimeout(_first_pkt_timeout)` 改为 `min(_first_pkt_timeout, ep.timeout)`，不再把 socket 阻塞窗口放大到 120s（ep.timeout 仅 60s）；③ `_get_resp_socket` 返回 None 时显式 WARN（原静默跳过）；④ 流内 `except Exception: pass` 改为区分记录：客户端断开(ConnectionResetError/BrokenPipeError)→WARN，上游异常→ERROR（23:58:26 假死请求"收到后无任何日志"即此缺陷）。已 py_compile + test_stream_timeout.py 三场景验证（normal/stall/keepalive 超时链路正常）。文件已推回宿主机（备份 .bak.20260815），**待手动重启 api-pool.service 生效**
 - [x] **端点列表卡片自适应** — 卡片高度与右侧列（聚合池管理+聚合链）底部对齐（alignCards），列表内部滚动，5s 自动刷新保持滚动位置；全局滚动条深色细窄风格统一（commit 1996320）
 
 ## 📝 决策日志

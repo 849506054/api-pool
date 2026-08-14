@@ -63,7 +63,9 @@ class LogManager:
 sys_logger = LogManager()
 def sys_log(msg, level="INFO"):
     sys_logger.log(level, msg)
-    print(f"[{time.strftime('%H:%M:%S')}] [{level}] {msg}")
+    # flush=True: systemd 下 stdout 是块缓冲（8KB），不加 flush 日志会积攒 6-12 分钟
+    # 才落盘 journal，排障时严重误导（2026-08-15 实测：23:53 的日志 23:52:53 才批量落盘）
+    print(f"[{time.strftime('%H:%M:%S')}] [{level}] {msg}", flush=True)
 
 class TokenTracker:
     def __init__(self, db_path="token_stats.db"):
@@ -1465,14 +1467,18 @@ class APIPool:
                     # Stream first-packet pre-read: timeout retries, not freeze
                     first_line = b""
                     _first_pkt_timeout = getattr(ep, "stream_first_packet_timeout", 0)
+                    # 2026-08-15: 首包超时不应超过 ep.timeout——原逻辑直接 settimeout(120s)
+                    # 会把 socket 阻塞窗口放大到 120s（ep.timeout 只有 60s），半开连接时
+                    # 让 Hermes 侧多等一倍时间才收到断开信号。取 min 保证不超过请求超时。
                     if _first_pkt_timeout > 0:
+                        _effective_pkt_timeout = min(_first_pkt_timeout, timeout or ep.timeout)
                         _sock1 = _get_resp_socket(resp)
                         if _sock1 is not None:
                             try:
-                                _sock1.settimeout(_first_pkt_timeout)
+                                _sock1.settimeout(_effective_pkt_timeout)
                                 first_line = resp.readline()
                             except socket.timeout:
-                                sys_log(f"endpoint {chr(39)}{ep.name}{chr(39)} stream first packet timeout ({_first_pkt_timeout}s) attempt {attempt+1}", "WARN")
+                                sys_log(f"endpoint {chr(39)}{ep.name}{chr(39)} stream first packet timeout ({_effective_pkt_timeout}s) attempt {attempt+1}", "WARN")
                                 try:
                                     resp.close()
                                 except Exception:
@@ -1480,9 +1486,13 @@ class APIPool:
                                 if attempt < retries:
                                     time.sleep(1.5 * (attempt + 1))
                                     continue
-                                return None, f"stream first packet timeout ({_first_pkt_timeout}s)"
+                                return None, f"stream first packet timeout ({_effective_pkt_timeout}s)"
                             except Exception as e:
                                 sys_log(f"端点 '{ep.name}' 首包预读 socket 不可用({e})，依赖请求超时/总时长兜底", "WARN")
+                        else:
+                            # 2026-08-15: _get_resp_socket 失败时无法设 socket 超时，
+                            # 只能依赖 urllib 的 timeout 参数（=ep.timeout），显式记录避免排障盲区
+                            sys_log(f"端点 '{ep.name}' 首包预读未取得 socket，依赖 urllib timeout({timeout or ep.timeout}s) 兜底", "WARN")
                     def stream_generator():
                         stream_id = f"chatcmpl-{int(time.time()*1000)}"
                         final_prompt_tokens = 0
@@ -1593,8 +1603,13 @@ class APIPool:
                         except socket.timeout:
                             yield from _timeout_abort(f"流式响应停滞({stall_timeout}s)")
                             return
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # 2026-08-15: 原逻辑静默吞掉流内所有异常——23:58:26 假死请求
+                            # "收到后无任何日志"的直接原因。区分客户端断开(常见噪音)与上游异常(需记录)。
+                            if isinstance(e, (ConnectionResetError, BrokenPipeError)):
+                                sys_log(f"端点 '{ep.name}' 流式响应客户端断开: {type(e).__name__}", "WARN")
+                            else:
+                                sys_log(f"端点 '{ep.name}' 流式响应异常: {type(e).__name__}: {e}", "ERROR")
                         finally:
                             if has_usage and log_usage and not ep.name.startswith("test_"):
                                 token_tracker.add_usage(ep.name, ep.model, final_prompt_tokens, final_completion_tokens, final_total_tokens, final_cached_tokens)
