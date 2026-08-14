@@ -1000,7 +1000,7 @@ class APIPool:
                 return ep
         return min(active, key=lambda e: e._cooldown_until) if active else None
 
-    def _rotate(self, failed_ep, error_msg, probe_failed=False):
+    def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False):
         failed_ep._fail_count += 1
         failed_ep._total_failures += 1
         failed_ep._last_error = error_msg
@@ -1009,6 +1009,10 @@ class APIPool:
             # 探活失败：只设短冷却（30秒），避免误杀冷启动端点
             failed_ep._cooldown_until = time.time() + 30
             sys_log(f"端点 '{failed_ep.name}' 探活失败，短冷却 30 秒", "WARN")
+        elif skip_cooldown:
+            # 端点级活跃判定：超时类失败但端点在 timeout 窗口内有成功响应
+            # → 单请求饿死，非端点故障；仅轮转，不冻结
+            sys_log(f"端点 '{failed_ep.name}' 活跃(窗口内有成功)，判定单请求饿死，不冻结", "WARN")
         else:
             self._set_cooldown(failed_ep)
             sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {failed_ep.cooldown_minutes} 分钟后", "WARN")
@@ -1259,7 +1263,16 @@ class APIPool:
             sys_log(f"端点 '{ep.name}' 请求失败: {error}", "ERROR")
             # _try_endpoint 内部已按 max_retries 重试完毕，直接冻结+轮转
             with self._lock:
-                self._rotate(ep, error)
+                # 端点级活跃判定（2026-08-14）：超时类错误但端点在 timeout 窗口内
+                # 有成功响应 → 单请求饿死（并发挤压），非端点故障 → 不冻结仅轮转。
+                # 窗口=端点自己的 timeout 配置（如 Opencode 60s/Tokenrhythm 90s）。
+                skip_cooldown = False
+                if "连接/超时错误" in error and ep._last_success_ts > 0:
+                    since_success = time.time() - ep._last_success_ts
+                    if since_success < ep.timeout:
+                        skip_cooldown = True
+                        sys_log(f"端点 '{ep.name}' 超时失败但 {since_success:.0f}s 前有成功响应（<timeout {ep.timeout}s），判定单请求饿死，不冻结", "WARN")
+                self._rotate(ep, error, skip_cooldown=skip_cooldown)
                 active = self._active_endpoints()
                 active.sort(key=lambda e: e.priority)
                 total = len(active)
