@@ -585,7 +585,12 @@ function alignCards(){
   if(window.innerWidth<=920){card.style.height='';return;} /* 单列布局不强制高度 */
   const right=document.querySelector('.grid>div:last-child');
   if(!right)return;
-  const h=right.getBoundingClientRect().bottom-card.getBoundingClientRect().top;
+  /* 2026-08-15: 对齐目标用右侧最后一个卡片的视觉底部，而不是容器底部——
+     容器 bottom 包含最后卡片的 margin-bottom(16px)，会把左侧卡片拉高固定 16px
+     (实测 epCard.bottom=934 vs 聚合链卡片视觉底部=918) */
+  const lastCard=right.lastElementChild;
+  const targetBottom=lastCard?lastCard.getBoundingClientRect().bottom:right.getBoundingClientRect().bottom;
+  const h=targetBottom-card.getBoundingClientRect().top;
   if(h>80)card.style.height=h+'px';
 }
 let alignT;window.addEventListener('resize',()=>{clearTimeout(alignT);alignT=setTimeout(alignCards,150);});
