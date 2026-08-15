@@ -686,11 +686,11 @@ class APIPool:
             except Exception as e:
                 return ep.id, "bad", int((time.time() - t0) * 1000), f"Models接口错误: {e}"[:100]
                 
-        payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3}
+        payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3, "stream": False}
         
         # Attempt 1
         t0 = time.time()
-        reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True)
+        reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True, is_probe=True)
         latency = int((time.time() - t0) * 1000)
         
         if reply is not None and latency <= LATENCY_OK_MAX:
@@ -704,7 +704,7 @@ class APIPool:
             
         # Attempt 2 (Retry for cold start or transient glitch)
         t1 = time.time()
-        reply2, err2 = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True)
+        reply2, err2 = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True, is_probe=True)
         latency2 = int((time.time() - t1) * 1000)
         
         if reply2 is not None and latency2 <= LATENCY_OK_MAX:
@@ -1109,8 +1109,8 @@ class APIPool:
             return True  # 关闭检测视为可用
         # 统一使用 chat ping 探活：models 接口可访问不代表模型可响应
         ep._health_last_check = time.time()
-        payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3}
-        reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True)
+        payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3, "stream": False}
+        reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True, is_probe=True)
         return reply is not None
 
     def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False):
@@ -1391,7 +1391,7 @@ class APIPool:
                 tried += 1
         raise AllEndpointsFailed(errors)
 
-    def _try_endpoint(self, ep, payload, timeout, log_usage=True, force_no_retry=False):
+    def _try_endpoint(self, ep, payload, timeout, log_usage=True, force_no_retry=False, is_probe=False):
         req_t0 = time.time()
         prompt_text_to_log = extract_prompt_text(payload) if log_usage and not ep.name.startswith("test_") else ""
         
@@ -1465,11 +1465,19 @@ class APIPool:
                 req.add_header(k, v)
                 
             try:
+                # 超时语义区分（2026-08-15 超时体系重构）：
+                # - 流式：timeout=ep.timeout 是 TTFB（等响应头/首包），首包后由 stall/max_duration 管控
+                # - 非流式：上游必须全量生成完才返回，60/90s TTFB 必然误杀大请求。
+                #   总时长语义放宽到 max(ep.timeout, 600)，与 Hermes 侧 stale watchdog(600s) 对齐，
+                #   超时由 Hermes 侧统一判定，避免双层 90s 叠加空转。
+                _open_timeout = timeout or ep.timeout
+                if not is_stream and not is_probe:
+                    _open_timeout = max(_open_timeout, 600)
                 if getattr(ep, "use_proxy", True) is False:
                     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                    resp = opener.open(req, timeout=timeout)
+                    resp = opener.open(req, timeout=_open_timeout)
                 else:
-                    resp = urllib.request.urlopen(req, timeout=timeout)
+                    resp = urllib.request.urlopen(req, timeout=_open_timeout)
                 
                 if is_stream:
                     # Stream first-packet pre-read: timeout retries, not freeze
