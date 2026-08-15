@@ -1330,11 +1330,11 @@ class APIPool:
                                         _e = _futures[_fut]
                                         try:
                                             _eid, _health, _lat, _err = _fut.result()
-                                            probe_results[_e] = _health
+                                            probe_results[_e.id] = _health
                                         except Exception:
-                                            probe_results[_e] = "bad"
+                                            probe_results[_e.id] = "bad"
                                     for _e in sorted(remaining, key=lambda x: x.priority):
-                                        if probe_results.get(_e) in ("ok", "slow") and _e is not ep:
+                                        if probe_results.get(_e.id) in ("ok", "slow") and _e is not ep:
                                             chosen = _e
                                             break
                                     if chosen is not None:
@@ -1347,11 +1347,11 @@ class APIPool:
                                             _e = _futures[_fut]
                                             try:
                                                 _eid, _health, _lat, _err = _fut.result()
-                                                probe_results[_e] = _health
+                                                probe_results[_e.id] = _health
                                             except Exception:
-                                                probe_results[_e] = "bad"
+                                                probe_results[_e.id] = "bad"
                                     for _e in sorted(remaining, key=lambda x: x.priority):
-                                        if probe_results.get(_e) in ("ok", "slow") and _e is not ep:
+                                        if probe_results.get(_e.id) in ("ok", "slow") and _e is not ep:
                                             chosen = _e
                                             break
                             if chosen is not None:
@@ -1362,7 +1362,7 @@ class APIPool:
                                         break
                                 # 其余探活失败的端点标记短冷却，避免后续轮转再撞上
                                 for e in remaining:
-                                    if e is not chosen and probe_results.get(e) not in ("ok", "slow") and not self._is_in_cooldown(e):
+                                    if e is not chosen and probe_results.get(e.id) not in ("ok", "slow") and not self._is_in_cooldown(e):
                                         self._rotate(e, "并发探活失败", probe_failed=True)
                                 continue
                             else:
