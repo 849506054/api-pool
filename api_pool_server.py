@@ -1263,6 +1263,10 @@ class APIPool:
                 return result
             errors.append(f"[{ep.name}] {error}")
             sys_log(f"端点 '{ep.name}' 请求失败: {error}", "ERROR")
+            # 2026-08-15: 502/503/504 网关级错误 → 跳过候选端点探活，直接重试。
+            # 探活(ping max_tokens=3) 无法鉴别网关故障：小请求通过≠真实请求可用，
+            # 避免"探活通过→重试超时"空转。超时/连接错误仍走探活（瞬态防误杀）。
+            gateway_error = any(f"HTTP {c}" in error for c in ("502", "503", "504"))
             # _try_endpoint 内部已按 max_retries 重试完毕，直接冻结+轮转
             with self._lock:
                 # 端点级活跃判定（2026-08-14）：超时类错误但端点在 timeout 窗口内
@@ -1294,6 +1298,10 @@ class APIPool:
                             idx = (i + 1) % len(active)
                             break
                 else:
+                    if gateway_error:
+                        # 网关错误：跳过候选探活直接重试（探活小请求无法鉴别网关故障）
+                        sys_log(f"网关错误(50x)，跳过候选端点 '{next_ep.name}' 探活直接重试", "INFO")
+                        continue
                     # 对候选端点做探活
                     sys_log(f"对候选端点 '{next_ep.name}' 进行探活...", "INFO")
                     if self._probe_endpoint(next_ep):
