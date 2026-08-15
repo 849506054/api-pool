@@ -239,10 +239,43 @@ class TokenTracker:
 token_tracker = TokenTracker()
 
 class ChatLogger:
+    RETENTION_DAYS = 30  # 对话日志滚动保留天数（2026-08-15 新增：超过该天数的记录定时删除）
+
     def __init__(self, db_path="chat_logs.db"):
         self.db_path = db_path
         self._lock = threading.Lock()
         self._init_db()
+        # 后台守护线程：每小时滚动清理一次过期日志（daemon 线程，失败不影响主服务）
+        threading.Thread(target=self._retention_loop, daemon=True).start()
+
+    def _retention_loop(self):
+        while True:
+            try:
+                self.prune_old_logs()
+            except Exception as e:
+                sys_log(f"滚动清理对话日志失败: {e}", "ERROR")
+            time.sleep(3600)
+
+    def prune_old_logs(self):
+        """删除超过 RETENTION_DAYS 天的对话日志（按 UTC 时间戳比较），返回删除行数。"""
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                c = conn.cursor()
+                c.execute(
+                    "DELETE FROM chat_logs WHERE timestamp < datetime('now', ?)",
+                    (f"-{self.RETENTION_DAYS} days",)
+                )
+                deleted = c.rowcount
+                conn.commit()
+                conn.close()
+                if deleted > 0:
+                    sys_log(f"滚动清理对话日志: 删除 {deleted} 条超过 {self.RETENTION_DAYS} 天的记录")
+                return deleted
+            except Exception as e:
+                sys_log(f"滚动清理对话日志失败: {e}", "ERROR")
+                return 0
+
 
     def _init_db(self):
         with self._lock:
@@ -2167,6 +2200,8 @@ def main():
         try: sys.stdout.reconfigure(encoding='utf-8')
         except: pass
     port = 5100
+    # 注：滚动清理由 ChatLogger.__init__ 的守护线程负责（启动即执行首次清理），
+    #     不在 main() 同步执行——大表 DELETE 会阻塞 server 启动（2026-08-15 实测 63s）
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"\n  ⚡ API Pool 管理面板已启动")
     print(f"  🌐 管理面板访问: http://localhost:{port}")
