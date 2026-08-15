@@ -1240,7 +1240,17 @@ class APIPool:
             if tried == 0:
                 sys_log(f"收到 API 请求，尝试请求端点 '{ep.name}' (模型: {ep_model})", "INFO")
             else:
-                sys_log(f"重试请求，尝试端点 '{ep.name}' (模型: {ep_model})", "INFO")
+                sys_log(f"重试请求，尝试请求端点 '{ep.name}' (模型: {ep_model})", "INFO")
+            # 请求特征 DEBUG（API_POOL_DEBUG / /api/debug 开关控制）
+            if _DEBUG_LOGGING:
+                try:
+                    _msg_chars = sum(len(str(m.get("content", ""))) for m in payload.get("messages", []))
+                    _tools = payload.get("tools")
+                    _tool_count = len(_tools) if isinstance(_tools, list) else 0
+                    _tool_choice = payload.get("tool_choice")
+                    sys_log(f"[DEBUG] 请求特征: msgs_chars={_msg_chars} stream={payload.get('stream')} max_tokens={payload.get('max_tokens')} thinking={payload.get('thinking')} reasoning_effort={payload.get('reasoning_effort')} tools={_tool_count} tool_choice={_tool_choice} temperature={payload.get('temperature')} top_p={payload.get('top_p')}", "INFO")
+                except Exception:
+                    pass
 
             # 上下文长度检查：超过限制时跳过该端点（不冻结、不记失败），轮转到下一个
             if ep.max_context_k > 0:
@@ -1259,10 +1269,24 @@ class APIPool:
                     if getattr(ep, "priority", 0) == 99:
                         self._fallback_lock_until = time.time() + self._FALLBACK_LOCK_SECONDS
                 sys_log(f"端点 '{ep.name}' 请求成功 (延迟: 正常)", "INFO")
+                # 请求耗时 DEBUG（API_POOL_DEBUG / /api/debug 开关控制）
+                if _DEBUG_LOGGING:
+                    try:
+                        _req_elapsed = int((time.time() - _chat_start) * 1000)
+                        sys_log(f"[DEBUG] 请求完成耗时: {_req_elapsed}ms", "INFO")
+                    except Exception:
+                        pass
                 if return_endpoint: return result, ep
                 return result
             errors.append(f"[{ep.name}] {error}")
             sys_log(f"端点 '{ep.name}' 请求失败: {error}", "ERROR")
+            # 请求失败耗时 DEBUG（API_POOL_DEBUG / /api/debug 开关控制）
+            if _DEBUG_LOGGING:
+                try:
+                    _fail_elapsed = int((time.time() - _chat_start) * 1000)
+                    sys_log(f"[DEBUG] 请求失败耗时: {_fail_elapsed}ms", "INFO")
+                except Exception:
+                    pass
             # 2026-08-15: 502/503/504 网关级错误 → 跳过候选端点探活，直接重试。
             # 探活(ping max_tokens=3) 无法鉴别网关故障：小请求通过≠真实请求可用，
             # 避免"探活通过→重试超时"空转。超时/连接错误仍走探活（瞬态防误杀）。
@@ -1855,6 +1879,15 @@ def api_handler(method, path, body):
         last_id = int(qs.get("since", 0))
         return 200, sys_logger.get_logs_since(last_id), False
 
+    if method == "GET" and cp == "/api/debug":
+        return 200, {"debug_enabled": _DEBUG_LOGGING}, False
+
+    if method == "POST" and cp == "/api/debug":
+        enabled = bool(body.get("enabled", False)) if isinstance(body, dict) else False
+        _set_debug_logging(enabled)
+        sys_log(f"请求特征 DEBUG 日志已{'开启' if _DEBUG_LOGGING else '关闭'}", "INFO")
+        return 200, {"debug_enabled": _DEBUG_LOGGING}, False
+
     if method == "DELETE" and cp == "/api/logs":
         sys_logger.clear_logs()
         return 200, {"ok": True}, False
@@ -1993,6 +2026,19 @@ GUI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 GUI_FILE = os.path.join(GUI_DIR, "index.html")
 _gui_html_cache = None
 _gui_html_mtime = 0
+
+# 请求特征 DEBUG 日志开关（2026-08-15）：默认关闭。
+# 开启方式：
+#   1. 启动时：环境变量 API_POOL_DEBUG=1
+#   2. 运行时：POST /api/debug {"enabled": true}（免重启）
+# 开启后在收到请求/请求成功时打印请求特征（大小/stream/max_tokens/thinking/tools 等）与耗时，
+# 便于排查"某请求为何慢/卡"类问题。排查完记得关闭。
+_DEBUG_LOGGING = os.environ.get("API_POOL_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
+def _set_debug_logging(enabled: bool) -> bool:
+    global _DEBUG_LOGGING
+    _DEBUG_LOGGING = bool(enabled)
+    return _DEBUG_LOGGING
 
 
 def _load_gui_html():
