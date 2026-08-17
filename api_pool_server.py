@@ -1127,6 +1127,31 @@ class APIPool:
                     m["tool_call_id"] = mapping[oid]
         return messages
 
+    @staticmethod
+    def _is_deepseek_endpoint(ep):
+        """Return whether an endpoint needs DeepSeek-specific message fields."""
+        model = str(getattr(ep, "model", "") or "").lower()
+        base_url = str(getattr(ep, "base_url", "") or "").lower()
+        prefix = str(getattr(ep, "tool_call_id_prefix", "") or "").lower()
+        return "deepseek" in model or "deepseek" in base_url or bool(prefix)
+
+    @classmethod
+    def _messages_for_endpoint(cls, messages, ep):
+        """Remove DeepSeek-only reasoning fields for non-DeepSeek targets."""
+        if cls._is_deepseek_endpoint(ep):
+            return messages
+
+        cleaned = []
+        for message in messages:
+            if not isinstance(message, dict):
+                cleaned.append(message)
+                continue
+            item = dict(message)
+            item.pop("reasoning_content", None)
+            item.pop("reasoning_text", None)
+            cleaned.append(item)
+        return cleaned
+
     def _estimate_context_tokens(self, messages):
         """粗略估算 prompt 上下文 token 数（1K=1000 tokens），用于 max_context_k 判断。
 
@@ -1236,8 +1261,9 @@ class APIPool:
             ep_timeout = timeout or ep.timeout
             ep_model = model or ep.model
             
-            # 按端点协议决定消息体：Anthropic 端点不注入 reasoning_content（避免缓存穿透）
-            loop_messages = messages
+            # 按目标端点隔离 DeepSeek 专属 reasoning 字段；每次轮转都
+            # 从同一份 Hermes 历史构造独立消息，避免污染后续端点。
+            loop_messages = self._messages_for_endpoint(messages, ep)
             is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
             # tool_call id 前缀重写：端点配置 tool_call_id_prefix 非空时，把消息里所有 tool_call id
             # 重写为该前缀格式（如 DeepSeek 官方 call_00_ET_）。跨端点切换后历史里混入其他端点
