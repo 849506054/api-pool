@@ -103,4 +103,5 @@
 
 ## 📌 活跃事项
 
+- [x] **[P1] 端点自定义 User-Agent（2026-08-17 已部署）** — 端点配置新增 `default_headers`，UI 提供可选 User-Agent；聊天、Models 探活、获取模型、延迟/多模态测试统一应用。实测 `ps.air-outer.com` 默认 UA 返回 401，`hermes-agent/0.20.1` 返回 200 并获取 3 个模型。部署后 16 端点全部带 `default_headers` 字段（存量端点 `{}` 向后兼容）；service 重启后新进程无 ERROR。
 - [ ] **[P3] 文档化 proxy.conf dropin** — `/etc/systemd/system/api-pool.service.d/proxy.conf` 为系统代理环境变量，建议在仓库中保留模板或注释

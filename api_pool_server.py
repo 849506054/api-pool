@@ -421,6 +421,7 @@ class Endpoint:
     use_proxy: bool = False
     protocol: str = "openai"
     extra_headers: dict = field(default_factory=dict)
+    default_headers: dict = field(default_factory=dict)
     is_vision: bool = True
     in_pool: bool = False  # 是否加入聚合池（默认不加入）
     check_fake_success: bool = False  # 是否检测假成功（200 OK 但内容含拒绝信息）
@@ -485,6 +486,8 @@ class APIPool:
     def add_endpoint(self, ep):
         if isinstance(ep, dict):
             ep_dict = {k: v for k, v in ep.items() if k in Endpoint.__dataclass_fields__}
+            if ep.get("user_agent") and "default_headers" not in ep_dict:
+                ep_dict["default_headers"] = {"User-Agent": ep["user_agent"]}
             # 新增时按组别自动设置健康检测模式（未显式指定时生效）
             if "health_mode" not in ep_dict:
                 ep_dict["health_mode"] = "models" if ep_dict.get("billing_mode", "subscription") == "pay_per_use" else ("chat" if ep_dict.get("in_pool", False) else "models")
@@ -608,6 +611,7 @@ class APIPool:
             "rpm_limit": ep.rpm_limit,
             "use_proxy": ep.use_proxy,
             "protocol": ep.protocol,
+            "default_headers": ep.default_headers,
             "health_mode": ep.health_mode,
             "billing_mode": ep.billing_mode,
             "is_vision": ep.is_vision,
@@ -710,7 +714,11 @@ class APIPool:
         if effective_mode == "models":
             t0 = time.time()
             try:
-                models = self.fetch_models(ep.base_url, ep.api_key, timeout=10, use_proxy=ep.use_proxy, protocol=ep.protocol)
+                models = self.fetch_models(
+                    ep.base_url, ep.api_key, timeout=10, use_proxy=ep.use_proxy,
+                    protocol=ep.protocol, default_headers=ep.default_headers,
+                    extra_headers=ep.extra_headers,
+                )
                 latency = int((time.time() - t0) * 1000)
                 if models:
                     return ep.id, "ok", latency, ""
@@ -1517,7 +1525,9 @@ class APIPool:
                 req.add_header("anthropic-version", "2023-06-01")
             req.add_header("Authorization", f"Bearer {safe_api_key}")
             req.add_header("User-Agent", "OpenAI/Python 2.33.0")
-                
+            for k, v in ep.default_headers.items():
+                req.add_header(k, v)
+
             for k, v in ep.extra_headers.items():
                 req.add_header(k, v)
                 
@@ -1785,12 +1795,16 @@ class APIPool:
                 return None, f"未知错误: {e}"
         return None, "重试次数用尽"
 
-    def fetch_models(self, base_url, api_key, timeout=10, use_proxy=True, protocol="openai"):
+    def fetch_models(self, base_url, api_key, timeout=10, use_proxy=True, protocol="openai", default_headers=None, extra_headers=None):
         url = base_url.rstrip("/") + "/models"
         req = urllib.request.Request(url, method="GET")
         safe_api_key = api_key.encode('ascii', 'ignore').decode('ascii').strip()
         req.add_header("Authorization", f"Bearer {safe_api_key}")
         req.add_header("User-Agent", "OpenAI/Python 2.33.0")
+        for k, v in (default_headers or {}).items():
+            req.add_header(k, v)
+        for k, v in (extra_headers or {}).items():
+            req.add_header(k, v)
             
         try:
             if not use_proxy:
@@ -1817,8 +1831,8 @@ class APIPool:
         except Exception as e:
             raise e
 
-    def test_vision(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai"):
-        ep = Endpoint(name="test_vision", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol)
+    def test_vision(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai", user_agent=""):
+        ep = Endpoint(name="test_vision", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol, default_headers={"User-Agent": user_agent} if user_agent else {})
         tiny_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwADhQGAWjR9awAAAABJRU5ErkJggg=="
         payload = {
             "model": model,
@@ -1842,8 +1856,8 @@ class APIPool:
             unsupported = "image" in err.lower() or "vision" in err.lower() or "content" in err.lower() or "400" in err
             return {"ok": not unsupported, "supports_vision": not unsupported, "latency_ms": latency, "reply": "", "error": err}
 
-    def test_model_latency(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai"):
-        ep = Endpoint(name="test_latency", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol)
+    def test_model_latency(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai", user_agent=""):
+        ep = Endpoint(name="test_latency", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol, default_headers={"User-Agent": user_agent} if user_agent else {})
         payload = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}
         t0 = time.time()
         reply, err = self._try_endpoint(ep, payload, timeout)
@@ -1976,6 +1990,7 @@ def api_handler(method, path, body):
                 "daily_limit": item.get("daily_limit", base.get("daily_limit", 0)), "rpm_limit": item.get("rpm_limit", base.get("rpm_limit", 0)),
                 "use_proxy": item.get("use_proxy", base.get("use_proxy", False)),
                 "protocol": item.get("protocol", base.get("protocol", "openai")),
+                "default_headers": item.get("default_headers", base.get("default_headers", {"User-Agent": item.get("user_agent", base.get("user_agent", ""))} if item.get("user_agent", base.get("user_agent", "")) else {})),
                 "health_mode": item.get("health_mode", base.get("health_mode", "chat")),
                   "billing_mode": item.get("billing_mode", base.get("billing_mode", "subscription")),
                   "is_vision": item.get("is_vision", base.get("is_vision", True)),
@@ -2007,7 +2022,11 @@ def api_handler(method, path, body):
         base_url = body.get("base_url", ""); api_key = body.get("api_key", "")
         if not base_url or not api_key: return 400, {"error": "需要 base_url 和 api_key"}, False
         try:
-            models = pool.fetch_models(base_url, api_key, use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai"))
+            models = pool.fetch_models(
+                base_url, api_key, use_proxy=body.get("use_proxy", True),
+                protocol=body.get("protocol", "openai"),
+                default_headers=body.get("default_headers", {"User-Agent": body["user_agent"]} if body.get("user_agent") else {}),
+            )
             return 200, {"ok": True, "models": models, "count": len(models)}, False
         except urllib.error.HTTPError as e:
             err_body = ""
@@ -2015,15 +2034,15 @@ def api_handler(method, path, body):
             except Exception: pass
             return 200, {"ok": False, "error": f"HTTP {e.code}: {err_body}"}, False
         except Exception as e: return 200, {"ok": False, "error": str(e)}, False
-    if method == "POST" and cp == "/api/test-model": return 200, pool.test_model_latency(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai")), False
-    if method == "POST" and cp == "/api/test-vision": return 200, pool.test_vision(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai")), False
+    if method == "POST" and cp == "/api/test-model": return 200, pool.test_model_latency(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai"), user_agent=body.get("user_agent", "")), False
+    if method == "POST" and cp == "/api/test-vision": return 200, pool.test_vision(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai"), user_agent=body.get("user_agent", "")), False
     if method == "POST" and cp == "/api/test":
         ep_id = body.get("id", ""); test_msg = body.get("message", "你好"); target_ep = None
         for ep in pool.list_endpoints():
             if ep["id"] == ep_id: target_ep = ep; break
         if not target_ep: return 404, {"error": "端点不存在"}, False
         test_pool = APIPool()
-        test_pool.add_endpoint({"name": target_ep["name"], "base_url": target_ep["base_url"], "api_key": target_ep["api_key_full"], "model": target_ep["model"], "priority": 1, "timeout": target_ep["timeout"], "max_retries": target_ep["max_retries"], "enabled": True, "in_pool": True, "use_proxy": target_ep.get("use_proxy", True), "protocol": target_ep.get("protocol", "openai"), "is_vision": target_ep.get("is_vision", True)})
+        test_pool.add_endpoint({"name": target_ep["name"], "base_url": target_ep["base_url"], "api_key": target_ep["api_key_full"], "model": target_ep["model"], "priority": 1, "timeout": target_ep["timeout"], "max_retries": target_ep["max_retries"], "enabled": True, "in_pool": True, "use_proxy": target_ep.get("use_proxy", True), "protocol": target_ep.get("protocol", "openai"), "default_headers": target_ep.get("default_headers", {}), "is_vision": target_ep.get("is_vision", True)})
         
         img = body.get("image")
         if img:
@@ -2051,7 +2070,7 @@ def api_handler(method, path, body):
     return 404, {"error": "Not found"}, False
 
 def _sync_to_config():
-    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "is_vision": ep.get("is_vision", True),
+    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "default_headers": ep.get("default_headers", {}), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "is_vision": ep.get("is_vision", True),
             "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0)} for ep in pool.list_endpoints()])
 
 
