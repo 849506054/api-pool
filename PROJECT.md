@@ -105,6 +105,7 @@
 
 - [x] **[P0] API Pool 2.0 并行基线（2026-08-18）** — 独立目录 `/vol1/1000/tool/api-pool2`、独立 unit `api-pool2.service`、端口 5200；配置由 1.0 快照初始化，`chat_logs.db` 与 `token_stats.db` 独立新建。Hermes 继续指向 5100，1.0 未重启。
 - [ ] **[P0] 2.0 多模型上游建模** — AgentRouter、Opencode、Tokenrhythm 均提供多个模型。数据模型需分离“上游连接/凭据”和“模型路由能力”，不得通过复制同一凭据创建多个伪端点。使用现有 `/api/fetch-models` 获取真实目录，建立 DeepSeek/非 DeepSeek 测试矩阵。
+- [ ] **[P1] claude-opus-5 直连失败归纳（2026-08-18 已诊断，列入 2.0）** — Hermes `/model` 会话级切 `claude-opus-5`(custom:ps.air-outer.com) 时报 `'NoneType' object has no attribute 'choices'`（AttributeError,非 HTTP）,3 次重试后 fallback gpt-5.6-sol。**已核实**:端点端到端正常（实测非流式/流式/tools/thinking 字段全 200 标准结构, `/v1/responses` 不支持 channel type 14）；Hermes E2E resolve 主通道直连 claude-opus-5 也成功。`NoneType.choices` 只发生在 Hermes 真实大请求（154 轮+工具+流式）里。**归纳到 2.0**:claude/gpt 这类非 DeepSeek 模型若经 API Pool 统一管理，需由 2.0 承担模型路由+请求/响应适配（吸收该失败,而非 Hermes 侧继续直连补丁）。细细节见 `provider-model-auto-switch` skill `references/auth-failed-misdiagnosis-session-switch.md`。
 - [ ] **[P0] 统一 reasoning 意图适配** — Hermes 仅发送统一 `reasoning_effort`；API Pool 2.0 按实际目标模型/协议转换或过滤 `thinking`、`reasoning_effort` 及历史 reasoning 字段。
 
 - [x] **[P1] 端点自定义 User-Agent（2026-08-17 已部署）** — 端点配置新增 `default_headers`，UI 提供可选 User-Agent；聊天、Models 探活、获取模型、延迟/多模态测试统一应用。实测 `ps.air-outer.com` 默认 UA 返回 401，`hermes-agent/0.20.1` 返回 200 并获取 3 个模型。部署后 16 端点全部带 `default_headers` 字段（存量端点 `{}` 向后兼容）；service 重启后新进程无 ERROR。
