@@ -7,10 +7,10 @@
 | **领域** | 基础设施 — DeepSeek API 端点集中管理 |
 | **定位** | DeepSeek 端点集中管理工具，对外统一 OpenAI 兼容接口 |
 | **当前阶段** | 功能维护 |
-| **状态** | 🟢 运行中 |
-| **源码** | `/vol1/1000/tool/api-pool/` (宿主机) |
-| **Git remote** | `github.com/849506054/api-pool` |
-| **端口** | 5100 |
+| **状态** | 🟡 API Pool 2.0 并行实验实例 |
+| **源码** | `/vol1/1000/tool/api-pool2/` (宿主机) |
+| **Git remote** | `github.com/849506054/api-pool`（分支 `api-pool-2.0`） |
+| **端口** | 5200（1.0 继续使用 5100） |
 | **Python** | 3.13 (宿主机默认) |
 | **协议** | OpenAI 兼容 + Anthropic (端点级 protocol 属性) |
 | **健康检测** | chat ping / models 探针 (端点级 health_mode) |
@@ -102,6 +102,10 @@
 | 2026-08-13 | 冷却恢复探活后台化（commit 5769d32） | `_cleanup_expired_cooldowns` 同步探活 → 后台入队（`_probe_executor` max_workers=3 + `_probe_inflight` 去重）。请求路径（chat/list_endpoints/get_active_chain）不再被冷却过期端点探活阻塞（原实现多端点串行探活每个最长 10s，前端 5s 轮询"轮流上阵"卡顿）。`_background_probe`：通过清冷却+defer 判断+更新 current / 失败续冷 / 异常兜底。defer 延迟切换保 cache 逻辑完整保留（池活跃恢复端点延迟 5min）。设计确认：后台探活与真实请求并发无害，inflight 只防重复探活不锁真实请求。5 场景烟测 + 重启 active |
 
 ## 📌 活跃事项
+
+- [x] **[P0] API Pool 2.0 并行基线（2026-08-18）** — 独立目录 `/vol1/1000/tool/api-pool2`、独立 unit `api-pool2.service`、端口 5200；配置由 1.0 快照初始化，`chat_logs.db` 与 `token_stats.db` 独立新建。Hermes 继续指向 5100，1.0 未重启。
+- [ ] **[P0] 2.0 多模型上游建模** — AgentRouter、Opencode、Tokenrhythm 均提供多个模型。数据模型需分离“上游连接/凭据”和“模型路由能力”，不得通过复制同一凭据创建多个伪端点。使用现有 `/api/fetch-models` 获取真实目录，建立 DeepSeek/非 DeepSeek 测试矩阵。
+- [ ] **[P0] 统一 reasoning 意图适配** — Hermes 仅发送统一 `reasoning_effort`；API Pool 2.0 按实际目标模型/协议转换或过滤 `thinking`、`reasoning_effort` 及历史 reasoning 字段。
 
 - [x] **[P1] 端点自定义 User-Agent（2026-08-17 已部署）** — 端点配置新增 `default_headers`，UI 提供可选 User-Agent；聊天、Models 探活、获取模型、延迟/多模态测试统一应用。实测 `ps.air-outer.com` 默认 UA 返回 401，`hermes-agent/0.20.1` 返回 200 并获取 3 个模型。部署后 16 端点全部带 `default_headers` 字段（存量端点 `{}` 向后兼容）；service 重启后新进程无 ERROR。
 - [ ] **[P3] 文档化 proxy.conf dropin** — `/etc/systemd/system/api-pool.service.d/proxy.conf` 为系统代理环境变量，建议在仓库中保留模板或注释

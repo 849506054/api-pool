@@ -1,0 +1,21 @@
+[Unit]
+Description=API Pool 2.0 - parallel experimental instance
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/vol1/1000/tool/api-pool2
+Environment=API_POOL_PORT=5200
+Environment="API_POOL_INSTANCE=API Pool 2.0"
+Environment=HTTPS_PROXY=http://192.168.5.6:7890
+Environment=HTTP_PROXY=http://192.168.5.6:7890
+Environment=NO_PROXY=127.0.0.1,localhost,192.168.0.0/16,10.0.0.0/8
+ExecStart=/usr/bin/python3 /vol1/1000/tool/api-pool2/api_pool_server.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

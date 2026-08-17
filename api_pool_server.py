@@ -1,8 +1,8 @@
 """
 API Pool — 聚合 API 自动切换模块（GUI 版）
 
-启动: python api_pool_server.py
-访问: http://localhost:5100
+启动: API_POOL_PORT=5200 API_POOL_INSTANCE="API Pool 2.0" python api_pool_server.py
+访问: http://localhost:5200
 
 ⚠️ EXPERIMENTAL (2026-08-13): 极端情况处理实验版本，观察期。
   1. 幂等冻结：并发请求二次失败不刷新冷却窗口（_set_cooldown）
@@ -2218,11 +2218,17 @@ def main():
     if sys.stdout.encoding.lower() != 'utf-8':
         try: sys.stdout.reconfigure(encoding='utf-8')
         except: pass
-    port = 5100
+    instance_name = os.environ.get("API_POOL_INSTANCE", "API Pool").strip() or "API Pool"
+    try:
+        port = int(os.environ.get("API_POOL_PORT", "5100"))
+    except ValueError:
+        raise SystemExit("API_POOL_PORT must be an integer")
+    if not 1 <= port <= 65535:
+        raise SystemExit("API_POOL_PORT must be between 1 and 65535")
     # 注：滚动清理由 ChatLogger.__init__ 的守护线程负责（启动即执行首次清理），
     #     不在 main() 同步执行——大表 DELETE 会阻塞 server 启动（2026-08-15 实测 63s）
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    print(f"\n  ⚡ API Pool 管理面板已启动")
+    print(f"\n  ⚡ {instance_name} 管理面板已启动")
     print(f"  🌐 管理面板访问: http://localhost:{port}")
     print(f"  🔗 客户端 Base URL: http://localhost:{port}/v1")
     print(f"  📋 已加载 {len(pool._endpoints)} 个端点")
