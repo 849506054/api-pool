@@ -508,6 +508,8 @@ class APIPool:
         self._endpoints: list[Endpoint] = []
         self._current_endpoint_id = None  # 用端点ID追踪当前端点，而非位置索引
         self._manual_override_id = None  # 用户手动指定端点的ID，优先级覆盖路由选择
+        self._restored_endpoint_id: str | None = None  # 重启后仅首个请求使用的上次成功端点
+        self._persisted_endpoint_id: str | None = None  # 避免同一端点每次成功都写盘
         self._last_reasoning_content = None  # 缓存上一轮返回的 reasoning_content，用于多轮对话补全
         self._last_reasoning_text = None  # 缓存上一轮返回的 reasoning_text（DeepSeek V4 request 字段名），用于多轮对话补全
         self._last_pool_activity: float = 0  # 上次池活跃时间（用于 defer 判断）
@@ -619,7 +621,13 @@ class APIPool:
         with self._lock:
             for ep in self._endpoints:
                 if ep.id == ep_id:
+                    if not ep.enabled or not ep.in_pool or ep._manual_unlock_required:
+                        return False
+                    # 手动选择明确表示用户希望立即使用该端点；只绕过 defer，
+                    # 不清除 cooldown、配额或余额保护。
+                    ep._defer_until = 0
                     self._manual_override_id = ep_id
+                    self._current_endpoint_id = ep_id
                     return True
         return False
 
@@ -1253,6 +1261,45 @@ class APIPool:
         fb = self._get_fallback_endpoint()
         return [fb] if fb else []
 
+    def _ordered_failover_candidates(self, failed_ep, active, prefer_model=None, exclude=None):
+        """Return available endpoints in ring order, preferring the failed model.
+
+        Ring order is calculated from the complete in-pool priority order instead
+        of the filtered active list, because the failed endpoint is already in
+        cooldown when this function is called.
+        """
+        excluded_ids = {ep.id for ep in (exclude or ())}
+        active_ids = {ep.id for ep in active}
+        pool = sorted(
+            (ep for ep in self._endpoints if ep.enabled and ep.in_pool),
+            key=lambda ep: ep.priority,
+        )
+        if not pool:
+            return []
+        try:
+            failed_index = next(i for i, ep in enumerate(pool) if ep is failed_ep)
+        except StopIteration:
+            failed_index = -1
+        if failed_index >= 0:
+            ring = pool[failed_index + 1:] + pool[:failed_index]
+        else:
+            ring = pool
+
+        candidates = [
+            ep for ep in ring
+            if ep.id in active_ids
+            and ep is not failed_ep
+            and ep.id not in excluded_ids
+            and not self._is_in_cooldown(ep)
+            and not self._is_manually_locked(ep)
+        ]
+        model = prefer_model if prefer_model is not None else getattr(failed_ep, "model", None)
+        if model is None:
+            return candidates
+        return [ep for ep in candidates if ep.model == model] + [
+            ep for ep in candidates if ep.model != model
+        ]
+
     @staticmethod
     def _is_manually_locked(ep):
         return bool(ep._manual_unlock_required)
@@ -1286,14 +1333,12 @@ class APIPool:
             self._set_cooldown(failed_ep)
             sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {failed_ep.cooldown_minutes} 分钟后", "WARN")
         active = self._active_endpoints()
-        if active:
-            for i, ep in enumerate(active):
-                if ep is failed_ep:
-                    next_idx = (i + 1) % len(active)
-                    self._current_endpoint_id = active[next_idx].id
-                    self._manual_override_id = None  # 健康检测自动切换时清除手动覆盖
-                    return
-            self._current_endpoint_id = active[0].id if active else None
+        candidates = self._ordered_failover_candidates(failed_ep, active)
+        if candidates:
+            self._current_endpoint_id = candidates[0].id
+        else:
+            self._current_endpoint_id = None
+        self._manual_override_id = None  # 健康检测自动切换时清除手动覆盖
 
     def _on_success(self, ep, result=None, clear_defer=True):
         now = time.time()
@@ -1317,6 +1362,8 @@ class APIPool:
         if not self._is_in_cooldown(ep):
             self._clear_cooldown(ep)
         self._current_endpoint_id = ep.id
+        if self._persisted_endpoint_id != ep.id and save_runtime_state(ep.id):
+            self._persisted_endpoint_id = ep.id
         if self._manual_override_id and self._manual_override_id != ep.id:
             self._manual_override_id = None  # 手动覆盖端点失败后落到其他端点，清除覆盖
         # 缓存 reasoning_content/reasoning_text 用于多轮对话
@@ -1478,6 +1525,13 @@ class APIPool:
             if override_ep:
                 active.remove(override_ep)
                 active.insert(0, override_ep)
+        elif self._restored_endpoint_id:
+            # 重启恢复只影响首个请求；不写入 manual override，也不改变 priority。
+            restored_ep = next((ep for ep in active if ep.id == self._restored_endpoint_id), None)
+            if restored_ep:
+                active.remove(restored_ep)
+                active.insert(0, restored_ep)
+            self._restored_endpoint_id = None
         idx = 0
         while tried < total:
             ep = active[idx]
@@ -1621,13 +1675,11 @@ class APIPool:
                 if total == 0:
                     break
                 tried = 0  # 轮转后重置尝试计数，用刷新后的 total 重新计算
-                # 按优先级逐个探活下一个候选端点
-                next_ep = None
-                for i, e in enumerate(active):
-                    if e is not ep and not self._is_in_cooldown(e):
-                        next_ep = e
-                        idx = i
-                        break
+                # 从失败端点之后的环形顺序选择候选，同模型优先。
+                candidates = self._ordered_failover_candidates(ep, active)
+                next_ep = candidates[0] if candidates else None
+                if next_ep is not None:
+                    idx = active.index(next_ep)
                 if next_ep is None:
                     for i, e in enumerate(active):
                         if e is ep:
@@ -1650,7 +1702,7 @@ class APIPool:
                         # 下一级探活也失败 → 并发探活剩余所有候选端点。
                         # 用 _check_one_health（含 Attempt 2 重试，最坏 20s）做参考性探测；
                         # 两阶段等待：11s 内返回结果的端点直接按优先级使用，最多等 21s。
-                        remaining = [e for e in active if e is not ep and e is not next_ep and not self._is_in_cooldown(e)]
+                        remaining = [e for e in candidates if e is not next_ep]
                         if remaining:
                             sys_log(f"并发探活剩余 {len(remaining)} 个候选端点...", "INFO")
                             probe_results = {}
@@ -1670,7 +1722,7 @@ class APIPool:
                                             probe_results[_e.id] = _health
                                         except Exception:
                                             probe_results[_e.id] = "bad"
-                                    for _e in sorted(remaining, key=lambda x: x.priority):
+                                    for _e in remaining:
                                         if probe_results.get(_e.id) in ("ok", "slow") and _e is not ep:
                                             chosen = _e
                                             break
@@ -1687,16 +1739,13 @@ class APIPool:
                                                 probe_results[_e.id] = _health
                                             except Exception:
                                                 probe_results[_e.id] = "bad"
-                                    for _e in sorted(remaining, key=lambda x: x.priority):
+                                    for _e in remaining:
                                         if probe_results.get(_e.id) in ("ok", "slow") and _e is not ep:
                                             chosen = _e
                                             break
                             if chosen is not None:
                                 sys_log(f"候选端点 '{chosen.name}' 并发探活通过，准备重试请求", "INFO")
-                                for i, e in enumerate(active):
-                                    if e is chosen:
-                                        idx = i
-                                        break
+                                idx = active.index(chosen)
                                 # 其余探活失败的端点标记短冷却，避免后续轮转再撞上
                                 for e in remaining:
                                     if e is not chosen and probe_results.get(e.id) not in ("ok", "slow") and not self._is_in_cooldown(e):
@@ -1713,12 +1762,12 @@ class APIPool:
                                 total = len(active)
                                 if total == 0:
                                     break
-                                next_ep2 = None
-                                for i, e in enumerate(active):
-                                    if e is not ep and e is not next_ep and not self._is_in_cooldown(e):
-                                        next_ep2 = e
-                                        idx = i
-                                        break
+                                candidates = self._ordered_failover_candidates(
+                                    ep, active, exclude=(next_ep,)
+                                )
+                                next_ep2 = candidates[0] if candidates else None
+                                if next_ep2 is not None:
+                                    idx = active.index(next_ep2)
                                 if next_ep2 is None:
                                     # 没有更多候选了，尝试任何非当前端点
                                     for i, e in enumerate(active):
@@ -1743,36 +1792,64 @@ class APIPool:
             if "temperature" in payload: anthropic_payload["temperature"] = payload["temperature"]
             if "top_p" in payload: anthropic_payload["top_p"] = payload["top_p"]
             if "stream" in payload: anthropic_payload["stream"] = payload["stream"]
+            if "thinking" in payload: anthropic_payload["thinking"] = payload["thinking"]
             sys_prompt = ""
             messages = []
             for m in payload.get("messages", []):
-                if m.get("role") == "system":
-                    sys_prompt += m.get("content", "") + "\n"
-                else:
-                    role = m.get("role")
-                    content = m.get("content")
-                    if isinstance(content, list):
-                        new_content = []
-                        for c in content:
-                            if c.get("type") == "image_url":
-                                url_val = c.get("image_url", {}).get("url", "")
-                                if url_val.startswith("data:image/"):
-                                    try:
-                                        media_type = url_val.split(";")[0].replace("data:", "")
-                                        b64_data = url_val.split(",")[1]
-                                        new_content.append({
-                                            "type": "image",
-                                            "source": {"type": "base64", "media_type": media_type, "data": b64_data}
-                                        })
-                                    except Exception:
-                                        pass
-                                else:
-                                    new_content.append({"type": "text", "text": f"[Image URL: {url_val}]"})
+                role = m.get("role")
+                content = m.get("content")
+                if role == "system":
+                    sys_prompt += content or ""
+                    sys_prompt += "\n"
+                    continue
+                if role == "tool":
+                    tool_result = {
+                        "type": "tool_result",
+                        "tool_use_id": m.get("tool_call_id", ""),
+                        "content": content if content is not None else "",
+                    }
+                    messages.append({"role": "user", "content": [tool_result]})
+                    continue
+                if role == "assistant" and m.get("tool_calls"):
+                    blocks = []
+                    if content:
+                        blocks.append({"type": "text", "text": content})
+                    for tool_call in m.get("tool_calls", []):
+                        function = tool_call.get("function") or {}
+                        try:
+                            tool_input = json.loads(function.get("arguments") or "{}")
+                        except (TypeError, ValueError):
+                            tool_input = {}
+                        blocks.append({
+                            "type": "tool_use",
+                            "id": tool_call.get("id", ""),
+                            "name": function.get("name", ""),
+                            "input": tool_input,
+                        })
+                    messages.append({"role": "assistant", "content": blocks})
+                    continue
+                if isinstance(content, list):
+                    new_content = []
+                    for c in content:
+                        if c.get("type") == "image_url":
+                            url_val = c.get("image_url", {}).get("url", "")
+                            if url_val.startswith("data:image/"):
+                                try:
+                                    media_type = url_val.split(";")[0].replace("data:", "")
+                                    b64_data = url_val.split(",")[1]
+                                    new_content.append({
+                                        "type": "image",
+                                        "source": {"type": "base64", "media_type": media_type, "data": b64_data}
+                                    })
+                                except Exception:
+                                    pass
                             else:
-                                new_content.append(c)
-                        messages.append({"role": role, "content": new_content})
-                    else:
-                        messages.append(m)
+                                new_content.append({"type": "text", "text": f"[Image URL: {url_val}]"})
+                        else:
+                            new_content.append(c)
+                    messages.append({"role": role, "content": new_content})
+                else:
+                    messages.append(m)
             if sys_prompt:
                 anthropic_payload["system"] = sys_prompt.strip()
             anthropic_payload["messages"] = messages
@@ -1870,8 +1947,10 @@ class APIPool:
                         final_cached_tokens = 0
                         has_usage = False
                         final_completion_text = ""
+                        final_reasoning_text = ""
                         anthropic_tool_blocks = {}
                         anthropic_stop_reason = None
+                        anthropic_message_stopped = False
 
                         def finish_chunk(reason):
                             return b"data: " + json.dumps({
@@ -1936,6 +2015,18 @@ class APIPool:
                                                 idx = chunk.get("index", 0)
                                                 if idx in anthropic_tool_blocks:
                                                     anthropic_tool_blocks[idx]["arguments"] += delta.get("partial_json", "")
+                                            elif delta.get("type") == "thinking_delta":
+                                                thinking = delta.get("thinking", "")
+                                                final_reasoning_text += thinking
+                                                if thinking:
+                                                    o_chunk = {
+                                                        "id": stream_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": ep.model,
+                                                        "choices": [{"index": 0, "delta": {"reasoning_content": thinking}}]
+                                                    }
+                                                    yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
                                             else:
                                                 text = delta.get("text", "")
                                                 final_completion_text += text
@@ -1975,6 +2066,7 @@ class APIPool:
                                                 }
                                                 yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
                                         elif ctype == "message_stop":
+                                            anthropic_message_stopped = True
                                             finish_reason = "tool_calls" if anthropic_tool_blocks else {
                                                 "end_turn": "stop",
                                                 "stop_sequence": "stop",
@@ -2031,6 +2123,9 @@ class APIPool:
                                                 has_usage = True
                                         except Exception:
                                             pass
+                            if is_anthropic and not anthropic_message_stopped:
+                                yield from _timeout_abort("Anthropic 流在 message_stop 前提前结束")
+                                return
                         except socket.timeout:
                             yield from _timeout_abort(f"流式响应停滞({stall_timeout}s)")
                             return
@@ -2044,7 +2139,7 @@ class APIPool:
                         finally:
                             if has_usage and log_usage and not ep.name.startswith("test_"):
                                 token_tracker.add_usage(ep.name, ep.model, final_prompt_tokens, final_completion_tokens, final_total_tokens, final_cached_tokens)
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, final_completion_text, final_total_tokens, int((time.time() - req_t0) * 1000))
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, final_completion_text.strip() or final_reasoning_text.strip(), final_total_tokens, int((time.time() - req_t0) * 1000))
                                 ep._today_used += final_total_tokens
                             resp.close()
                     return stream_generator(), ""
@@ -2052,8 +2147,22 @@ class APIPool:
                     body = json.loads(resp.read().decode("utf-8"))
                     if is_anthropic:
                         reply = ""
+                        reasoning = ""
+                        tool_calls = []
                         for c in body.get("content", []):
-                            if c.get("type") == "text": reply += c.get("text") or ""
+                            if c.get("type") == "text":
+                                reply += c.get("text") or ""
+                            elif c.get("type") == "thinking":
+                                reasoning += c.get("thinking") or ""
+                            elif c.get("type") == "tool_use":
+                                tool_calls.append({
+                                    "id": c.get("id", ""),
+                                    "type": "function",
+                                    "function": {
+                                        "name": c.get("name", ""),
+                                        "arguments": json.dumps(c.get("input") or {}, ensure_ascii=False),
+                                    },
+                                })
                         u = body.get("usage", {})
                         prompt_t = 0; cached = 0; tot = 0
                         if u:
@@ -2062,8 +2171,23 @@ class APIPool:
                             cached = u.get("cache_read_input_tokens", 0)
                             if log_usage and not ep.name.startswith("test_"):
                                 token_tracker.add_usage(ep.name, ep.model, prompt_t, u.get("output_tokens", 0), tot, cached)
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, reply.strip(), tot, int((time.time() - req_t0) * 1000))
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, reply.strip() or reasoning.strip(), tot, int((time.time() - req_t0) * 1000))
                                 ep._today_used += tot
+                        stop_reason = body.get("stop_reason")
+                        finish_reason = {
+                            "tool_use": "tool_calls",
+                            "max_tokens": "length",
+                            "end_turn": "stop",
+                            "stop_sequence": "stop",
+                        }.get(stop_reason, "stop")
+                        message = {
+                            "role": "assistant",
+                            "content": reply.strip()
+                        }
+                        if reasoning:
+                            message["reasoning_content"] = reasoning
+                        if tool_calls:
+                            message["tool_calls"] = tool_calls
                         o_body = {
                             "id": f"chatcmpl-{int(time.time())}",
                             "object": "chat.completion",
@@ -2071,11 +2195,8 @@ class APIPool:
                             "model": ep.model,
                             "choices": [{
                                 "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": reply.strip()
-                                },
-                                "finish_reason": "stop"
+                                "message": message,
+                                "finish_reason": finish_reason
                             }],
                             "usage": {
                                 "prompt_tokens": prompt_t,
@@ -2221,6 +2342,38 @@ class APIPool:
             return {"ok": False, "status": "bad", "latency_ms": latency, "reply": "", "error": err}
 
 CONFIG_FILE = "api_config.json"
+RUNTIME_STATE_FILE = "api_runtime_state.json"
+_runtime_state_lock = threading.Lock()
+
+
+def load_runtime_state():
+    try:
+        with open(RUNTIME_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        endpoint_id = data.get("last_success_endpoint_id")
+        return endpoint_id if isinstance(endpoint_id, str) and endpoint_id else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def save_runtime_state(endpoint_id):
+    state = {"last_success_endpoint_id": endpoint_id}
+    tmp_file = f"{RUNTIME_STATE_FILE}.tmp"
+    try:
+        with _runtime_state_lock:
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, RUNTIME_STATE_FILE)
+        return True
+    except OSError as exc:
+        try:
+            os.unlink(tmp_file)
+        except OSError:
+            pass
+        sys_log(f"保存运行态失败，不影响当前请求: {exc}", "WARN")
+        return False
 
 def load_config():
     try:
@@ -2241,6 +2394,19 @@ pool = APIPool()
 for ep_data in load_config():
     if "in_pool" not in ep_data: ep_data["in_pool"] = True
     pool.add_endpoint(ep_data)
+restored_endpoint_id = load_runtime_state()
+restored_endpoint = next(
+    (
+        ep for ep in pool._endpoints
+        if ep.id == restored_endpoint_id and ep.enabled and ep.in_pool
+        and not ep._manual_unlock_required
+    ),
+    None,
+)
+if restored_endpoint is not None:
+    pool._current_endpoint_id = restored_endpoint.id
+    pool._restored_endpoint_id = restored_endpoint.id
+    pool._persisted_endpoint_id = restored_endpoint.id
 
 
 def api_handler(method, path, body):
@@ -2339,6 +2505,8 @@ def api_handler(method, path, body):
     if method == "POST" and cp.startswith("/api/switch-endpoint/"):
         ep_id = unquote(cp.split("/")[-1])
         ok = pool.switch_to_endpoint(ep_id)
+        if ok and save_runtime_state(ep_id):
+            pool._persisted_endpoint_id = ep_id
         return 200, {"ok": ok}, False
     if method == "POST" and cp == "/api/endpoints":
         pool.add_endpoint(body); _sync_to_config(); return 201, {"ok": True}, False

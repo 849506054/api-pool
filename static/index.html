@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>API Pool 2.0</title>
+<title>API Pool 2.0 实验实例</title>
 <style>
 :root{
   --bg:#090a0f;--card:rgba(255,255,255,0.03);--card-hover:rgba(255,255,255,0.06);--border:rgba(255,255,255,0.08);
@@ -575,7 +575,13 @@ let epFilter='all',modelPage=1,PP=50;
 
 async function refresh(){
   const[eps,chain]=await Promise.all([api('GET','/api/endpoints'),api('GET','/api/chain')]);
-  renderStats(eps);renderFilterBar(eps);renderEndpoints(eps);renderPoolList(eps);renderChain(chain);
+  renderStats(eps);renderFilterBar(eps);renderEndpoints(eps);
+  // 优先级下拉框展开/操作期间，避免 5s 自动刷新重建 DOM 导致下拉框收回
+  const active = document.activeElement;
+  if (!(active && active.tagName === 'SELECT' && active.closest('#poolList'))) {
+    renderPoolList(eps);
+  }
+  renderChain(chain);
   alignCards();
 }
 
