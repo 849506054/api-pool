@@ -33,17 +33,17 @@ cd api-pool
 python api_pool_server.py
 ```
 
-访问 http://localhost:5100 打开管理面板。
-API 接口：http://localhost:5100/v1/chat/completions
+访问 http://localhost:5200 打开 API Pool 2.0 管理面板。
+API 接口：http://localhost:5200/v1/chat/completions
 
 ## 部署
 
-生产环境推荐通过 systemd 管理：
+API Pool 2.0 生产环境推荐通过独立的 systemd 单元管理：
 
 ```bash
-cp api-pool.service /etc/systemd/system/
+cp api-pool2.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now api-pool.service
+systemctl enable --now api-pool2.service
 ```
 
 ## 端点配置字段
