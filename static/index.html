@@ -647,6 +647,7 @@ function renderEndpoints(eps){
     if(!ep.enabled)cls+=' disabled';
     if(ep.is_current)cls+=' current';
     if(ep.in_cooldown)cls+=' in-cooldown';
+    if(ep.manual_unlock_required)cls+=' has-error';
     if(ep.in_pool)cls+=' in-pool';
     if(ep.last_error&&!ep.in_cooldown)cls+=' has-error';
     if(ep.daily_limit>0&&ep.today_used>=ep.daily_limit)cls+=' in-cooldown';
@@ -659,7 +660,8 @@ function renderEndpoints(eps){
     if(!ep.enabled)b+='<span class="badge badge-disabled">禁用</span>';
 
       if(ep.is_vision!==false)b+=`<span class=\"badge\" style=\"background:rgba(0,122,255,.15);color:#0a84ff\" title=\"原生支持视觉能力\">👁️视觉</span>`;
-    if(ep.is_rpm_limited)b+=`<span class="badge badge-cooldown" title="每分钟并发已满，限流降级中">🚧限流中</span>`;
+    if(ep.manual_unlock_required)b+=`<span class="badge badge-h-bad" title="余额不足：不会自动探活或恢复，需手动解冻">💳余额不足·手动解冻</span>`;
+    else if(ep.is_rpm_limited)b+=`<span class="badge badge-cooldown" title="每分钟并发已满，限流降级中">🚧限流中</span>`;
     else if(ep.daily_limit>0&&ep.today_used>=ep.daily_limit)b+=`<span class="badge badge-cooldown" title="今日额度已满，挂起至明日">🛑额度耗尽</span>`;
     else if(ep.in_cooldown)b+=`<span class="badge badge-cooldown">⏳${fmtTime(ep.cooldown_remaining)}</span>`;
     if(ep.is_deferred)b+=`<span class="badge badge-deferred" title="已恢复但为保持当前端点 cache 延迟切换，剩余 ${fmtTime(ep.defer_remaining)}">⏸延迟切换 ${fmtTime(ep.defer_remaining)}</span>`;
@@ -675,7 +677,7 @@ function renderEndpoints(eps){
         <div class="ep-name"><span style="word-break: break-all;">${esc(ep.name)}</span> ${b}</div>
         <div class="ep-actions">
           <button class="btn btn-ghost btn-sm" title="连通性测试" onclick="openTestDrawer('${ep.id}', '${esc(ep.name)} (${esc(ep.model)})')">🧪</button>
-          ${ep.in_cooldown?`<button class="btn btn-yellow btn-sm" title="立刻解除冷却" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
+          ${(ep.in_cooldown||ep.manual_unlock_required)?`<button class="btn btn-yellow btn-sm" title="${ep.manual_unlock_required?'手动解冻余额不足端点':'立刻解除冷却'}" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
           <button class="btn btn-ghost btn-sm" title="${ep.enabled?'禁用端点':'启用端点'}" onclick="toggleEndpoint('${ep.id}')">${ep.enabled?'⏸':'▶'}</button>
           ${!ep.in_pool?'<button class="btn btn-ghost btn-sm" title="加入聚合池" onclick="addToPool(\''+ep.id+'\')">📥</button>':''}
           ${ep.enabled && ep.in_pool && !ep.is_current?'<button class="btn btn-ghost btn-sm" title="切换为当前端点" onclick="switchEndpoint(\''+ep.id+'\')">⚡</button>':''}
@@ -686,6 +688,7 @@ function renderEndpoints(eps){
       <div class="ep-meta">
         <span title="绑定的模型名称">🤖${esc(ep.model)}</span><span title="单次请求超时时间">⏱${ep.timeout}s</span><span title="失败后最大重试次数">🔁${ep.max_retries}次</span><span title="请求失败后的冷却惩罚时间">❄️${ep.cooldown_minutes}分</span>${ep.max_context_k>0?`<span title="最大上下文长度限制">📏${ep.max_context_k}K</span>`:''}<span title="累计成功响应次数">📞${ep.total_calls}次</span><span title="最后一次成功响应时间">🕐${last}</span>
       </div>
+      ${ep.manual_unlock_required?`<div class="ep-error">💳 余额不足：已冻结，仅支持手动解冻</div>`:''}
       ${ep.last_error?`<div class="ep-error">⚠ ${esc(ep.last_error)}</div>`:''}
     </div>`;
   }).join('');
@@ -704,6 +707,7 @@ function renderPoolList(eps){
     if(!ep.enabled)cls+=' disabled';
     if(ep.is_current)cls+=' current';
     if(ep.in_cooldown)cls+=' in-cooldown';
+    if(ep.manual_unlock_required)cls+=' has-error';
     if(ep.in_pool)cls+=' in-pool';
     let h=ep.health,lat=ep.health_latency_ms;
     let rh='';
@@ -728,7 +732,7 @@ function renderPoolList(eps){
           +rh
           +(ep.is_current?'<span class="badge badge-current" style="font-size:10px;padding:1px 6px">● 当前</span>':'')
           +(ep.in_cooldown?'<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px">⏳'+fmtTime(ep.cooldown_remaining)+'</span>':'')
-          +(ep.in_cooldown?'<button class="btn btn-yellow btn-sm" style="padding:2px 5px;font-size:11px" title="解除冷却" onclick="clearCooldown(\''+ep.id+'\')">⏰</button>':'')
+          +((ep.in_cooldown||ep.manual_unlock_required)?'<button class="btn btn-yellow btn-sm" style="padding:2px 5px;font-size:11px" title="'+(ep.manual_unlock_required?'手动解冻余额不足端点':'解除冷却')+'" onclick="clearCooldown(\''+ep.id+'\')">⏰</button>':'')
         +'</div>'
       +'</div>'
       +'<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">'
@@ -751,10 +755,11 @@ function renderChain(chain){
   if(!chain.length){el.innerHTML='<div class="empty">没有启用的端点</div>';return;}
   el.innerHTML=chain.map((it,i)=>{
     let cls='chain-item';
-    if(it.in_cooldown)cls+=' cooldown';
+    if(it.manual_unlock_required)cls+=' failed';
+    else if(it.in_cooldown)cls+=' cooldown';
     else if(it.is_current)cls+=' active';
     else if(it.health==='bad'||it.fail_count>0)cls+=' failed';
-    const st=it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(it.is_current?'<span class="badge badge-success">服务中</span>':'');
+    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">💳余额不足·手动解冻</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(it.is_current?'<span class="badge badge-success">服务中</span>':''));
     const h=it.health, lat=it.health_latency_ms;
     let rh='';
     if(h==='ok')rh=`<div class="chain-health" style="color:var(--green)">✓${lat>=0?' '+lat+'ms':''}</div>`;

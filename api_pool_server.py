@@ -19,8 +19,10 @@ import threading
 import sqlite3
 import socket
 import itertools
+import re
 import urllib.request
 import urllib.error
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass, field
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote
@@ -404,6 +406,38 @@ def _get_resp_socket(resp):
         return None
 
 
+def _anthropic_tools_from_chat(tools):
+    """将 OpenAI 格式的 tools 转换为 Anthropic 格式。"""
+    if not isinstance(tools, list):
+        return []
+    anthropic_tools = []
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        fn = tool.get("function") or {}
+        anthropic_tools.append({
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters") or {"type": "object", "properties": {}}
+        })
+    return anthropic_tools
+
+
+def _anthropic_tool_choice_from_chat(tool_choice):
+    """将 OpenAI 格式的 tool_choice 转换为 Anthropic 格式。"""
+    if isinstance(tool_choice, str):
+        if tool_choice in ("required", "any"):
+            return {"type": "any"}
+        return {"type": tool_choice if tool_choice in ("auto", "none") else "auto"}
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        fn = tool_choice.get("function") or {}
+        name = fn.get("name") or tool_choice.get("name")
+        if name:
+            return {"type": "tool", "name": name}
+    return None
+
+
+
 @dataclass
 class Endpoint:
     id: str = ""
@@ -441,6 +475,8 @@ class Endpoint:
     _total_calls: int = field(default=0, repr=False)
     _total_failures: int = field(default=0, repr=False)
     _cooldown_until: float = field(default=0, repr=False)
+    _cooldown_reason: str = field(default="", repr=False)
+    _manual_unlock_required: bool = field(default=False, repr=False)
     _defer_until: float = field(default=0, repr=False)  # 延迟切换到期时间，在此期间不切回此端点
     
     _today_used: int = field(default=0, repr=False)
@@ -468,7 +504,7 @@ class AllEndpointsFailed(Exception):
 
 class APIPool:
     def __init__(self, endpoints=None):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._endpoints: list[Endpoint] = []
         self._current_endpoint_id = None  # 用端点ID追踪当前端点，而非位置索引
         self._manual_override_id = None  # 用户手动指定端点的ID，优先级覆盖路由选择
@@ -478,22 +514,26 @@ class APIPool:
         self._fallback_lock_until: float = 0  # 终极兜底锁定截止时间（滑动窗口 300s）
         # 后台探活基础设施：冷却过期端点在后台线程探活，不阻塞请求路径
         self._probe_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="apipool-probe")
-        self._probe_inflight = set()  # 正在后台探活的端点 id 集合（防重复入队）
+        self._probe_inflight = set()  # 正在探活的端点 id 集合（后台/批量探活共享，防重复请求）
+        self._health_check_lock = threading.Lock()  # 防止多个全量探活批次重叠
+        self._health_probe_max_workers = 2  # chat/models 探针会消耗上游并发与额度
         if endpoints:
             for ep in endpoints:
                 self.add_endpoint(ep)
 
     def add_endpoint(self, ep):
         if isinstance(ep, dict):
-            ep_dict = {k: v for k, v in ep.items() if k in Endpoint.__dataclass_fields__}
-            if ep.get("user_agent") and "default_headers" not in ep_dict:
-                ep_dict["default_headers"] = {"User-Agent": ep["user_agent"]}
+            raw_ep = ep
+            ep_dict = {k: v for k, v in raw_ep.items() if k in Endpoint.__dataclass_fields__}
+            if raw_ep.get("user_agent") and "default_headers" not in ep_dict:
+                ep_dict["default_headers"] = {"User-Agent": raw_ep["user_agent"]}
             # 新增时按组别自动设置健康检测模式（未显式指定时生效）
             if "health_mode" not in ep_dict:
                 ep_dict["health_mode"] = "models" if ep_dict.get("billing_mode", "subscription") == "pay_per_use" else ("chat" if ep_dict.get("in_pool", False) else "models")
             if "billing_mode" not in ep_dict:
                 ep_dict["billing_mode"] = "subscription"
             ep = Endpoint(**ep_dict)
+            ep._manual_unlock_required = bool(raw_ep.get("manual_unlock_required", False))
         elif not ep.health_mode:
             ep.health_mode = "models" if ep.billing_mode == "pay_per_use" else ("chat" if ep.in_pool else "models")
         if not ep.id:
@@ -628,6 +668,8 @@ class APIPool:
             "in_cooldown": ep._cooldown_until > now,
             "cooldown_remaining": max(0, int(ep._cooldown_until - now)),
             "cooldown_until": ep._cooldown_until,
+            "cooldown_reason": ep._cooldown_reason,
+            "manual_unlock_required": ep._manual_unlock_required,
             "deferrable": ep.deferrable,
             "is_deferred": ep._defer_until > now,
             "defer_remaining": max(0, int(ep._defer_until - now)),
@@ -656,6 +698,8 @@ class APIPool:
                     "fail_count": ep._fail_count,
                     "in_cooldown": ep._cooldown_until > now,
                     "cooldown_remaining": max(0, int(ep._cooldown_until - now)),
+                    "cooldown_reason": ep._cooldown_reason,
+                    "manual_unlock_required": ep._manual_unlock_required,
                     "deferrable": ep.deferrable,
                     "is_deferred": ep._defer_until > now,
                     "defer_remaining": max(0, int(ep._defer_until - now)),
@@ -681,6 +725,8 @@ class APIPool:
                 ep._last_error = ""
                 ep._last_error_ts = 0
                 ep._cooldown_until = 0
+                ep._cooldown_reason = ""
+                ep._manual_unlock_required = False
                 ep._defer_until = 0
                 with ep._rpm_lock:
                     ep._req_timestamps.clear()
@@ -690,6 +736,7 @@ class APIPool:
     def reset_to_priority_mode(self):
         with self._lock:
             active = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
+                      and not ep._manual_unlock_required
                       and not self._is_in_cooldown(ep)
                       and not self._is_quota_exceeded(ep)
                       and not self._is_rpm_limited(ep)]
@@ -800,9 +847,17 @@ class APIPool:
                 sys_log(f"图片解析失败 ({v_ep.name} - {v_ep.model}): {error}", "WARNING")
                 continue
                 
-            description = result if isinstance(result, str) else result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if isinstance(result, str):
+                description = result
+                result_message = {}
+            elif isinstance(result, dict):
+                result_message = (result.get("choices") or [{}])[0].get("message") or {}
+                description = result_message.get("content") or ""
+            else:
+                result_message = {}
+                description = ""
             if not description.strip():
-                reasoning = result.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
+                reasoning = result_message.get("reasoning_content") or ""
                 if reasoning:
                     description = reasoning
             if description:
@@ -830,33 +885,91 @@ class APIPool:
         return new_msgs
 
     def check_all_health(self):
-        with self._lock:
-            endpoints = [ep for ep in self._endpoints if ep.enabled and ep.in_pool]
-            for ep in endpoints:
-                ep._health = "testing"
-        if not endpoints:
-            return []
-        results = []
-        with ThreadPoolExecutor(max_workers=min(len(endpoints), 10)) as pool_exec:
-            futures = {pool_exec.submit(self._check_one_health, ep): ep for ep in endpoints}
-            for future in as_completed(futures):
-                try:
-                    results.append(future.result())
-                except Exception as e:
+        """探活全部池内端点；批次互斥且与后台探活共享端点级去重。"""
+        # 不允许多个 HTTP 入口同时创建探活批次；第二个调用复用当前状态。
+        if not self._health_check_lock.acquire(blocking=False):
+            with self._lock:
+                endpoints = [ep for ep in self._endpoints if ep.enabled and ep.in_pool]
+                return [
+                    {
+                        "id": ep.id,
+                        "health": ep._health,
+                        "latency_ms": ep._health_latency_ms,
+                        "error": ep._health_error or "健康检测进行中",
+                    }
+                    for ep in endpoints
+                ]
+
+        claimed_ids = set()
+        try:
+            with self._lock:
+                endpoints = [ep for ep in self._endpoints if ep.enabled and ep.in_pool]
+                for ep in endpoints:
+                    if ep._manual_unlock_required or ep.id in self._probe_inflight:
+                        continue
+                    self._probe_inflight.add(ep.id)
+                    claimed_ids.add(ep.id)
+                    ep._health = "testing"
+            if not endpoints:
+                return []
+
+            results = []
+            claimed = [ep for ep in endpoints if ep.id in claimed_ids]
+            if not claimed:
+                return [
+                    {
+                        "id": ep.id,
+                        "health": ep._health,
+                        "latency_ms": ep._health_latency_ms,
+                        "error": ep._health_error or "健康检测进行中",
+                    }
+                    for ep in endpoints
+                ]
+            with ThreadPoolExecutor(max_workers=min(len(claimed), self._health_probe_max_workers)) as pool_exec:
+                futures = {pool_exec.submit(self._check_one_health, ep): ep for ep in claimed}
+                for future in as_completed(futures):
                     ep = futures[future]
-                    results.append((ep.id, "bad", -1, str(e)))
-        now = time.time()
-        with self._lock:
-            id_map = {ep.id: ep for ep in self._endpoints}
-            for ep_id, health, latency, error in results:
-                ep = id_map.get(ep_id)
-                if ep:
-                    ep._health = health
-                    ep._health_latency_ms = latency
-                    ep._health_last_check = now
-                    ep._health_error = error
-        sys_log(f"健康检测完成: 检测了 {len(endpoints)} 个端点", "INFO")
-        return [{"id": i, "health": h, "latency_ms": l, "error": e} for i, h, l, e in results]
+                    try:
+                        results.append(future.result())
+                    except Exception as e:
+                        results.append((ep.id, "bad", -1, str(e)[:100]))
+
+            now = time.time()
+            with self._lock:
+                id_map = {ep.id: ep for ep in self._endpoints}
+                for ep_id, health, latency, error in results:
+                    ep = id_map.get(ep_id)
+                    if ep:
+                        ep._health = health
+                        ep._health_latency_ms = latency
+                        ep._health_last_check = now
+                        ep._health_error = error
+                result_map = {
+                    ep_id: {"id": ep_id, "health": health, "latency_ms": latency, "error": error}
+                    for ep_id, health, latency, error in results
+                }
+                response = [
+                    result_map.get(
+                        ep.id,
+                        {
+                            "id": ep.id,
+                            "health": ep._health,
+                            "latency_ms": ep._health_latency_ms,
+                            "error": (
+                                "余额不足，仅支持手动解冻"
+                                if ep._manual_unlock_required
+                                else ep._health_error or "健康检测进行中"
+                            ),
+                        },
+                    )
+                    for ep in endpoints
+                ]
+            sys_log(f"健康检测完成: 检测了 {len(results)} 个端点", "INFO")
+            return response
+        finally:
+            with self._lock:
+                self._probe_inflight.difference_update(claimed_ids)
+            self._health_check_lock.release()
 
     def _is_in_cooldown(self, ep):
         return ep._cooldown_until > time.time()
@@ -870,7 +983,7 @@ class APIPool:
     def _get_fallback_endpoint(self):
         """返回优先级 99 的终极兜底端点（启用、在池、未冷却）。"""
         for ep in self._endpoints:
-            if (ep.enabled and ep.in_pool and ep.priority == 99
+            if (ep.enabled and ep.in_pool and not ep._manual_unlock_required and ep.priority == 99
                     and not self._is_in_cooldown(ep) and not self._is_quota_exceeded(ep)):
                 return ep
         return None
@@ -897,6 +1010,91 @@ class APIPool:
     def _is_deferred(self, ep):
         return ep._defer_until > time.time()
 
+    @staticmethod
+    def _classify_capacity_error(error_msg):
+        text = str(error_msg or "").lower()
+        balance_markers = (
+            "余额不足", "余额已用尽", "余额耗尽", "insufficient balance",
+            "insufficient funds", "no remaining balance", "credit balance exhausted",
+            "payment required", "账户余额不足",
+        )
+        if any(marker in text for marker in balance_markers):
+            return "balance_insufficient"
+
+        quota_markers = (
+            "配额不足", "配额已用尽", "配额耗尽", "quota exceeded", "quota exhausted",
+            "insufficient quota", "usage limit exceeded", "usage limit reached",
+            "daily limit exceeded", "daily limit reached", "monthly limit exceeded",
+            "monthly limit reached", "token quota exceeded", "请求配额已用尽",
+        )
+        if any(marker in text for marker in quota_markers):
+            return "quota_exceeded"
+        return ""
+
+    @staticmethod
+    def _parse_quota_cooldown_seconds(error_msg, now=None):
+        text = str(error_msg or "")
+        lower = text.lower()
+        now = time.time() if now is None else now
+
+        patterns = (
+            (r"retry[- ]after\s*[:=]?\s*(\d+(?:\.\d+)?)\s*(seconds?|secs?|s)\b", 1),
+            (r"(?:retry|try again|reset(?:s)?)(?:\s+after|\s+in)?\s*[:=]?\s*(\d+(?:\.\d+)?)\s*(minutes?|mins?|m)\b", 60),
+            (r"(?:retry|try again|reset(?:s)?)(?:\s+after|\s+in)?\s*[:=]?\s*(\d+(?:\.\d+)?)\s*(hours?|hrs?|h)\b", 3600),
+            (r"retry[- ]after\s*[:=]?\s*(\d+(?:\.\d+)?)\b", 1),
+            (r"(\d+(?:\.\d+)?)\s*(?:秒|秒钟)后", 1),
+            (r"(\d+(?:\.\d+)?)\s*分钟后", 60),
+            (r"(\d+(?:\.\d+)?)\s*小时后", 3600),
+        )
+        for pattern, multiplier in patterns:
+            match = re.search(pattern, lower)
+            if match:
+                return max(1, int(float(match.group(1)) * multiplier))
+
+        epoch_match = re.search(r"(?:reset(?:_at)?|重置时间)\s*[:=]?\s*(\d{10}(?:\.\d+)?)", lower)
+        if epoch_match:
+            return max(1, int(float(epoch_match.group(1)) - now))
+
+        iso_match = re.search(
+            r"(?:reset(?:s)?(?:\s+at)?|重置时间)\s*[:=]?\s*"
+            r"(\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2}))",
+            lower,
+        )
+        if iso_match:
+            try:
+                reset_at = datetime.fromisoformat(iso_match.group(1).replace("z", "+00:00"))
+                return max(1, int(reset_at.timestamp() - now))
+            except ValueError:
+                pass
+
+        retry_after_date = re.search(r"retry[- ]after\s*:\s*([^;]+(?:gmt|utc))", lower)
+        if retry_after_date:
+            try:
+                reset_at = parsedate_to_datetime(retry_after_date.group(1))
+                return max(1, int(reset_at.timestamp() - now))
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    def _set_capacity_cooldown(self, ep, error_msg):
+        kind = self._classify_capacity_error(error_msg)
+        if kind == "balance_insufficient":
+            ep._manual_unlock_required = True
+            ep._cooldown_until = 0
+            ep._cooldown_reason = kind
+            ep._health = "bad"
+            ep._health_error = "余额不足，仅支持手动解冻"
+            return kind, None
+        if kind == "quota_exceeded":
+            seconds = self._parse_quota_cooldown_seconds(error_msg)
+            if seconds is None:
+                seconds = 5 * 60 * 60
+            ep._manual_unlock_required = False
+            ep._cooldown_until = time.time() + seconds
+            ep._cooldown_reason = kind
+            return kind, seconds
+        return "", None
+
     def _set_cooldown(self, ep):
         # 幂等：已在冷却中不刷新冻结时间（并发请求的失败是同一故障的重复观测，
         # 不延长冷却窗口；fail_count 仍由调用方累加）。窗口过期后的新失败自然触发新冻结。
@@ -918,6 +1116,8 @@ class APIPool:
                     ep._fail_count = 0
                     ep._last_error = ""
                     ep._last_error_ts = 0
+                    ep._cooldown_reason = ""
+                    ep._manual_unlock_required = False
                     ep._health = "ok"
                     ep._transient_count = 0
                     ep._transient_window_start = 0
@@ -935,7 +1135,8 @@ class APIPool:
         expired = []
         with self._lock:
             for ep in self._endpoints:
-                if ep.in_pool and ep._cooldown_until > 0 and ep._cooldown_until <= now:
+                if (ep.in_pool and not ep._manual_unlock_required
+                        and ep._cooldown_until > 0 and ep._cooldown_until <= now):
                     expired.append(ep)
 
         for ep in expired:
@@ -958,13 +1159,15 @@ class APIPool:
     def _background_probe(self, ep, probe_current_id):
         """后台探活单个端点：通过→清冷却+defer判断+更新current指针；失败→继续冷却。"""
         try:
-            if self._probe_endpoint(ep):
+            probe_ok, probe_error = self._probe_endpoint(ep)
+            if probe_ok:
                 now = time.time()
                 with self._lock:
                     ep._fail_count = 0
                     ep._last_error = ""
                     ep._last_error_ts = 0
                     ep._cooldown_until = 0
+                    ep._cooldown_reason = ""
                     ep._health = "ok"
                     ep._transient_count = 0
                     ep._transient_window_start = 0
@@ -990,8 +1193,16 @@ class APIPool:
                             self._current_endpoint_id = best.id
             else:
                 with self._lock:
-                    self._set_cooldown(ep)
-                sys_log(f"端点 '{ep.name}' 冷却过期探活未通过，继续冷却 {ep.cooldown_minutes} 分钟", "WARN")
+                    capacity_kind, capacity_seconds = self._set_capacity_cooldown(ep, probe_error or "探活失败")
+                if capacity_kind == "balance_insufficient":
+                    sys_log(f"端点 '{ep.name}' 后台探活发现余额不足，已冻结，仅支持手动解冻", "WARN")
+                elif capacity_kind == "quota_exceeded":
+                    detail = f"{capacity_seconds} 秒" if capacity_seconds is not None else "默认 5 小时"
+                    sys_log(f"端点 '{ep.name}' 后台探活发现配额不足，冻结 {detail}", "WARN")
+                else:
+                    with self._lock:
+                        self._set_cooldown(ep)
+                sys_log(f"端点 '{ep.name}' 冷却过期探活未通过，继续冷却", "WARN")
         except Exception as e:
             sys_log(f"端点 '{ep.name}' 后台探活异常: {e}", "ERROR")
         finally:
@@ -1029,13 +1240,22 @@ class APIPool:
                     sys_log(f"端点 '{ep.name}' 延迟切换解除（池空闲）", "INFO")
 
     def _active_endpoints(self):
-        available = [ep for ep in self._endpoints if ep.enabled and ep.in_pool and not self._is_in_cooldown(ep) and not self._is_quota_exceeded(ep) and not self._is_rpm_limited(ep) and not self._is_deferred(ep)]
+        available = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
+                     and not ep._manual_unlock_required
+                     and not self._is_in_cooldown(ep)
+                     and not self._is_quota_exceeded(ep)
+                     and not self._is_rpm_limited(ep)
+                     and not self._is_deferred(ep)]
         if available:
             return available
         # 最后手段：全池无可用 → 返回优先级 99 终极兜底端点（若有）；否则空列表 → AllEndpointsFailed → Hermes fallback。
         # 不再返回冷却中的端点去试错（避免轮转超时 + Hermes 600s 叠加）。
         fb = self._get_fallback_endpoint()
         return [fb] if fb else []
+
+    @staticmethod
+    def _is_manually_locked(ep):
+        return bool(ep._manual_unlock_required)
 
     def _pick_best(self, active):
         for ep in active:
@@ -1048,7 +1268,13 @@ class APIPool:
         failed_ep._total_failures += 1
         failed_ep._last_error = error_msg
         failed_ep._last_error_ts = time.time()
-        if probe_failed:
+        capacity_kind, capacity_seconds = self._set_capacity_cooldown(failed_ep, error_msg)
+        if capacity_kind == "balance_insufficient":
+            sys_log(f"端点 '{failed_ep.name}' 余额不足，已冻结，仅支持手动解冻", "WARN")
+        elif capacity_kind == "quota_exceeded":
+            detail = f"{capacity_seconds} 秒" if capacity_seconds is not None else "默认 5 小时"
+            sys_log(f"端点 '{failed_ep.name}' 配额不足，冻结 {detail}", "WARN")
+        elif probe_failed:
             # 探活失败：只设短冷却（30秒），避免误杀冷启动端点
             failed_ep._cooldown_until = time.time() + 30
             sys_log(f"端点 '{failed_ep.name}' 探活失败，短冷却 30 秒", "WARN")
@@ -1084,6 +1310,9 @@ class APIPool:
         ep._transient_count = 0
         ep._transient_window_start = 0
         ep._last_error = ""
+        ep._health_error = ""
+        if not ep._manual_unlock_required:
+            ep._cooldown_reason = ""
         # 仅在非冷却中清除冷却，防止并发请求穿透冷却保护（429→冷却→并发成功→清冷却→再429）
         if not self._is_in_cooldown(ep):
             self._clear_cooldown(ep)
@@ -1171,13 +1400,29 @@ class APIPool:
 
     def _probe_endpoint(self, ep):
         """对单个端点做快速探活，成功返回 True，失败返回 False。统一用 chat ping 检测。"""
+        started = time.time()
         if ep.health_mode == "none":
-            return True  # 关闭检测视为可用
+            with self._lock:
+                ep._health = "unknown"
+                ep._health_latency_ms = 0
+                ep._health_last_check = started
+                ep._health_error = "已禁用健康检测"
+            return True, ""  # 关闭检测视为可用
         # 统一使用 chat ping 探活：models 接口可访问不代表模型可响应
-        ep._health_last_check = time.time()
+        with self._lock:
+            ep._health = "testing"
+            ep._health_last_check = started
+            ep._health_error = ""
         payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3, "stream": False}
         reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True, is_probe=True)
-        return reply is not None
+        latency = int((time.time() - started) * 1000)
+        success = reply is not None
+        with self._lock:
+            ep._health = "ok" if success and latency <= LATENCY_OK_MAX else ("slow" if success else "bad")
+            ep._health_latency_ms = latency
+            ep._health_last_check = time.time()
+            ep._health_error = "" if success else (str(err)[:100] if err else "未知错误")
+        return success, err
 
     def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False):
         self._cleanup_expired_cooldowns()
@@ -1259,7 +1504,7 @@ class APIPool:
             # 竞态保护：defer 设置前已进入的请求（快照=0）成功后不清 defer。
             defer_at_request = ep._defer_until
             ep_timeout = timeout or ep.timeout
-            ep_model = model or ep.model
+            ep_model = ep.model
             
             # 按目标端点隔离 DeepSeek 专属 reasoning 字段；每次轮转都
             # 从同一份 Hermes 历史构造独立消息，避免污染后续端点。
@@ -1395,12 +1640,13 @@ class APIPool:
                         continue
                     # 对候选端点做探活
                     sys_log(f"对候选端点 '{next_ep.name}' 进行探活...", "INFO")
-                    if self._probe_endpoint(next_ep):
+                    probe_ok, probe_error = self._probe_endpoint(next_ep)
+                    if probe_ok:
                         sys_log(f"候选端点 '{next_ep.name}' 探活通过，准备重试请求", "INFO")
                         continue  # 探活通过，回到循环顶部用 next_ep 发起实际请求
                     else:
                         sys_log(f"候选端点 '{next_ep.name}' 探活失败，跳过", "WARN")
-                        self._rotate(next_ep, "探活失败", probe_failed=True)
+                        self._rotate(next_ep, probe_error or "探活失败", probe_failed=True)
                         # 下一级探活也失败 → 并发探活剩余所有候选端点。
                         # 用 _check_one_health（含 Attempt 2 重试，最坏 20s）做参考性探测；
                         # 两阶段等待：11s 内返回结果的端点直接按优先级使用，最多等 21s。
@@ -1530,6 +1776,20 @@ class APIPool:
             if sys_prompt:
                 anthropic_payload["system"] = sys_prompt.strip()
             anthropic_payload["messages"] = messages
+            # tools 转换：OpenAI → Anthropic 格式
+            anthropic_tools = _anthropic_tools_from_chat(payload.get("tools"))
+            if anthropic_tools:
+                anthropic_payload["tools"] = anthropic_tools
+                tool_choice = _anthropic_tool_choice_from_chat(payload.get("tool_choice"))
+                if tool_choice:
+                    anthropic_payload["tool_choice"] = tool_choice
+            # stop_sequences 转换
+            if "stop" in payload:
+                stop = payload["stop"]
+                anthropic_payload["stop_sequences"] = stop if isinstance(stop, list) else [stop]
+            # user metadata
+            if "user" in payload:
+                anthropic_payload["metadata"] = {"user_id": str(payload["user"])}
             data = json.dumps(anthropic_payload).encode("utf-8")
         else:
             url = ep.base_url.rstrip("/") + "/chat/completions"
@@ -1610,10 +1870,7 @@ class APIPool:
                         final_cached_tokens = 0
                         has_usage = False
                         final_completion_text = ""
-                        tool_calls_state = {}
                         anthropic_tool_blocks = {}
-                        responses_tool_states = {}
-                        done_sent = False
                         anthropic_stop_reason = None
 
                         def finish_chunk(reason):
@@ -1664,16 +1921,57 @@ class APIPool:
                                     try:
                                         chunk = json.loads(line[6:].decode("utf-8"))
                                         ctype = chunk.get("type")
-                                        if ctype == "content_block_delta":
-                                            text = chunk.get("delta", {}).get("text", "")
-                                            final_completion_text += text
-                                            if text:
+                                        if ctype == "content_block_start":
+                                            block = chunk.get("content_block", {})
+                                            if block.get("type") == "tool_use":
+                                                idx = chunk.get("index", len(anthropic_tool_blocks))
+                                                anthropic_tool_blocks[idx] = {
+                                                    "id": block.get("id", ""),
+                                                    "name": block.get("name", ""),
+                                                    "arguments": ""
+                                                }
+                                        elif ctype == "content_block_delta":
+                                            delta = chunk.get("delta", {})
+                                            if delta.get("type") == "input_json_delta":
+                                                idx = chunk.get("index", 0)
+                                                if idx in anthropic_tool_blocks:
+                                                    anthropic_tool_blocks[idx]["arguments"] += delta.get("partial_json", "")
+                                            else:
+                                                text = delta.get("text", "")
+                                                final_completion_text += text
+                                                if text:
+                                                    o_chunk = {
+                                                        "id": stream_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": ep.model,
+                                                        "choices": [{"index": 0, "delta": {"content": text}}]
+                                                    }
+                                                    yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
+                                        elif ctype == "content_block_stop":
+                                            idx = chunk.get("index", 0)
+                                            block = anthropic_tool_blocks.get(idx)
+                                            if block:
                                                 o_chunk = {
                                                     "id": stream_id,
                                                     "object": "chat.completion.chunk",
                                                     "created": int(time.time()),
                                                     "model": ep.model,
-                                                    "choices": [{"index": 0, "delta": {"content": text}}]
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {
+                                                            "tool_calls": [{
+                                                                "index": idx,
+                                                                "id": block["id"],
+                                                                "type": "function",
+                                                                "function": {
+                                                                    "name": block["name"],
+                                                                    "arguments": block["arguments"]
+                                                                }
+                                                            }]
+                                                        },
+                                                        "finish_reason": "tool_calls"
+                                                    }]
                                                 }
                                                 yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
                                         elif ctype == "message_stop":
@@ -1698,7 +1996,6 @@ class APIPool:
                                             }
                                             yield b"data: " + json.dumps(usage_chunk).encode("utf-8") + b"\n\n"
                                             yield b"data: [DONE]\n\n"
-                                            done_sent = True
                                         elif ctype == "message_delta" and "usage" in chunk:
                                             u = chunk["usage"]
                                             final_completion_tokens += u.get("output_tokens", 0)
@@ -1715,153 +2012,15 @@ class APIPool:
                                             has_usage = True
                                     except Exception:
                                         pass
-                                elif is_responses:
-                                    if not line.strip() or not line.startswith(b"data: "):
-                                        continue
-                                    payload_line = line[6:].strip()
-                                    if payload_line == b"[DONE]":
-                                        continue
-                                    try:
-                                        evt = json.loads(payload_line.decode("utf-8"))
-                                    except Exception:
-                                        continue
-                                    etype = evt.get("type")
-                                    if etype == "response.output_text.delta":
-                                        text = evt.get("delta", "")
-                                        final_completion_text += text
-                                        if text:
-                                            o_chunk = {
-                                                "id": stream_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": ep.model,
-                                                "choices": [{"index": 0, "delta": {"content": text}}]
-                                            }
-                                            yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
-                                    elif etype == "response.output_item.added":
-                                        item = evt.get("item") or {}
-                                        if item.get("type") == "function_call":
-                                            idx = evt.get("output_index", len(responses_tool_states))
-                                            responses_tool_states[idx] = {
-                                                "id": item.get("call_id", ""),
-                                                "name": item.get("name", ""),
-                                                "arguments": item.get("arguments", "") or "",
-                                                "emitted": False
-                                            }
-                                    elif etype == "response.function_call_arguments.delta":
-                                        idx = evt.get("output_index", len(responses_tool_states))
-                                        state = responses_tool_states.setdefault(idx, {
-                                            "id": "", "name": "", "arguments": "", "emitted": False
-                                        })
-                                        state["arguments"] += evt.get("delta", "")
-                                    elif etype == "response.function_call_arguments.done":
-                                        idx = evt.get("output_index", len(responses_tool_states))
-                                        state = responses_tool_states.setdefault(idx, {
-                                            "id": "", "name": "", "arguments": "", "emitted": False
-                                        })
-                                        state["id"] = evt.get("call_id", state["id"])
-                                        state["name"] = evt.get("name", state["name"])
-                                        state["arguments"] = evt.get("arguments", state["arguments"])
-                                        if not state["emitted"]:
-                                            state["emitted"] = True
-                                            o_chunk = {
-                                                "id": stream_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": ep.model,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {
-                                                        "tool_calls": [{
-                                                            "index": idx,
-                                                            "id": state["id"],
-                                                            "type": "function",
-                                                            "function": {
-                                                                "name": state["name"],
-                                                                "arguments": state["arguments"]
-                                                            }
-                                                        }]
-                                                    },
-                                                    "finish_reason": "tool_calls"
-                                                }]
-                                            }
-                                            yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
-                                    elif etype == "response.output_item.done":
-                                        item = evt.get("item") or {}
-                                        if item.get("type") == "function_call":
-                                            idx = evt.get("output_index", len(responses_tool_states))
-                                            state = responses_tool_states.setdefault(idx, {
-                                                "id": "", "name": "", "arguments": "", "emitted": False
-                                            })
-                                            state["id"] = item.get("call_id", state["id"])
-                                            state["name"] = item.get("name", state["name"])
-                                            state["arguments"] = item.get("arguments", state["arguments"])
-                                            if not state["emitted"]:
-                                                state["emitted"] = True
-                                                o_chunk = {
-                                                    "id": stream_id,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": int(time.time()),
-                                                    "model": ep.model,
-                                                    "choices": [{
-                                                        "index": 0,
-                                                        "delta": {
-                                                            "tool_calls": [{
-                                                                "index": idx,
-                                                                "id": state["id"],
-                                                                "type": "function",
-                                                                "function": {
-                                                                    "name": state["name"],
-                                                                    "arguments": state["arguments"]
-                                                                }
-                                                            }]
-                                                        },
-                                                        "finish_reason": "tool_calls"
-                                                    }]
-                                                }
-                                                yield b"data: " + json.dumps(o_chunk).encode("utf-8") + b"\n\n"
-                                    elif etype == "response.completed":
-                                        response_obj = evt.get("response") or {}
-                                        incomplete = response_obj.get("incomplete_details") or {}
-                                        finish_reason = (
-                                            "length"
-                                            if response_obj.get("status") == "incomplete"
-                                            or incomplete.get("reason") == "max_output_tokens"
-                                            else "stop"
-                                        )
-                                        if not responses_tool_states:
-                                            yield finish_chunk(finish_reason)
-                                        u = response_obj.get("usage") or {}
-                                        if u:
-                                            final_prompt_tokens = u.get("input_tokens", 0)
-                                            final_cached_tokens = (u.get("input_tokens_details") or {}).get("cached_tokens", 0)
-                                            final_completion_tokens = u.get("output_tokens", 0)
-                                            final_total_tokens = u.get("total_tokens", 0)
-                                            has_usage = True
-                                            usage_chunk = {
-                                                "id": stream_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": ep.model,
-                                                "choices": [],
-                                                "usage": {
-                                                    "prompt_tokens": final_prompt_tokens,
-                                                    "completion_tokens": final_completion_tokens,
-                                                    "total_tokens": final_total_tokens
-                                                }
-                                            }
-                                            yield b"data: " + json.dumps(usage_chunk).encode("utf-8") + b"\n\n"
-                                        yield b"data: [DONE]\n\n"
-                                        done_sent = True
-                                        break
                                 else:
+                                    yield line
                                     if line.strip() and line.startswith(b"data: ") and not line.startswith(b"data: [DONE]"):
                                         try:
                                             chunk = json.loads(line[6:].decode("utf-8"))
                                             if "choices" in chunk and len(chunk["choices"]) > 0:
                                                 delta = chunk["choices"][0].get("delta", {})
                                                 if "content" in delta:
-                                                    final_completion_text += delta.get("content", "")
+                                                    final_completion_text += delta.get("content") or ""
                                             if "usage" in chunk and chunk["usage"]:
                                                 u = chunk["usage"]
                                                 final_prompt_tokens = u.get("prompt_tokens", 0)
@@ -1883,10 +2042,6 @@ class APIPool:
                             else:
                                 sys_log(f"端点 '{ep.name}' 流式响应异常: {type(e).__name__}: {e}", "ERROR")
                         finally:
-                            if is_responses and not done_sent:
-                                if not responses_tool_states:
-                                    yield finish_chunk("stop")
-                                yield b"data: [DONE]\n\n"
                             if has_usage and log_usage and not ep.name.startswith("test_"):
                                 token_tracker.add_usage(ep.name, ep.model, final_prompt_tokens, final_completion_tokens, final_total_tokens, final_cached_tokens)
                                 chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, final_completion_text, final_total_tokens, int((time.time() - req_t0) * 1000))
@@ -1898,7 +2053,7 @@ class APIPool:
                     if is_anthropic:
                         reply = ""
                         for c in body.get("content", []):
-                            if c.get("type") == "text": reply += c.get("text", "")
+                            if c.get("type") == "text": reply += c.get("text") or ""
                         u = body.get("usage", {})
                         prompt_t = 0; cached = 0; tot = 0
                         if u:
@@ -1938,8 +2093,8 @@ class APIPool:
                         return o_body, ""
                     else:
                         u = body.get("usage", {})
-                        content = body["choices"][0]["message"].get("content", "")
-                        reasoning = body["choices"][0]["message"].get("reasoning_content", "")
+                        content = body["choices"][0]["message"].get("content") or ""
+                        reasoning = body["choices"][0]["message"].get("reasoning_content") or ""
                         if u:
                             tot = u.get("total_tokens", 0)
                             cached = 0
@@ -1947,7 +2102,7 @@ class APIPool:
                                 cached = u["prompt_tokens_details"].get("cached_tokens", 0)
                             if log_usage and not ep.name.startswith("test_"):
                                 token_tracker.add_usage(ep.name, ep.model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), tot, cached)
-                                log_text = content.strip() or reasoning.strip() or ""
+                                log_text = content.strip() or reasoning.strip()
                                 chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000))
                                 ep._today_used += tot
                         # 假成功检测（仅端点启用时）
@@ -1961,9 +2116,12 @@ class APIPool:
                     
             except urllib.error.HTTPError as e:
                 err_body = ""
-                try: err_body = e.read().decode("utf-8", errors="ignore")[:200]
+                try: err_body = e.read().decode("utf-8", errors="ignore")[:1000]
                 except Exception: pass
                 msg = f"HTTP {e.code}: {err_body}"
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                if retry_after:
+                    msg += f"; Retry-After: {retry_after}"
                 if (e.code == 400 and not force_no_retry
                         and any(k in payload for k in ("temperature", "top_p"))
                         and ("temperature" in err_body or "top_p" in err_body)):
@@ -2089,6 +2247,18 @@ def api_handler(method, path, body):
     parsed = urlparse(path)
     cp = parsed.path
 
+    # ================= OpenAI 兼容模型目录 =================
+    if method == "GET" and cp in ("/v1/models", "/models"):
+        return 200, {
+            "object": "list",
+            "data": [{
+                "id": "api-pool",
+                "object": "model",
+                "created": 0,
+                "owned_by": "api-pool",
+            }],
+        }, False
+
     # ================= 代理接口 =================
     if method == "POST" and cp in ("/v1/chat/completions", "/chat/completions"):
         messages = body.get("messages", [])
@@ -2209,6 +2379,7 @@ def api_handler(method, path, body):
     if method == "POST" and cp.endswith("/clear-error"):
         ep_id = unquote(cp.split("/")[3])
         pool.clear_error(ep_id)
+        _sync_to_config()
         return 200, {"ok": True}, False
     if method == "POST" and cp == "/api/health-check": return 200, {"ok": True, "results": pool.check_all_health()}, False
     if method == "POST" and cp == "/api/fetch-models":
@@ -2263,7 +2434,7 @@ def api_handler(method, path, body):
     return 404, {"error": "Not found"}, False
 
 def _sync_to_config():
-    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "default_headers": ep.get("default_headers", {}), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "is_vision": ep.get("is_vision", True),
+    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "default_headers": ep.get("default_headers", {}), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
             "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0)} for ep in pool.list_endpoints()])
 
 
@@ -2355,7 +2526,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             except ConnectionError:
                 pass
-        elif self.path.startswith("/api/"):
+        elif self.path.startswith("/api/") or self.path.startswith("/v1/") or self.path == "/models":
             res = api_handler("GET", self.path, {})
             if len(res) == 3 and res[2] is True:
                 code, stream_gen = res[0], res[1]

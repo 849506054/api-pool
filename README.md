@@ -19,7 +19,7 @@
 - **优先级调度 + 故障恢复回迁** — 按 priority 自动轮选，故障熔断冷却，恢复后自动回迁
 - **延迟切换（Deferred Failback）** — 端点冷却到期探活通过后，不立即切回（避免破坏当前端点 prompt cache），仅在会话空闲 5 分钟后才自动切回；支持端点级开关（`deferrable`），适用于昂贵兜底端点（并发竞态修复：2026-08-09, commit 00fb6b9）
 - **上下文长度限制（端点可选）** — 配置 `max_context_k` 后，超过长度限制的请求自动跳过该端点，避免账号被限制
-- **多协议兼容** — 支持 OpenAI 兼容协议与 Anthropic 协议（管理存量端点），对外统一 OpenAI 接口
+- **多协议兼容** — 支持 OpenAI 兼容协议与 Anthropic 协议（管理存量端点），对外统一 OpenAI 接口。已验收文本、工具调用、多轮工具结果、base64 PNG 图片和 Hermes 实际工具循环；详见 [`docs/anthropic-compatibility-matrix.md`](docs/anthropic-compatibility-matrix.md)
 - **自动图片预处理** — 目标端点不支持视觉时自动调用视觉模型解析
 - **ToolCall ID 前缀重写（端点可选）** — 端点配置 `tool_call_id_prefix` 时，请求中 tool_call id 确定性重写为该前缀（如 DeepSeek 官方 `call_00_ET_`），解决跨端点切换后历史混入其他端点格式 id 导致的 400（Kcne 场景）
 - **统计大盘** — Token 消耗、缓存命中、请求数趋势

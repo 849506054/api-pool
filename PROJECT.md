@@ -31,6 +31,7 @@
 - [x] **UI 健康状态同步** — `_on_success` 更新 `_health`
 - [x] **优先级插入模式** — `update_endpoint` 支持 insert-at-position 重排
 - [x] **Anthropic 协议转换** — 消息体/流式/非流式格式转换 (commit d218936)
+- [x] **Anthropic 兼容性运行态验收** — 文本、流式、单轮/多轮/并行工具、跨协议工具历史、Hermes 实际工具循环、base64 PNG 图片；验收矩阵：`docs/anthropic-compatibility-matrix.md`
 - [x] **协议下拉框恢复** — 从 hidden input 恢复为可见 select (commit 91110b1)
 - [x] **test_vision reply 防御** — `_try_endpoint` 返回 string 时 `reply.get()` 防御 (commit afe3326)
 - [x] **项目收口** — README / PROJECT.md 定位更新 (commit 31581f2)
