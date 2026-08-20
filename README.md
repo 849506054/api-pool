@@ -2,6 +2,8 @@
 
 一个轻量、零依赖的多模型 API 聚合网关与 Endpoint 路由管理工具。
 
+![API Pool 2.0 概览](docs/api-pool2-poster-16x9.png)
+
 > **定位**：API Pool 2.0 对外提供稳定的 OpenAI-compatible Chat Completions 入口，
 > 对内按 Endpoint 配置进行模型路由、协议转换、健康管理、故障转移和统计。Endpoint
 > 可以使用不同的模型和协议，不要求整个池只服务于某一种模型。
