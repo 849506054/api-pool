@@ -437,7 +437,6 @@ def _anthropic_tool_choice_from_chat(tool_choice):
     return None
 
 
-
 @dataclass
 class Endpoint:
     id: str = ""
@@ -508,7 +507,7 @@ class APIPool:
         self._endpoints: list[Endpoint] = []
         self._current_endpoint_id = None  # 用端点ID追踪当前端点，而非位置索引
         self._manual_override_id = None  # 用户手动指定端点的ID，优先级覆盖路由选择
-        self._restored_endpoint_id: str | None = None  # 重启后仅首个请求使用的上次成功端点
+        self._restored_endpoint_id: str | None = None  # 兼容旧状态字段；恢复后转为持续手动覆盖
         self._persisted_endpoint_id: str | None = None  # 避免同一端点每次成功都写盘
         self._last_reasoning_content = None  # 缓存上一轮返回的 reasoning_content，用于多轮对话补全
         self._last_reasoning_text = None  # 缓存上一轮返回的 reasoning_text（DeepSeek V4 request 字段名），用于多轮对话补全
@@ -1526,12 +1525,11 @@ class APIPool:
                 active.remove(override_ep)
                 active.insert(0, override_ep)
         elif self._restored_endpoint_id:
-            # 重启恢复只影响首个请求；不写入 manual override，也不改变 priority。
+            # 兼容旧对象状态：恢复端点必须持续保持，不能只影响首个请求。
             restored_ep = next((ep for ep in active if ep.id == self._restored_endpoint_id), None)
             if restored_ep:
                 active.remove(restored_ep)
                 active.insert(0, restored_ep)
-            self._restored_endpoint_id = None
         idx = 0
         while tried < total:
             ep = active[idx]
@@ -1867,7 +1865,14 @@ class APIPool:
             # user metadata
             if "user" in payload:
                 anthropic_payload["metadata"] = {"user_id": str(payload["user"])}
-            data = json.dumps(anthropic_payload).encode("utf-8")
+            # Anthropic automatic prompt caching：由上游将断点推进到最后
+            # 一个可缓存 block，避免 API Pool 自己改写动态消息内容。
+            anthropic_payload["cache_control"] = {"type": "ephemeral"}
+            data = json.dumps(
+                anthropic_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
         else:
             url = ep.base_url.rstrip("/") + "/chat/completions"
             data = json.dumps(payload).encode("utf-8")
@@ -2405,7 +2410,9 @@ restored_endpoint = next(
 )
 if restored_endpoint is not None:
     pool._current_endpoint_id = restored_endpoint.id
-    pool._restored_endpoint_id = restored_endpoint.id
+    # 重启恢复的是“当前端点”而非一次性首请求偏好。复用手动覆盖路径，
+    # 直到该端点失败/进入冷却或用户主动切换，才允许离开该端点。
+    pool._manual_override_id = restored_endpoint.id
     pool._persisted_endpoint_id = restored_endpoint.id
 
 

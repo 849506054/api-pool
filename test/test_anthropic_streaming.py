@@ -85,6 +85,80 @@ class OpenAIStreamHandler(BaseHTTPRequestHandler):
 
 
 class AnthropicStreamingTests(unittest.TestCase):
+    def test_prompt_cache_control_and_usage_are_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, format, *args):
+                    del format, args
+
+                def do_POST(self):
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    self.server.body = body
+                    response = {
+                        "id": "msg_cache",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {
+                            "input_tokens": 12,
+                            "cache_creation_input_tokens": 1000,
+                            "cache_read_input_tokens": 9000,
+                            "output_tokens": 2,
+                        },
+                    }
+                    encoded = json.dumps(response).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(encoded)))
+                    self.end_headers()
+                    self.wfile.write(encoded)
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                ep = module.Endpoint(
+                    id="anthropic-cache",
+                    name="anthropic-cache-test",
+                    base_url=f"http://127.0.0.1:{server.server_port}",
+                    api_key="test",
+                    model="claude-test",
+                    protocol="anthropic",
+                    use_proxy=False,
+                    timeout=10,
+                )
+                pool = module.APIPool([ep])
+                result, error = pool._try_endpoint(
+                    ep,
+                    {
+                        "model": ep.model,
+                        "messages": [
+                            {"role": "system", "content": "stable system"},
+                            {"role": "user", "content": "hello"},
+                        ],
+                        "stream": False,
+                        "max_tokens": 16,
+                    },
+                    timeout=10,
+                    log_usage=False,
+                )
+                self.assertEqual(error, "")
+                self.assertEqual(result["usage"]["prompt_tokens"], 10012)
+                self.assertEqual(result["usage"]["prompt_tokens_details"]["cached_tokens"], 9000)
+                self.assertEqual(
+                    server.body["cache_control"],
+                    {"type": "ephemeral"},
+                )
+                self.assertEqual(server.body["system"], "stable system")
+                self.assertNotIn("cache_control", server.body["messages"][-1])
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_stream_text_tool_finish_usage_and_done(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
