@@ -1,6 +1,6 @@
 # API Pool 2.0 跨模型路由与故障转移设计稿
 
-> 状态：**历史过度设计，2026-08-18 已废弃，不得作为实现依据。** 当前唯一有效设计为 `docs/minimal-non-deepseek-fallback-design-v1.md`；本文件仅保留审计记录，未实现、未部署、未切换 Hermes 流量。
+> 状态：**历史过度设计，2026-08-18 已废弃，不得作为实现依据。** 当前唯一有效设计为 `docs/minimal-non-deepseek-fallback-design-v1.md`；本文件仅保留审计记录。文中的 1.0/2.0 并行描述是当时状态；API Pool 1.0 已于 2026-08-21 彻底删除。
 >
 > 目标：在 API Pool 2.0 中复用 1.0 已验证的端点轮转原语，并参考 Hermes fallback 的 `(provider, model)` 有序链，实现可控的跨端点、跨模型故障转移，同时保持请求上下文和会话连贯性。
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=API Pool 2.0 - parallel experimental instance
+Description=API Pool 2.0 - multi-model API gateway
 After=network.target
 
 [Service]

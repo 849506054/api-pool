@@ -4,13 +4,13 @@
 
 | 字段 | 值 |
 |------|------|
-| **领域** | 基础设施 — DeepSeek API 端点集中管理 |
-| **定位** | DeepSeek 端点集中管理工具，对外统一 OpenAI 兼容接口 |
+| **领域** | 基础设施 — 多模型 API 端点集中管理 |
+| **定位** | 多模型 API 聚合网关，对外统一 OpenAI-compatible 接口 |
 | **当前阶段** | 功能维护 |
-| **状态** | 🟡 API Pool 2.0 并行实验实例 |
+| **状态** | 🟢 API Pool 2.0 正式运行（唯一实例） |
 | **源码** | `/vol1/1000/tool/api-pool2/` (宿主机) |
-| **Git remote** | `github.com/849506054/api-pool`（分支 `api-pool-2.0`） |
-| **端口** | 5200（1.0 继续使用 5100） |
+| **Git remote** | `github.com/849506054/api-pool`（唯一正式分支 `main`） |
+| **端口** | 5200 |
 | **Python** | 3.13 (宿主机默认) |
 | **协议** | OpenAI 兼容 + Anthropic (端点级 protocol 属性) |
 | **健康检测** | chat ping / models 探针 (端点级 health_mode) |
@@ -53,13 +53,13 @@
 
 ### 待办
 
-- [x] **[P0] 2.0 非 DeepSeek Endpoint fallback 兼容（工作区已实现，未部署）** — 复用 1.0 端点轮转/重试/冷却；按目标 Endpoint 隔离 DeepSeek reasoning 字段；模拟 DeepSeek 502 → OpenAI-compatible `gpt-5.6-sol` 切换验证通过；4 项 unittest 通过。仍待真实端点矩阵和 5200 实例冒烟，Hermes 未切流
+- [x] **[P0] 2.0 非 DeepSeek Endpoint fallback 兼容** — 已部署至 5200；按目标 Endpoint 隔离 DeepSeek reasoning 字段，真实端点矩阵和 Hermes 5200 链路均已验收。
 - [x] **[P3] 提交未 commit 的本地改动** — 已随 9303572/4626f16 提交（含探活竞态去重补丁）
-- [ ] **[P3] 同步 systemd dropin 配置**
+- [x] **[P3] systemd 代理环境收口** — `api-pool2.service` 已内置 HTTPS_PROXY / HTTP_PROXY / NO_PROXY，不再依赖已删除的 1.0 drop-in。
 - [ ] **[P2] 待评估：频繁切换端点导致 cache 命中率骤降、增加成本** — 短暂故障应优先原地重试而不是立刻切换，避免丢缓存。可能方案：降权不冻结、首包超时 120s→30~45s、连续 N 次失败才切换 — `proxy.conf` 不在版本控制中，建议文档化或提交模板
 
 - [x] **前后端分离** — GUI 从 `GUI_HTML` 常量抽离至 `static/index.html`，服务端 mtime 缓存读取（改文件热更新，前端改动免重启）；删除 GUI_HTML 常量（commit 1996320）
-- [x] **日志 flush + 流式超时兜底补洞（2026-08-15，待重启生效）** — ① `sys_log` print 加 `flush=True`：systemd 下 stdout 块缓冲导致 journal 延迟 6-12 分钟落盘（23:53 的日志 23:52:53 才批量落盘，排障严重误导）；② 首包预读 `settimeout(_first_pkt_timeout)` 改为 `min(_first_pkt_timeout, ep.timeout)`，不再把 socket 阻塞窗口放大到 120s（ep.timeout 仅 60s）；③ `_get_resp_socket` 返回 None 时显式 WARN（原静默跳过）；④ 流内 `except Exception: pass` 改为区分记录：客户端断开(ConnectionResetError/BrokenPipeError)→WARN，上游异常→ERROR（23:58:26 假死请求"收到后无任何日志"即此缺陷）。已 py_compile + test_stream_timeout.py 三场景验证（normal/stall/keepalive 超时链路正常）。文件已推回宿主机（备份 .bak.20260815），**待手动重启 api-pool.service 生效**
+- [x] **日志 flush + 流式超时兜底补洞（2026-08-15）** — `sys_log` 强制 flush、首包 socket 超时受 Endpoint timeout 约束、socket 获取失败与流异常不再静默；已部署并纳入 2.0 运行版本。
 - [x] **端点列表卡片自适应** — 卡片高度与右侧列（聚合池管理+聚合链）底部对齐（alignCards），列表内部滚动，5s 自动刷新保持滚动位置；全局滚动条深色细窄风格统一（commit 1996320）
 - [x] **端点列表卡片固定 16px 高度差修复（2026-08-15，commit 14370cc）** — alignCards 原用右侧**容器** `getBoundingClientRect().bottom` 作对齐目标，容器 bottom 包含聚合链卡片 `margin-bottom:16px`，导致左侧 epCard 被固定拉高 16px（实测 epCard.bottom=934 vs 聚合链视觉底部=918）。改为取右侧**最后一个卡片**的视觉底部（`right.lastElementChild.getBoundingClientRect().bottom`），实测 diff=0。前端静态文件热更新，无需重启
 
@@ -102,14 +102,16 @@
 | 2026-08-13 | deepseek-official priority 5→99（终极兜底端点） | 正常参与轮换（排最末），全池故障/530s 超时锁定兜底。池内优先级：Tokenrhythm=1 / Kcne=2 / kuapi=3 / X5m5x=4 / deepseek-official=99。落盘 api_config.json |
 | 2026-08-14 | 单请求饿死判定（skip_cooldown） | 超时类失败但端点在 timeout 窗口内有成功响应 → 并发挤压单请求饿死，非端点故障，仅轮转不冻结（Opencode 连接超时分析结论） |
 | 2026-08-13 | 冷却恢复探活后台化（commit 5769d32） | `_cleanup_expired_cooldowns` 同步探活 → 后台入队（`_probe_executor` max_workers=3 + `_probe_inflight` 去重）。请求路径（chat/list_endpoints/get_active_chain）不再被冷却过期端点探活阻塞（原实现多端点串行探活每个最长 10s，前端 5s 轮询"轮流上阵"卡顿）。`_background_probe`：通过清冷却+defer 判断+更新 current / 失败续冷 / 异常兜底。defer 延迟切换保 cache 逻辑完整保留（池活跃恢复端点延迟 5min）。设计确认：后台探活与真实请求并发无害，inflight 只防重复探活不锁真实请求。5 场景烟测 + 重启 active |
+| 2026-08-21 | Anthropic 自动缓存适配（顶层 `cache_control`） | 协议兼容性与缓存命中属于基础适配，所有 Anthropic Endpoint 统一默认生效，不设端点级开关。 |
+| 2026-08-21 | 重启当前端点持久化修复（commit 51869db） | 恢复端点持续保持为当前路由，直到故障、冷却或主动切换；不再只作用于重启后首个请求。 |
+| 2026-08-21 | API Pool 1.0 生命周期终局 | 1.0 服务、目录、备份与封存分支全部删除；2.0 成为唯一正式实例，`main` 成为唯一正式分支。 |
 
 ## 📌 活跃事项
 
-- [x] **[P0] API Pool 2.0 并行基线（2026-08-18）** — 独立目录 `/vol1/1000/tool/api-pool2`、独立 unit `api-pool2.service`、端口 5200；配置由 1.0 快照初始化，`chat_logs.db` 与 `token_stats.db` 独立新建。Hermes 继续指向 5100，1.0 未重启。
-- [x] **[P0] 2.0 非 DeepSeek Endpoint fallback 兼容（2026-08-18，工作区已实现，未部署）** — 复用 1.0 端点轮转/重试/冷却；按目标 Endpoint 隔离 DeepSeek reasoning 字段；模拟 DeepSeek 502 → OpenAI-compatible `gpt-5.6-sol` 切换验证通过；4 项 unittest 通过。仍待真实端点矩阵和 5200 实例冒烟，Hermes 未切流。
+- [x] **[P0] API Pool 2.0 正式运行** — 独立目录 `/vol1/1000/tool/api-pool2`、unit `api-pool2.service`、端口 5200；Hermes 主路由已切换并验收。
+- [x] **[P0] 非 DeepSeek Endpoint fallback 兼容** — 已完成真实端点矩阵、协议转换、工具调用和 Hermes E2E 验收。
 - [x] **[P0] 2.0 多模型上游建模** — **不属于当前 2.0 范围，已否决**；不引入 ModelRoute/独立 Upstream，继续一端点一模型。
 - [x] **[P1] claude-opus-5 直连失败归纳** — **不扩展为当前 2.0 的通用模型路由/协议适配任务**；只作为非 DeepSeek Endpoint 真实矩阵的一个验证目标。
 - [x] **[P0] 统一 reasoning 意图适配** — **不属于当前 2.0 范围，已否决**；本版本只隔离 DeepSeek 专属字段，不做 reasoning wire 统一转换。
 
 - [x] **[P1] 端点自定义 User-Agent（2026-08-17 已部署）** — 端点配置新增 `default_headers`，UI 提供可选 User-Agent；聊天、Models 探活、获取模型、延迟/多模态测试统一应用。实测 `ps.air-outer.com` 默认 UA 返回 401，`hermes-agent/0.20.1` 返回 200 并获取 3 个模型。部署后 16 端点全部带 `default_headers` 字段（存量端点 `{}` 向后兼容）；service 重启后新进程无 ERROR。
-- [ ] **[P3] 文档化 proxy.conf dropin** — `/etc/systemd/system/api-pool.service.d/proxy.conf` 为系统代理环境变量，建议在仓库中保留模板或注释

@@ -21,3 +21,6 @@ test_suite.py
 
 # Runtime logs
 api_pool.log
+
+# Runtime route state
+api_runtime_state.json
