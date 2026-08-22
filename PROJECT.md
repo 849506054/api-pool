@@ -42,6 +42,7 @@
 - [x] **移除 `chat()` 层瞬态重试，统一由 `_try_endpoint` 内部 `max_retries` 控制** — 两层重试叠加（4 次/240s/4RPM）改为单层（2 次/120s/2RPM）
 - [x] **端点假成功检测** — `check_fake_success` 字段，按端点开关，匹配拒绝内容触发轮转
 - [x] **移动端 UI 适配** — 三断点响应式 + 触摸优化
+- [x] **Anthropic prompt cache 修复：块级显式 breakpoint** — 顶层 `cache_control` 被 `ps.air-outer.com` 无视，改用 system + 最后消息最后文本块的显式 breakpoint。实测非流式/流式均确认缓存命中（commit 47a2bf3）
 | 2026-08-05 | _on_success 冷却期间不清除冷却 | 并发请求穿透冷却保护: Ark 429 后冷却被迟到成功请求清除，导致冷却→清冷却→再429 无限循环 |
 - [x] **聚合池自动刷新** — 恢复 5s 间隔状态轮询
 - [x] **cooldown_minutes 最低 1** — 不允许 0/负数，保证出错端点走冷却→探活→清除完整恢复流程 (commit 3264380)
@@ -102,7 +103,7 @@
 | 2026-08-13 | deepseek-official priority 5→99（终极兜底端点） | 正常参与轮换（排最末），全池故障/530s 超时锁定兜底。池内优先级：Tokenrhythm=1 / Kcne=2 / kuapi=3 / X5m5x=4 / deepseek-official=99。落盘 api_config.json |
 | 2026-08-14 | 单请求饿死判定（skip_cooldown） | 超时类失败但端点在 timeout 窗口内有成功响应 → 并发挤压单请求饿死，非端点故障，仅轮转不冻结（Opencode 连接超时分析结论） |
 | 2026-08-13 | 冷却恢复探活后台化（commit 5769d32） | `_cleanup_expired_cooldowns` 同步探活 → 后台入队（`_probe_executor` max_workers=3 + `_probe_inflight` 去重）。请求路径（chat/list_endpoints/get_active_chain）不再被冷却过期端点探活阻塞（原实现多端点串行探活每个最长 10s，前端 5s 轮询"轮流上阵"卡顿）。`_background_probe`：通过清冷却+defer 判断+更新 current / 失败续冷 / 异常兜底。defer 延迟切换保 cache 逻辑完整保留（池活跃恢复端点延迟 5min）。设计确认：后台探活与真实请求并发无害，inflight 只防重复探活不锁真实请求。5 场景烟测 + 重启 active |
-| 2026-08-21 | Anthropic 自动缓存适配（顶层 `cache_control`） | 协议兼容性与缓存命中属于基础适配，所有 Anthropic Endpoint 统一默认生效，不设端点级开关。 |
+|| 2026-08-22 | **Anthropic 缓存修复：顶层 cache_control → 块级显式 breakpoint** | `ps.air-outer.com` 网关无视顶层缓存字段，只认消息块级显式 `cache_control`。2026-08-21 旧结论（326 token 小前缀假阴性）已更正。同时补全流式 usage chunk 的 `prompt_tokens_details`。提交：`47a2bf3` |
 | 2026-08-21 | 重启当前端点持久化修复（commit 51869db） | 恢复端点持续保持为当前路由，直到故障、冷却或主动切换；不再只作用于重启后首个请求。 |
 | 2026-08-21 | API Pool 1.0 生命周期终局 | 1.0 服务、目录、备份与封存分支全部删除；2.0 成为唯一正式实例，`main` 成为唯一正式分支。 |
 
