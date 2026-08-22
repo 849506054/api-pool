@@ -149,12 +149,18 @@ class AnthropicStreamingTests(unittest.TestCase):
                 self.assertEqual(error, "")
                 self.assertEqual(result["usage"]["prompt_tokens"], 10012)
                 self.assertEqual(result["usage"]["prompt_tokens_details"]["cached_tokens"], 9000)
+                # 2026-08-22: 块级显式断点，不再使用顶层 cache_control
+                self.assertNotIn("cache_control", server.body)
+                # system 被转为带 cache_control 的文本块数组
                 self.assertEqual(
-                    server.body["cache_control"],
-                    {"type": "ephemeral"},
+                    server.body["system"],
+                    [{"type": "text", "text": "stable system", "cache_control": {"type": "ephemeral"}}],
                 )
-                self.assertEqual(server.body["system"], "stable system")
-                self.assertNotIn("cache_control", server.body["messages"][-1])
+                # 最后一条消息的最后文本块应带 cache_control
+                last_msg = server.body["messages"][-1]
+                self.assertEqual(last_msg["role"], "user")
+                self.assertIsInstance(last_msg["content"], list)
+                self.assertEqual(last_msg["content"][-1]["cache_control"], {"type": "ephemeral"})
             finally:
                 server.shutdown()
                 server.server_close()
@@ -216,7 +222,7 @@ class AnthropicStreamingTests(unittest.TestCase):
                 finishes = [(p.get("choices") or [{}])[0].get("finish_reason") for p in payloads if p.get("choices")]
                 self.assertIn("tool_calls", finishes)
                 usage = [p["usage"] for p in payloads if p.get("usage")]
-                self.assertEqual(usage[-1], {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18})
+                self.assertEqual(usage[-1], {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18, "prompt_tokens_details": {}})
                 self.assertEqual(done_count, 1)
             finally:
                 server.shutdown()

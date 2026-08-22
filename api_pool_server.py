@@ -1865,9 +1865,26 @@ class APIPool:
             # user metadata
             if "user" in payload:
                 anthropic_payload["metadata"] = {"user_id": str(payload["user"])}
-            # Anthropic automatic prompt caching：由上游将断点推进到最后
-            # 一个可缓存 block，避免 API Pool 自己改写动态消息内容。
-            anthropic_payload["cache_control"] = {"type": "ephemeral"}
+            # Anthropic prompt caching：使用显式块级断点（block-level cache_control）
+            # 2026-08-22 实测：ps.air-outer.com 顶层 cache_control 被无视，
+            # 只认消息块级显式 breakpoint（create=4564, read=4564 验证通过）
+            # 给 system 和最后一条消息的最后文本块加断点
+            if "system" in anthropic_payload and isinstance(anthropic_payload["system"], str):
+                s = anthropic_payload["system"].strip()
+                if s:
+                    anthropic_payload["system"] = [{"type": "text", "text": s, "cache_control": {"type": "ephemeral"}}]
+            if anthropic_payload.get("messages"):
+                last_msg = anthropic_payload["messages"][-1]
+                content = last_msg.get("content")
+                if isinstance(content, str):
+                    anthropic_payload["messages"][-1] = {
+                        "role": last_msg["role"],
+                        "content": [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+                    }
+                elif isinstance(content, list) and content:
+                    last_block = content[-1]
+                    if isinstance(last_block, dict) and last_block.get("type") == "text":
+                        last_block["cache_control"] = {"type": "ephemeral"}
             data = json.dumps(
                 anthropic_payload,
                 ensure_ascii=False,
@@ -2088,7 +2105,8 @@ class APIPool:
                                                 "usage": {
                                                     "prompt_tokens": final_prompt_tokens,
                                                     "completion_tokens": final_completion_tokens,
-                                                    "total_tokens": final_total_tokens
+                                                    "total_tokens": final_total_tokens,
+                                                    "prompt_tokens_details": {"cached_tokens": final_cached_tokens} if final_cached_tokens else {}
                                                 }
                                             }
                                             yield b"data: " + json.dumps(usage_chunk).encode("utf-8") + b"\n\n"
