@@ -30,6 +30,35 @@ class Endpoint:
 
 
 class NonDeepSeekCompatibilityTests(unittest.TestCase):
+    def test_starvation_rotation_does_not_freeze_or_change_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            first = module.Endpoint(
+                id="first",
+                name="first",
+                base_url="https://first.example/v1",
+                model="claude-opus-5",
+                priority=1,
+                in_pool=True,
+            )
+            second = module.Endpoint(
+                id="second",
+                name="second",
+                base_url="https://second.example/v1",
+                model="gpt-5.6-sol",
+                priority=2,
+                in_pool=True,
+            )
+            pool = module.APIPool([first, second])
+            pool._current_endpoint_id = first.id
+            pool._manual_override_id = first.id
+
+            pool._rotate(first, "连接/超时错误: simulated", skip_cooldown=True)
+
+            self.assertEqual(first._cooldown_until, 0)
+            self.assertEqual(pool._current_endpoint_id, first.id)
+            self.assertEqual(pool._manual_override_id, first.id)
+
     def test_non_deepseek_messages_drop_deepseek_reasoning_fields(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)

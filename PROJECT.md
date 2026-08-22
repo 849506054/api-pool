@@ -14,7 +14,7 @@
 | **Python** | 3.13 (宿主机默认) |
 | **协议** | OpenAI 兼容 + Anthropic (端点级 protocol 属性) |
 | **健康检测** | chat ping / models 探针 (端点级 health_mode) |
-| **故障转移** | 优先级轮选 → _try_endpoint 内部重试 → 冻结冷却 → 轮转(tried 重置) → 恢复自动回迁 |
+| **故障转移** | 普通请求按优先级轮选 → `_try_endpoint` 内部重试 → 明确端点故障才冻结冷却 → 轮转；单请求饿死不冻结、不切换；流式停滞由 API Pool 流事务层处理，不直接冻结端点 |
 | **代理** | 端点级 use_proxy 控制 (默认强制直连) |
 | **配置持久化** | `api_config.json` (不提交 git) |
 
@@ -101,10 +101,11 @@
 | 2026-08-07 | Tokenrhythm 优先级 1，Kcne 降为 2 | 用户指定 Tokenrhythm 为当前使用端点（deepseek-official 未出过 400，不配 prefix）|
 | 2026-08-13 | ⚠️ **EXPERIMENTAL 实验版本**（极端情况处理，观察期）四层修改一次性落地 | 08-13 08:00-11:28 大面积端点故障 + Hermes 600s 重试并发 → 33 分钟轮转死循环（详见 skill references/probe-pass-real-request-timeout-loop-2026-08-13.md）。修复：① `_set_cooldown` 幂等化（并发失败不刷新冷却窗口）② chat() 循环顶部冷却跳过（并发请求立即转向）③ 下一级探活失败后并发探活剩余端点（`_check_one_health` 两阶段 11s/21s）④ **prio99 终极兜底**：priority=99 端点正常参与轮换（排最末），全池故障/轮转超 530s 时锁定兜底（60s 容错，530+60=590 < Hermes 600s），成功后续请求 5min 滑动窗口直连，保底失败返回错误走 Hermes fallback（详见 skill references/prio99-fallback-design-2026-08-13.md）|
 | 2026-08-13 | deepseek-official priority 5→99（终极兜底端点） | 正常参与轮换（排最末），全池故障/530s 超时锁定兜底。池内优先级：Tokenrhythm=1 / Kcne=2 / kuapi=3 / X5m5x=4 / deepseek-official=99。落盘 api_config.json |
-| 2026-08-14 | 单请求饿死判定（skip_cooldown） | 超时类失败但端点在 timeout 窗口内有成功响应 → 并发挤压单请求饿死，非端点故障，仅轮转不冻结（Opencode 连接超时分析结论） |
+| 2026-08-14 | 单请求饿死判定（skip_cooldown） | 超时类失败但端点在 timeout 窗口内有成功响应 → 并发挤压单请求饿死，非端点故障；当前实现不冻结、不改当前端点、不清手动覆盖、不探活、不切换，失败交回 Hermes。 |
 | 2026-08-13 | 冷却恢复探活后台化（commit 5769d32） | `_cleanup_expired_cooldowns` 同步探活 → 后台入队（`_probe_executor` max_workers=3 + `_probe_inflight` 去重）。请求路径（chat/list_endpoints/get_active_chain）不再被冷却过期端点探活阻塞（原实现多端点串行探活每个最长 10s，前端 5s 轮询"轮流上阵"卡顿）。`_background_probe`：通过清冷却+defer 判断+更新 current / 失败续冷 / 异常兜底。defer 延迟切换保 cache 逻辑完整保留（池活跃恢复端点延迟 5min）。设计确认：后台探活与真实请求并发无害，inflight 只防重复探活不锁真实请求。5 场景烟测 + 重启 active |
-|| 2026-08-22 | **Anthropic 缓存修复：顶层 cache_control → 块级显式 breakpoint** | `ps.air-outer.com` 网关无视顶层缓存字段，只认消息块级显式 `cache_control`。2026-08-21 旧结论（326 token 小前缀假阴性）已更正。同时补全流式 usage chunk 的 `prompt_tokens_details`。提交：`47a2bf3` |
-| 2026-08-21 | 重启当前端点持久化修复（commit 51869db） | 恢复端点持续保持为当前路由，直到故障、冷却或主动切换；不再只作用于重启后首个请求。 |
+| 2026-08-22 | 单请求饿死处理边界修正 | `_last_success_ts` 在端点 timeout 窗口内命中时，判定为单请求饿死：不冻结、不改 `_current_endpoint_id`、不清手动覆盖、不探活、不切换端点；本次失败交回 Hermes 现有重试机制。旧记录“仅轮转”已废弃。 |
+| 2026-08-22 | 流式停滞与端点冻结解耦并部署 | 下游流式停滞不等同端点故障；`_timeout_abort` 不再冻结端点。尚未向下游输出有效内容时，API Pool 对同一端点内部重试一次；已有输出时不做透明续传，避免重复内容。错误 SSE 改用 `json.dumps`，修复 `Unterminated string`。服务 `api-pool2.service` 已重启，工作区/宿主机 hash=`896b52042c85c9e02834582281c11afd`，测试 `28 tests, OK`。 |
+| 2026-08-22 | **Anthropic 缓存修复：顶层 cache_control → 块级显式 breakpoint** | `ps.air-outer.com` 网关无视顶层缓存字段，只认消息块级显式 `cache_control`。2026-08-21 旧结论（326 token 小前缀假阴性）已更正。同时补全流式 usage chunk 的 `prompt_tokens_details`。提交：`47a2bf3` |
 | 2026-08-21 | API Pool 1.0 生命周期终局 | 1.0 服务、目录、备份与封存分支全部删除；2.0 成为唯一正式实例，`main` 成为唯一正式分支。 |
 
 ## 📌 活跃事项

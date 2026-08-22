@@ -209,10 +209,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .chain-item:last-child{border-left-color:transparent}
 .chain-item.active{border-left-color:var(--green);background:var(--green-dim);border-radius:0 8px 8px 0}
 .chain-item.cooldown{border-left-color:var(--yellow);background:var(--yellow-dim);border-radius:0 8px 8px 0}
+.chain-item.deferred{border-left-color:var(--blue);background:var(--blue-dim);border-radius:0 8px 8px 0}
 .chain-item.failed{border-left-color:var(--red);background:var(--red-dim);border-radius:0 8px 8px 0}
 .chain-dot{width:8px;height:8px;border-radius:50%;background:var(--border);flex-shrink:0;position:absolute;left:-5px}
 .chain-item.active .chain-dot{background:var(--green);box-shadow:0 0 6px var(--green)}
 .chain-item.cooldown .chain-dot{background:var(--yellow)}
+.chain-item.deferred .chain-dot{background:var(--blue)}
 .chain-item.failed .chain-dot{background:var(--red)}
 .chain-info{flex:1;min-width:0}
 .chain-info .name{font-weight:600;font-size:12px}
@@ -748,6 +750,7 @@ function renderPoolList(eps){
           +'<select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority(\''+ep.id+'\', this.value)" title="修改优先级">'
             +options
           +'</select>'
+          +'<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="'+(ep.enabled?'暂停端点':'恢复端点')+'" onclick="toggleEndpoint(\''+ep.id+'\')">'+(ep.enabled?'⏸':'▶')+'</button>'
           +'<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="编辑端点" onclick="editEndpoint(\''+ep.id+'\')">✏️</button>'
           +(!ep.is_current?'<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="切换为当前端点" onclick="switchEndpoint(\''+ep.id+'\')">⚡</button>':'')
           +'<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="移出聚合池" onclick="removeFromPool(\''+ep.id+'\')">📤</button>'
@@ -764,9 +767,10 @@ function renderChain(chain){
     let cls='chain-item';
     if(it.manual_unlock_required)cls+=' failed';
     else if(it.in_cooldown)cls+=' cooldown';
+    else if(it.is_deferred)cls+=' deferred';
     else if(it.is_current)cls+=' active';
     else if(it.health==='bad'||it.fail_count>0)cls+=' failed';
-    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">💳余额不足·手动解冻</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(it.is_current?'<span class="badge badge-success">服务中</span>':''));
+    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">💳余额不足·手动解冻</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(it.is_deferred?'<span class="badge badge-deferred">⏳延迟切换 '+fmtTime(it.defer_remaining)+'</span>':(it.is_current?'<span class="badge badge-success">服务中</span>':'')));
     const h=it.health, lat=it.health_latency_ms;
     let rh='';
     if(h==='ok')rh=`<div class="chain-health" style="color:var(--green)">✓${lat>=0?' '+lat+'ms':''}</div>`;

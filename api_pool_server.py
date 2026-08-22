@@ -691,7 +691,12 @@ class APIPool:
         self._cleanup_expired_cooldowns()
         now = time.time()
         with self._lock:
-            active = self._active_endpoints()
+            # The chain is a status view, so keep healthy deferred endpoints
+            # visible even though routing excludes them until defer expires.
+            active = sorted(
+                (ep for ep in self._endpoints if ep.enabled and ep.in_pool),
+                key=lambda ep: ep.priority,
+            )
             current_ep = None
             current_display_id = self._manual_override_id or self._current_endpoint_id
             if current_display_id:
@@ -1326,8 +1331,9 @@ class APIPool:
             sys_log(f"端点 '{failed_ep.name}' 探活失败，短冷却 30 秒", "WARN")
         elif skip_cooldown:
             # 端点级活跃判定：超时类失败但端点在 timeout 窗口内有成功响应
-            # → 单请求饿死，非端点故障；仅轮转，不冻结
-            sys_log(f"端点 '{failed_ep.name}' 活跃(窗口内有成功)，判定单请求饿死，不冻结", "WARN")
+            # → 单请求饿死，非端点故障；不冻结、不切换当前端点。
+            sys_log(f"端点 '{failed_ep.name}' 活跃(窗口内有成功)，判定单请求饿死，不冻结不切换", "WARN")
+            return
         else:
             self._set_cooldown(failed_ep)
             sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {failed_ep.cooldown_minutes} 分钟后", "WARN")
@@ -1667,6 +1673,10 @@ class APIPool:
                         skip_cooldown = True
                         sys_log(f"端点 '{ep.name}' 超时失败但 {since_success:.0f}s 前有成功响应（<timeout {ep.timeout}s），判定单请求饿死，不冻结", "WARN")
                 self._rotate(ep, error, skip_cooldown=skip_cooldown)
+                if skip_cooldown:
+                    # 单请求饿死不是 API Pool 的端点故障。不要探活或切换到
+                    # 其他模型；交回 Hermes，由其现有请求重试机制善后。
+                    break
                 active = self._active_endpoints()
                 active.sort(key=lambda e: e.priority)
                 total = len(active)
@@ -1775,7 +1785,10 @@ class APIPool:
                 tried += 1
         raise AllEndpointsFailed(errors)
 
-    def _try_endpoint(self, ep, payload, timeout, log_usage=True, force_no_retry=False, is_probe=False):
+    def _try_endpoint(
+        self, ep, payload, timeout, log_usage=True, force_no_retry=False,
+        is_probe=False, stream_stall_retry_used=False,
+    ):
         req_t0 = time.time()
         prompt_text_to_log = extract_prompt_text(payload) if log_usage and not ep.name.startswith("test_") else ""
         
@@ -1992,14 +2005,42 @@ class APIPool:
                                 sys_log(f"端点 '{ep.name}' 设置 stream_stall_timeout 失败({e})，依赖 stream_max_duration 兜底", "WARN")
 
                         def _timeout_abort(reason):
-                            """停滞/超时长统一终止：日志 + 冷却 + error chunk（2026-08-13 修复，不再静默吞）"""
-                            sys_log(f"端点 '{ep.name}' {reason}", "ERROR")
-                            with self._lock:
-                                ep._fail_count += 1
-                                ep._last_error = reason
-                                ep._last_error_ts = time.time()
-                                self._set_cooldown(ep)
-                            yield b'data: {"choices":[{"delta":{"content":"\\n\\n[API Pool Error: ' + reason.encode("utf-8", "ignore") + b']"},"finish_reason":"stop"}]}\n\n'
+                            """Handle an upstream stream stall without treating it as endpoint failure."""
+                            has_output = bool(final_completion_text.strip() or final_reasoning_text.strip())
+                            sys_log(f"端点 '{ep.name}' {reason}（流式事务失败，不冻结端点）", "ERROR")
+                            if not has_output and not stream_stall_retry_used:
+                                # Before any downstream bytes were emitted, retry the
+                                # same upstream endpoint inside API Pool. Hermes must
+                                # not see an internal upstream stall as its own failure.
+                                try:
+                                    resp.close()
+                                except Exception:
+                                    pass
+                                retry_result, retry_error = self._try_endpoint(
+                                    ep, payload, timeout, log_usage=log_usage,
+                                    force_no_retry=True, is_probe=is_probe,
+                                    stream_stall_retry_used=True,
+                                )
+                                if retry_result is not None:
+                                    yield from retry_result
+                                    return
+                                sys_log(
+                                    f"端点 '{ep.name}' 流式停滞后原端点内部重试失败: {retry_error}",
+                                    "WARN",
+                                )
+                            if has_output:
+                                # The partial response is already visible to Hermes;
+                                # do not replay it and create duplicated text.
+                                yield b'data: ' + json.dumps({
+                                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                                }, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
+                            else:
+                                yield b'data: ' + json.dumps({
+                                    "choices": [{
+                                        "delta": {"content": f"\\n\\n[API Pool Error: {reason}]"},
+                                        "finish_reason": "error",
+                                    }],
+                                }, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
                             yield b"data: [DONE]\n\n"
 
                         # 流总时长上限：循环内绝对时间检查。
