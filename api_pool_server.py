@@ -1196,9 +1196,22 @@ class APIPool:
                     with self._lock:
                         ep._defer_until = 0
                     sys_log(f"端点 '{ep.name}' 冷却过期探活通过，已恢复", "INFO")
-                # 更新 current 指针（保留手动覆盖）
+                # 仅在当前端点不存在或已不可用时更新当前指针；恢复一个端点不应
+                # 在池仍使用其他健康端点时把路由无故改回 priority 最小端点。
                 with self._lock:
-                    if not self._manual_override_id:
+                    current_id = self._manual_override_id or self._current_endpoint_id
+                    current_ep = next(
+                        (e for e in self._endpoints if e.id == current_id), None
+                    ) if current_id else None
+                    current_unavailable = (
+                        current_ep is None
+                        or not current_ep.enabled
+                        or not current_ep.in_pool
+                        or self._is_in_cooldown(current_ep)
+                        or self._is_quota_exceeded(current_ep)
+                        or self._is_rpm_limited(current_ep)
+                    )
+                    if not self._manual_override_id and current_unavailable:
                         active = self._active_endpoints()
                         if active:
                             best = min(active, key=lambda e: e.priority)
@@ -1524,18 +1537,15 @@ class APIPool:
 
         
         # 补全 reasoning_content：找到最后一个 assistant 消息，如果没有则注入缓存值
-        # 手动覆盖：如果用户通过UI指定了端点，优先走该端点
-        if self._manual_override_id:
-            override_ep = next((ep for ep in active if ep.id == self._manual_override_id), None)
-            if override_ep:
-                active.remove(override_ep)
-                active.insert(0, override_ep)
-        elif self._restored_endpoint_id:
-            # 兼容旧对象状态：恢复端点必须持续保持，不能只影响首个请求。
-            restored_ep = next((ep for ep in active if ep.id == self._restored_endpoint_id), None)
-            if restored_ep:
-                active.remove(restored_ep)
-                active.insert(0, restored_ep)
+        # 当前端点保持粘性：无明确故障/手动切换/恢复回迁时，后续请求继续使用
+        # 最近成功或故障转移选中的端点，而不是每次回到最高优先级端点。
+        current_id = self._manual_override_id or self._current_endpoint_id or self._restored_endpoint_id
+        if current_id:
+            current_ep = next((ep for ep in active if ep.id == current_id), None)
+            if current_ep is not None:
+                active.remove(current_ep)
+                active.insert(0, current_ep)
+
         idx = 0
         while tried < total:
             ep = active[idx]

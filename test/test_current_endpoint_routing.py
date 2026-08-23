@@ -1,0 +1,98 @@
+import importlib.util
+import os
+import sys
+import tempfile
+import unittest
+
+MODULE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "api_pool_server.py")
+
+
+def load_module(tmp_path):
+    previous_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        spec = importlib.util.spec_from_file_location("api_pool_current_endpoint_test", MODULE_PATH)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("could not load api_pool_server.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        os.chdir(previous_cwd)
+
+
+class CurrentEndpointRoutingTests(unittest.TestCase):
+    @staticmethod
+    def endpoint(module, endpoint_id, priority, model):
+        return module.Endpoint(
+            id=endpoint_id,
+            name=endpoint_id,
+            base_url="http://127.0.0.1:1",
+            api_key="test",
+            model=model,
+            priority=priority,
+            in_pool=True,
+            use_proxy=False,
+        )
+
+    def test_successful_current_endpoint_stays_first_on_next_request(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            low = self.endpoint(module, "low", 1, "deepseek-v4-flash")
+            current = self.endpoint(module, "current", 3, "gpt-5.6-sol")
+            pool = module.APIPool([low, current])
+            pool._current_endpoint_id = current.id
+            calls = []
+
+            def fake_try(ep, payload, timeout, **kwargs):
+                calls.append(ep.id)
+                return {"choices": [{"message": {"content": "ok"}}]}, ""
+
+            pool._try_endpoint = fake_try
+            pool.chat([{"role": "user", "content": "one"}])
+            pool.chat([{"role": "user", "content": "two"}])
+
+            self.assertEqual(calls, ["current", "current"])
+
+    def test_failover_keeps_same_model_candidate_before_lower_priority_model(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            failed = self.endpoint(module, "failed", 5, "claude-opus-5")
+            same_model = self.endpoint(module, "same-model", 6, "claude-opus-5")
+            lower_priority = self.endpoint(module, "other-model", 1, "deepseek-v4-flash")
+            pool = module.APIPool([lower_priority, failed, same_model])
+            pool._current_endpoint_id = failed.id
+            calls = []
+
+            def fake_try(ep, payload, timeout, **kwargs):
+                calls.append(ep.id)
+                if ep is failed:
+                    return None, "connection failed"
+                return {"choices": [{"message": {"content": "ok"}}]}, ""
+
+            pool._try_endpoint = fake_try
+            pool._probe_endpoint = lambda ep: (True, "")
+            pool.chat([{"role": "user", "content": "one"}])
+
+            self.assertEqual(calls, ["failed", "same-model"])
+
+    def test_background_recovery_does_not_replace_healthy_current_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            recovered = self.endpoint(module, "recovered", 1, "deepseek-v4-flash")
+            current = self.endpoint(module, "current", 3, "gpt-5.6-sol")
+            pool = module.APIPool([recovered, current])
+            pool._current_endpoint_id = current.id
+            pool._last_pool_activity = module.time.time()
+            recovered._cooldown_until = module.time.time() - 1
+            pool._probe_endpoint = lambda ep: (True, "")
+
+            pool._background_probe(recovered, current.id)
+
+            self.assertEqual(pool._current_endpoint_id, current.id)
+            self.assertGreater(recovered._defer_until, module.time.time())
+
+
+if __name__ == "__main__":
+    unittest.main()
