@@ -107,6 +107,17 @@
 
 ## 📌 活跃事项
 
+### 工作区归属
+
+`workspace/` 是本地工作区整理产物，不属于发布源码树，已由 `.gitignore` 排除。其内容按来源处理：
+
+- `workspace/repositories/github-sync/` 保留 API Pool 正式 Git 历史，用于只读核对和同步参考；
+- `workspace/repositories/github-verify/` 是验证用浅克隆，不作为开发入口；
+- `workspace/experiments/`、`workspace/snapshots/`、`workspace/records/`、`workspace/tools/`、`workspace/archive/` 是实验、部署快照、记录、工具和历史归档，不进入 GitHub 发布树；
+- 正式开发目录是本项目根目录，分支跟踪 GitHub `main`。
+
+这些目录不删除；需要恢复历史时，应从对应独立 clone 或 `/opt/data/backups/` 读取，不应将整个 `workspace/` 作为新代码提交。
+
 - [x] **[P0] API Pool 2.0 正式运行** — 独立目录 `/vol1/1000/tool/api-pool2`、unit `api-pool2.service`、端口 5200；Hermes 主路由已切换并验收。
 - [x] **[P0] 非 DeepSeek Endpoint fallback 兼容** — 已完成真实端点矩阵、协议转换、工具调用和 Hermes E2E 验收。
 - [x] **[P0] 2.0 多模型上游建模** — **不属于当前 2.0 范围，已否决**；不引入 ModelRoute/独立 Upstream，继续一端点一模型。

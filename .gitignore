@@ -24,3 +24,6 @@ api_pool.log
 
 # Runtime route state
 api_runtime_state.json
+
+# Local workspace artifacts: snapshots, experiments, records, tools, and repository clones
+workspace/
