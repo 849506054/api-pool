@@ -462,7 +462,7 @@ class Endpoint:
     stream_first_packet_timeout: int = 120
     stream_stall_timeout: int = 60
     stream_max_duration: int = 120  # 流总时长上限（秒），0=禁用；防 keep-alive 型无限挂起（2026-08-14 缩短至120s）
-    deferrable: bool = True  # 是否可延迟切换（false=上游恢复时立即切回，不保留cache）
+    deferrable: bool = True  # 是否可延迟回迁（false=上游恢复时立即回迁，不保留cache）
     max_context_k: int = 0  # 最大上下文长度（K=1000 tokens），0=不限
 
     _fail_count: int = field(default=0, repr=False)
@@ -476,7 +476,7 @@ class Endpoint:
     _cooldown_until: float = field(default=0, repr=False)
     _cooldown_reason: str = field(default="", repr=False)
     _manual_unlock_required: bool = field(default=False, repr=False)
-    _defer_until: float = field(default=0, repr=False)  # 延迟切换到期时间，在此期间不切回此端点
+    _defer_until: float = field(default=0, repr=False)  # 延迟回迁到期时间，在此期间不主动回迁到此端点
     
     _today_used: int = field(default=0, repr=False)
     _today_date: str = field(default="", repr=False)
@@ -567,7 +567,7 @@ class APIPool:
             for ep in self._endpoints:
                 if ep.id == ep_id:
                     ep.in_pool = in_pool
-                    # 手动移出池再移回 = 显式信任该端点 → 清除延迟切换状态，恢复最高优先级
+                    # 手动移出池再移回 = 显式信任该端点 → 清除延迟回迁状态，恢复最高优先级
                     if in_pool:
                         ep._defer_until = 0
                     break
@@ -1183,7 +1183,7 @@ class APIPool:
                     ep._health = "ok"
                     ep._transient_count = 0
                     ep._transient_window_start = 0
-                # 判断是否延迟切换（保护当前端点 cache）
+                # 判断是否延迟回迁（保护当前端点 cache）
                 current_ep = None
                 if probe_current_id:
                     current_ep = next((e for e in self._endpoints if e.id == probe_current_id), None)
@@ -1191,7 +1191,7 @@ class APIPool:
                 if current_ep and current_ep is not ep and current_ep.deferrable and pool_active:
                     with self._lock:
                         ep._defer_until = now + 300
-                    sys_log(f"端点 '{ep.name}' 冷却过期探活通过，但池活跃（当前在 '{current_ep.name}'），延迟切换 5 分钟以保持 cache", "INFO")
+                    sys_log(f"端点 '{ep.name}' 冷却过期探活通过，但池活跃（当前在 '{current_ep.name}'），延迟回迁 5 分钟以保持 cache", "INFO")
                 else:
                     with self._lock:
                         ep._defer_until = 0
@@ -1235,7 +1235,7 @@ class APIPool:
                 self._probe_inflight.discard(ep.id)
 
     def _reconcile_deferred(self, now=None, defer_window=300):
-        """已延迟切换的端点：池仍活跃且当前端点可 defer → 滚动延长；池空闲/当前不可 defer → 解除。
+        """已延迟回迁的端点：池仍活跃且当前端点可 defer → 滚动延长；池空闲/当前不可 defer → 解除。
 
         实现「直到无响应为止」：活跃会话期间 defer 持续滚动，会话空闲 5 分钟后才解除，
         下一次请求自然切回最高优先级端点。
@@ -1257,12 +1257,24 @@ class APIPool:
                 # （探活/请求期间 current 被并发修改，如场景9 竞态）。
                 if current_ep and not current_ep.deferrable:
                     ep._defer_until = 0  # 当前端点不可 defer（昂贵兜底）→ 立即恢复上游
-                    sys_log(f"端点 '{ep.name}' 延迟切换解除（当前端点 '{current_ep.name}' 不可延迟）", "INFO")
+                    sys_log(f"端点 '{ep.name}' 延迟回迁解除（当前端点 '{current_ep.name}' 不可延迟）", "INFO")
                 elif pool_active:
                     ep._defer_until = now + defer_window  # 滚动延长，保持 cache
                 else:
                     ep._defer_until = 0  # 池已空闲 → 解除延迟，下次切回
-                    sys_log(f"端点 '{ep.name}' 延迟切换解除（池空闲）", "INFO")
+                    sys_log(f"端点 '{ep.name}' 延迟回迁解除（池空闲）", "INFO")
+
+    def _failover_endpoints(self):
+        """Return failover-eligible endpoints, including deferred recoveries.
+
+        Deferred recovery blocks proactive failback only. If the current endpoint
+        fails, a healthy deferred endpoint remains a valid failover target.
+        """
+        return [ep for ep in self._endpoints if ep.enabled and ep.in_pool
+                and not ep._manual_unlock_required
+                and not self._is_in_cooldown(ep)
+                and not self._is_quota_exceeded(ep)
+                and not self._is_rpm_limited(ep)]
 
     def _active_endpoints(self):
         available = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
@@ -1350,7 +1362,7 @@ class APIPool:
         else:
             self._set_cooldown(failed_ep)
             sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {failed_ep.cooldown_minutes} 分钟后", "WARN")
-        active = self._active_endpoints()
+        active = self._failover_endpoints()
         candidates = self._ordered_failover_candidates(failed_ep, active)
         if candidates:
             self._current_endpoint_id = candidates[0].id
@@ -1363,7 +1375,7 @@ class APIPool:
         self._last_pool_activity = now  # 记录池活跃时间（用于 defer 判断）
         # 仅在"请求开始时端点已在 defer（兜底使用）"时清除延迟状态。
         # 竞态保护：defer 设置前已进入的并发请求（请求开始时不在 defer）成功后
-        # 不清 defer，避免并发请求破坏延迟切换保护窗口。
+        # 不清 defer，避免并发请求破坏延迟回迁保护窗口。
         if clear_defer:
             ep._defer_until = 0
         ep._total_calls += 1
@@ -1687,7 +1699,7 @@ class APIPool:
                     # 单请求饿死不是 API Pool 的端点故障。不要探活或切换到
                     # 其他模型；交回 Hermes，由其现有请求重试机制善后。
                     break
-                active = self._active_endpoints()
+                active = self._failover_endpoints()
                 active.sort(key=lambda e: e.priority)
                 total = len(active)
                 if total == 0:
@@ -1775,7 +1787,7 @@ class APIPool:
                                 for e in remaining:
                                     if not self._is_in_cooldown(e):
                                         self._rotate(e, "并发探活失败", probe_failed=True)
-                                active = self._active_endpoints()
+                                active = self._failover_endpoints()
                                 active.sort(key=lambda e: e.priority)
                                 total = len(active)
                                 if total == 0:

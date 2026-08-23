@@ -20,7 +20,7 @@
 - **Endpoint 集中管理** — UI 可视化维护多个上游 Endpoint，各自配置 URL、Key、模型、协议、代理和兼容参数
 - **自动健康检测** — 内置周期性连通性检测和 Endpoint 状态管理，避免把请求持续发送到不可用上游
 - **优先级调度与故障转移** — 按 priority 选择 Endpoint，支持失败重试、冷却、恢复探活和自动回迁
-- **延迟切换（Deferred Failback）** — 上游恢复后可延迟切回，减少切换造成的 prompt cache 损失；支持 Endpoint 级开关 `deferrable`
+- **延迟回迁（Deferred Failback）** — 上游恢复后可延迟回迁，减少切换造成的 prompt cache 损失；当前端点再次故障时，延迟回迁端点仍可作为故障转移目标；支持 Endpoint 级开关 `deferrable`
 - **上下文长度限制（Endpoint 可选）** — 配置 `max_context_k` 后，超出 Endpoint 上限的请求会跳过该 Endpoint
 - **多协议转换** — 对外统一 OpenAI-compatible 接口，可管理 OpenAI-compatible 与 Anthropic 上游 Endpoint；已验收文本、流式、工具调用、多轮工具结果、跨协议工具历史、base64 PNG 图片和 Hermes 实际工具循环，详见 [`docs/anthropic-compatibility-matrix.md`](docs/anthropic-compatibility-matrix.md)
 - **多模态兼容处理** — 目标 Endpoint 不支持视觉时，可配置视觉模型进行图片预处理
@@ -184,7 +184,7 @@ curl -sS "$BASE_URL/chat/completions" \\
 | `model` | string | - | 发送给该上游的实际模型名；不会被 Hermes 的符号入口模型名覆盖。 |
 | `protocol` | string | `openai` | 上游协议类型，支持 OpenAI-compatible 和 Anthropic 兼容转换路径。 |
 | `priority` | int | - | Endpoint 选择优先级，具体数值关系以管理面板和当前路由实现为准。 |
-| `deferrable` | bool | `true` | 冷却到期后是否延迟切换（保 cache）。false=上游恢复立即切回。 |
+| `deferrable` | bool | `true` | 冷却到期后是否延迟回迁（保 cache）。false=上游恢复立即回迁；当前端点故障时，延迟回迁端点仍可参与故障转移。 |
 | `max_context_k` | int | `0` | 最大上下文长度（K=1000 tokens），0=不限。超过时自动跳过该 Endpoint。 |
 | `tool_call_id_prefix` | string | 空 | 按 Endpoint 重写 tool call ID 前缀，用于兼容特定上游格式。 |
 | `extra_payload` | object | `{}` | 注入该 Endpoint 的供应商参数；应按目标模型/协议配置，不要把 DeepSeek 专属字段全局化。 |
