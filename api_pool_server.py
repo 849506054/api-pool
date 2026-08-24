@@ -2049,9 +2049,9 @@ class APIPool:
                 return result
             errors.append(f"[{ep.name}] {error}")
             sys_log(f"端点 '{ep.name}' 请求失败: {error}", "ERROR")
-            # 2026-08-24 敏感词诊断：失败时打印转发体形态统计（无原文）
-            if getattr(self, "_last_cf_diag", None) and "sensitive" in str(error).lower():
-                d = self._last_cf_diag
+            # 敏感词诊断只在 DEBUG 且确实出现相关拦截错误时执行；使用当前失败尝试的 payload，避免共享状态串扰。
+            if _DEBUG_LOGGING and "sensitive" in str(error).lower():
+                d = self._build_cf_diag(payload)
                 sys_log(
                     f"CF-DIAG ep={ep.name} hyphen={d['hyphen']} underscore={d['underscore']} "
                     f"space={d['space']} messages={d['messages']} tools={d['tools']}",
@@ -2231,26 +2231,33 @@ class APIPool:
         walk(payload, "")
         return out
 
+    def _build_cf_diag(self, payload):
+        """按需生成当前失败请求的敏感词诊断，不在正常热路径执行。"""
+        hyp = "role" + "-" + "play"
+        und = "role" + "_" + "play"
+        spc = "role" + " " + "play"
+        return {
+            "hyphen": self._cf_probe_count(payload, hyp),
+            "underscore": self._cf_probe_count(payload, und),
+            "space": self._cf_probe_count(payload, spc),
+            "messages": len(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else -1,
+            "tools": len(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else -1,
+            "hyphen_paths": self._cf_probe_paths(payload, hyp),
+            "underscore_paths": self._cf_probe_paths(payload, und),
+        }
+
     def _try_endpoint(
         self, ep, payload, timeout, log_usage=True, force_no_retry=False,
         is_probe=False, stream_stall_retry_used=False,
     ):
         req_t0 = time.time()
+        log_prepare_t0 = time.perf_counter() if _DEBUG_LOGGING else None
         prompt_text_to_log = extract_prompt_text(payload) if log_usage and not ep.name.startswith("test_") else ""
-        # 2026-08-24 敏感词诊断：转发前统计各形态计数（无原文），失败时用于定位
-        _hyp = "role" + "-" + "play"
-        _und = "role" + "_" + "play"
-        _spc = "role" + " " + "play"
-        _cf_diag = {
-            "hyphen": self._cf_probe_count(payload, _hyp),
-            "underscore": self._cf_probe_count(payload, _und),
-            "space": self._cf_probe_count(payload, _spc),
-            "messages": len(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else -1,
-            "tools": len(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else -1,
-            "hyphen_paths": self._cf_probe_paths(payload, _hyp),
-            "underscore_paths": self._cf_probe_paths(payload, _und),
-        }
-        self._last_cf_diag = _cf_diag
+        log_prepare_ms = (
+            (time.perf_counter() - log_prepare_t0) * 1000
+            if log_prepare_t0 is not None else 0.0
+        )
+        transform_t0 = time.perf_counter() if _DEBUG_LOGGING else None
         
         # 协议层处理：Anthropic 端点做完整格式转换以保证 Kcne 缓存 key 一致性
         is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
@@ -2368,6 +2375,10 @@ class APIPool:
             data = json.dumps(payload).encode("utf-8")
             
         is_stream = payload.get("stream", False)
+        transform_ms = (
+            (time.perf_counter() - transform_t0) * 1000
+            if transform_t0 is not None else 0.0
+        )
         
         retries = 0 if force_no_retry else ep.max_retries
         for attempt in range(retries + 1):
@@ -2390,6 +2401,7 @@ class APIPool:
                 req.add_header(k, v)
                 
             try:
+                upstream_t0 = time.perf_counter() if _DEBUG_LOGGING else None
                 # 超时语义区分（2026-08-15 超时体系重构）：
                 # - 流式：timeout=ep.timeout 是 TTFB（等响应头/首包），首包后由 stall/max_duration 管控
                 # - 非流式：上游必须全量生成完才返回，60/90s TTFB 必然误杀大请求。
@@ -2404,6 +2416,14 @@ class APIPool:
                 else:
                     resp = urllib.request.urlopen(req, timeout=_open_timeout)
                 
+                if upstream_t0 is not None:
+                    sys_log(
+                        f"[DEBUG] 分段 ep={ep.name} attempt={attempt + 1} "
+                        f"log_prepare_ms={log_prepare_ms:.3f} "
+                        f"protocol_transform_ms={transform_ms:.3f} "
+                        f"upstream_open_ms={(time.perf_counter() - upstream_t0) * 1000:.3f}",
+                        "INFO",
+                    )
                 if is_stream:
                     # Stream first-packet pre-read: timeout retries, not freeze
                     first_line = b""
@@ -2965,6 +2985,13 @@ def api_handler(method, path, body):
             return 503, {"error": {"message": "API Pool content filter unavailable", "type": "service_unavailable"}}, False
         if filter_stats.get("matched"):
             sys_log(f"敏感字过滤命中 {filter_stats['matched']} 处 ({filter_stats['duration_ms']}ms)", "INFO")
+        if _DEBUG_LOGGING:
+            sys_log(
+                f"[DEBUG] 分段 filter_ms={filter_stats.get('duration_ms', 0)} "
+                f"filter_copy_ms={filter_stats.get('copy_ms', 0)} "
+                f"filter_scan_ms={filter_stats.get('scan_ms', 0)}",
+                "INFO",
+            )
 
         extra_payload = {k: v for k, v in body.items() if k not in ("messages", "model")}
         extra_payload.pop("extra_body", None)
