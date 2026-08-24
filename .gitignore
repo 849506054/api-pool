@@ -8,6 +8,9 @@ Thumbs.db
 # 实际配置文件（含 API Key），不提交
 api_config.json
 
+# 敏感字过滤词典（含敏感词原文），绝不提交
+content_filter.json
+
 # 数据库文件
 token_stats.db
 token_stats.db-journal

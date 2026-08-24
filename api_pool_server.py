@@ -30,6 +30,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 import queue
 from datetime import datetime, timedelta
 from collections import deque
+import copy as _copy
+
+# 敏感字过滤私有配置文件（仅 API Pool 进程读取，Hermes 不可见）
+CONTENT_FILTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content_filter.json")
 
 LATENCY_OK_MAX = 2000     
 LATENCY_SLOW_MAX = 5000   
@@ -68,6 +72,358 @@ def sys_log(msg, level="INFO"):
     # flush=True: systemd 下 stdout 是块缓冲（8KB），不加 flush 日志会积攒 6-12 分钟
     # 才落盘 journal，排障时严重误导（2026-08-15 实测：23:53 的日志 23:52:53 才批量落盘）
     print(f"[{time.strftime('%H:%M:%S')}] [{level}] {msg}", flush=True)
+
+
+class ContentFilterError(Exception):
+    """敏感字过滤器不可用。请求应被拒绝，禁止降级放行原始请求。"""
+
+
+class ContentFilter:
+    """入口敏感字过滤器。
+
+    - 词典：私有 content_filter.json，key=替换词映射；值取空串表示删除。
+    - 匹配：正则多分支，单次扫描，长词优先（按词长降序排列）。
+    - 替换结果不参与二次匹配（single-pass，A->B 后不再用 B 匹配）。
+    - 结构保护：messages 中非字符串 content、图像块等字段不触碰。
+    - 快速路径：未启用或词典为空时直接返回原对象（不深拷贝）。
+
+    扫描范围由配置 targets 控制（精准最小化，实测命中位置默认开启）：
+      messages.content              messages[].content 字符串              [默认开]
+      messages.text_blocks          messages[].content[].text 多模态文本块  [默认开]
+      messages.reasoning            reasoning_content / reasoning_text      [默认关]
+      messages.name                 messages[].name                        [默认关]
+      messages.tool_call_arguments  tool_calls[].function.arguments         [默认关]
+      tools.descriptions            tools[].function..*.description         [默认关]
+      all_strings                   递归扫描 payload 全部字符串值(不碰 key)  [默认关]
+    """
+
+    # 实测命中位置：敏感词由 Hermes untrusted 包装提示语产生，落在 messages content
+    DEFAULT_TARGETS = ("messages.content", "messages.text_blocks")
+    KNOWN_TARGETS = (
+        "messages.content",
+        "messages.text_blocks",
+        "messages.reasoning",
+        "messages.name",
+        "messages.tool_call_arguments",
+        "tools.descriptions",
+        "all_strings",
+    )
+
+    def __init__(self, file_path=CONTENT_FILTER_FILE, logger=None):
+        self.file_path = file_path
+        self._logger = logger or sys_log
+        self._lock = threading.Lock()
+        self._enabled = False
+        self._dictionary_version = ""
+        self._pairs = []  # [(pattern, raw, replacement)]
+        self._targets = set(self.DEFAULT_TARGETS)
+        self._raw = {}
+        self.load()
+
+    def load(self):
+        with self._lock:
+            try:
+                with open(self.file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except FileNotFoundError:
+                self._enabled = False
+                self._pairs = []
+                self._raw = {}
+                return False
+            except (OSError, ValueError) as e:
+                self._logger(
+                    f"敏感字过滤词典加载失败: {type(e).__name__}: {e}",
+                    "ERROR",
+                )
+                self._enabled = False
+                self._pairs = []
+                self._raw = {}
+                return False
+            try:
+                section = data.get("content_filter") if isinstance(data, dict) else None
+                if not isinstance(section, dict):
+                    raise TypeError("content_filter 配置段缺失或类型错误")
+                enabled = bool(section.get("enabled", False))
+                raw_rules = section.get("rules")
+                raw_dict = section.get("dictionary", {})
+                if raw_rules is not None and not isinstance(raw_rules, list):
+                    raise TypeError("rules 必须是数组")
+                if not isinstance(raw_dict, dict):
+                    raise TypeError("dictionary 必须是对象")
+                version = str(section.get("dictionary_version", ""))
+                raw_targets = section.get("targets")
+                if raw_targets is None:
+                    targets = set(self.DEFAULT_TARGETS)
+                elif isinstance(raw_targets, list):
+                    targets = {str(t) for t in raw_targets if isinstance(t, str)}
+                    unknown = targets - set(self.KNOWN_TARGETS)
+                    if unknown:
+                        self._logger(
+                            f"敏感字过滤配置含未知 targets，已忽略: {sorted(unknown)}",
+                            "WARN",
+                        )
+                        targets -= unknown
+                else:
+                    raise TypeError("targets 必须是数组")
+            except (ValueError, TypeError) as e:
+                self._logger(f"敏感字过滤配置结构无效: {e}", "ERROR")
+                self._enabled = False
+                self._pairs = []
+                self._raw = {}
+                return False
+
+            pairs = []
+            if raw_rules is not None:
+                for rule in raw_rules:
+                    if not isinstance(rule, dict):
+                        continue
+                    kind = rule.get("type", "literal")
+                    pattern = rule.get("pattern", "")
+                    replacement = rule.get("replacement", "")
+                    if not isinstance(pattern, str) or not pattern:
+                        continue
+                    if not isinstance(replacement, str):
+                        replacement = str(replacement)
+                    if kind == "literal":
+                        pattern = re.escape(pattern)
+                    elif kind != "regex":
+                        raise TypeError(f"不支持的规则类型: {kind}")
+                    try:
+                        pairs.append((pattern, replacement))
+                    except re.error as e:
+                        raise ValueError(f"规则正则无效: {e}") from e
+            else:
+                # 兼容旧 dictionary 配置
+                for word, replacement in raw_dict.items():
+                    if not isinstance(word, str) or not word:
+                        continue
+                    if replacement is None:
+                        replacement = ""
+                    if not isinstance(replacement, str):
+                        replacement = str(replacement)
+                    pairs.append((re.escape(word), replacement))
+            # 长规则优先，避免短规则先截断长规则
+            pairs.sort(key=lambda pr: len(pr[0]), reverse=True)
+            self._pairs = [(re.compile(pattern), replacement) for pattern, replacement in pairs]
+            self._enabled = enabled
+            self._dictionary_version = version
+            self._targets = targets
+            self._raw = data
+            return True
+
+    def _reload(self):
+        self.load()
+
+    def _match_and_replace(self, text):
+        """对单个字符串执行单次扫描替换，替换结果不参与二次匹配。"""
+        if not text:
+            return text, 0
+        if not self._pairs:
+            return text, 0
+        # 交替正则：每条规则一个捕获组，一次 sub 扫描完成
+        pattern = re.compile("|".join(f"({p.pattern})" for p, _ in self._pairs))
+        replacements = [replacement for _, replacement in self._pairs]
+        matched = []
+
+        def _repl(m):
+            matched.append(1)
+            for index, group in enumerate(m.groups()):
+                if group is not None:
+                    return replacements[index]
+            return m.group(0)
+
+        new_text = pattern.sub(_repl, text)
+        return new_text, len(matched)
+
+    def filter_payload(self, payload, return_stats=False):
+        """对请求 payload 执行清洗，返回 (清洗后 payload, stats)。
+
+        - 未启用或词典为空：返回原对象（不深拷贝），stats.matched=0。
+        - 失败时抛出 ContentFilterError，调用方应拒绝请求。
+        """
+        stats = {
+            "enabled": self._enabled,
+            "matched": 0,
+            "duration_ms": 0.0,
+            "dictionary_version": self._dictionary_version,
+        }
+        if not self._enabled or not self._pairs:
+            if return_stats:
+                return payload, stats
+            return payload
+
+        t0 = time.time()
+        try:
+            # 深拷贝 payload，确保后续端点/日志共用清洗结果且不污染原请求
+            cleaned = _copy.deepcopy(payload)
+            total = self._apply(cleaned)
+        except Exception as e:
+            raise ContentFilterError(
+                f"敏感字过滤执行失败: {type(e).__name__}: {e}"
+            ) from e
+        stats["matched"] = total
+        stats["duration_ms"] = round((time.time() - t0) * 1000, 3)
+        if return_stats:
+            return cleaned, stats
+        return cleaned
+
+    def _apply(self, payload):
+        """就地修改 payload 结构，返回命中次数。范围由 self._targets 控制。"""
+        if not isinstance(payload, dict):
+            return 0
+        t = self._targets
+        # 全量递归扫描：从根开始扫所有字符串值（不碰 key），一次覆盖全部位置
+        if "all_strings" in t:
+            return self._walk_strings(payload)
+        total = 0
+        messages = payload.get("messages")
+        if isinstance(messages, list) and (
+            "messages.content" in t
+            or "messages.text_blocks" in t
+            or "messages.reasoning" in t
+            or "messages.name" in t
+            or "messages.tool_call_arguments" in t
+        ):
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if "messages.content" in t and isinstance(content, str):
+                    new_text, n = self._match_and_replace(content)
+                    if n:
+                        msg["content"] = new_text
+                        total += n
+                elif "messages.text_blocks" in t and isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            tv = part.get("text")
+                            if isinstance(tv, str):
+                                new_text, n = self._match_and_replace(tv)
+                                if n:
+                                    part["text"] = new_text
+                                    total += n
+                if "messages.reasoning" in t:
+                    for rfield in ("reasoning_content", "reasoning_text"):
+                        rv = msg.get(rfield)
+                        if isinstance(rv, str):
+                            new_rv, n = self._match_and_replace(rv)
+                            if n:
+                                msg[rfield] = new_rv
+                                total += n
+                if "messages.name" in t:
+                    mname = msg.get("name")
+                    if isinstance(mname, str):
+                        new_mname, n = self._match_and_replace(mname)
+                        if n:
+                            msg["name"] = new_mname
+                            total += n
+                if "messages.tool_call_arguments" in t:
+                    tool_calls = msg.get("tool_calls")
+                    if isinstance(tool_calls, list):
+                        for tc in tool_calls:
+                            if not isinstance(tc, dict):
+                                continue
+                            fn = tc.get("function")
+                            if not isinstance(fn, dict):
+                                continue
+                            args = fn.get("arguments")
+                            if isinstance(args, str):
+                                new_args, n = self._replace_json_arguments(args)
+                                if n:
+                                    fn["arguments"] = new_args
+                                    total += n
+                            elif isinstance(args, dict):
+                                total += self._walk_strings(args)
+        if "tools.descriptions" in t:
+            tools = payload.get("tools")
+            if isinstance(tools, list):
+                for tool in tools:
+                    if not isinstance(tool, dict):
+                        continue
+                    fn = tool.get("function")
+                    if not isinstance(fn, dict):
+                        continue
+                    desc = fn.get("description")
+                    if isinstance(desc, str):
+                        new_text, n = self._match_and_replace(desc)
+                        if n:
+                            fn["description"] = new_text
+                            total += n
+                    params = fn.get("parameters")
+                    if isinstance(params, dict):
+                        total += self._walk_descriptions(params)
+        return total
+
+    def _walk_descriptions(self, node):
+        """遍历 parameters 中的 description 字符串字段。"""
+        count = 0
+        if isinstance(node, dict):
+            desc = node.get("description")
+            if isinstance(desc, str):
+                new_text, n = self._match_and_replace(desc)
+                if n:
+                    node["description"] = new_text
+                    count += n
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    count += self._walk_descriptions(value)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    count += self._walk_descriptions(item)
+        return count
+
+    def _walk_strings(self, node):
+        """递归替换 dict/list 中所有字符串值（不碰 key），用于工具参数对象。"""
+        count = 0
+        if isinstance(node, dict):
+            for key in list(node.keys()):
+                value = node[key]
+                if isinstance(value, str):
+                    new_value, n = self._match_and_replace(value)
+                    if n:
+                        node[key] = new_value
+                        count += n
+                elif isinstance(value, (dict, list)):
+                    count += self._walk_strings(value)
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                if isinstance(item, str):
+                    new_item, n = self._match_and_replace(item)
+                    if n:
+                        node[i] = new_item
+                        count += n
+                elif isinstance(item, (dict, list)):
+                    count += self._walk_strings(item)
+        return count
+
+    def _replace_json_arguments(self, args_str):
+        """工具调用参数：优先解析 JSON 后递归替换值，解析失败则直接字符串替换。"""
+        try:
+            obj = json.loads(args_str)
+        except (ValueError, TypeError):
+            return self._match_and_replace(args_str)
+        if isinstance(obj, (dict, list)):
+            n = self._walk_strings(obj)
+            if n:
+                return json.dumps(obj, ensure_ascii=False), n
+        return args_str, 0
+
+    def status(self):
+        with self._lock:
+            return {
+                "enabled": self._enabled,
+                "dictionary_version": self._dictionary_version,
+                "word_count": len(self._pairs),
+                "targets": sorted(self._targets),
+            }
+
+    def reload(self):
+        """重新加载词典（运行期可调用，不影响进行中的请求）。"""
+        return self.load()
+
+
+content_filter = ContentFilter()
 
 class TokenTracker:
     def __init__(self, db_path="token_stats.db"):
@@ -1672,6 +2028,18 @@ class APIPool:
                 return result
             errors.append(f"[{ep.name}] {error}")
             sys_log(f"端点 '{ep.name}' 请求失败: {error}", "ERROR")
+            # 2026-08-24 敏感词诊断：失败时打印转发体形态统计（无原文）
+            if getattr(self, "_last_cf_diag", None) and "sensitive" in str(error).lower():
+                d = self._last_cf_diag
+                sys_log(
+                    f"CF-DIAG ep={ep.name} hyphen={d['hyphen']} underscore={d['underscore']} "
+                    f"space={d['space']} messages={d['messages']} tools={d['tools']}",
+                    "INFO",
+                )
+                if d.get("hyphen_paths"):
+                    sys_log(f"CF-DIAG hyphen_paths={d['hyphen_paths']}", "INFO")
+                if d.get("underscore_paths"):
+                    sys_log(f"CF-DIAG underscore_paths={d['underscore_paths']}", "INFO")
             # 请求失败耗时 DEBUG（API_POOL_DEBUG / /api/debug 开关控制）
             if _DEBUG_LOGGING:
                 try:
@@ -1807,12 +2175,61 @@ class APIPool:
                 tried += 1
         raise AllEndpointsFailed(errors)
 
+    def _cf_probe_count(self, payload, needle):
+        """统计 payload 内所有字符串值中出现 needle 的次数（不含原文，仅计数）。"""
+        def walk(node):
+            c = 0
+            if isinstance(node, str):
+                return node.count(needle)
+            if isinstance(node, dict):
+                for v in node.values():
+                    c += walk(v)
+            elif isinstance(node, list):
+                for it in node:
+                    c += walk(it)
+            return c
+        return walk(payload)
+
+    def _cf_probe_paths(self, payload, needle, limit=20):
+        """返回命中 needle 的字段路径列表（不含原文）。格式: messages[3].content 等。"""
+        out = []
+
+        def walk(node, path):
+            if len(out) >= limit:
+                return
+            if isinstance(node, str):
+                if needle in node:
+                    out.append(path)
+                return
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    walk(v, f"{path}.{k}" if path else str(k))
+            elif isinstance(node, list):
+                for i, it in enumerate(node):
+                    walk(it, f"{path}[{i}]" if path else f"[{i}]")
+        walk(payload, "")
+        return out
+
     def _try_endpoint(
         self, ep, payload, timeout, log_usage=True, force_no_retry=False,
         is_probe=False, stream_stall_retry_used=False,
     ):
         req_t0 = time.time()
         prompt_text_to_log = extract_prompt_text(payload) if log_usage and not ep.name.startswith("test_") else ""
+        # 2026-08-24 敏感词诊断：转发前统计各形态计数（无原文），失败时用于定位
+        _hyp = "role" + "-" + "play"
+        _und = "role" + "_" + "play"
+        _spc = "role" + " " + "play"
+        _cf_diag = {
+            "hyphen": self._cf_probe_count(payload, _hyp),
+            "underscore": self._cf_probe_count(payload, _und),
+            "space": self._cf_probe_count(payload, _spc),
+            "messages": len(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else -1,
+            "tools": len(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else -1,
+            "hyphen_paths": self._cf_probe_paths(payload, _hyp),
+            "underscore_paths": self._cf_probe_paths(payload, _und),
+        }
+        self._last_cf_diag = _cf_diag
         
         # 协议层处理：Anthropic 端点做完整格式转换以保证 Kcne 缓存 key 一致性
         is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
@@ -2518,6 +2935,16 @@ def api_handler(method, path, body):
         messages = body.get("messages", [])
         is_stream = body.get("stream", False)
         
+        # 入口敏感字清洗（唯一执行点）：清洗结果贯穿端点选择/协议转换/重试/日志
+        try:
+            body, filter_stats = content_filter.filter_payload(body, return_stats=True)
+            messages = body.get("messages", messages)
+        except ContentFilterError as e:
+            sys_log(f"敏感字过滤不可用，拒绝请求: {e}", "ERROR")
+            return 503, {"error": {"message": "API Pool content filter unavailable", "type": "service_unavailable"}}, False
+        if filter_stats.get("matched"):
+            sys_log(f"敏感字过滤命中 {filter_stats['matched']} 处 ({filter_stats['duration_ms']}ms)", "INFO")
+
         extra_payload = {k: v for k, v in body.items() if k not in ("messages", "model")}
         extra_payload.pop("extra_body", None)
         extra_payload.pop("response_format", None)
