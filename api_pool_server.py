@@ -115,7 +115,9 @@ class ContentFilter:
         self._lock = threading.Lock()
         self._enabled = False
         self._dictionary_version = ""
-        self._pairs = []  # [(pattern, raw, replacement)]
+        self._pairs = []  # [(pattern, replacement)]
+        self._pattern = None
+        self._replacements = []
         self._targets = set(self.DEFAULT_TARGETS)
         self._raw = {}
         self.load()
@@ -128,6 +130,8 @@ class ContentFilter:
             except FileNotFoundError:
                 self._enabled = False
                 self._pairs = []
+                self._pattern = None
+                self._replacements = []
                 self._raw = {}
                 return False
             except (OSError, ValueError) as e:
@@ -137,6 +141,8 @@ class ContentFilter:
                 )
                 self._enabled = False
                 self._pairs = []
+                self._pattern = None
+                self._replacements = []
                 self._raw = {}
                 return False
             try:
@@ -169,6 +175,8 @@ class ContentFilter:
                 self._logger(f"敏感字过滤配置结构无效: {e}", "ERROR")
                 self._enabled = False
                 self._pairs = []
+                self._pattern = None
+                self._replacements = []
                 self._raw = {}
                 return False
 
@@ -205,6 +213,13 @@ class ContentFilter:
             # 长规则优先，避免短规则先截断长规则
             pairs.sort(key=lambda pr: len(pr[0]), reverse=True)
             self._pairs = [(re.compile(pattern), replacement) for pattern, replacement in pairs]
+            # 交替正则只在加载词典时编译一次；请求处理阶段直接复用。
+            self._pattern = (
+                re.compile("|".join(f"({pattern})" for pattern, _ in pairs))
+                if pairs
+                else None
+            )
+            self._replacements = [replacement for _, replacement in pairs]
             self._enabled = enabled
             self._dictionary_version = version
             self._targets = targets
@@ -218,22 +233,22 @@ class ContentFilter:
         """对单个字符串执行单次扫描替换，替换结果不参与二次匹配。"""
         if not text:
             return text, 0
-        if not self._pairs:
+        pattern = self._pattern
+        if pattern is None:
             return text, 0
-        # 交替正则：每条规则一个捕获组，一次 sub 扫描完成
-        pattern = re.compile("|".join(f"({p.pattern})" for p, _ in self._pairs))
-        replacements = [replacement for _, replacement in self._pairs]
-        matched = []
+        replacements = self._replacements
+        matched_count = 0
 
         def _repl(m):
-            matched.append(1)
+            nonlocal matched_count
+            matched_count += 1
             for index, group in enumerate(m.groups()):
                 if group is not None:
                     return replacements[index]
             return m.group(0)
 
         new_text = pattern.sub(_repl, text)
-        return new_text, len(matched)
+        return new_text, matched_count
 
     def filter_payload(self, payload, return_stats=False):
         """对请求 payload 执行清洗，返回 (清洗后 payload, stats)。
@@ -245,6 +260,8 @@ class ContentFilter:
             "enabled": self._enabled,
             "matched": 0,
             "duration_ms": 0.0,
+            "copy_ms": 0.0,
+            "scan_ms": 0.0,
             "dictionary_version": self._dictionary_version,
         }
         if not self._enabled or not self._pairs:
@@ -252,17 +269,21 @@ class ContentFilter:
                 return payload, stats
             return payload
 
-        t0 = time.time()
+        t0 = time.perf_counter()
         try:
             # 深拷贝 payload，确保后续端点/日志共用清洗结果且不污染原请求
             cleaned = _copy.deepcopy(payload)
+            copy_done = time.perf_counter()
             total = self._apply(cleaned)
+            scan_done = time.perf_counter()
         except Exception as e:
             raise ContentFilterError(
                 f"敏感字过滤执行失败: {type(e).__name__}: {e}"
             ) from e
         stats["matched"] = total
-        stats["duration_ms"] = round((time.time() - t0) * 1000, 3)
+        stats["copy_ms"] = round((copy_done - t0) * 1000, 3)
+        stats["scan_ms"] = round((scan_done - copy_done) * 1000, 3)
+        stats["duration_ms"] = round((scan_done - t0) * 1000, 3)
         if return_stats:
             return cleaned, stats
         return cleaned

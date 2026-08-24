@@ -292,6 +292,58 @@ class ContentFilterTests(unittest.TestCase):
         self.assertEqual(stats["matched"], 1)
         self.assertEqual(f.status()["targets"], ["messages.content"])
 
+    def test_known_regions_exclude_unproven_payload_fields(self):
+        targets = [
+            "messages.content",
+            "messages.text_blocks",
+            "messages.reasoning",
+            "messages.name",
+            "messages.tool_call_arguments",
+        ]
+        f = self._make_filter({"token_a": "token a"}, targets=targets)
+        payload = {
+            "model": "token_a_model",
+            "metadata": "token_a_metadata",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "name": "token_a_name",
+                    "content": "token_a_content",
+                    "reasoning_content": "token_a_reasoning",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "token_a_function",
+                                "arguments": json.dumps({"q": "token_a_argument"}),
+                            }
+                        }
+                    ],
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "token_a_tool",
+                        "description": "token_a_description",
+                        "parameters": {"enum": ["token_a_enum"]},
+                    },
+                }
+            ],
+        }
+        cleaned, stats = f.filter_payload(payload, return_stats=True)
+        message = cleaned["messages"][0]
+        self.assertEqual(message["name"], "token a_name")
+        self.assertEqual(message["content"], "token a_content")
+        self.assertEqual(message["reasoning_content"], "token a_reasoning")
+        self.assertIn("token a_argument", message["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "token_a_function")
+        self.assertEqual(cleaned["model"], "token_a_model")
+        self.assertEqual(cleaned["metadata"], "token_a_metadata")
+        self.assertEqual(cleaned["tools"][0]["function"]["description"], "token_a_description")
+        self.assertEqual(cleaned["tools"][0]["function"]["parameters"]["enum"], ["token_a_enum"])
+        self.assertEqual(stats["matched"], 4)
+
     def test_unknown_targets_ignored(self):
         f = self._make_filter({"token_a": "token a"},
                               targets=["messages.content", "bogus.target"])
