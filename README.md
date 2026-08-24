@@ -25,6 +25,7 @@
 - **多协议转换** — 对外统一 OpenAI-compatible 接口，可管理 OpenAI-compatible 与 Anthropic 上游 Endpoint；已验收文本、流式、工具调用、多轮工具结果、跨协议工具历史、base64 PNG 图片和 Hermes 实际工具循环，详见 [`docs/anthropic-compatibility-matrix.md`](docs/anthropic-compatibility-matrix.md)
 - **多模态兼容处理** — 目标 Endpoint 不支持视觉时，可配置视觉模型进行图片预处理
 - **工具调用兼容** — 支持 tool call 转换、工具结果回传，以及按 Endpoint 配置 `tool_call_id_prefix` 修正跨上游切换后的 ID 格式
+- **入口敏感词过滤** — 请求进入路由前统一清洗已知字段，覆盖普通消息、多模态文本、reasoning、消息名称和工具调用参数；范围可配置，默认不扫描整个 payload
 - **独立入口与内部路由** — Hermes 只需连接稳定的 `api-pool` 入口模型名，API Pool 2.0 使用目标 Endpoint 自己的 `model` 转发
 - **统计大盘** — Token 消耗、缓存命中、请求数趋势
 - **零依赖** — 只需 Python 3.13，单文件即可运行
@@ -39,6 +40,75 @@ python api_pool_server.py
 
 访问 http://localhost:5200 打开 API Pool 2.0 管理面板。
 API 接口：http://localhost:5200/v1/chat/completions
+
+## 入口敏感词过滤
+
+API Pool 可在请求进入 Endpoint 路由前执行一次统一清洗，避免同一份请求在重试或故障转移时重复处理。过滤器只修改请求副本，不改变客户端原始 payload；词典加载或执行失败时拒绝请求，不会降级放行未清洗内容。
+
+### 私有配置文件
+
+过滤器配置文件为运行环境中的客户私有文件：
+
+```text
+content_filter.json
+```
+
+该文件包含客户自定义规则，已被 `.gitignore` 排除，**不会提交到 Git**。生产环境以宿主机当前文件为唯一事实源。部署代码时不要用工作区副本整体覆盖它；如需调整扫描范围，应在宿主机现有配置基础上只修改 `targets` 等字段，原样保留 `rules`。
+
+### 配置示例
+
+下面示例只展示结构。实际敏感词规则应在客户私有配置中维护，不要把真实规则提交到仓库：
+
+```json
+{
+  "content_filter": {
+    "enabled": true,
+    "dictionary_version": "2026-08-24",
+    "targets": [
+      "messages.content",
+      "messages.text_blocks",
+      "messages.reasoning",
+      "messages.name",
+      "messages.tool_call_arguments"
+    ],
+    "rules": [
+      {
+        "type": "literal",
+        "pattern": "client-private-pattern",
+        "replacement": "safe-replacement"
+      },
+      {
+        "type": "regex",
+        "pattern": "private[-_]pattern",
+        "replacement": "safe replacement"
+      }
+    ]
+  }
+}
+```
+
+### 扫描范围
+
+当前推荐的精确 targets：
+
+| target | 扫描内容 |
+|---|---|
+| `messages.content` | `messages[].content` 字符串，覆盖所有消息角色 |
+| `messages.text_blocks` | 多模态消息中的 `content[].text` |
+| `messages.reasoning` | `reasoning_content` 和 `reasoning_text` |
+| `messages.name` | `messages[].name` |
+| `messages.tool_call_arguments` | `tool_calls[].function.arguments` 的 JSON 值；不修改 JSON key |
+
+`all_strings` 会递归扫描 payload 中全部字符串值，包括工具名称、Schema 的 `enum/default`、顶层 metadata 等非目标字段。它适合排查漏网字段，**不建议长期作为生产默认值**，因为扫描范围更大、开销更高，也可能改写执行数据。
+
+`tools.descriptions` 仅在有实际命中证据时启用。每次收窄范围后，应确认上述已知区域仍能过滤，工具名称、Schema 和顶层 metadata 等非目标字段保持原样。
+
+### 维护与部署注意事项
+
+- `content_filter.json` 是客户私有配置，不进入 Git 流程；规则原文不得写入 README、源码、测试或日志。
+- 工具层可能对敏感词 `pattern` 自动脱敏。写入规则时，必须避免让待替换的 `pattern` 被错误改写；禁止把经过脱敏的工作区副本当成生产词典。
+- 部署前后应比较每条规则的类型、pattern/replacement 长度和脱敏后的 SHA-256 指纹，不打印规则原文。
+- 如果预期是替换规则，却出现 `pattern == replacement`，应立即停止部署并从宿主机备份恢复规则，再只做字段级修改。
 
 ## 部署
 
