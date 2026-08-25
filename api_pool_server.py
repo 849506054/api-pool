@@ -839,7 +839,7 @@ class Endpoint:
     stream_first_packet_timeout: int = 120
     stream_stall_timeout: int = 60
     stream_max_duration: int = 120  # 流总时长上限（秒），0=禁用；防 keep-alive 型无限挂起（2026-08-14 缩短至120s）
-    deferrable: bool = True  # 是否可延迟回迁（false=上游恢复时立即回迁，不保留cache）
+    deferrable: bool = True  # 是否保护本端点缓存（true=本端点工作时延迟切走）
     max_context_k: int = 0  # 最大上下文长度（K=1000 tokens），0=不限
 
     _fail_count: int = field(default=0, repr=False)
@@ -1189,10 +1189,9 @@ class APIPool:
             
         # If retry also fails or isn't fast enough, return the original attempt's status
         if reply is not None:
-            if latency <= LATENCY_SLOW_MAX:
-                return ep.id, "slow", latency, ""
-            else:
-                return ep.id, "bad", latency, f"延迟过高: {latency}ms"
+            # A successful response is healthy even when it is slow.  Latency is
+            # reported separately; it must not turn a live endpoint into a fault.
+            return ep.id, "slow", latency, ""
         else:
             return ep.id, "bad", latency, err_str or "未知错误"
 
@@ -1542,7 +1541,8 @@ class APIPool:
                 self._probe_inflight.add(ep.id)
             self._probe_executor.submit(self._background_probe, ep, probe_current_id)
 
-        # 滚动处理已延迟的端点：池仍活跃则延长 defer，池空闲/当前不可 defer 则解除
+        # 滚动处理缓存保护产生的延迟回切：当前端点仍保护 cache 时延长，
+        # 池空闲或当前端点关闭保护时解除。
         self._reconcile_deferred(now, defer_window)
 
     def _background_probe(self, ep, probe_current_id):
@@ -1560,19 +1560,33 @@ class APIPool:
                     ep._health = "ok"
                     ep._transient_count = 0
                     ep._transient_window_start = 0
-                # 判断是否延迟回迁（保护当前端点 cache）
+                # 当前工作端点决定是否保护自身 cache：开启时延迟切走，
+                # 关闭时恢复端点立即回切。恢复端点自己的开关不参与本次判断。
                 current_ep = None
                 if probe_current_id:
                     current_ep = next((e for e in self._endpoints if e.id == probe_current_id), None)
                 pool_active = self._last_pool_activity > now - 300
-                if current_ep and current_ep is not ep and current_ep.deferrable and pool_active:
+                protect_current_cache = (
+                    current_ep is not None
+                    and current_ep is not ep
+                    and current_ep.deferrable
+                    and pool_active
+                )
+                if protect_current_cache:
                     with self._lock:
                         ep._defer_until = now + 300
-                    sys_log(f"端点 '{ep.name}' 冷却过期探活通过，但池活跃（当前在 '{current_ep.name}'），延迟回迁 5 分钟以保持 cache", "INFO")
+                    sys_log(f"端点 '{ep.name}' 冷却过期探活通过；当前端点 '{current_ep.name}' 已开启缓存保护，延迟回切 5 分钟", "INFO")
                 else:
                     with self._lock:
                         ep._defer_until = 0
-                    sys_log(f"端点 '{ep.name}' 冷却过期探活通过，已恢复", "INFO")
+                        # 手动指定端点不被后台恢复覆盖；自动路由则立即回切
+                        # 到刚恢复的端点，兑现“关闭缓存保护=立即回切”。
+                        if not self._manual_override_id:
+                            self._current_endpoint_id = ep.id
+                    if current_ep is not None and current_ep is not ep and not current_ep.deferrable:
+                        sys_log(f"端点 '{ep.name}' 冷却过期探活通过；当前端点 '{current_ep.name}' 未开启缓存保护，立即回切", "INFO")
+                    else:
+                        sys_log(f"端点 '{ep.name}' 冷却过期探活通过，已恢复", "INFO")
                 # 仅在当前端点不存在或已不可用时更新当前指针；恢复一个端点不应
                 # 在池仍使用其他健康端点时把路由无故改回 priority 最小端点。
                 with self._lock:
@@ -1612,10 +1626,10 @@ class APIPool:
                 self._probe_inflight.discard(ep.id)
 
     def _reconcile_deferred(self, now=None, defer_window=300):
-        """已延迟回迁的端点：池仍活跃且当前端点可 defer → 滚动延长；池空闲/当前不可 defer → 解除。
+        """处理缓存保护产生的延迟回切状态。
 
-        实现「直到无响应为止」：活跃会话期间 defer 持续滚动，会话空闲 5 分钟后才解除，
-        下一次请求自然切回最高优先级端点。
+        当前端点保护 cache 且池活跃时持续滚动；池空闲或当前端点关闭保护时，
+        解除延迟并恢复自动路由。
         """
         if now is None:
             now = time.time()
@@ -1625,21 +1639,22 @@ class APIPool:
             if current_display_id:
                 current_ep = next((e for e in self._endpoints if e.id == current_display_id), None)
             pool_active = self._last_pool_activity > now - defer_window
+            released = []
             for ep in self._endpoints:
                 if not (ep.in_pool and ep._defer_until > 0):
                     continue
-                # 注意：不再有 "ep is current_ep → 解除" 分支。
                 # 兜底使用的 defer 清除已由 _on_success(clear_defer=True) 处理；
                 # 这里若用实时 current 判断会误清"defer 前进入的并发请求"产生的 defer
                 # （探活/请求期间 current 被并发修改，如场景9 竞态）。
-                if current_ep and not current_ep.deferrable:
-                    ep._defer_until = 0  # 当前端点不可 defer（昂贵兜底）→ 立即恢复上游
-                    sys_log(f"端点 '{ep.name}' 延迟回迁解除（当前端点 '{current_ep.name}' 不可延迟）", "INFO")
-                elif pool_active:
+                if current_ep and current_ep.deferrable and pool_active:
                     ep._defer_until = now + defer_window  # 滚动延长，保持 cache
                 else:
-                    ep._defer_until = 0  # 池已空闲 → 解除延迟，下次切回
-                    sys_log(f"端点 '{ep.name}' 延迟回迁解除（池空闲）", "INFO")
+                    ep._defer_until = 0
+                    released.append(ep)
+                    reason = "池空闲" if not pool_active else "当前端点未开启缓存保护"
+                    sys_log(f"端点 '{ep.name}' 延迟回切解除（{reason}）", "INFO")
+            if released and not self._manual_override_id:
+                self._current_endpoint_id = min(released, key=lambda item: item.priority).id
 
     def _failover_endpoints(self):
         """Return failover-eligible endpoints, including deferred recoveries.
@@ -1881,6 +1896,7 @@ class APIPool:
     def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False):
         self._cleanup_expired_cooldowns()
         _chat_start = time.time()  # 530s 轮转预算计时起点（与 Hermes 600s 超时窗口对齐）
+        debug_trace = [] if _DEBUG_LOGGING else None
         # 终极兜底锁定：锁定期间所有请求直连 prio99（全局滑动窗口）
         if self._is_fallback_locked():
             fb = self._get_fallback_endpoint()
@@ -1957,7 +1973,7 @@ class APIPool:
                             idx = i
                             break
                     continue
-            # 快照请求开始时的 defer 状态：用于 _on_success 判断是否"兜底使用"。
+            # 快照请求开始时的缓存保护延迟状态：用于 _on_success 判断是否为回切后的请求。
             # 竞态保护：defer 设置前已进入的请求（快照=0）成功后不清 defer。
             defer_at_request = ep._defer_until
             ep_timeout = timeout or ep.timeout
@@ -2010,17 +2026,6 @@ class APIPool:
                 sys_log(f"收到 API 请求，尝试请求端点 '{ep.name}' (模型: {ep_model})", "INFO")
             else:
                 sys_log(f"重试请求，尝试请求端点 '{ep.name}' (模型: {ep_model})", "INFO")
-            # 请求特征 DEBUG（API_POOL_DEBUG / /api/debug 开关控制）
-            if _DEBUG_LOGGING:
-                try:
-                    _msg_chars = sum(len(str(m.get("content", ""))) for m in payload.get("messages", []))
-                    _tools = payload.get("tools")
-                    _tool_count = len(_tools) if isinstance(_tools, list) else 0
-                    _tool_choice = payload.get("tool_choice")
-                    sys_log(f"[DEBUG] 请求特征: msgs_chars={_msg_chars} stream={payload.get('stream')} max_tokens={payload.get('max_tokens')} thinking={payload.get('thinking')} reasoning_effort={payload.get('reasoning_effort')} tools={_tool_count} tool_choice={_tool_choice} temperature={payload.get('temperature')} top_p={payload.get('top_p')}", "INFO")
-                except Exception:
-                    pass
-
             # 上下文长度检查：超过限制时跳过该端点（不冻结、不记失败），轮转到下一个
             if ep.max_context_k > 0:
                 estimated = self._estimate_context_tokens(loop_messages)
@@ -2030,7 +2035,36 @@ class APIPool:
                     idx = (idx + 1) % total
                     continue
 
-            result, error = self._try_endpoint(ep, payload, ep_timeout, force_no_retry=(getattr(ep, "priority", 0) == 99))
+            force_no_retry = getattr(ep, "priority", 0) == 99
+            if debug_trace is None:
+                result, error = self._try_endpoint(ep, payload, ep_timeout, force_no_retry=force_no_retry)
+            else:
+                result, error = self._try_endpoint(
+                    ep,
+                    payload,
+                    ep_timeout,
+                    force_no_retry=force_no_retry,
+                    debug_trace=debug_trace,
+                )
+            if debug_trace is not None:
+                if result is not None:
+                    outcome = "stream_opened" if payload.get("stream") else "success"
+                    debug_trace.append({"endpoint": ep.name, "result": outcome})
+                else:
+                    error_text = str(error)
+                    if error_text.startswith("HTTP "):
+                        error_kind = error_text.split(":", 1)[0].replace(" ", "_").lower()
+                    elif "timeout" in error_text.lower() or "超时" in error_text:
+                        error_kind = "timeout"
+                    elif "auth error" in error_text:
+                        error_kind = "auth"
+                    elif "rate-limited" in error_text:
+                        error_kind = "rate_limited"
+                    elif error_text.startswith("fake-success"):
+                        error_kind = "fake_success"
+                    else:
+                        error_kind = "request_error"
+                    debug_trace.append({"endpoint": ep.name, "result": "error", "kind": error_kind})
             if result is not None:
                 with self._lock:
                     self._on_success(ep, result, clear_defer=defer_at_request > 0)
@@ -2042,7 +2076,18 @@ class APIPool:
                 if _DEBUG_LOGGING:
                     try:
                         _req_elapsed = int((time.time() - _chat_start) * 1000)
-                        sys_log(f"[DEBUG] 请求完成耗时: {_req_elapsed}ms", "INFO")
+                        endpoint_records = [item for item in (debug_trace or []) if item.get("result") in ("success", "stream_opened", "error")]
+                        switch_count = sum(
+                            1 for previous, current in zip(endpoint_records, endpoint_records[1:])
+                            if previous.get("endpoint") != current.get("endpoint")
+                        )
+                        diagnostic_status = "建立" if payload.get("stream") else "完成"
+                        sys_log(
+                            f"[DEBUG] 请求诊断{diagnostic_status} elapsed_ms={_req_elapsed} "
+                            f"switches={switch_count} "
+                            f"attempts={json.dumps(debug_trace, ensure_ascii=False, separators=(',', ':'))}",
+                            "INFO",
+                        )
                     except Exception:
                         pass
                 if return_endpoint: return result, ep
@@ -2061,13 +2106,6 @@ class APIPool:
                     sys_log(f"CF-DIAG hyphen_paths={d['hyphen_paths']}", "INFO")
                 if d.get("underscore_paths"):
                     sys_log(f"CF-DIAG underscore_paths={d['underscore_paths']}", "INFO")
-            # 请求失败耗时 DEBUG（API_POOL_DEBUG / /api/debug 开关控制）
-            if _DEBUG_LOGGING:
-                try:
-                    _fail_elapsed = int((time.time() - _chat_start) * 1000)
-                    sys_log(f"[DEBUG] 请求失败耗时: {_fail_elapsed}ms", "INFO")
-                except Exception:
-                    pass
             # 2026-08-15: 502/503/504 网关级错误 → 跳过候选端点探活，直接重试。
             # 探活(ping max_tokens=3) 无法鉴别网关故障：小请求通过≠真实请求可用，
             # 避免"探活通过→重试超时"空转。超时/连接错误仍走探活（瞬态防误杀）。
@@ -2167,14 +2205,17 @@ class APIPool:
                                 idx = active.index(chosen)
                                 # 其余探活失败的端点标记短冷却，避免后续轮转再撞上
                                 for e in remaining:
-                                    if e is not chosen and probe_results.get(e.id) not in ("ok", "slow") and not self._is_in_cooldown(e):
+                                    # Only an explicit completed failure is evidence
+                                    # for cooldown. Missing results mean the probe
+                                    # exceeded the observation window, not that it failed.
+                                    if e is not chosen and probe_results.get(e.id) == "bad" and not self._is_in_cooldown(e):
                                         self._rotate(e, "并发探活失败", probe_failed=True)
                                 continue
                             else:
                                 # 全部探活失败：全部短冷却，回到循环顶部走 fallback 兜底
                                 sys_log(f"剩余候选端点全部探活失败", "WARN")
                                 for e in remaining:
-                                    if not self._is_in_cooldown(e):
+                                    if probe_results.get(e.id) == "bad" and not self._is_in_cooldown(e):
                                         self._rotate(e, "并发探活失败", probe_failed=True)
                                 active = self._failover_endpoints()
                                 active.sort(key=lambda e: e.priority)
@@ -2194,6 +2235,22 @@ class APIPool:
                                             idx = (i + 1) % len(active)
                                             break
                 tried += 1
+        if _DEBUG_LOGGING:
+            try:
+                _fail_elapsed = int((time.time() - _chat_start) * 1000)
+                endpoint_records = [item for item in (debug_trace or []) if item.get("result") == "error"]
+                switch_count = sum(
+                    1 for previous, current in zip(endpoint_records, endpoint_records[1:])
+                    if previous.get("endpoint") != current.get("endpoint")
+                )
+                sys_log(
+                    f"[DEBUG] 请求诊断失败 elapsed_ms={_fail_elapsed} "
+                    f"switches={switch_count} "
+                    f"attempts={json.dumps(debug_trace, ensure_ascii=False, separators=(',', ':'))}",
+                    "INFO",
+                )
+            except Exception:
+                pass
         raise AllEndpointsFailed(errors)
 
     def _cf_probe_count(self, payload, needle):
@@ -2248,16 +2305,10 @@ class APIPool:
 
     def _try_endpoint(
         self, ep, payload, timeout, log_usage=True, force_no_retry=False,
-        is_probe=False, stream_stall_retry_used=False,
+        is_probe=False, stream_stall_retry_used=False, debug_trace=None,
     ):
         req_t0 = time.time()
-        log_prepare_t0 = time.perf_counter() if _DEBUG_LOGGING else None
         prompt_text_to_log = extract_prompt_text(payload) if log_usage and not ep.name.startswith("test_") else ""
-        log_prepare_ms = (
-            (time.perf_counter() - log_prepare_t0) * 1000
-            if log_prepare_t0 is not None else 0.0
-        )
-        transform_t0 = time.perf_counter() if _DEBUG_LOGGING else None
         
         # 协议层处理：Anthropic 端点做完整格式转换以保证 Kcne 缓存 key 一致性
         is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
@@ -2375,11 +2426,6 @@ class APIPool:
             data = json.dumps(payload).encode("utf-8")
             
         is_stream = payload.get("stream", False)
-        transform_ms = (
-            (time.perf_counter() - transform_t0) * 1000
-            if transform_t0 is not None else 0.0
-        )
-        
         retries = 0 if force_no_retry else ep.max_retries
         for attempt in range(retries + 1):
             if ep.rpm_limit > 0:
@@ -2401,7 +2447,6 @@ class APIPool:
                 req.add_header(k, v)
                 
             try:
-                upstream_t0 = time.perf_counter() if _DEBUG_LOGGING else None
                 # 超时语义区分（2026-08-15 超时体系重构）：
                 # - 流式：timeout=ep.timeout 是 TTFB（等响应头/首包），首包后由 stall/max_duration 管控
                 # - 非流式：上游必须全量生成完才返回，60/90s TTFB 必然误杀大请求。
@@ -2416,14 +2461,6 @@ class APIPool:
                 else:
                     resp = urllib.request.urlopen(req, timeout=_open_timeout)
                 
-                if upstream_t0 is not None:
-                    sys_log(
-                        f"[DEBUG] 分段 ep={ep.name} attempt={attempt + 1} "
-                        f"log_prepare_ms={log_prepare_ms:.3f} "
-                        f"protocol_transform_ms={transform_ms:.3f} "
-                        f"upstream_open_ms={(time.perf_counter() - upstream_t0) * 1000:.3f}",
-                        "INFO",
-                    )
                 if is_stream:
                     # Stream first-packet pre-read: timeout retries, not freeze
                     first_line = b""
@@ -2445,6 +2482,8 @@ class APIPool:
                                 except Exception:
                                     pass
                                 if attempt < retries:
+                                    if debug_trace is not None:
+                                        debug_trace.append({"endpoint": ep.name, "result": "retry", "attempt": attempt + 1, "kind": "stream_first_packet_timeout"})
                                     time.sleep(1.5 * (attempt + 1))
                                     continue
                                 return None, f"stream first packet timeout ({_effective_pkt_timeout}s)"
@@ -2533,7 +2572,7 @@ class APIPool:
                             lines = itertools.chain([first_line], resp) if first_line else resp
                             for line in lines:
                                 if stream_deadline is not None and time.time() > stream_deadline:
-                                    yield from _timeout_abort(f"流式总时长超限({ep.stream_max_duration}s)")
+                                    yield from _timeout_abort(f"流式总时长超限（非停滞，{ep.stream_max_duration}s）")
                                     return
                                 if is_anthropic:
                                     if not line.strip() or not line.startswith(b"data: "):
@@ -2671,7 +2710,7 @@ class APIPool:
                                 yield from _timeout_abort("Anthropic 流在 message_stop 前提前结束")
                                 return
                         except socket.timeout:
-                            yield from _timeout_abort(f"流式响应停滞({stall_timeout}s)")
+                            yield from _timeout_abort(f"流式无新数据停滞（连续 {stall_timeout}s）")
                             return
                         except Exception as e:
                             # 2026-08-15: 原逻辑静默吞掉流内所有异常——23:58:26 假死请求
@@ -2792,11 +2831,20 @@ class APIPool:
                         and ("temperature" in err_body or "top_p" in err_body)):
                     cleaned = {k: v for k, v in payload.items() if k not in ("temperature", "top_p")}
                     sys_log(f"\u7aef\u70b9 '{ep.name}' \u4e0d\u652f\u6301 temperature/top_p\uff0c\u5df2\u81ea\u52a8\u79fb\u9664\u540e\u91cd\u8bd5", "WARNING")
-                    return self._try_endpoint(ep, cleaned, timeout, log_usage=log_usage, force_no_retry=True)
+                    return self._try_endpoint(
+                        ep,
+                        cleaned,
+                        timeout,
+                        log_usage=log_usage,
+                        force_no_retry=True,
+                        debug_trace=debug_trace,
+                    )
                 if e.code == 429: return None, msg + " (429 rate-limited)"
                 if e.code in (401, 403): return None, msg + " (auth error)"
                 if e.code >= 500:
                     if attempt < retries:
+                        if debug_trace is not None:
+                            debug_trace.append({"endpoint": ep.name, "result": "retry", "attempt": attempt + 1, "kind": f"http_{e.code}"})
                         time.sleep(1.5 * (attempt + 1))
                         continue
                     return None, msg
@@ -2804,6 +2852,8 @@ class APIPool:
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 msg = f"连接/超时错误: {e}"
                 if attempt < retries:
+                    if debug_trace is not None:
+                        debug_trace.append({"endpoint": ep.name, "result": "retry", "attempt": attempt + 1, "kind": "timeout"})
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 return None, msg
@@ -2985,14 +3035,6 @@ def api_handler(method, path, body):
             return 503, {"error": {"message": "API Pool content filter unavailable", "type": "service_unavailable"}}, False
         if filter_stats.get("matched"):
             sys_log(f"敏感字过滤命中 {filter_stats['matched']} 处 ({filter_stats['duration_ms']}ms)", "INFO")
-        if _DEBUG_LOGGING:
-            sys_log(
-                f"[DEBUG] 分段 filter_ms={filter_stats.get('duration_ms', 0)} "
-                f"filter_copy_ms={filter_stats.get('copy_ms', 0)} "
-                f"filter_scan_ms={filter_stats.get('scan_ms', 0)}",
-                "INFO",
-            )
-
         extra_payload = {k: v for k, v in body.items() if k not in ("messages", "model")}
         extra_payload.pop("extra_body", None)
         extra_payload.pop("response_format", None)

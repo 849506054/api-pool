@@ -528,7 +528,7 @@ select option { background: var(--bg); color: var(--text); }
       <div class="form-group"><label>启用</label><select id="fEnabled"><option value="true">是</option><option value="false">否</option></select></div>
       <div class="form-group"><label>加入聚合池</label><select id="fPool"><option value="false">否（仅保存）</option><option value="true">是（参与轮换）</option></select></div>
       <div class="form-group"><label title="检测上游返回内容是否含拒绝信息，从而触发自动轮转">假成功检测</label><select id="fFakeCheck"><option value="false">关闭</option><option value="true">开启</option></select></div>
-      <div class="form-group"><label title="true=上游恢复后若池活跃则延迟回迁以保护当前端点 cache；false=上游恢复立即回迁（适用于昂贵兜底端点）">延迟回迁</label><select id="fDeferrable"><option value="true">开启（保 cache）</option><option value="false">关闭（立即回迁）</option></select></div>
+      <div class="form-group"><label title="开启后，本端点工作时会保护其缓存：其他端点恢复后暂不切走；关闭后允许立即回切到恢复端点">缓存保护</label><select id="fDeferrable"><option value="true">开启（延迟切走）</option><option value="false">关闭（允许立即回切）</option></select></div>
       <div class="form-group"><label title="最大上下文长度（K=1000 tokens），0=不限。超过此长度时自动跳过该端点，避免账号被限制">上下文限制</label><input type="number" id="fMaxContext" value="0" min="0" placeholder="0=不限, 如 128"></div>
       <div class="form-group"><label title="非空时启用：请求消息里的 tool_call id 重写为该前缀（如 call_00_ET_），解决跨端点切换后 DeepSeek 官方端点 reasoning_text 400">ToolCall ID 前缀</label><input type="text" id="fToolCallPrefix" placeholder="留空=不重写，如 call_00_ET_" value=""></div>
       <div class="form-group"><label title="达到额度后挂起，0为不限制">每日额度 (0不限)</label><input type="number" id="fDailyLimit" value="0" min="0"></div>
@@ -673,7 +673,7 @@ function renderEndpoints(eps){
     else if(ep.is_rpm_limited)b+=`<span class="badge badge-cooldown" title="每分钟并发已满，限流降级中">🚧限流中</span>`;
     else if(ep.daily_limit>0&&ep.today_used>=ep.daily_limit)b+=`<span class="badge badge-cooldown" title="今日额度已满，挂起至明日">🛑额度耗尽</span>`;
     else if(ep.in_cooldown)b+=`<span class="badge badge-cooldown">⏳${fmtTime(ep.cooldown_remaining)}</span>`;
-    if(ep.is_deferred)b+=`<span class="badge badge-deferred" title="已恢复但为保持当前端点 cache 延迟回迁，剩余 ${fmtTime(ep.defer_remaining)}">⏸延迟回迁 ${fmtTime(ep.defer_remaining)}</span>`;
+    if(ep.is_deferred)b+=`<span class="badge badge-deferred" title="当前工作端点已开启缓存保护，恢复端点延迟回切，剩余 ${fmtTime(ep.defer_remaining)}">⏸延迟回切 ${fmtTime(ep.defer_remaining)}</span>`;
     if(!ep.use_proxy)b+=`<span class="badge badge-priority" title="绕过系统全局代理，强制直连">🌐直连</span>`;
     if(ep.health_mode==='none')b+=`<span class="badge" style="background:rgba(255,255,255,.05);color:var(--text-dim)" title="已关闭后台健康监测">🔕免扰</span>`;
     else if(ep.health_mode==='models')b+=`<span class="badge" style="background:rgba(50,215,75,.1);color:var(--green)" title="零成本 Models 探针">☘️无感测</span>`;
@@ -770,7 +770,7 @@ function renderChain(chain){
     else if(it.is_deferred)cls+=' deferred';
     else if(it.is_current)cls+=' active';
     else if(it.health==='bad'||it.fail_count>0)cls+=' failed';
-    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">💳余额不足·手动解冻</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(it.is_deferred?'<span class="badge badge-deferred">⏳延迟回迁 '+fmtTime(it.defer_remaining)+'</span>':(it.is_current?'<span class="badge badge-success">服务中</span>':'')));
+    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">💳余额不足·手动解冻</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(it.is_deferred?'<span class="badge badge-deferred">⏳延迟回切 '+fmtTime(it.defer_remaining)+'</span>':(it.is_current?'<span class="badge badge-success">服务中</span>':'')));
     const h=it.health, lat=it.health_latency_ms;
     let rh='';
     if(h==='ok')rh=`<div class="chain-health" style="color:var(--green)">✓${lat>=0?' '+lat+'ms':''}</div>`;

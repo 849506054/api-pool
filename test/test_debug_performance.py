@@ -61,27 +61,73 @@ class DebugPerformanceTests(unittest.TestCase):
         self.assertEqual(second_diag["tools"], 1)
         self.assertFalse(hasattr(pool, "_last_cf_diag"))
 
-    def test_filter_segment_log_only_when_debug_enabled(self):
+    def test_debug_trace_is_local_and_summarizes_failover(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
+            first = module.Endpoint(
+                id="first", name="first", base_url="http://127.0.0.1:1", api_key="x",
+                model="m", priority=1, max_retries=0, use_proxy=False, in_pool=True,
+            )
+            second = module.Endpoint(
+                id="second", name="second", base_url="http://127.0.0.1:1", api_key="x",
+                model="m", priority=2, max_retries=0, use_proxy=False, in_pool=True,
+            )
+            pool = module.APIPool([first, second])
             logs = []
             module.sys_log = lambda msg, level="INFO": logs.append((msg, level))
-            module.pool.chat = lambda messages, extra_payload=None: {
-                "model": "m",
-                "choices": [{"message": {"content": "ok"}}],
-            }
-            body = {"model": "m", "messages": [{"role": "user", "content": "hello"}], "stream": False}
 
-            module._set_debug_logging(False)
-            code, _, _ = module.api_handler("POST", "/v1/chat/completions", body)
-            self.assertEqual(code, 200)
-            self.assertFalse(any("[DEBUG] 分段 filter_ms=" in msg for msg, _ in logs))
+            def fake_try(ep, payload, timeout, **kwargs):
+                if ep is first:
+                    return None, "连接/超时错误: offline"
+                return {"choices": [{"message": {"content": "ok"}}]}, ""
 
-            logs.clear()
+            pool._try_endpoint = fake_try
+            pool._probe_endpoint = lambda ep: (True, "")
             module._set_debug_logging(True)
-            code, _, _ = module.api_handler("POST", "/v1/chat/completions", body)
-            self.assertEqual(code, 200)
-            self.assertTrue(any("[DEBUG] 分段 filter_ms=" in msg for msg, _ in logs))
+            result = pool.chat([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(result["choices"][0]["message"]["content"], "ok")
+        diagnostic = next(msg for msg, _ in logs if msg.startswith("[DEBUG] 请求诊断完成"))
+        self.assertIn('switches=1', diagnostic)
+        self.assertIn('"endpoint":"first","result":"error","kind":"timeout"', diagnostic)
+        self.assertIn('"endpoint":"second","result":"success"', diagnostic)
+        self.assertNotIn("hello", diagnostic)
+        self.assertFalse(hasattr(pool, "_debug_trace"))
+
+    def test_debug_trace_records_internal_retry(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            ep = module.Endpoint(
+                id="retry", name="retry", base_url="http://127.0.0.1:1", api_key="x",
+                model="m", priority=1, max_retries=1, use_proxy=False, in_pool=True,
+            )
+            trace = []
+            module._set_debug_logging(True)
+            with mock.patch.object(module.urllib.request, "urlopen", side_effect=OSError("offline")):
+                result, error = module.APIPool()._try_endpoint(
+                    ep, {"model": "m", "messages": []}, 1, log_usage=False, debug_trace=trace
+                )
+            self.assertIsNone(result)
+            self.assertIn("连接/超时错误", error)
+            self.assertTrue(any(item.get("result") == "retry" for item in trace))
+    def test_debug_disabled_does_not_build_trace_or_debug_log(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            ep = module.Endpoint(
+                id="only", name="only", base_url="http://127.0.0.1:1", api_key="x",
+                model="m", priority=1, max_retries=0, use_proxy=False, in_pool=True,
+            )
+            pool = module.APIPool([ep])
+            logs = []
+            module.sys_log = lambda msg, level="INFO": logs.append((msg, level))
+            pool._try_endpoint = lambda ep, payload, timeout, **kwargs: (
+                {"choices": [{"message": {"content": "ok"}}]}, ""
+            )
+            module._set_debug_logging(False)
+            pool.chat([{"role": "user", "content": "hello"}])
+
+        self.assertFalse(any(msg.startswith("[DEBUG]") for msg, _ in logs))
+        self.assertFalse(hasattr(pool, "_debug_trace"))
 
 
 if __name__ == "__main__":

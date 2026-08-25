@@ -7,6 +7,7 @@ import time
 import unittest
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
+from unittest import mock
 
 MODULE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "api_pool_server.py")
 
@@ -228,6 +229,26 @@ class ConcurrentHealthCheckTests(unittest.TestCase):
         self.assertEqual({item["id"] for item in result}, {locked.id, available.id})
         locked_result = next(item for item in result if item["id"] == locked.id)
         self.assertEqual(locked_result["error"], "余额不足，仅支持手动解冻")
+
+    def test_successful_slow_probe_is_not_reported_as_fault(self):
+        pool, endpoints = self.make_pool(1)
+        endpoint = endpoints[0]
+        pool._try_endpoint = lambda *args, **kwargs: ({"choices": []}, "")
+        with mock.patch.object(self.module.time, "time", side_effect=[0, 6, 6, 12]):
+            result = pool._check_one_health(endpoint)
+
+        self.assertEqual(result[1], "slow")
+        self.assertNotEqual(result[1], "bad")
+
+    def test_concurrent_probe_timeout_without_result_does_not_cooldown_endpoint(self):
+        pool, endpoints = self.make_pool(2)
+        first, delayed = endpoints
+        pool._probe_endpoint = lambda ep: (False, "first failed") if ep is first else (True, "")
+        pool._check_one_health = lambda ep: (ep.id, "bad", -1, "explicit failure") if ep is first else (ep.id, "ok", 1, "")
+        result = pool.check_all_health()
+
+        self.assertEqual({item["health"] for item in result}, {"bad", "ok"})
+        self.assertEqual(delayed._cooldown_until, 0)
 
     def test_quota_error_uses_parsed_retry_after(self):
         pool, endpoints = self.make_pool(1)

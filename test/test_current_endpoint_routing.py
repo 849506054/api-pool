@@ -92,6 +92,76 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
 
             self.assertEqual(pool._current_endpoint_id, current.id)
             self.assertGreater(recovered._defer_until, module.time.time())
+
+    def test_current_endpoint_cache_protection_controls_deferred_failback(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            recovered = self.endpoint(module, "recovered", 1, "deepseek-v4-flash")
+            current = self.endpoint(module, "current", 3, "gpt-5.6-sol")
+            recovered.deferrable = False
+            current.deferrable = True
+            pool = module.APIPool([recovered, current])
+            pool._current_endpoint_id = current.id
+            pool._last_pool_activity = module.time.time()
+            pool._probe_endpoint = lambda ep: (True, "")
+
+            pool._background_probe(recovered, current.id)
+
+            self.assertGreater(recovered._defer_until, module.time.time())
+            self.assertEqual(pool._current_endpoint_id, current.id)
+
+    def test_current_endpoint_without_cache_protection_immediately_fails_back(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            recovered = self.endpoint(module, "recovered", 1, "deepseek-v4-flash")
+            current = self.endpoint(module, "current", 3, "gpt-5.6-sol")
+            recovered.deferrable = True
+            current.deferrable = False
+            pool = module.APIPool([recovered, current])
+            pool._current_endpoint_id = current.id
+            pool._last_pool_activity = module.time.time()
+            pool._probe_endpoint = lambda ep: (True, "")
+
+            pool._background_probe(recovered, current.id)
+
+            self.assertEqual(recovered._defer_until, 0)
+            self.assertEqual(pool._current_endpoint_id, recovered.id)
+
+    def test_reconciliation_uses_current_endpoint_cache_protection(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            recovered = self.endpoint(module, "recovered", 1, "deepseek-v4-flash")
+            current = self.endpoint(module, "current", 3, "gpt-5.6-sol")
+            recovered.deferrable = False
+            current.deferrable = False
+            recovered._defer_until = module.time.time() + 300
+            pool = module.APIPool([recovered, current])
+            pool._current_endpoint_id = current.id
+            pool._last_pool_activity = module.time.time()
+
+            pool._reconcile_deferred()
+
+            self.assertEqual(recovered._defer_until, 0)
+            self.assertEqual(pool._current_endpoint_id, recovered.id)
+
+    def test_manual_override_is_not_replaced_by_background_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            recovered = self.endpoint(module, "recovered", 1, "deepseek-v4-flash")
+            current = self.endpoint(module, "current", 3, "gpt-5.6-sol")
+            current.deferrable = False
+            pool = module.APIPool([recovered, current])
+            pool._current_endpoint_id = current.id
+            pool._manual_override_id = current.id
+            pool._last_pool_activity = module.time.time()
+            pool._probe_endpoint = lambda ep: (True, "")
+
+            pool._background_probe(recovered, current.id)
+
+            self.assertEqual(recovered._defer_until, 0)
+            self.assertEqual(pool._current_endpoint_id, current.id)
+            self.assertEqual(pool._manual_override_id, current.id)
+
     def test_deferred_recovery_does_not_proactively_replace_healthy_current(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
@@ -120,6 +190,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             current = self.endpoint(module, "current", 3, "gpt-5.6-sol")
             pool = module.APIPool([deferred, current])
             pool._current_endpoint_id = current.id
+            pool._last_pool_activity = module.time.time()
             deferred._defer_until = module.time.time() + 300
             calls = []
 
