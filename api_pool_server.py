@@ -860,8 +860,6 @@ class Endpoint:
     health_mode: str = field(default="models")
     billing_mode: str = field(default="subscription")
 
-    _transient_count: int = field(default=0, repr=False)
-    _transient_window_start: float = field(default=0, repr=False)
     _health: str = field(default="unknown", repr=False) 
     _health_latency_ms: int = field(default=-1, repr=False)
     _health_last_check: float = field(default=0, repr=False)
@@ -1004,6 +1002,7 @@ class APIPool:
                     ep._defer_until = 0
                     self._manual_override_id = ep_id
                     self._current_endpoint_id = ep_id
+                    sys_log(f"手动切换端点: '{ep.name}'（清除其 defer，保留冷却/配额/余额状态）", "INFO")
                     return True
         return False
 
@@ -1510,8 +1509,6 @@ class APIPool:
                     ep._cooldown_reason = ""
                     ep._manual_unlock_required = False
                     ep._health = "ok"
-                    ep._transient_count = 0
-                    ep._transient_window_start = 0
                     sys_log(f"端点 '{ep.name}' 手动解冻，错误状态已清除", "INFO")
                     return True
         return False
@@ -1561,8 +1558,6 @@ class APIPool:
                     ep._cooldown_until = 0
                     ep._cooldown_reason = ""
                     ep._health = "ok"
-                    ep._transient_count = 0
-                    ep._transient_window_start = 0
                 # 当前工作端点决定是否保护自身 cache：开启时延迟切走，
                 # 关闭时恢复端点立即回切。恢复端点自己的开关不参与本次判断。
                 current_ep = None
@@ -1777,8 +1772,6 @@ class APIPool:
         ep._last_success_ts = now
         ep._health = "ok"
         ep._fail_count = 0
-        ep._transient_count = 0
-        ep._transient_window_start = 0
         ep._last_error = ""
         ep._health_error = ""
         if not ep._manual_unlock_required:
