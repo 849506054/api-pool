@@ -1042,6 +1042,9 @@ class APIPool:
             "in_pool": ep.in_pool,
             "check_fake_success": ep.check_fake_success,
             "tool_call_id_prefix": ep.tool_call_id_prefix,
+            "stream_first_packet_timeout": ep.stream_first_packet_timeout,
+            "stream_stall_timeout": ep.stream_stall_timeout,
+            "stream_max_duration": ep.stream_max_duration,
             "is_rpm_limited": self._is_rpm_limited(ep),
             "fail_count": ep._fail_count,
             "last_error": ep._last_error,
@@ -3208,7 +3211,7 @@ def api_handler(method, path, body):
 
 def _sync_to_config():
     save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "default_headers": ep.get("default_headers", {}), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
-            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0)} for ep in pool.list_endpoints()])
+            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120)} for ep in pool.list_endpoints()])
 
 
 GUI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
