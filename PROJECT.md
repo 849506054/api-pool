@@ -58,6 +58,9 @@
 - [x] **[P3] 提交未 commit 的本地改动** — 已随 9303572/4626f16 提交（含探活竞态去重补丁）
 - [x] **[P3] systemd 代理环境收口** — `api-pool2.service` 已内置 HTTPS_PROXY / HTTP_PROXY / NO_PROXY，不再依赖已删除的 1.0 drop-in。
 - [ ] **[P2] 待评估：频繁切换端点导致 cache 命中率骤降、增加成本** — 短暂故障应优先原地重试而不是立刻切换，避免丢缓存。可能方案：降权不冻结、首包超时 120s→30~45s、连续 N 次失败才切换 — `proxy.conf` 不在版本控制中，建议文档化或提交模板
+- [ ] **[P3] save_config 原子写** — L2974 裸 `open("w")` 覆盖写改为 tmp+fsync+os.replace（与 `save_runtime_state` 同构），消除进程中断留下半截 JSON → 启动静默回落空配置的风险。设计见 docs/upstream-borrow-design-v1.md 改动三。独立小项，可先做
+- [ ] **[P2] 确定性抖动冷却** — `_set_cooldown()`（L1488）固定时长乘 80–120% 系数（种子 sha256(ep.id+fail_count)），同批冻结端点解冻错开防惊群；配额/余额通道不加抖动。设计见 docs/upstream-borrow-design-v1.md 改动一
+- [ ] **[P2] 客户端类错误分类** — 400/404/413/422 且非瞬态字样、未被既有 workaround 消化的失败：不冻结、fail_count 不增、不探活，但同请求内继续轮转其余候选（已批准「轮转不记账」方案）；temperature/top_p 与 tool_call_id_prefix 特例保留在前。设计见 docs/upstream-borrow-design-v1.md 改动二
 
 - [x] **前后端分离** — GUI 从 `GUI_HTML` 常量抽离至 `static/index.html`，服务端 mtime 缓存读取（改文件热更新，前端改动免重启）；删除 GUI_HTML 常量（commit 1996320）
 - [x] **日志 flush + 流式超时兜底补洞（2026-08-15）** — `sys_log` 强制 flush、首包 socket 超时受 Endpoint timeout 约束、socket 获取失败与流异常不再静默；已部署并纳入 2.0 运行版本。
