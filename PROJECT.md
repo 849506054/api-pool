@@ -58,7 +58,7 @@
 - [x] **[P3] 提交未 commit 的本地改动** — 已随 9303572/4626f16 提交（含探活竞态去重补丁）
 - [x] **[P3] systemd 代理环境收口** — `api-pool2.service` 已内置 HTTPS_PROXY / HTTP_PROXY / NO_PROXY，不再依赖已删除的 1.0 drop-in。
 - [ ] **[P2] 待评估：频繁切换端点导致 cache 命中率骤降、增加成本** — 短暂故障应优先原地重试而不是立刻切换，避免丢缓存。可能方案：降权不冻结、首包超时 120s→30~45s、连续 N 次失败才切换 — `proxy.conf` 不在版本控制中，建议文档化或提交模板。（已并入下方 P2 路由与恢复整合评审，见 docs/upstream-borrow-design-v1.md §6）
-- [x] **[P3] save_config 原子写** — 已完成：改为同目录临时文件 + `flush`/`fsync`/`os.replace`，增加进程内写锁与失败清理；写入失败向上抛出，旧配置文件保持不变。新增 3 项回归测试覆盖完整写入、替换失败保护和并发写入。设计见 docs/upstream-borrow-design-v1.md 改动三。
+- [x] **[P3] save_config 原子写（2026-08-27 已部署）** — 改为同目录临时文件 + `flush`/`fsync`/`os.replace`，增加进程内写锁与失败清理；写入失败向上抛出，旧配置文件保持不变。3 项回归测试覆盖完整写入、替换失败保护和并发写入；部署后源码 hash 一致，服务重启正常并加载 27 个端点。设计见 docs/upstream-borrow-design-v1.md 改动三。
 - [ ] **[P2] 确定性抖动冷却** — `_set_cooldown()`（L1488）固定时长乘 80–120% 系数（种子 sha256(ep.id+fail_count)），同批冻结端点解冻错开防惊群；配额/余额通道不加抖动。设计见 docs/upstream-borrow-design-v1.md 改动一
 - [ ] **[P2] 客户端类错误分类** — 400/404/413/422 且非瞬态字样、未被既有 workaround 消化的失败：不冻结、fail_count 不增、不探活，但同请求内继续轮转其余候选（已批准「轮转不记账」方案）；temperature/top_p 与 tool_call_id_prefix 特例保留在前。设计见 docs/upstream-borrow-design-v1.md 改动二
 
