@@ -2933,6 +2933,7 @@ class APIPool:
 
 CONFIG_FILE = "api_config.json"
 RUNTIME_STATE_FILE = "api_runtime_state.json"
+_config_lock = threading.Lock()
 _runtime_state_lock = threading.Lock()
 
 
@@ -2972,8 +2973,23 @@ def load_config():
         return []
 
 def save_config(endpoints_data):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump({"api_endpoints": endpoints_data}, f, ensure_ascii=False, indent=2)
+    tmp_file = os.path.join(
+        os.path.dirname(os.path.abspath(CONFIG_FILE)),
+        f".{os.path.basename(CONFIG_FILE)}.tmp",
+    )
+    try:
+        with _config_lock:
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump({"api_endpoints": endpoints_data}, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, CONFIG_FILE)
+    except OSError:
+        try:
+            os.unlink(tmp_file)
+        except OSError:
+            pass
+        raise
 
 def ensure_config():
     if not os.path.exists(CONFIG_FILE): save_config([])
