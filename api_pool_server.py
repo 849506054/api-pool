@@ -1736,11 +1736,47 @@ class APIPool:
                 return ep
         return min(active, key=lambda e: e._cooldown_until) if active else None
 
-    def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False):
-        failed_ep._fail_count += 1
-        failed_ep._total_failures += 1
-        failed_ep._last_error = error_msg
-        failed_ep._last_error_ts = time.time()
+    @staticmethod
+    def _classify_client_error(error_msg):
+        """客户端类错误识别（轮转不记账，upstream-borrow 设计改动二）。
+
+        判定：HTTP 状态码 ∈ {400, 404, 413, 422} 且不含瞬态/配额字样，
+        且不含已被内部 workaround 消化的标记（temperature/top_p 自动剥离
+        后的重试在 _try_endpoint 内部完成，到达这里的都是二次失败或特例外）。
+        这类失败是请求形状问题，不是端点健康问题：好端点也会拒绝畸形请求。
+        """
+        text = str(error_msg or "")
+        if not text.startswith("HTTP "):
+            return False
+        try:
+            code = int(text.split(":", 1)[0].replace("HTTP ", "").strip())
+        except ValueError:
+            return False
+        if code not in (400, 404, 413, 422):
+            return False
+        lower = text.lower()
+        transient_markers = (
+            "rate limit", "rate-limited", "429", "quota", "balance",
+            "余额", "配额", "限流", "temporarily", "overloaded",
+        )
+        return not any(marker in lower for marker in transient_markers)
+
+    def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False, health_impact=True):
+        if health_impact:
+            failed_ep._fail_count += 1
+            failed_ep._total_failures += 1
+            failed_ep._last_error = error_msg
+            failed_ep._last_error_ts = time.time()
+            sys_log(f"端点 '{failed_ep.name}' 请求失败: {error_msg}", "ERROR")
+        else:
+            # 客户端类错误：请求形状问题，非端点故障。不冻结、fail_count 不增、
+            # 不探活（探活小请求必然通过，无信息量），仅记录最后错误便于排查。
+            # 也不改路由指针：端点本身健康，后续请求仍应粘性使用（本请求内的
+            # 候选轮转由 chat() 的 client_error_tried 集合控制）。
+            failed_ep._last_error = error_msg
+            failed_ep._last_error_ts = time.time()
+            sys_log(f"端点 '{failed_ep.name}' 客户端类错误(不冻结/不记账)，同请求继续轮转: {error_msg}", "WARN")
+            return
         capacity_kind, capacity_seconds = self._set_capacity_cooldown(failed_ep, error_msg)
         if capacity_kind == "balance_insufficient":
             sys_log(f"端点 '{failed_ep.name}' 余额不足，已冻结，仅支持手动解冻", "WARN")
@@ -1758,7 +1794,9 @@ class APIPool:
             return
         else:
             self._set_cooldown(failed_ep)
-            sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {failed_ep.cooldown_minutes} 分钟后", "WARN")
+            # 抖动后实际窗口为 cooldown_minutes×[80%,120%]，日志展示真实值
+            actual = max(0, (failed_ep._cooldown_until - time.time()) / 60)
+            sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {actual:.1f} 分钟后", "WARN")
         active = self._failover_endpoints()
         candidates = self._ordered_failover_candidates(failed_ep, active)
         if candidates:
@@ -1915,6 +1953,7 @@ class APIPool:
         if not active:
             raise ValueError("没有可用的 API 端点")
         errors = []
+        client_error_tried = set()  # 本请求内已因客户端类错误轮转过的端点（防不冻结路径死循环）
         tried = 0
         total = len(active)
         # 按优先级排序：每次从最高优先级端点开始尝试，故障自动降级，恢复后自动回迁
@@ -1957,6 +1996,11 @@ class APIPool:
         idx = 0
         while tried < total:
             ep = active[idx]
+            # 客户端类错误轮转终止：不冻结路径没有冷却收缩 total，靠请求级已试集合收口。
+            if ep.id in client_error_tried:
+                tried += 1
+                idx = (idx + 1) % total
+                continue
             # 并发保护：端点已被其他请求冻结时，跳过它转向下一个可用端点。
             # 仅当池中还存在非冷却端点时才跳过；全部冷却时走 _active_endpoints 的
             # fallback（按解冻时间排序尝试），保留"宁可试冷却端点也不报错"的兜底语义。
@@ -2067,6 +2111,8 @@ class APIPool:
                         error_kind = "fake_success"
                     else:
                         error_kind = "request_error"
+                    if self._classify_client_error(error_text):
+                        error_kind = "client_error"
                     debug_trace.append({"endpoint": ep.name, "result": "error", "kind": error_kind})
             if result is not None:
                 with self._lock:
@@ -2124,7 +2170,12 @@ class APIPool:
                     if since_success < ep.timeout:
                         skip_cooldown = True
                         sys_log(f"端点 '{ep.name}' 超时失败但 {since_success:.0f}s 前有成功响应（<timeout {ep.timeout}s），判定单请求饿死，不冻结", "WARN")
-                self._rotate(ep, error, skip_cooldown=skip_cooldown)
+                # 客户端类错误（改动二 A′）：不冻结、fail_count 不增、不探活，
+                # 同请求内继续轮转其余候选；全部候选同类失败时按现状把错误返回给客户端。
+                client_error = self._classify_client_error(error)
+                self._rotate(ep, error, skip_cooldown=skip_cooldown, health_impact=not client_error)
+                if client_error:
+                    client_error_tried.add(ep.id)
                 if skip_cooldown:
                     # 单请求饿死不是 API Pool 的端点故障。不要探活或切换到
                     # 其他模型；交回 Hermes，由其现有请求重试机制善后。
@@ -2137,6 +2188,10 @@ class APIPool:
                 tried = 0  # 轮转后重置尝试计数，用刷新后的 total 重新计算
                 # 从失败端点之后的环形顺序选择候选，同模型优先。
                 candidates = self._ordered_failover_candidates(ep, active)
+                if client_error:
+                    # 客户端类错误不冻结端点，冷却机制不会收缩 total；
+                    # 排除本请求内已试过的端点，全部试完即终止轮转。
+                    candidates = [e for e in candidates if e.id not in client_error_tried]
                 next_ep = candidates[0] if candidates else None
                 if next_ep is not None:
                     idx = active.index(next_ep)
@@ -2146,9 +2201,10 @@ class APIPool:
                             idx = (i + 1) % len(active)
                             break
                 else:
-                    if gateway_error:
+                    if gateway_error or client_error:
                         # 网关错误：跳过候选探活直接重试（探活小请求无法鉴别网关故障）
-                        sys_log(f"网关错误(50x)，跳过候选端点 '{next_ep.name}' 探活直接重试", "INFO")
+                        # 客户端类错误：探活必然通过（小请求不带畸形 payload），无信息量，直接轮转
+                        sys_log(f"跳过候选端点 '{next_ep.name}' 探活直接重试", "INFO")
                         continue
                     # 对候选端点做探活
                     sys_log(f"对候选端点 '{next_ep.name}' 进行探活...", "INFO")
