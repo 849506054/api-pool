@@ -1491,8 +1491,14 @@ class APIPool:
         # 不延长冷却窗口；fail_count 仍由调用方累加）。窗口过期后的新失败自然触发新冻结。
         if ep._cooldown_until > time.time():
             return
-        cd = max(ep.cooldown_minutes, 1)
-        ep._cooldown_until = time.time() + cd * 60
+        # 确定性抖动：80%–120% 系数，种子 sha256(ep.id:fail_count)。
+        # 不同端点同批冻结时解冻时间错开（防惊群）；同一端点同一档位跨重启可复现，
+        # 便于排查与测试。仅作用于普通故障冷却；配额/余额/探活短冷却通道不参与。
+        import hashlib
+        seed = f"{ep.id}:{int(ep._fail_count)}"
+        jitter_pct = 80 + int(hashlib.sha256(seed.encode()).hexdigest(), 16) % 41  # 80..120
+        cd_seconds = max(ep.cooldown_minutes, 1) * 60 * jitter_pct / 100
+        ep._cooldown_until = time.time() + cd_seconds
 
     def _clear_cooldown(self, ep):
         ep._cooldown_until = 0

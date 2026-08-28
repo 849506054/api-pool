@@ -283,8 +283,9 @@ class ConcurrentHealthCheckTests(unittest.TestCase):
 
         self.assertEqual(endpoint._cooldown_reason, "")
         self.assertFalse(endpoint._manual_unlock_required)
-        self.assertGreaterEqual(endpoint._cooldown_until, before + 179)
-        self.assertLessEqual(endpoint._cooldown_until, before + 181)
+        # 确定性抖动后窗口为 3min × [80%, 120%] = [144, 216] 秒
+        self.assertGreaterEqual(endpoint._cooldown_until, before + 143)
+        self.assertLessEqual(endpoint._cooldown_until, before + 217)
 
 
 if __name__ == "__main__":
