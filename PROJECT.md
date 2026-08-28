@@ -59,8 +59,8 @@
 - [x] **[P3] systemd 代理环境收口** — `api-pool2.service` 已内置 HTTPS_PROXY / HTTP_PROXY / NO_PROXY，不再依赖已删除的 1.0 drop-in。
 - [ ] **[P2] 待评估：频繁切换端点导致 cache 命中率骤降、增加成本** — 短暂故障应优先原地重试而不是立刻切换，避免丢缓存。可能方案：降权不冻结、首包超时 120s→30~45s、连续 N 次失败才切换 — `proxy.conf` 不在版本控制中，建议文档化或提交模板。（已并入下方 P2 路由与恢复整合评审，见 docs/upstream-borrow-design-v1.md §6）
 - [x] **[P3] save_config 原子写（2026-08-27 已部署）** — 改为同目录临时文件 + `flush`/`fsync`/`os.replace`，增加进程内写锁与失败清理；写入失败向上抛出，旧配置文件保持不变。3 项回归测试覆盖完整写入、替换失败保护和并发写入；部署后源码 hash 一致，服务重启正常并加载 27 个端点。设计见 docs/upstream-borrow-design-v1.md 改动三。
-- [ ] **[P2] 确定性抖动冷却** — `_set_cooldown()`（L1488）固定时长乘 80–120% 系数（种子 sha256(ep.id+fail_count)），同批冻结端点解冻错开防惊群；配额/余额通道不加抖动。设计见 docs/upstream-borrow-design-v1.md 改动一
-- [ ] **[P2] 客户端类错误分类** — 400/404/413/422 且非瞬态字样、未被既有 workaround 消化的失败：不冻结、fail_count 不增、不探活，但同请求内继续轮转其余候选（已批准「轮转不记账」方案）；temperature/top_p 与 tool_call_id_prefix 特例保留在前。设计见 docs/upstream-borrow-design-v1.md 改动二
+- [x] **[P2] 确定性抖动冷却**（2026-08-28 已部署）— `_set_cooldown()` 固定时长乘 80–120% 系数（种子 sha256(ep.id+fail_count)，跨重启可复现）；配额/余额/探活短冷却通道不参与；冷却日志展示抖动后真实时长。8 项单测 + mock 上游 E2E。commit 6561ced，宿主机 hash=`637027c83b3fbbc20d546ce478ce8189`
+- [x] **[P2] 客户端类错误分类**（2026-08-28 已部署）— HTTP 400/404/413/422 且无瞬态字样：不冻结、fail_count 不增、不探活、不改路由指针（A′ 轮转不记账）；`chat()` 请求级 `client_error_tried` 集合防不冻结路径死循环；客户端错误跳过候选探活；DEBUG trace 增加 `kind=client_error`。temperature/top_p 与 tool_call_id_prefix 特例不动。12 项单测（含真实 HTTP auto-strip 集成）+ mock 上游 E2E 16/16。commit 6550d88
 
 - [x] **前后端分离** — GUI 从 `GUI_HTML` 常量抽离至 `static/index.html`，服务端 mtime 缓存读取（改文件热更新，前端改动免重启）；删除 GUI_HTML 常量（commit 1996320）
 - [x] **日志 flush + 流式超时兜底补洞（2026-08-15）** — `sys_log` 强制 flush、首包 socket 超时受 Endpoint timeout 约束、socket 获取失败与流异常不再静默；已部署并纳入 2.0 运行版本。
