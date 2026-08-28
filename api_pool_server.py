@@ -1413,6 +1413,7 @@ class APIPool:
 
         quota_markers = (
             "配额不足", "配额已用尽", "配额耗尽", "quota exceeded", "quota exhausted",
+            "quota has been exhausted",
             "insufficient quota", "usage limit exceeded", "usage limit reached",
             "daily limit exceeded", "daily limit reached", "monthly limit exceeded",
             "monthly limit reached", "token quota exceeded", "请求配额已用尽",
