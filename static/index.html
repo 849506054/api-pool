@@ -634,10 +634,40 @@ function renderFilterBar(eps){
     <button class="filter-btn ${epFilter==='pooled'?'active':''}" onclick="setFilter('pooled')">已聚合 ${eps.filter(e=>e.in_pool).length}</button>
     <button class="filter-btn ${epFilter==='vision'?'active':''}" onclick="setFilter('vision')">视觉 ${vision}</button>
     <button class="filter-btn ${epFilter==='payperuse'?'active':''}" onclick="setFilter('payperuse')">按次 ${payperuse}</button>
+    ${(()=>{const vc=vendorCounts(eps);const names=Object.keys(vc).filter(v=>v!=='其他').sort((a,b)=>vc[b]-vc[a]||a.localeCompare(b));if(vc['其他'])names.push('其他');return names.map(v=>`<button class="filter-btn ${epFilter==='vendor:'+v?'active':''}" onclick="setFilter('vendor:${v}')">${esc(v)} ${vc[v]}</button>`).join('');})()}
 
     <span class="filter-count" id="filterCount"></span>`;
 }
 function setFilter(f){epFilter=f;refresh();}
+
+// ── 厂商过滤：按 model 前缀映射厂商，未匹配归「其他」 ──
+const VENDOR_PREFIXES = [
+  ['deepseek', 'DeepSeek'],
+  ['glm', '智谱'],
+  ['gpt', 'OpenAI'],
+  ['claude', 'Anthropic'],
+  ['qwen', 'Qwen'],
+  ['step', '阶跃星辰'],
+  ['grok', 'xAI'],
+  ['kimi', '月之暗面'],
+  ['minimax', 'MiniMax'],
+  ['mimo', '小米'],
+  ['hy3', 'Hy3'],
+  ['seed', '字节'],
+  ['muse', 'Muse'],
+  ['ox-', 'OX'],
+];
+function vendorOf(model){
+  const m = String(model || '').toLowerCase();
+  for(const [p, v] of VENDOR_PREFIXES){ if(m.startsWith(p)) return v; }
+  return '其他';
+}
+function vendorCounts(eps){
+  const c = {};
+  for(const e of eps){ const v = vendorOf(e.model); c[v] = (c[v] || 0) + 1; }
+  return c;
+}
+function isVendorFilter(f){ return typeof f === 'string' && f.startsWith('vendor:'); }
 
 function hBadge(h,lat){
   const m={ok:['badge-h-ok','✅'],slow:['badge-h-slow','🐢'],bad:['badge-h-bad','❌'],unknown:['badge-h-unknown','❓'],testing:['badge-h-unknown','⏳']};
@@ -651,6 +681,7 @@ function renderEndpoints(eps){
   else if(epFilter==='pooled')eps=eps.filter(e=>e.in_pool);
   else if(epFilter==='vision')eps=eps.filter(e=>e.is_vision!==false);
   else if(epFilter==='payperuse')eps=eps.filter(e=>e.billing_mode==='pay_per_use');
+  else if(isVendorFilter(epFilter))eps=eps.filter(e=>vendorOf(e.model)===epFilter.slice(7));
 
   const c=document.getElementById('filterCount');if(c)c.textContent=`${eps.length} 个`;
   const el=document.getElementById('epList');
