@@ -822,7 +822,7 @@ function renderPoolList(eps){
   const barHtml=groups.map(gr=>{
     const gi=groupsInfo[gr]||{};
     const memN=poolEps.filter(e=>groupsOf(e).includes(gr)).length;
-    const icon=gr==='main'?'🏊':'🏷️';
+    const icon=gr==='main'?'🏊':'🗂';
     const tip=`当前端点：${gi.current_endpoint?esc(gi.current_endpoint):'无'}${gi.fallback_count>0?' · 已 fallback '+gi.fallback_count+' 次':''}`;
     return `<button class="filter-btn ${gr===poolGroupFilter?'active':''}" onclick="setPoolGroupFilter('${esc(gr)}')" title="${tip}">${icon}${esc(gr)} ${memN}</button>`;
   }).join('');
@@ -865,7 +865,7 @@ function renderChain(chain){
       gEl.innerHTML=`<div class="filter-bar" style="margin-bottom:8px">`+allGroups.map(g=>{
         const info=gs[g]||{};
         const memN=chain.filter(it=>chainGroupsOf(it).includes(g)).length;
-        const icon=g==='main'?'🏊':'🏷️';
+        const icon=g==='main'?'🏊':'🗂';
         const tip=`当前端点：${info.current_endpoint?esc(info.current_endpoint):'无'}${info.fallback_count>0?' · 已 fallback '+info.fallback_count+' 次':''}`;
         return `<button class="filter-btn ${g===chainGroupFilter?'active':''}" onclick="setChainGroupFilter('${esc(g)}')" title="${tip}">${icon}${esc(g)} ${memN}</button>`;
       }).join('')+`</div>`+
@@ -914,7 +914,7 @@ function openJoinPoolModal(id,name){
   const cur=(ep&&ep.pool_groups&&ep.pool_groups.length)?ep.pool_groups:[];
   const rows=groups.map(g=>`
     <div onclick="joinPoolGroup('${id}','${esc(g)}')" style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;cursor:pointer;font-size:13px;transition:all .12s" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
-      <span>${g==='main'?'🏊':'🏷️'}</span>
+      <span>${g==='main'?'🏊':'🗂'}</span>
       <span><b>${esc(g)}</b></span>
       ${(ep&&ep.in_pool&&cur.includes(g))?`<span class="badge badge-current" style="font-size:9px">已在该组</span>`:''}
       ${gs[g]&&gs[g].members?`<span class="badge badge-h-unknown" style="font-size:9px;margin-left:auto">${gs[g].members} 成员</span>`:''}
