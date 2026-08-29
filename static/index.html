@@ -372,13 +372,14 @@ select option { background: var(--bg); color: var(--text); }
       </div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
         <div style="font-size:10px;color:var(--text-dim);">从左侧端点列表添加，参与 API 调用轮换</div>
-        <button class="btn btn-ghost btn-sm" onclick="resetPriority()" title="忽略手动切换，按优先级自动选择最优端点">⬆️ 按优先级</button>
+        <button class="btn btn-ghost btn-sm" onclick="resetPriority()" title="忽略手动切换，当前查看的组按优先级自动选择最优端点">⬆️ 按优先级</button>
       </div>
       <div id="poolList"></div>
     </div>
     <div class="card" style="margin-bottom:16px">
       <div class="card-title"><span class="icon">🔗</span> 聚合链</div>
-      <div style="font-size:10px;color:var(--text-dim);margin-bottom:10px">遇 429/超时自动切换 · 冷却到期自动切回</div>
+      <div style="font-size:10px;color:var(--text-dim);margin-bottom:6px">遇 429/超时自动切换 · 冷却到期自动切回</div>
+      <div id="groupSummary" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px"></div>
       <div class="chain-list" id="chainList"></div>
     </div>
 
@@ -550,6 +551,7 @@ select option { background: var(--bg); color: var(--text); }
       <div class="form-group"><label title="流式首包超时（秒），0=禁用独立超时。超过视为端点故障并重试">首包超时 (秒)</label><input type="number" id="fStreamFirstPacket" value="120" min="0" placeholder="0=禁用, 默认120"></div>
       <div class="form-group"><label title="流式无新数据停滞判定（秒），0=禁用停滞检测。停滞不冻结端点，仅事务失败">停滞判定 (秒)</label><input type="number" id="fStreamStall" value="60" min="0" placeholder="0=禁用, 默认60"></div>
       <div class="form-group"><label title="流式总时长上限（秒），0=禁用。超过后截断并标记事务失败，不冻结端点">总时长上限 (秒)</label><input type="number" id="fStreamMaxDuration" value="120" min="0" placeholder="0=禁用, 默认120"></div>
+      <div class="form-group"><label title="所属路由组（逗号分隔，2026-08-29 分组池）。请求 model 字段精确匹配组名即路由到该组；main=默认主组；跨组共享端点在其他组占用时自动避让">路由组</label><input type="text" id="fPoolGroups" placeholder="main（默认），如 bg 或 main,bg" value="main"></div>
     </div>
     <div class="form-group">
       <label>后台探针</label>
@@ -582,7 +584,11 @@ let allModels=[],selectedModels=new Set(),latencyResults={},visionResults={};
 let epFilter='all',modelPage=1,PP=50;
 
 async function refresh(){
-  const[eps,chain]=await Promise.all([api('GET','/api/endpoints'),api('GET','/api/chain')]);
+  const[eps,chainRes]=await Promise.all([api('GET','/api/endpoints'),api('GET','/api/chain')]);
+  // 分组池：/api/chain 返回 {chain, groups}（groups = 各组指针与 fallback 统计）
+  const chain = Array.isArray(chainRes) ? chainRes : (chainRes.chain || []);
+  window._poolGroups = (chainRes && chainRes.groups) ? chainRes.groups : {};
+  window._allEps = eps; // 入池弹层读取端点当前组（回显勾选）
   renderStats(eps);renderFilterBar(eps);renderEndpoints(eps);
   // 优先级下拉框展开/操作期间，避免 5s 自动刷新重建 DOM 导致下拉框收回
   const active = document.activeElement;
@@ -724,8 +730,7 @@ function renderEndpoints(eps){
           <button class="btn btn-ghost btn-sm" title="连通性测试" onclick="openTestDrawer('${ep.id}', '${esc(ep.name)} (${esc(ep.model)})')">🧪</button>
           ${(ep.in_cooldown||ep.manual_unlock_required)?`<button class="btn btn-yellow btn-sm" title="${ep.manual_unlock_required?'手动解冻余额不足端点':'立刻解除冷却'}" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
           <button class="btn btn-ghost btn-sm" title="${ep.enabled?'禁用端点':'启用端点'}" onclick="toggleEndpoint('${ep.id}')">${ep.enabled?'⏸':'▶'}</button>
-          ${!ep.in_pool?'<button class="btn btn-ghost btn-sm" title="加入聚合池" onclick="addToPool(\''+ep.id+'\')">📥</button>':''}
-          ${ep.enabled && ep.in_pool && !ep.is_current?'<button class="btn btn-ghost btn-sm" title="切换为当前端点" onclick="switchEndpoint(\''+ep.id+'\')">⚡</button>':''}
+          <button class="btn btn-ghost btn-sm" title="加入聚合池（选择分组）" onclick="openJoinPoolModal('${ep.id}','${esc(ep.name)}')">📥</button>
           <button class="btn btn-ghost btn-sm" title="编辑端点" onclick="editEndpoint('${ep.id}')">✏️</button>
           <button class="btn btn-ghost btn-sm" title="删除端点" onclick="deleteEndpoint('${ep.id}', '${esc(ep.name)}')" style="color:var(--red)">🗑</button>
         </div>
@@ -741,72 +746,144 @@ function renderEndpoints(eps){
 }
 
 
+// 分组池（2026-08-29）：聚合池内组筛选标签——默认显示 main，点击切换子组，一次只看一组
+let poolGroupFilter='main';
+function setPoolGroupFilter(g){poolGroupFilter=g;refresh();}
+
 function renderPoolList(eps){
   const poolEps=eps.filter(e=>e.in_pool).sort((a,b)=>a.priority-b.priority);
   const el=document.getElementById('poolList');
   const cnt=document.getElementById('poolCount');
   if(cnt)cnt.textContent=poolEps.length+' 个成员';
   if(!poolEps.length){el.innerHTML='<div class="empty">聚合池为空，从左侧添加端点</div>';return;}
-  el.innerHTML=poolEps.map(ep=>{
+  const groupsInfo=window._poolGroups||{};
+  const groupsOf=(e)=>((e.pool_groups&&e.pool_groups.length)?e.pool_groups:['main']);
+  const groups=[];
+  for(const e of poolEps){
+    for(const g of groupsOf(e)) if(g!=='main'&&!groups.includes(g)) groups.push(g);
+  }
+  groups.unshift('main');
+  const multiGroup=groups.length>1||groups[0]!=='main';
+  const displayGroup=multiGroup?poolGroupFilter:'main';
+  const cardOf=(ep)=>{
     let cls='ep-item';
     if(!ep.enabled)cls+=' disabled';
-    if(ep.is_current)cls+=' current';
+    // 高亮边框仅本组当前端点；其他组的当前端点只显示紫色组名 badge（无高亮）
+    if(ep.is_current&&(ep.current_groups||[]).includes(displayGroup))cls+=' current';
     if(ep.in_cooldown)cls+=' in-cooldown';
     if(ep.manual_unlock_required)cls+=' has-error';
     if(ep.in_pool)cls+=' in-pool';
     let h=ep.health,lat=ep.health_latency_ms;
     let rh='';
-    if(h==='ok')rh='<span style="color:var(--green);font-size:11px">✓'+(lat>=0?' '+lat+'ms':'')+'</span>';
-    else if(h==='slow')rh='<span style="color:var(--yellow);font-size:11px">🐢'+(lat>=0?' '+lat+'ms':'')+'</span>';
-    else if(h==='bad')rh='<span style="color:var(--red);font-size:11px">✗'+(lat>=0?' '+lat+'ms':'')+'</span>';
-    else rh='<span style="color:var(--text-dim);font-size:11px">-</span>';
-    const maxP = Math.max(poolEps.length, Math.max(...poolEps.map(e => e.priority)));
-    let options = [];
-    for(let p = 1; p <= maxP; p++){
-      options.push('<option value="'+p+'" '+(p===ep.priority?'selected':'')+'>#'+p+'</option>');
-    }
-    options = options.join('');
-    return '<div class="'+cls+'" style="display:flex;flex-direction:column;gap:6px;padding:10px 12px">'
-      +'<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">'
-        +'<div style="display:flex;align-items:center;gap:6px;min-width:0">'
-          +'<span class="badge badge-priority">#'+ep.priority+'</span>'
-          +'<span style="font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(ep.name)+'</span>'
-          +(ep.billing_mode==='pay_per_use'?'<span class="badge" style="background:rgba(255,159,10,.15);color:#ff9f0a;font-size:10px;padding:1px 5px" title="按次计费">💰按次</span>':'')
-        +'</div>'
-        +'<div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">'
-          +rh
-          +(ep.is_current?'<span class="badge badge-current" style="font-size:10px;padding:1px 6px">● 当前</span>':'')
-          +(ep.in_cooldown?'<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px">⏳'+fmtTime(ep.cooldown_remaining)+'</span>':'')
-          +((ep.in_cooldown||ep.manual_unlock_required)?'<button class="btn btn-yellow btn-sm" style="padding:2px 5px;font-size:11px" title="'+(ep.manual_unlock_required?'手动解冻余额不足端点':'解除冷却')+'" onclick="clearCooldown(\''+ep.id+'\')">⏰</button>':'')
-        +'</div>'
-      +'</div>'
-      +'<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">'
-        +'<span style="color:var(--text-dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(ep.model||'')+'</span>'
-        +'<div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">'
-          +'<select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority(\''+ep.id+'\', this.value);this.blur()" title="修改优先级">'
-            +options
-          +'</select>'
-          +'<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="'+(ep.enabled?'暂停端点':'恢复端点')+'" onclick="toggleEndpoint(\''+ep.id+'\')">'+(ep.enabled?'⏸':'▶')+'</button>'
-          +'<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="编辑端点" onclick="editEndpoint(\''+ep.id+'\')">✏️</button>'
-          +(!ep.is_current?'<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="切换为当前端点" onclick="switchEndpoint(\''+ep.id+'\')">⚡</button>':'')
-          +'<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="移出聚合池" onclick="removeFromPool(\''+ep.id+'\')">📤</button>'
-        +'</div>'
-      +'</div>'
-    +'</div>';
+    if(h==='ok')rh=`<span style="color:var(--green);font-size:11px">✓${lat>=0?' '+lat+'ms':''}</span>`;
+    else if(h==='slow')rh=`<span style="color:var(--yellow);font-size:11px">🐢${lat>=0?' '+lat+'ms':''}</span>`;
+    else if(h==='bad')rh=`<span style="color:var(--red);font-size:11px">✗${lat>=0?' '+lat+'ms':''}</span>`;
+    else rh=`<span style="color:var(--text-dim);font-size:11px">-</span>`;
+    // 组内优先级：显示该组独立编号（缺省回退全局值）
+    const prioOf=(e)=>((e.priority_by_group&&e.priority_by_group[displayGroup]!==undefined)?e.priority_by_group[displayGroup]:e.priority);
+    const maxP=Math.max(poolEps.length, Math.max(...poolEps.map(e=>prioOf(e))));
+    let options='';
+    for(let p=1;p<=maxP;p++) options+=`<option value="${p}" ${p===prioOf(ep)?'selected':''}>#${p}</option>`;
+    return `<div class="${cls}" style="display:flex;flex-direction:column;gap:6px;padding:10px 12px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:6px;min-width:0">
+          <span class="badge badge-priority">#${prioOf(ep)}</span>
+          <span style="font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(ep.name)}</span>
+          ${(ep.pool_groups&&ep.pool_groups.length>1)?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;font-size:9px;padding:1px 5px" title="跨组共享：${esc(ep.pool_groups.join(', '))}">🔗${ep.pool_groups.length}组</span>`:''}
+          ${ep.billing_mode==='pay_per_use'?`<span class="badge" style="background:rgba(255,159,10,.15);color:#ff9f0a;font-size:10px;padding:1px 5px" title="按次计费">💰按次</span>`:''}
+        </div>
+        <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
+          ${rh}
+          ${(()=>{const cg=ep.current_groups||[];if(!ep.is_current||!cg.length)return '';if(cg.includes(displayGroup))return `<span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="当前服务组：${esc(cg.join(', '))}">● 当前</span>`;const others=cg.filter(g=>g!==displayGroup);return `<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:10px;padding:1px 6px" title="本组未使用：它是其他组的当前端点">🏷️${esc(others.join('·'))} 当前</span>`;})()}
+          ${ep.in_cooldown?`<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px">⏳${fmtTime(ep.cooldown_remaining)}</span>`:''}
+          ${(ep.in_cooldown||ep.manual_unlock_required)?`<button class="btn btn-yellow btn-sm" style="padding:2px 5px;font-size:11px" title="${ep.manual_unlock_required?'手动解冻余额不足端点':'解除冷却'}" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
+        <span style="color:var(--text-dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(ep.model||'')}</span>
+        <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
+          <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority('${ep.id}', this.value, '${esc(displayGroup)}');this.blur()" title="修改组内优先级">${options}</select>
+          <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="${ep.enabled?'暂停端点':'恢复端点'}" onclick="toggleEndpoint('${ep.id}')">${ep.enabled?'⏸':'▶'}</button>
+          <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="编辑端点" onclick="editEndpoint('${ep.id}')">✏️</button>
+          ${!ep.is_current?`<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="切换为当前端点（组 ${esc(displayGroup)}）" onclick="switchEndpoint('${ep.id}','${esc(displayGroup)}')">⚡</button>`:''}
+          <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="从当前组移除（其他组不受影响；最后一组移除时整体出池）" onclick="removeFromPool('${ep.id}','${esc(displayGroup)}')">📤</button>
+        </div>
+      </div>
+    </div>`;
+  };
+  if(!multiGroup){
+    el.innerHTML=poolEps.map(cardOf).join('');
+    return;
+  }
+  if(!groups.includes(poolGroupFilter)) poolGroupFilter='main';
+  const pbgOf=(e,g)=>((e.priority_by_group&&e.priority_by_group[g]!==undefined)?e.priority_by_group[g]:e.priority);
+  const members=poolEps.filter(e=>groupsOf(e).includes(poolGroupFilter)).sort((a,b)=>pbgOf(a,poolGroupFilter)-pbgOf(b,poolGroupFilter));
+  const info=groupsInfo[poolGroupFilter]||{};
+  const barHtml=groups.map(gr=>{
+    const gi=groupsInfo[gr]||{};
+    const memN=poolEps.filter(e=>groupsOf(e).includes(gr)).length;
+    const icon=gr==='main'?'🏊':'🏷️';
+    const tip=`当前端点：${gi.current_endpoint?esc(gi.current_endpoint):'无'}${gi.fallback_count>0?' · 已 fallback '+gi.fallback_count+' 次':''}`;
+    return `<button class="filter-btn ${gr===poolGroupFilter?'active':''}" onclick="setPoolGroupFilter('${esc(gr)}')" title="${tip}">${icon}${esc(gr)} ${memN}</button>`;
   }).join('');
+  const statusHtml=`<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;margin:2px 0 10px">
+    <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
+      <span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="该组当前端点">● ${info.current_endpoint?esc(info.current_endpoint):'无'}</span>
+      ${info.fallback_count>0?`<span class="badge badge-cooldown" style="font-size:9px;padding:1px 5px" title="fallback 到 main 累计次数（扩容信号）">↩${info.fallback_count}</span>`:''}
+    </div>
+    <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:10px" title="编辑分组属性（类型：混合/专用，暂未开放）" onclick="editPoolGroup('${esc(poolGroupFilter)}')">⚙️ 编辑分组</button>
+  </div>`;
+  el.innerHTML=`<div class="filter-bar" style="margin-bottom:8px">${barHtml}</div>`+statusHtml+members.map(cardOf).join('');
 }
 
+// 分组属性编辑（预留）：混合型 mixed / 专用型 dedicated（绑定单一模型）。
+// 后端组实体存储与校验未实施前，仅弹提示不执行写操作。
+function editPoolGroup(g){
+  toast('⚙️ 分组编辑（类型：混合/专用）暂未开放，当前组：'+g,'info');
+}
+
+
+// 分组池：聚合链组筛选（与聚合池管理一致的标签交互，默认 main）
+let chainGroupFilter='main';
+function setChainGroupFilter(g){chainGroupFilter=g;renderChain(window._lastChain||[]);}
 function renderChain(chain){
   const el=document.getElementById('chainList');
-  if(!chain.length){el.innerHTML='<div class="empty">没有启用的端点</div>';return;}
+  window._lastChain=chain;
+  const gs=window._poolGroups||{};
+  const gEl=document.getElementById('groupSummary');
+  const chainGroupsOf=(it)=>((it.pool_groups&&it.pool_groups.length)?it.pool_groups:['main']);
+  const allGroups=['main'];
+  for(const it of chain) for(const g of chainGroupsOf(it)) if(g!=='main'&&!allGroups.includes(g)) allGroups.push(g);
+  const multiGroup=allGroups.length>1||allGroups[0]!=='main';
+  if(gEl){
+    if(multiGroup){
+      gEl.innerHTML=`<div class="filter-bar" style="margin-bottom:8px">`+allGroups.map(g=>{
+        const info=gs[g]||{};
+        const memN=chain.filter(it=>chainGroupsOf(it).includes(g)).length;
+        const icon=g==='main'?'🏊':'🏷️';
+        const tip=`当前端点：${info.current_endpoint?esc(info.current_endpoint):'无'}${info.fallback_count>0?' · 已 fallback '+info.fallback_count+' 次':''}`;
+        return `<button class="filter-btn ${g===chainGroupFilter?'active':''}" onclick="setChainGroupFilter('${esc(g)}')" title="${tip}">${icon}${esc(g)} ${memN}</button>`;
+      }).join('')+`</div>`+
+      `<div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin:2px 0 10px">
+        <span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="该组当前端点">● ${gs[chainGroupFilter]&&gs[chainGroupFilter].current_endpoint?esc(gs[chainGroupFilter].current_endpoint):'无'}</span>
+        ${(gs[chainGroupFilter]&&gs[chainGroupFilter].fallback_count>0)?`<span class="badge badge-cooldown" style="font-size:9px;padding:1px 5px" title="fallback 到 main 累计次数（扩容信号）">↩${gs[chainGroupFilter].fallback_count}</span>`:''}
+      </div>`;
+    } else { gEl.innerHTML=''; }
+  }
+  if(!chainGroupFilter||!allGroups.includes(chainGroupFilter)) chainGroupFilter='main';
+  if(multiGroup) chain=chain.filter(it=>chainGroupsOf(it).includes(chainGroupFilter));
+  if(!chain.length){el.innerHTML='<div class="empty">该组没有启用的端点</div>';return;}
   el.innerHTML=chain.map((it,i)=>{
+    // 分组隔离：仅本组当前端点高亮；其他组的当前端点显示组名 badge 不高亮
+    const cg=it.current_groups||[];
+    const isCurHere=it.is_current&&cg.includes(chainGroupFilter);
     let cls='chain-item';
     if(it.manual_unlock_required)cls+=' failed';
     else if(it.in_cooldown)cls+=' cooldown';
     else if(it.is_deferred)cls+=' deferred';
-    else if(it.is_current)cls+=' active';
+    else if(isCurHere)cls+=' active';
     else if(it.health==='bad'||it.fail_count>0)cls+=' failed';
-    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">💳余额不足·手动解冻</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(it.is_deferred?'<span class="badge badge-deferred">⏳延迟回切 '+fmtTime(it.defer_remaining)+'</span>':(it.is_current?'<span class="badge badge-success">服务中</span>':'')));
+    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">💳余额不足·手动解冻</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(it.is_deferred?'<span class="badge badge-deferred">⏳延迟回切 '+fmtTime(it.defer_remaining)+'</span>':(isCurHere?'<span class="badge badge-success">服务中</span>':(it.is_current?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:9px;padding:1px 5px" title="本组未使用：它是其他组的当前端点">🏷️${esc(cg.filter(g=>g!==chainGroupFilter).join('·'))} 当前</span>`:''))));
     const h=it.health, lat=it.health_latency_ms;
     let rh='';
     if(h==='ok')rh=`<div class="chain-health" style="color:var(--green)">✓${lat>=0?' '+lat+'ms':''}</div>`;
@@ -816,58 +893,72 @@ function renderChain(chain){
     else rh='<div class="chain-health" style="color:var(--text-dim)">-</div>';
     const conn=i<chain.length-1?'<div class="chain-connector"></div>':'';
     const vis = (it.is_vision !== false) ? '<span class="badge" style="background:rgba(0,122,255,.15);color:#0a84ff" title="支持原生视觉">👁️视觉</span>' : '';
-    return`<div class="${cls}"><div class="chain-dot"></div><div class="chain-info"><div class="name">${esc(it.name)} ${st}</div><div class="model">${esc(it.model)} ${vis}</div></div><div class="chain-right">${rh}</div></div>${conn}`;
+    const cp_=(it.priority_by_group&&it.priority_by_group[chainGroupFilter]!==undefined)?it.priority_by_group[chainGroupFilter]:it.priority;
+    return`<div class="${cls}"><div class="chain-dot"></div><div class="chain-info"><div class="name"><span class="badge badge-priority">#${cp_}</span> ${esc(it.name)} ${st}</div><div class="model">${esc(it.model)} ${vis}</div></div><div class="chain-right">${rh}</div></div>${conn}`;
   }).join('');
 }
 
 async function runHealthCheck(){toast('正在检测...','info');const r=await api('POST','/api/health-check');if(r.ok){const o=r.results.filter(x=>x.health==='ok').length,s=r.results.filter(x=>x.health==='slow').length,b=r.results.filter(x=>x.health==='bad').length;toast(`✅${o} 🐢${s} ❌${b}`,'success');}refresh();}
 async function toggleEndpoint(id){await api('POST',`/api/endpoints/${encodeURIComponent(id)}/toggle`);refresh();}
-async function addToPool(id){await api('POST',`/api/pool/${encodeURIComponent(id)}`);refresh();}
-async function removeFromPool(id){await api('DELETE',`/api/pool/${encodeURIComponent(id)}`);refresh();}
-async function setPriority(targetId, newPrio){
+// ── 分组池：入池组点选弹层（点击组即加入该组，一次一组；要再加组重复操作）──
+function openJoinPoolModal(id,name){
+  const gs=window._poolGroups||{};
+  const groups=['main'];
+  for(const g of Object.keys(gs)) if(g!=='main'&&!groups.includes(g)) groups.push(g);
+  const ep=(window._allEps||[]).find(e=>e.id===id);
+  const cur=(ep&&ep.pool_groups&&ep.pool_groups.length)?ep.pool_groups:[];
+  const rows=groups.map(g=>`
+    <div onclick="joinPoolGroup('${id}','${esc(g)}')" style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;cursor:pointer;font-size:13px;transition:all .12s" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
+      <span>${g==='main'?'🏊':'🏷️'}</span>
+      <span><b>${esc(g)}</b></span>
+      ${(ep&&ep.in_pool&&cur.includes(g))?`<span class="badge badge-current" style="font-size:9px">已在该组</span>`:''}
+      ${gs[g]&&gs[g].members?`<span class="badge badge-h-unknown" style="font-size:9px;margin-left:auto">${gs[g].members} 成员</span>`:''}
+    </div>`).join('');
+  const overlay=document.createElement('div');
+  overlay.className='modal-overlay show';
+  overlay.id='joinPoolOverlay';
+  overlay.innerHTML=`<div class="modal" style="width:400px">
+    <h2>📥 加入聚合池</h2>
+    <div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">端点：<b>${esc(name)}</b> — 点击要加入的组（一次一组，加入其他组再点一次 📥）</div>
+    <div style="display:flex;flex-direction:column;gap:6px">${rows}</div>
+    <div class="form-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn btn-ghost" onclick="closeJoinPoolModal()">取消</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+}
+function closeJoinPoolModal(){
+  const o=document.getElementById('joinPoolOverlay');
+  if(o)o.remove();
+}
+async function joinPoolGroup(id,g){
+  const ep=(window._allEps||[]).find(e=>e.id===id);
+  const cur=(ep&&ep.pool_groups&&ep.pool_groups.length)?ep.pool_groups:[];
+  // 仅当端点已在池且属于该组时才拦截；in_pool=False 时组配置只是残留，直接入池
+  if(ep&&ep.in_pool&&cur.includes(g)){toast('该端点已在组 '+g+' 中','info');closeJoinPoolModal();return;}
+  const groups=cur.includes(g)?cur:[...cur,g]; // 保留已有组，追加本次选择
+  await api('POST',`/api/pool/${encodeURIComponent(id)}?groups=${encodeURIComponent(groups.join(','))}`);
+  closeJoinPoolModal();
+  toast(`✅ 已加入组：${g}`,'success');
+  refresh();
+}
+async function removeFromPool(id, group){
+  // 分组池：从当前查看的组移出（其他组不动；最后一组移除时整体出池）
+  const g=group||poolGroupFilter||'main';
+  await api('DELETE',`/api/pool/${encodeURIComponent(id)}?group=${encodeURIComponent(g)}`);
+  toast(`已从组 ${g} 移除`,'success');
+  refresh();
+}
+async function setPriority(targetId, newPrio, group){
   newPrio = parseInt(newPrio);
-  // 获取所有端点，筛选聚合池内的，按当前优先级排序
-  const all = await api('GET', '/api/endpoints');
-  const poolEps = all.filter(e => e.in_pool).sort((a,b) => a.priority - b.priority);
-  const target = poolEps.find(e => e.id === targetId);
-  if(!target){console.error('Target not found');return;}
-  
-  const oldPrio = target.priority;
-  if(oldPrio === newPrio){return;} // 没有变化
-  
-  // 只收集需要改 priority 的端点，不传其他字段（避免覆盖 API key 等敏感字段）
-  const updates = [];
-  
-  if(newPrio < oldPrio){
-    // 提升优先级：原位置 和 新位置 之间的所有端点优先级 +1
-    for(const ep of poolEps){
-      if(ep.priority >= newPrio && ep.priority < oldPrio){
-        updates.push({id: ep.id, priority: ep.priority + 1});
-      }
-    }
-  } else {
-    // 降低优先级：新位置 和 原位置 之间的所有端点优先级 -1
-    for(const ep of poolEps){
-      if(ep.priority > oldPrio && ep.priority <= newPrio){
-        updates.push({id: ep.id, priority: ep.priority - 1});
-      }
-    }
-  }
-  
-  // 更新目标端点自身
-  updates.push({id: target.id, priority: newPrio});
-  
-  // 逐个PUT更新（只传priority字段，不碰其他字段）
+  if(!newPrio || newPrio < 1){return;}
+  // 分组池：走组内优先级接口（POST /api/priority/<id>?group=&priority=），
+  // 后端做组内 insert-at-position + 重编号；旧的全局 priority PUT 路径只改
+  // 全局字段，路由读 priority_by_group，改动会被完全遮蔽（2026-08-30 修复）。
+  const g = group || poolGroupFilter || 'main';
   toast('正在更新优先级...', 'info');
-  let success = true;
-  for(const update of updates){
-    const r = await api('PUT', `/api/endpoints/${encodeURIComponent(update.id)}`, {priority: update.priority});
-    if(!r.ok){
-      success = false;
-      break;
-    }
-  }
-  if(success){
+  const r = await api('POST', `/api/priority/${encodeURIComponent(targetId)}?group=${encodeURIComponent(g)}&priority=${newPrio}`);
+  if(r.ok){
     toast('✅ 优先级已更新', 'success');
     refresh();
   } else {
@@ -876,9 +967,16 @@ async function setPriority(targetId, newPrio){
 }
 async function deleteEndpoint(id, n){if(!confirm(`删除「${n}」？`))return;await api('DELETE',`/api/endpoints/${encodeURIComponent(id)}`);toast('已删除','success');refresh();}
 async function clearCooldown(id){await api('POST',`/api/endpoints/${encodeURIComponent(id)}/clear-error`);refresh();toast('已解除冷却','success');}
-async function switchEndpoint(id){
-  const r = await api('POST', `/api/switch-endpoint/${encodeURIComponent(id)}`);
-  if(r.ok){ toast('✅ 已切换','success'); refresh(); }
+// 分组池：端点的主组 = 非 main 的第一个组（单组端点即其归属；多组端点取最高优先展示组）
+function primaryGroupOf(ep){
+  const gs = (ep && ep.pool_groups && ep.pool_groups.length) ? ep.pool_groups : ['main'];
+  const nonMain = gs.find(g => g !== 'main');
+  return nonMain || 'main';
+}
+async function switchEndpoint(id, group){
+  const g = group || 'main';
+  const r = await api('POST', `/api/switch-endpoint/${encodeURIComponent(id)}?group=${encodeURIComponent(g)}`);
+  if(r.ok){ toast(`✅ 已切换（组 ${g}）`,'success'); refresh(); }
   else { toast('❌ 切换失败','error'); }
 }
 let testImageBase64 = null;
@@ -937,7 +1035,7 @@ async function sendTest() {
   refresh();
 }
 async function resetPool(){await api('POST','/api/reset');toast('已重置','success');refresh();}
-async function resetPriority(){await api('POST','/api/reset-priority');toast('✅ 已切换为按优先级运行','success');refresh();}
+async function resetPriority(){const g=poolGroupFilter||'main';await api('POST','/api/reset-priority?group='+encodeURIComponent(g));toast('✅ 组 '+g+' 已按优先级运行','success');refresh();}
 
 function checkFetchBtn(){
     const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
@@ -1101,7 +1199,7 @@ function editEndpoint(id){
     api('GET','/api/endpoints').then(eps=>{const ep=eps.find(e=>e.id===id);if(!ep)return;
         document.getElementById('editName').value=id;document.getElementById('modalTitle').textContent='编辑端点';
         document.getElementById('fName').value=ep.name;document.getElementById('fUrl').value=ep.base_url;document.getElementById('fKey').value=ep.api_key_full||'';document.getElementById('fModel').value=ep.model;document.getElementById('fUserAgent').value=ep.default_headers?.['User-Agent']||'';
-        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fPool').value=String(ep.in_pool!==false);document.getElementById('fDeferrable').value=String(ep.deferrable!==false);document.getElementById('fMaxContext').value=ep.max_context_k||0;document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);document.getElementById('fToolCallPrefix').value=ep.tool_call_id_prefix||'';document.getElementById('fStreamFirstPacket').value=ep.stream_first_packet_timeout||0;document.getElementById('fStreamStall').value=ep.stream_stall_timeout||0;document.getElementById('fStreamMaxDuration').value=ep.stream_max_duration||0;
+        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fPool').value=String(ep.in_pool!==false);document.getElementById('fDeferrable').value=String(ep.deferrable!==false);document.getElementById('fMaxContext').value=ep.max_context_k||0;document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);document.getElementById('fToolCallPrefix').value=ep.tool_call_id_prefix||'';document.getElementById('fStreamFirstPacket').value=ep.stream_first_packet_timeout||0;document.getElementById('fStreamStall').value=ep.stream_stall_timeout||0;document.getElementById('fStreamMaxDuration').value=ep.stream_max_duration||0;document.getElementById('fPoolGroups').value=((ep.pool_groups&&ep.pool_groups.length)?ep.pool_groups:['main']).join(',');
         document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
         allModels=[];selectedModels=new Set();latencyResults={};visionResults={};checkFetchBtn();document.getElementById('modal').classList.add('show');
     });
@@ -1111,7 +1209,7 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 async function saveEndpoint(){
     const ep_id=document.getElementById('editName').value;
     const ua=document.getElementById('fUserAgent').value.trim();
-    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),enabled:document.getElementById('fEnabled').value==='true',deferrable:document.getElementById('fDeferrable').value==='true',max_context_k:parseInt(document.getElementById('fMaxContext').value)||0,daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',default_headers:ua?{'User-Agent':ua}:{},health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true',tool_call_id_prefix:document.getElementById('fToolCallPrefix').value.trim(),stream_first_packet_timeout:parseInt(document.getElementById('fStreamFirstPacket').value)||0,stream_stall_timeout:parseInt(document.getElementById('fStreamStall').value)||0,stream_max_duration:parseInt(document.getElementById('fStreamMaxDuration').value)||0};
+    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),enabled:document.getElementById('fEnabled').value==='true',deferrable:document.getElementById('fDeferrable').value==='true',max_context_k:parseInt(document.getElementById('fMaxContext').value)||0,daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',default_headers:ua?{'User-Agent':ua}:{},health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true',tool_call_id_prefix:document.getElementById('fToolCallPrefix').value.trim(),stream_first_packet_timeout:parseInt(document.getElementById('fStreamFirstPacket').value)||0,stream_stall_timeout:parseInt(document.getElementById('fStreamStall').value)||0,stream_max_duration:parseInt(document.getElementById('fStreamMaxDuration').value)||0,pool_groups:document.getElementById('fPoolGroups').value.split(',').map(x=>x.trim()).filter(x=>x)};
     if(!d.name||!d.base_url||!d.api_key){toast('填写名称/URL/Key','error');return;}
     if(!d.model){toast('选择模型','error');return;}
     if(ep_id){await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d);toast('已更新','success');}

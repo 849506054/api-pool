@@ -112,6 +112,8 @@
 | 2026-08-28 | quota_markers 补齐 AgentRouter 402 文案（commit 8751b32，已部署） | AgentRouter "Budget pool quota has been exhausted" 402 不匹配既有 quota 词典（差 "has been"），只走 5 分钟短冷却；UI 5s 轮询触发冷却过期探活 → 每 5 分钟刷两条 WARN。补一个 marker 后按 quota_exceeded 默认 5h 冷却。测试 78 OK；宿主机 hash=`13a1dd00a681c98247fc598dc8d08195`。 |
 | 2026-08-29 | UI 聚合池优先级实时刷新修复（commit 4d4fef0） | 焦点守卫（防 5s 自动刷新收回下拉框）无法区分「下拉展开中」与「选择已完成」——change 触发后 `<select>` 仍持焦点，`setPriority()` 末尾的主动 refresh 与后续 5s 轮询全部被守卫拦截，卡片一直显示旧顺序。修复：优先级下拉框 onchange 末尾追加 `this.blur()`，选择完成即释放焦点、立即重绘；下拉展开期间不触发 change，原防收回功能不受影响。纯前端静态文件 mtime 热更新，无需重启服务。 |
 | 2026-08-29 | Git 历史清洗：移除误推的已否决提交 | 工作区 ahead 2 时直接 push，把一条用户已否决的提交连带推上远端。处理：rebase 重放保留有效修复（哈希 441c3f6→4d4fef0）+ force-with-lease 推送 + reflog expire/gc 清理本地残留，全历史验证特征串零残留；同步清理引用旧哈希的文档记录。沉淀为「推送前检查 ahead N」流程。 |
+| 2026-08-30 | 分组路由（priority_by_group 分组隔离）实施部署 + UI 优先级接线修复 | 分组池实施已部署生产，bg 组真实流量（background_review / knowledge-sync cron）验证通过。诊断发现 UI 下拉框从未接线到分组接口：仍走旧全局 `priority` PUT 路径，而路由只读 `priority_by_group`——全局改动零效果且被 `_renumber` 静默回滚。修复：`setPriority()` 改为带组参数 `POST /api/priority/<id>?group=&priority=`。遗留：编辑表单 saveEndpoint() 的「优先级」字段仍走全局 PUT，被遮蔽未修。 |
+| 2026-08-30 | 越权组筛选功能回滚删除 | 端点列表的 `🏷️组名` 筛选标签（groupCounts/isGroupFilter/renderEndpoint 组标签）不在 8/29 批准终态清单范围内（组筛选标签栏仅授权于聚合池/聚合链两处），用户追问后 3 处全部删除并部署。沉淀「UI 实现范围铁律」：清单外功能须先请示或显式标注，不得默认保留。 |
 
 ## 📌 活跃事项
 

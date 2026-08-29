@@ -31,6 +31,7 @@ import queue
 from datetime import datetime, timedelta
 from collections import deque
 import copy as _copy
+import types as _types
 
 # 敏感字过滤私有配置文件（仅 API Pool 进程读取，Hermes 不可见）
 CONTENT_FILTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content_filter.json")
@@ -822,6 +823,7 @@ class Endpoint:
     api_key: str = ""
     model: str = "gpt-4o-mini"
     priority: int = 999
+    priority_by_group: dict = field(default_factory=dict)  # per-group 优先级（2026-08-29 分组隔离；main 组值同时镜像到 priority 字段保持旧格式兼容）
     timeout: int = 60
     max_retries: int = 1
     enabled: bool = True
@@ -841,6 +843,7 @@ class Endpoint:
     stream_max_duration: int = 120  # 流总时长上限（秒），0=禁用；防 keep-alive 型无限挂起（2026-08-14 缩短至120s）
     deferrable: bool = True  # 是否保护本端点缓存（true=本端点工作时延迟切走）
     max_context_k: int = 0  # 最大上下文长度（K=1000 tokens），0=不限
+    pool_groups: list = field(default_factory=lambda: ["main"])  # 所属路由组（2026-08-29 分组池方案）
 
     _fail_count: int = field(default=0, repr=False)
     _req_timestamps: deque = field(default_factory=deque, repr=False)
@@ -880,14 +883,21 @@ class APIPool:
     def __init__(self, endpoints=None):
         self._lock = threading.RLock()
         self._endpoints: list[Endpoint] = []
-        self._current_endpoint_id = None  # 用端点ID追踪当前端点，而非位置索引
-        self._manual_override_id = None  # 用户手动指定端点的ID，优先级覆盖路由选择
         self._restored_endpoint_id: str | None = None  # 兼容旧状态字段；恢复后转为持续手动覆盖
-        self._persisted_endpoint_id: str | None = None  # 避免同一端点每次成功都写盘
         self._last_reasoning_content = None  # 缓存上一轮返回的 reasoning_content，用于多轮对话补全
         self._last_reasoning_text = None  # 缓存上一轮返回的 reasoning_text（DeepSeek V4 request 字段名），用于多轮对话补全
         self._last_pool_activity: float = 0  # 上次池活跃时间（用于 defer 判断）
-        self._fallback_lock_until: float = 0  # 终极兜底锁定截止时间（滑动窗口 300s）
+        # ── 分组池路由状态（2026-08-29 spec：四个路由全局态 per-group 化）──
+        # 每组独立的粘性指针/手动覆盖/持久化指针/兜底锁。旧扁平状态在 _migrate_legacy_state 兼容。
+        self._current_endpoint_by_group: dict[str, str | None] = {}
+        self._manual_override_by_group: dict[str, str | None] = {}
+        self._persisted_endpoint_by_group: dict[str, str | None] = {}
+        self._fallback_lock_until_by_group: dict[str, float] = {}
+        # 端点在途归属：ep.id → 该请求所属组名（同一时刻每端点仅记录一个组的在途请求；
+        # 多组共享端点的其他组在互斥过滤时视其为被占用）。值恒为当前真实持有者，无需清理。
+        self._inflight_owner: dict[str, str] = {}
+        # per-group fallback 到 main 的累计次数（bg 组扩容信号，/api/endpoints 暴露）
+        self._group_fallback_count: dict[str, int] = {}
         # 后台探活基础设施：冷却过期端点在后台线程探活，不阻塞请求路径
         self._probe_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="apipool-probe")
         self._probe_inflight = set()  # 正在探活的端点 id 集合（后台/批量探活共享，防重复请求）
@@ -903,6 +913,17 @@ class APIPool:
             ep_dict = {k: v for k, v in raw_ep.items() if k in Endpoint.__dataclass_fields__}
             if raw_ep.get("user_agent") and "default_headers" not in ep_dict:
                 ep_dict["default_headers"] = {"User-Agent": raw_ep["user_agent"]}
+            # pool_groups 归一化：旧配置无此字段 → 默认 ["main"]；去重保序，剔除空串
+            raw_groups = ep_dict.get("pool_groups")
+            if not isinstance(raw_groups, list) or not raw_groups:
+                ep_dict["pool_groups"] = ["main"]
+            else:
+                seen = []
+                for g in raw_groups:
+                    gs = str(g).strip()
+                    if gs and gs not in seen:
+                        seen.append(gs)
+                ep_dict["pool_groups"] = seen or ["main"]
             # 新增时按组别自动设置健康检测模式（未显式指定时生效）
             if "health_mode" not in ep_dict:
                 ep_dict["health_mode"] = "models" if ep_dict.get("billing_mode", "subscription") == "pay_per_use" else ("chat" if ep_dict.get("in_pool", False) else "models")
@@ -925,11 +946,14 @@ class APIPool:
     def remove_endpoint(self, ep_id):
         with self._lock:
             self._endpoints = [e for e in self._endpoints if e.id != ep_id]
-            if self._current_endpoint_id == ep_id:
-                self._current_endpoint_id = None
+            for grp in list(self._current_endpoint_by_group):
+                if self._current_endpoint_by_group.get(grp) == ep_id:
+                    self._set_current(grp, None)
             self._renumber_pool_priorities()
-            if self._manual_override_id == ep_id:
-                self._manual_override_id = None
+            for grp in list(self._manual_override_by_group):
+                if self._manual_override_by_group.get(grp) == ep_id:
+                    self._set_manual(grp, None)
+            self._inflight_owner.pop(ep_id, None)
 
     def set_enabled(self, ep_id, enabled):
         with self._lock:
@@ -937,16 +961,61 @@ class APIPool:
                 if ep.id == ep_id:
                     ep.enabled = enabled
 
-    def set_pool(self, ep_id, in_pool):
+    def set_pool(self, ep_id, in_pool, groups=None):
         with self._lock:
             for ep in self._endpoints:
                 if ep.id == ep_id:
                     ep.in_pool = in_pool
+                    # 入池同时指定组（2026-08-29 分组池）：?groups=main,bg 形式
+                    if in_pool and groups is not None:
+                        ep.pool_groups = self._sanitize_groups(groups)
+                    # 出池清组绑定，避免残留（全量出池路径；单组移除走 remove_from_group）
+                    if not in_pool:
+                        ep.pool_groups = [self.MAIN_GROUP]
+                        self._clear_pointers_for(ep_id)
                     # 手动移出池再移回 = 显式信任该端点 → 清除延迟回迁状态，恢复最高优先级
                     if in_pool:
                         ep._defer_until = 0
                     break
             self._renumber_pool_priorities()
+
+    def remove_from_group(self, ep_id, group):
+        """组感知移除（2026-08-29）：仅从指定组移出端点，其他组不动；
+        移除的是最后一个组时整体出池并清指针。"""
+        with self._lock:
+            for ep in self._endpoints:
+                if ep.id != ep_id or not ep.in_pool:
+                    continue
+                remaining = [g for g in self._ep_groups(ep) if g != group]
+                if remaining:
+                    ep.pool_groups = remaining
+                    # 该组粘性指针若指向本端点 → 清除（其他组指针不动）
+                    if self._current_endpoint_by_group.get(group) == ep_id:
+                        self._set_current(group, None)
+                    if self._manual_override_by_group.get(group) == ep_id:
+                        self._set_manual(group, None)
+                    sys_log(f"端点 '{ep.name}' 已从组 '{group}' 移除（仍属其他组）", "INFO")
+                else:
+                    # 最后一组 → 整体出池
+                    ep.in_pool = False
+                    ep.pool_groups = [self.MAIN_GROUP]
+                    self._clear_pointers_for(ep_id)
+                    sys_log(f"端点 '{ep.name}' 从组 '{group}' 移除后无剩余组，已整体移出聚合池", "INFO")
+                break
+            self._renumber_pool_priorities()
+
+    def _clear_pointers_for(self, ep_id):
+        """端点整体出池/删除时清理所有组的指针与在途登记。"""
+        for grp in list(self._current_endpoint_by_group):
+            if self._current_endpoint_by_group.get(grp) == ep_id:
+                self._set_current(grp, None)
+        for grp in list(self._manual_override_by_group):
+            if self._manual_override_by_group.get(grp) == ep_id:
+                self._set_manual(grp, None)
+        for grp in list(self._persisted_endpoint_by_group):
+            if self._persisted_endpoint_by_group.get(grp) == ep_id:
+                self._set_persisted(grp, None)
+        self._inflight_owner.pop(ep_id, None)
 
     def update_endpoint(self, ep_id, updates: dict):
         with self._lock:
@@ -959,6 +1028,9 @@ class APIPool:
                     for k, v in updates.items():
                         if hasattr(ep, k) and not k.startswith("_") and k != "id":
                             setattr(ep, k, v)
+                    # pool_groups 归一化（分组池 2026-08-29）：去重/去空/空列表回退 main
+                    if updates.get("pool_groups") is not None:
+                        ep.pool_groups = self._sanitize_groups(ep.pool_groups)
                     # cooldown_minutes 最低 1，防止跳过冷却恢复流程
                     if updates.get("cooldown_minutes") is not None and updates["cooldown_minutes"] < 1:
                         ep.cooldown_minutes = 1
@@ -986,12 +1058,218 @@ class APIPool:
                     break
 
     def _renumber_pool_priorities(self):
-        """对池内端点分配唯一连续优先级，池外端点不动。"""
-        pool_eps = sorted([ep for ep in self._endpoints if ep.in_pool], key=lambda e: e.priority)
-        for i, ep in enumerate(pool_eps):
-            ep.priority = i + 1
+        """对每组内端点分配该组独立的连续优先级（2026-08-29 分组隔离）。
 
-    def switch_to_endpoint(self, ep_id):
+        每组独立 1..N：跨组端点在不同组可有不同排序；main 组值镜像到全局
+        priority 字段（兼容旧 config 格式与 prio99 兜底语义）。
+        """
+        for grp in self._all_group_names():
+            group_eps = sorted(
+                (ep for ep in self._endpoints if ep.in_pool and grp in self._ep_groups(ep)),
+                key=lambda e: self._ep_priority(e, grp),
+            )
+            for i, ep in enumerate(group_eps):
+                self._set_ep_priority(ep, grp, i + 1)
+
+    def set_group_priority(self, ep_id, group, new_priority):
+        """组内优先级 insert-at-position（2026-08-29 分组隔离）：只影响该组。"""
+        with self._lock:
+            for ep in self._endpoints:
+                if ep.id != ep_id or not ep.in_pool:
+                    continue
+                members = sorted(
+                    (e for e in self._endpoints if e.in_pool and group in self._ep_groups(e)),
+                    key=lambda e: self._ep_priority(e, group),
+                )
+                old = self._ep_priority(ep, group)
+                new_priority = max(1, min(int(new_priority), len(members)))
+                self._set_ep_priority(ep, group, new_priority)
+                for other in members:
+                    if other is ep:
+                        continue
+                    op = self._ep_priority(other, group)
+                    if new_priority < old and new_priority <= op < old:
+                        self._set_ep_priority(other, group, op + 1)
+                    elif old < op <= new_priority:
+                        self._set_ep_priority(other, group, op - 1)
+                break
+            self._renumber_pool_priorities()
+            self._endpoints.sort(key=lambda e: e.priority)
+
+    # ══════════════ 分组池路由基础设施（2026-08-29 spec）══════════════
+
+    MAIN_GROUP = "main"
+
+    def _sanitize_groups(self, raw):
+        """候选组名列表归一化：去重保序、剔除空串、非法类型忽略。"""
+        if not isinstance(raw, list):
+            return [self.MAIN_GROUP]
+        seen = []
+        for g in raw:
+            gs = str(g).strip()
+            if gs and gs not in seen:
+                seen.append(gs)
+        return seen or [self.MAIN_GROUP]
+
+    def _ep_groups(self, ep):
+        """端点归属组（运行时归一化，兼容字段缺失/空列表）。"""
+        return getattr(ep, "pool_groups", None) or [self.MAIN_GROUP]
+
+    # ── per-group 优先级访问器（2026-08-29 分组隔离）──
+    def _ep_priority(self, ep, group):
+        """端点在指定组的优先级：优先 priority_by_group，缺失时回退全局 priority。"""
+        pbg = getattr(ep, "priority_by_group", None) or {}
+        return pbg.get(group, ep.priority)
+
+    def _set_ep_priority(self, ep, group, value):
+        if not hasattr(ep, "priority_by_group") or ep.priority_by_group is None:
+            ep.priority_by_group = {}
+        ep.priority_by_group[group] = value
+        # main 组值镜像到全局 priority 字段（旧格式兼容：config、探活日志、prio99 兜底语义）
+        if group == self.MAIN_GROUP:
+            ep.priority = value
+
+    def _resolve_request_group(self, model):
+        """请求 model 字段 → 路由组名（薄封装，唯一解析点）。
+
+        - None/空 → main
+        - "api-pool"（历史别名）→ main
+        - 精确匹配已知组名（端点声明 ∪ 指针态出现过的组；bg 组全挂时仍可解析到 bg，
+          从而正确触发 bg→main fallback 而不是静默落 main）→ 该组
+        - 其他 → main（存量流量零感知）
+        """
+        if not model:
+            return self.MAIN_GROUP
+        name = str(model).strip()
+        if not name or name == "api-pool":
+            return self.MAIN_GROUP
+        if name in self._all_group_names():
+            return name
+        return self.MAIN_GROUP
+
+    def _migrate_legacy_state(self):
+        """启动时把旧扁平路由状态迁移为 main 组状态（一次性）。"""
+        legacy_current = getattr(self, "_legacy_current_endpoint_id", None)
+        legacy_manual = getattr(self, "_legacy_manual_override_id", None)
+        if legacy_current or legacy_manual:
+            self._current_endpoint_by_group[self.MAIN_GROUP] = legacy_current
+            self._manual_override_by_group[self.MAIN_GROUP] = legacy_manual
+
+    # ── 旧扁平属性兼容层：映射到 main 组（测试与外部脚本零改动迁移）──
+    @property
+    def _current_endpoint_id(self):
+        return self._current_endpoint_by_group.get(self.MAIN_GROUP)
+
+    @_current_endpoint_id.setter
+    def _current_endpoint_id(self, ep_id):
+        self._set_current(self.MAIN_GROUP, ep_id)
+
+    @property
+    def _manual_override_id(self):
+        return self._manual_override_by_group.get(self.MAIN_GROUP)
+
+    @_manual_override_id.setter
+    def _manual_override_id(self, ep_id):
+        self._set_manual(self.MAIN_GROUP, ep_id)
+
+    @property
+    def _persisted_endpoint_id(self):
+        return self._persisted_endpoint_by_group.get(self.MAIN_GROUP)
+
+    @_persisted_endpoint_id.setter
+    def _persisted_endpoint_id(self, ep_id):
+        self._set_persisted(self.MAIN_GROUP, ep_id)
+
+    def _get_current(self, group):
+        return self._current_endpoint_by_group.get(group)
+
+    def _set_current(self, group, ep_id):
+        if ep_id is None:
+            self._current_endpoint_by_group.pop(group, None)
+        else:
+            self._current_endpoint_by_group[group] = ep_id
+
+    def _get_manual(self, group):
+        return self._manual_override_by_group.get(group)
+
+    def _set_manual(self, group, ep_id):
+        if ep_id is None:
+            self._manual_override_by_group.pop(group, None)
+        else:
+            self._manual_override_by_group[group] = ep_id
+
+    def _get_persisted(self, group):
+        return self._persisted_endpoint_by_group.get(group)
+
+    def _set_persisted(self, group, ep_id):
+        if ep_id is None:
+            self._persisted_endpoint_by_group.pop(group, None)
+        else:
+            self._persisted_endpoint_by_group[group] = ep_id
+
+    def _is_fallback_locked_group(self, group):
+        return self._fallback_lock_until_by_group.get(group, 0) > time.time()
+
+    def _is_ep_inflight_elsewhere(self, ep, group):
+        """端点是否被其他组的在途请求占用。"""
+        owner = self._inflight_owner.get(ep.id)
+        return bool(owner) and owner != group
+
+    def _acquire_inflight(self, ep_id, group):
+        self._inflight_owner[ep_id] = group
+
+    def _release_inflight(self, ep_id, group):
+        """释放端点在途归属：仅当持有者仍是本组时清除（防误删并发新持有者）。"""
+        if self._inflight_owner.get(ep_id) == group:
+            self._inflight_owner.pop(ep_id, None)
+
+    def _wrap_stream_release(self, gen, ep_id, group):
+        """流式响应外层 generator：正常结束/异常/提前关闭时释放在途占用。
+
+        泄漏兜底：若消费方从不迭代也不 close（罕见），10 分钟无活动的清零
+        逻辑（_cleanup_expired_cooldowns 内）会兜底。GeneratorExit 由 close() 触发，
+        也是合法释放路径。
+        """
+        try:
+            yield from gen
+        finally:
+            with self._lock:
+                self._release_inflight(ep_id, group)
+
+    def _is_ep_sticky_elsewhere(self, ep, group):
+        """端点是否是其他组的粘性指针目标（跨组互斥的静态半）。"""
+        for other, ep_id in self._current_endpoint_by_group.items():
+            if other != group and ep_id == ep.id:
+                return True
+        for other, ep_id in self._manual_override_by_group.items():
+            if other != group and ep_id == ep.id:
+                return True
+        return False
+
+    def _group_sticky_candidates(self, group):
+        """组内可用端点：健康过滤 + 跨组互斥（粘性半 + 在途半）。
+
+        main 组互斥饿死时忽略互斥强行使用（主组保底特权）。
+        """
+        base = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
+                and group in self._ep_groups(ep)
+                and not ep._manual_unlock_required
+                and not self._is_in_cooldown(ep)
+                and not self._is_quota_exceeded(ep)
+                and not self._is_rpm_limited(ep)]
+        if not base:
+            return [], False
+        free = [ep for ep in base
+                if not self._is_ep_sticky_elsewhere(ep, group)
+                and not self._is_ep_inflight_elsewhere(ep, group)]
+        if free:
+            return free, False
+        if group == self.MAIN_GROUP:
+            # main 互斥过滤后无可用 → 忽略互斥强行使用（WARN 在调用方记录频率）
+            return base, True
+        return [], False
+
+    def switch_to_endpoint(self, ep_id, group=None):
         with self._lock:
             for ep in self._endpoints:
                 if ep.id == ep_id:
@@ -1000,9 +1278,10 @@ class APIPool:
                     # 手动选择明确表示用户希望立即使用该端点；只绕过 defer，
                     # 不清除 cooldown、配额或余额保护。
                     ep._defer_until = 0
-                    self._manual_override_id = ep_id
-                    self._current_endpoint_id = ep_id
-                    sys_log(f"手动切换端点: '{ep.name}'（清除其 defer，保留冷却/配额/余额状态）", "INFO")
+                    grp = group or self.MAIN_GROUP
+                    self._set_manual(grp, ep_id)
+                    self._set_current(grp, ep_id)
+                    sys_log(f"手动切换端点: '{ep.name}' → 组 '{grp}'（清除其 defer，保留冷却/配额/余额状态）", "INFO")
                     return True
         return False
 
@@ -1010,13 +1289,42 @@ class APIPool:
         self._cleanup_expired_cooldowns()
         now = time.time()
         with self._lock:
-            current_ep = None
-            current_display_id = self._manual_override_id or self._current_endpoint_id
-            if current_display_id:
-                current_ep = next((ep for ep in self._endpoints if ep.id == current_display_id), None)
-            return [self._ep_to_dict(ep, ep is current_ep, now) for ep in self._endpoints]
+            current_by_group = {
+                grp: (self._manual_override_by_group.get(grp) or self._current_endpoint_by_group.get(grp))
+                for grp in self._all_group_names()
+            }
+            current_ids = set(current_by_group.values())
+            return [
+                self._ep_to_dict(ep, ep.id in current_ids, now, ep.id in current_ids)
+                for ep in self._endpoints
+            ]
 
-    def _ep_to_dict(self, ep, is_current, now):
+    def _all_group_names(self):
+        """全部已知组名：端点声明 ∪ 指针态出现过的组（含手动设置但暂无成员的组）。"""
+        names = []
+        for ep in self._endpoints:
+            for g in self._ep_groups(ep):
+                if g not in names:
+                    names.append(g)
+        for state in (self._current_endpoint_by_group, self._manual_override_by_group,
+                      self._persisted_endpoint_by_group):
+            for g in state:
+                if g not in names:
+                    names.append(g)
+        if self.MAIN_GROUP not in names:
+            names.insert(0, self.MAIN_GROUP)
+        return names
+
+    def _groups_pointing_at(self, ep_id):
+        """哪些组的粘性/手动指针正指向该端点（UI 展示 + 互斥透明度）。"""
+        groups = []
+        for state in (self._current_endpoint_by_group, self._manual_override_by_group):
+            for grp, eid in state.items():
+                if eid == ep_id and grp not in groups:
+                    groups.append(grp)
+        return groups
+
+    def _ep_to_dict(self, ep, is_current, now, in_flight=False):
         return {
             "id": ep.id,
             "name": ep.name,
@@ -1025,6 +1333,7 @@ class APIPool:
             "api_key_full": ep.api_key,
             "model": ep.model,
             "priority": ep.priority,
+            "priority_by_group": dict(getattr(ep, "priority_by_group", None) or {}),
             "timeout": ep.timeout,
             "max_retries": ep.max_retries,
             "enabled": ep.enabled,
@@ -1044,6 +1353,8 @@ class APIPool:
             "stream_first_packet_timeout": ep.stream_first_packet_timeout,
             "stream_stall_timeout": ep.stream_stall_timeout,
             "stream_max_duration": ep.stream_max_duration,
+            "pool_groups": list(self._ep_groups(ep)),
+            "current_groups": self._groups_pointing_at(ep.id),
             "is_rpm_limited": self._is_rpm_limited(ep),
             "fail_count": ep._fail_count,
             "last_error": ep._last_error,
@@ -1074,18 +1385,22 @@ class APIPool:
             # visible even though routing excludes them until defer expires.
             active = sorted(
                 (ep for ep in self._endpoints if ep.enabled and ep.in_pool),
-                key=lambda ep: ep.priority,
+                key=lambda ep: (self._ep_priority(ep, self.MAIN_GROUP), ep.priority),
             )
-            current_ep = None
-            current_display_id = self._manual_override_id or self._current_endpoint_id
-            if current_display_id:
-                current_ep = next((ep for ep in active if ep.id == current_display_id), None)
+            current_by_group = {
+                grp: (self._manual_override_by_group.get(grp) or self._current_endpoint_by_group.get(grp))
+                for grp in self._all_group_names()
+            }
+            current_ids = set(current_by_group.values())
             return [
                 {
                     "name": ep.name,
                     "model": ep.model,
                     "priority": ep.priority,
-                    "is_current": ep is current_ep,
+                    "priority_by_group": dict(getattr(ep, "priority_by_group", None) or {}),
+                    "is_current": ep.id in current_ids,
+                    "current_groups": self._groups_pointing_at(ep.id),
+                    "pool_groups": list(self._ep_groups(ep)),
                     "fail_count": ep._fail_count,
                     "in_cooldown": ep._cooldown_until > now,
                     "cooldown_remaining": max(0, int(ep._cooldown_until - now)),
@@ -1121,21 +1436,24 @@ class APIPool:
                 ep._defer_until = 0
                 with ep._rpm_lock:
                     ep._req_timestamps.clear()
-            self._current_endpoint_id = None
-            self._manual_override_id = None
+            self._current_endpoint_by_group.clear()
+            self._manual_override_by_group.clear()
 
-    def reset_to_priority_mode(self):
+    def reset_to_priority_mode(self, group=None):
         with self._lock:
-            active = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
-                      and not ep._manual_unlock_required
-                      and not self._is_in_cooldown(ep)
-                      and not self._is_quota_exceeded(ep)
-                      and not self._is_rpm_limited(ep)]
-            if not active:
-                return False
-            best = min(active, key=lambda ep: ep.priority)
-            self._current_endpoint_id = best.id
-            self._manual_override_id = None
+            target_groups = [group] if group else self._all_group_names()
+            for grp in target_groups:
+                active = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
+                          and grp in self._ep_groups(ep)
+                          and not ep._manual_unlock_required
+                          and not self._is_in_cooldown(ep)
+                          and not self._is_quota_exceeded(ep)
+                          and not self._is_rpm_limited(ep)]
+                if not active:
+                    continue
+                best = min(active, key=lambda ep: self._ep_priority(ep, grp))
+                self._set_current(grp, best.id)
+                self._set_manual(grp, None)
             return True
 
     def _check_one_health(self, ep):
@@ -1379,7 +1697,7 @@ class APIPool:
         return None
 
     def _is_fallback_locked(self):
-        return self._fallback_lock_until > time.time()
+        return self._is_fallback_locked_group(self.MAIN_GROUP)
 
     def _is_quota_exceeded(self, ep):
         if ep.daily_limit <= 0: return False
@@ -1533,6 +1851,10 @@ class APIPool:
                 if (ep.in_pool and not ep._manual_unlock_required
                         and ep._cooldown_until > 0 and ep._cooldown_until <= now):
                     expired.append(ep)
+            # 分组池在途泄漏兜底：10 分钟无活动仍未释放的在途登记直接清零
+            # （正常路径非流式即释放、流式由 wrapper finally 释放；此为异常路径兜底）。
+            if now - self._last_pool_activity > 600:
+                self._inflight_owner.clear()
 
         for ep in expired:
             with self._lock:
@@ -1542,18 +1864,28 @@ class APIPool:
                 # 已在后台探活中的跳过（防重复入队）
                 if ep.id in self._probe_inflight:
                     continue
-                # 探活前快照当前端点：探活耗时数秒，期间并发请求可能修改 _current_endpoint_id，
+                # 探活前快照当前端点：探活耗时数秒，期间并发请求可能修改指针，
                 # 用快照保证 defer 判断基于探活开始时的状态（避免 999554"已恢复"竞态）
-                probe_current_id = self._manual_override_id or self._current_endpoint_id
+                probe_current_ids = {
+                    grp: (self._manual_override_by_group.get(grp) or self._current_endpoint_by_group.get(grp))
+                    for grp in self._all_group_names()
+                }
                 self._probe_inflight.add(ep.id)
-            self._probe_executor.submit(self._background_probe, ep, probe_current_id)
+            self._probe_executor.submit(self._background_probe, ep, probe_current_ids)
 
         # 滚动处理缓存保护产生的延迟回切：当前端点仍保护 cache 时延长，
         # 池空闲或当前端点关闭保护时解除。
         self._reconcile_deferred(now, defer_window)
 
-    def _background_probe(self, ep, probe_current_id):
-        """后台探活单个端点：通过→清冷却+defer判断+更新current指针；失败→继续冷却。"""
+    def _background_probe(self, ep, probe_current_ids=None):
+        """后台探活单个端点：通过→清冷却+defer判断+更新各组指针；失败→继续冷却。
+
+        2026-08-29 分组池：端点可属多组，指针更新遍历该端点所属各组判断；
+        probe_current_ids 是探活开始时各组指针快照（防竞态）。
+        兼容：传入单个 str 视为 main 组指针快照（旧签名）。
+        """
+        if isinstance(probe_current_ids, str) or probe_current_ids is None:
+            probe_current_ids = {self.MAIN_GROUP: probe_current_ids} if probe_current_ids else {}
         try:
             probe_ok, probe_error = self._probe_endpoint(ep)
             if probe_ok:
@@ -1565,53 +1897,61 @@ class APIPool:
                     ep._cooldown_until = 0
                     ep._cooldown_reason = ""
                     ep._health = "ok"
+                # 端点所属各组逐一评估：当前指针端点决定是否保护自身 cache。
                 # 当前工作端点决定是否保护自身 cache：开启时延迟切走，
                 # 关闭时恢复端点立即回切。恢复端点自己的开关不参与本次判断。
-                current_ep = None
-                if probe_current_id:
-                    current_ep = next((e for e in self._endpoints if e.id == probe_current_id), None)
                 pool_active = self._last_pool_activity > now - 300
-                protect_current_cache = (
-                    current_ep is not None
-                    and current_ep is not ep
-                    and current_ep.deferrable
-                    and pool_active
-                )
-                if protect_current_cache:
-                    with self._lock:
-                        ep._defer_until = now + 300
-                    sys_log(f"端点 '{ep.name}' 冷却过期探活通过；当前端点 '{current_ep.name}' 已开启缓存保护，延迟回切 5 分钟", "INFO")
-                else:
-                    with self._lock:
-                        ep._defer_until = 0
-                        # 手动指定端点不被后台恢复覆盖；自动路由则立即回切
-                        # 到刚恢复的端点，兑现“关闭缓存保护=立即回切”。
-                        if not self._manual_override_id:
-                            self._current_endpoint_id = ep.id
-                    if current_ep is not None and current_ep is not ep and not current_ep.deferrable:
-                        sys_log(f"端点 '{ep.name}' 冷却过期探活通过；当前端点 '{current_ep.name}' 未开启缓存保护，立即回切", "INFO")
-                    else:
-                        sys_log(f"端点 '{ep.name}' 冷却过期探活通过，已恢复", "INFO")
-                # 仅在当前端点不存在或已不可用时更新当前指针；恢复一个端点不应
-                # 在池仍使用其他健康端点时把路由无故改回 priority 最小端点。
-                with self._lock:
-                    current_id = self._manual_override_id or self._current_endpoint_id
-                    current_ep = next(
-                        (e for e in self._endpoints if e.id == current_id), None
-                    ) if current_id else None
-                    current_unavailable = (
-                        current_ep is None
-                        or not current_ep.enabled
-                        or not current_ep.in_pool
-                        or self._is_in_cooldown(current_ep)
-                        or self._is_quota_exceeded(current_ep)
-                        or self._is_rpm_limited(current_ep)
+                for grp in self._ep_groups(ep):
+                    current_ep = None
+                    current_id = probe_current_ids.get(grp)
+                    if current_id:
+                        current_ep = next((e for e in self._endpoints if e.id == current_id), None)
+                    protect_current_cache = (
+                        current_ep is not None
+                        and current_ep is not ep
+                        and current_ep.deferrable
+                        and pool_active
                     )
-                    if not self._manual_override_id and current_unavailable:
-                        active = self._active_endpoints()
-                        if active:
-                            best = min(active, key=lambda e: e.priority)
-                            self._current_endpoint_id = best.id
+                    if protect_current_cache:
+                        with self._lock:
+                            ep._defer_until = now + 300
+                        current_name = current_ep.name if current_ep else "无"
+                        sys_log(f"端点 '{ep.name}' 冷却过期探活通过（组 '{grp}'）；当前端点 '{current_name}' 已开启缓存保护，延迟回切 5 分钟", "INFO")
+                    else:
+                        with self._lock:
+                            ep._defer_until = 0
+                            # 手动指定端点不被后台恢复覆盖；自动路由则立即回切
+                            # 到刚恢复的端点，兑现"关闭缓存保护=立即回切"。
+                            if not self._get_manual(grp):
+                                self._set_current(grp, ep.id)
+                        if current_ep is not None and current_ep is not ep and not current_ep.deferrable:
+                            sys_log(f"端点 '{ep.name}' 冷却过期探活通过（组 '{grp}'）；当前端点 '{current_ep.name}' 未开启缓存保护，立即回切", "INFO")
+                        else:
+                            sys_log(f"端点 '{ep.name}' 冷却过期探活通过（组 '{grp}'），已恢复", "INFO")
+                    # 仅在该组当前端点不存在或已不可用时更新指针；恢复一个端点不应
+                    # 在池仍使用其他健康端点时把路由无故改回 priority 最小端点。
+                    with self._lock:
+                        current_id = self._get_manual(grp) or self._get_current(grp)
+                        current_ep = next(
+                            (e for e in self._endpoints if e.id == current_id), None
+                        ) if current_id else None
+                        current_unavailable = (
+                            current_ep is None
+                            or not current_ep.enabled
+                            or not current_ep.in_pool
+                            or self._is_in_cooldown(current_ep)
+                            or self._is_quota_exceeded(current_ep)
+                            or self._is_rpm_limited(current_ep)
+                        )
+                        if not self._get_manual(grp) and current_unavailable:
+                            group_eps = [e for e in self._endpoints if e.enabled and e.in_pool
+                                         and grp in self._ep_groups(e)
+                                         and not self._is_in_cooldown(e)
+                                         and not self._is_quota_exceeded(e)
+                                         and not self._is_rpm_limited(e)]
+                            if group_eps:
+                                best = min(group_eps, key=lambda e: self._ep_priority(e, grp))
+                                self._set_current(grp, best.id)
             else:
                 with self._lock:
                     capacity_kind, capacity_seconds = self._set_capacity_cooldown(ep, probe_error or "探活失败")
@@ -1639,11 +1979,15 @@ class APIPool:
         if now is None:
             now = time.time()
         with self._lock:
-            current_ep = None
-            current_display_id = self._manual_override_id or self._current_endpoint_id
-            if current_display_id:
-                current_ep = next((e for e in self._endpoints if e.id == current_display_id), None)
             pool_active = self._last_pool_activity > now - defer_window
+            current_by_group = {
+                grp: (self._manual_override_by_group.get(grp) or self._current_endpoint_by_group.get(grp))
+                for grp in self._all_group_names()
+            }
+            current_eps = {
+                grp: next((e for e in self._endpoints if e.id == eid), None)
+                for grp, eid in current_by_group.items() if eid
+            }
             released = []
             for ep in self._endpoints:
                 if not (ep.in_pool and ep._defer_until > 0):
@@ -1651,15 +1995,26 @@ class APIPool:
                 # 兜底使用的 defer 清除已由 _on_success(clear_defer=True) 处理；
                 # 这里若用实时 current 判断会误清"defer 前进入的并发请求"产生的 defer
                 # （探活/请求期间 current 被并发修改，如场景9 竞态）。
-                if current_ep and current_ep.deferrable and pool_active:
+                # 分组池：任一组的当前端点保护 cache 且池活跃即保持 defer。
+                protected = any(
+                    cur is not None and cur is not ep and cur.deferrable
+                    for cur in current_eps.values()
+                )
+                if protected and pool_active:
                     ep._defer_until = now + defer_window  # 滚动延长，保持 cache
                 else:
                     ep._defer_until = 0
                     released.append(ep)
                     reason = "池空闲" if not pool_active else "当前端点未开启缓存保护"
                     sys_log(f"端点 '{ep.name}' 延迟回切解除（{reason}）", "INFO")
-            if released and not self._manual_override_id:
-                self._current_endpoint_id = min(released, key=lambda item: item.priority).id
+            if released:
+                for grp in self._all_group_names():
+                    if self._get_manual(grp):
+                        continue
+                    group_eps = [e for e in released if grp in self._ep_groups(e)]
+                    if group_eps:
+                        best = min(group_eps, key=lambda e: self._ep_priority(e, grp))
+                        self._set_current(grp, best.id)
 
     def _failover_endpoints(self):
         """Return failover-eligible endpoints, including deferred recoveries.
@@ -1687,18 +2042,19 @@ class APIPool:
         fb = self._get_fallback_endpoint()
         return [fb] if fb else []
 
-    def _ordered_failover_candidates(self, failed_ep, active, prefer_model=None, exclude=None):
+    def _ordered_failover_candidates(self, failed_ep, active, prefer_model=None, exclude=None, group=None):
         """Return available endpoints in ring order, preferring the failed model.
 
         Ring order is calculated from the complete in-pool priority order instead
         of the filtered active list, because the failed endpoint is already in
-        cooldown when this function is called.
+        cooldown when this function is called. 分组隔离：按该组优先级排 ring。
         """
+        grp = group or self.MAIN_GROUP
         excluded_ids = {ep.id for ep in (exclude or ())}
         active_ids = {ep.id for ep in active}
         pool = sorted(
             (ep for ep in self._endpoints if ep.enabled and ep.in_pool),
-            key=lambda ep: ep.priority,
+            key=lambda ep: (self._ep_priority(ep, grp), ep.priority),
         )
         if not pool:
             return []
@@ -1761,7 +2117,8 @@ class APIPool:
         )
         return not any(marker in lower for marker in transient_markers)
 
-    def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False, health_impact=True):
+    def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False, health_impact=True, group=None):
+        grp = group or self.MAIN_GROUP
         if health_impact:
             failed_ep._fail_count += 1
             failed_ep._total_failures += 1
@@ -1797,15 +2154,17 @@ class APIPool:
             # 抖动后实际窗口为 cooldown_minutes×[80%,120%]，日志展示真实值
             actual = max(0, (failed_ep._cooldown_until - time.time()) / 60)
             sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {actual:.1f} 分钟后", "WARN")
-        active = self._failover_endpoints()
-        candidates = self._ordered_failover_candidates(failed_ep, active)
+        # 分组池：轮转切换限定在失败请求所属组内（含 bg 组 fallback 逻辑见 chat()）。
+        active = [e for e in self._failover_endpoints() if grp in self._ep_groups(e)]
+        candidates = self._ordered_failover_candidates(failed_ep, active, group=grp)
         if candidates:
-            self._current_endpoint_id = candidates[0].id
+            self._set_current(grp, candidates[0].id)
         else:
-            self._current_endpoint_id = None
-        self._manual_override_id = None  # 健康检测自动切换时清除手动覆盖
+            self._set_current(grp, None)
+        self._set_manual(grp, None)  # 健康检测自动切换时清除手动覆盖
 
-    def _on_success(self, ep, result=None, clear_defer=True):
+    def _on_success(self, ep, result=None, clear_defer=True, group=None):
+        grp = group or self.MAIN_GROUP
         now = time.time()
         self._last_pool_activity = now  # 记录池活跃时间（用于 defer 判断）
         # 仅在"请求开始时端点已在 defer（兜底使用）"时清除延迟状态。
@@ -1824,11 +2183,17 @@ class APIPool:
         # 仅在非冷却中清除冷却，防止并发请求穿透冷却保护（429→冷却→并发成功→清冷却→再429）
         if not self._is_in_cooldown(ep):
             self._clear_cooldown(ep)
-        self._current_endpoint_id = ep.id
-        if self._persisted_endpoint_id != ep.id and save_runtime_state(ep.id):
-            self._persisted_endpoint_id = ep.id
-        if self._manual_override_id and self._manual_override_id != ep.id:
-            self._manual_override_id = None  # 手动覆盖端点失败后落到其他端点，清除覆盖
+        # 分组池：请求成功只更新该组粘性指针；runtime_state 按组持久化。
+        self._set_current(grp, ep.id)
+        if self._get_persisted(grp) != ep.id:
+            state = load_runtime_state() or {}
+            groups_state = state.get("groups") if isinstance(state, dict) else None
+            groups_state = dict(groups_state) if isinstance(groups_state, dict) else {}
+            groups_state[grp] = ep.id
+            if save_runtime_state_groups(groups_state):
+                self._set_persisted(grp, ep.id)
+        if self._get_manual(grp) and self._get_manual(grp) != ep.id:
+            self._set_manual(grp, None)  # 手动覆盖端点失败后落到其他端点，清除覆盖
         # 缓存 reasoning_content/reasoning_text 用于多轮对话
         if result and isinstance(result, dict):
             try:
@@ -1938,18 +2303,33 @@ class APIPool:
         self._cleanup_expired_cooldowns()
         _chat_start = time.time()  # 530s 轮转预算计时起点（与 Hermes 600s 超时窗口对齐）
         debug_trace = [] if _DEBUG_LOGGING else None
-        # 终极兜底锁定：锁定期间所有请求直连 prio99（全局滑动窗口）
-        if self._is_fallback_locked():
+        # ── 分组池路由（2026-08-29 spec）：model 字段 → 组选择器 ──
+        # "api-pool"→main 别名（存量流量零感知）；精确匹配组名；无匹配→main。
+        group = self._resolve_request_group(model)
+        group_fallback_used = False  # bg 组入口/耗尽 fallback 到 main 的标记
+        # 终极兜底锁定：锁定期间该组请求直连 prio99（per-group 滑动窗口，prio99 仅 main 组语义生效）
+        if self._is_fallback_locked_group(group):
             fb = self._get_fallback_endpoint()
             if fb is not None:
-                sys_log(f"终极兜底锁定中，直连端点 '{fb.name}'", "INFO")
+                sys_log(f"终极兜底锁定中（组 '{group}'），直连端点 '{fb.name}'", "INFO")
                 active = [fb]
+                starved = False
             else:
                 with self._lock:
-                    self._fallback_lock_until = 0  # 兜底不可用，解除锁定
-                active = self._active_endpoints()
+                    self._fallback_lock_until_by_group[group] = 0  # 兜底不可用，解除锁定
+                active, starved = self._group_sticky_candidates(group)
         else:
-            active = self._active_endpoints()
+            active, starved = self._group_sticky_candidates(group)
+        if starved:
+            sys_log(f"组 '{group}' 互斥过滤后无可用端点，main 保底特权忽略互斥", "WARN")
+        # bg → main 入口兜底（触发点 1）：bg 组无可用端点 → 整请求改走 main 组正常路由
+        if not active and group != self.MAIN_GROUP:
+            active, starved2 = self._group_sticky_candidates(self.MAIN_GROUP)
+            if active:
+                group_fallback_used = True
+                sys_log(f"组 '{group}' 无可用端点，入口 fallback 到 main 组（组内 fallback 计数+1）", "WARN")
+                self._group_fallback_count[group] = self._group_fallback_count.get(group, 0) + 1
+                group = self.MAIN_GROUP
         if not active:
             raise ValueError("没有可用的 API 端点")
         errors = []
@@ -1957,7 +2337,8 @@ class APIPool:
         tried = 0
         total = len(active)
         # 按优先级排序：每次从最高优先级端点开始尝试，故障自动降级，恢复后自动回迁
-        active.sort(key=lambda e: e.priority)
+        # 分组隔离（2026-08-29）：按请求所属组的组内优先级排序
+        active.sort(key=lambda e: self._ep_priority(e, group))
         # 修复消息顺序：tool 消息前缺少 tool_calls 时自动补 assistant 回复
         needs_fix = False
         tool_call_ids = set()
@@ -1986,7 +2367,8 @@ class APIPool:
         # 补全 reasoning_content：找到最后一个 assistant 消息，如果没有则注入缓存值
         # 当前端点保持粘性：无明确故障/手动切换/恢复回迁时，后续请求继续使用
         # 最近成功或故障转移选中的端点，而不是每次回到最高优先级端点。
-        current_id = self._manual_override_id or self._current_endpoint_id or self._restored_endpoint_id
+        # 分组池：粘性指针按组读取（fallback 到 main 后读 main 组指针）。
+        current_id = self._get_manual(group) or self._get_current(group)
         if current_id:
             current_ep = next((ep for ep in active if ep.id == current_id), None)
             if current_ep is not None:
@@ -2009,22 +2391,25 @@ class APIPool:
                 idx = (idx + 1) % total
                 continue
             # 530s 预算：正常轮转超时 → 立即切终极兜底（不再继续轮转，避免 Hermes 600s 超时并发重试）
-            if (time.time() - _chat_start) >= self._FALLBACK_DEADLINE_SECONDS:
+            # 分组池：prio99 终极兜底语义仅 main 组生效（spec），预算跨组共享不翻倍。
+            if (time.time() - _chat_start) >= self._FALLBACK_DEADLINE_SECONDS and group == self.MAIN_GROUP:
                 fb = self._get_fallback_endpoint()
                 if fb is not None and fb is not ep and not self._is_in_cooldown(fb):
                     sys_log(f"轮转超 {self._FALLBACK_DEADLINE_SECONDS}s，切换终极兜底 '{fb.name}'", "WARN")
                     with self._lock:
-                        self._fallback_lock_until = time.time() + self._FALLBACK_LOCK_SECONDS
-                    for i, e in enumerate(active):
-                        if e is fb:
-                            idx = i
-                            break
-                    continue
+                        self._fallback_lock_until_by_group[group] = time.time() + self._FALLBACK_LOCK_SECONDS
+                    if fb in active:
+                        idx = active.index(fb)
+                        continue
             # 快照请求开始时的缓存保护延迟状态：用于 _on_success 判断是否为回切后的请求。
             # 竞态保护：defer 设置前已进入的请求（快照=0）成功后不清 defer。
             defer_at_request = ep._defer_until
             ep_timeout = timeout or ep.timeout
             ep_model = ep.model
+            # 分组池在途登记：本请求即将占用该端点（组内互斥用；流式请求在整个
+            # 流生命周期内保持占用，由 stream_generator 的 finally 释放）。
+            with self._lock:
+                self._acquire_inflight(ep.id, group)
             
             # 按目标端点隔离 DeepSeek 专属 reasoning 字段；每次轮转都
             # 从同一份 Hermes 历史构造独立消息，避免污染后续端点。
@@ -2063,8 +2448,10 @@ class APIPool:
                                 # 实际请求成功后标记端点成功
                                 # clear_defer：仅当请求开始时端点已在 defer（兜底使用）才清除
                                 with self._lock:
-                                    self._on_success(tgt_ep, clear_defer=defer_at_request > 0)
+                                    self._on_success(tgt_ep, clear_defer=defer_at_request > 0, group=group)
                                 yield from gen
+                                with self._lock:
+                                    self._release_inflight(tgt_ep.id, group)
                         return vision_wrapper(ep, payload, ep_timeout, active)
                     else:
                         payload["messages"] = self._translate_images_sync(payload["messages"], active)
@@ -2116,10 +2503,14 @@ class APIPool:
                     debug_trace.append({"endpoint": ep.name, "result": "error", "kind": error_kind})
             if result is not None:
                 with self._lock:
-                    self._on_success(ep, result, clear_defer=defer_at_request > 0)
+                    self._on_success(ep, result, clear_defer=defer_at_request > 0, group=group)
                     # 终极兜底成功 → 滑动刷新锁定窗口（5 分钟无新请求视为任务结束）
-                    if getattr(ep, "priority", 0) == 99:
-                        self._fallback_lock_until = time.time() + self._FALLBACK_LOCK_SECONDS
+                    if getattr(ep, "priority", 0) == 99 and group == self.MAIN_GROUP:
+                        self._fallback_lock_until_by_group[group] = time.time() + self._FALLBACK_LOCK_SECONDS
+                    if not (payload.get("stream") and isinstance(result, _types.GeneratorType)):
+                        # 非流式（或流已由 _try_endpoint 内部消费完）→ 立即释放在途占用；
+                        # 流式 generator 的占用由消费方迭代结束时释放（见 stream close 路径）。
+                        self._release_inflight(ep.id, group)
                 sys_log(f"端点 '{ep.name}' 请求成功 (延迟: 正常)", "INFO")
                 # 请求耗时 DEBUG（API_POOL_DEBUG / /api/debug 开关控制）
                 if _DEBUG_LOGGING:
@@ -2140,6 +2531,9 @@ class APIPool:
                     except Exception:
                         pass
                 if return_endpoint: return result, ep
+                # 分组池：流式结果包一层释放在途占用的 wrapper（迭代完成/关闭/异常时释放）
+                if payload.get("stream") and isinstance(result, _types.GeneratorType):
+                    return self._wrap_stream_release(result, ep.id, group)
                 return result
             errors.append(f"[{ep.name}] {error}")
             sys_log(f"端点 '{ep.name}' 请求失败: {error}", "ERROR")
@@ -2173,21 +2567,23 @@ class APIPool:
                 # 客户端类错误（改动二 A′）：不冻结、fail_count 不增、不探活，
                 # 同请求内继续轮转其余候选；全部候选同类失败时按现状把错误返回给客户端。
                 client_error = self._classify_client_error(error)
-                self._rotate(ep, error, skip_cooldown=skip_cooldown, health_impact=not client_error)
+                self._rotate(ep, error, skip_cooldown=skip_cooldown, health_impact=not client_error, group=group)
+                with self._lock:
+                    self._release_inflight(ep.id, group)
                 if client_error:
                     client_error_tried.add(ep.id)
                 if skip_cooldown:
                     # 单请求饿死不是 API Pool 的端点故障。不要探活或切换到
                     # 其他模型；交回 Hermes，由其现有请求重试机制善后。
                     break
-                active = self._failover_endpoints()
-                active.sort(key=lambda e: e.priority)
+                active = [e for e in self._failover_endpoints() if group in self._ep_groups(e)]
+                active.sort(key=lambda e: self._ep_priority(e, group))
                 total = len(active)
                 if total == 0:
                     break
                 tried = 0  # 轮转后重置尝试计数，用刷新后的 total 重新计算
                 # 从失败端点之后的环形顺序选择候选，同模型优先。
-                candidates = self._ordered_failover_candidates(ep, active)
+                candidates = self._ordered_failover_candidates(ep, active, group=group)
                 if client_error:
                     # 客户端类错误不冻结端点，冷却机制不会收缩 total；
                     # 排除本请求内已试过的端点，全部试完即终止轮转。
@@ -2214,7 +2610,7 @@ class APIPool:
                         continue  # 探活通过，回到循环顶部用 next_ep 发起实际请求
                     else:
                         sys_log(f"候选端点 '{next_ep.name}' 探活失败，跳过", "WARN")
-                        self._rotate(next_ep, probe_error or "探活失败", probe_failed=True)
+                        self._rotate(next_ep, probe_error or "探活失败", probe_failed=True, group=group)
                         # 下一级探活也失败 → 并发探活剩余所有候选端点。
                         # 用 _check_one_health（含 Attempt 2 重试，最坏 20s）做参考性探测；
                         # 两阶段等待：11s 内返回结果的端点直接按优先级使用，最多等 21s。
@@ -2268,21 +2664,21 @@ class APIPool:
                                     # for cooldown. Missing results mean the probe
                                     # exceeded the observation window, not that it failed.
                                     if e is not chosen and probe_results.get(e.id) == "bad" and not self._is_in_cooldown(e):
-                                        self._rotate(e, "并发探活失败", probe_failed=True)
+                                        self._rotate(e, "并发探活失败", probe_failed=True, group=group)
                                 continue
                             else:
                                 # 全部探活失败：全部短冷却，回到循环顶部走 fallback 兜底
                                 sys_log(f"剩余候选端点全部探活失败", "WARN")
                                 for e in remaining:
                                     if probe_results.get(e.id) == "bad" and not self._is_in_cooldown(e):
-                                        self._rotate(e, "并发探活失败", probe_failed=True)
-                                active = self._failover_endpoints()
-                                active.sort(key=lambda e: e.priority)
+                                        self._rotate(e, "并发探活失败", probe_failed=True, group=group)
+                                active = [e for e in self._failover_endpoints() if group in self._ep_groups(e)]
+                                active.sort(key=lambda e: self._ep_priority(e, group))
                                 total = len(active)
                                 if total == 0:
                                     break
                                 candidates = self._ordered_failover_candidates(
-                                    ep, active, exclude=(next_ep,)
+                                    ep, active, exclude=(next_ep,), group=group
                                 )
                                 next_ep2 = candidates[0] if candidates else None
                                 if next_ep2 is not None:
@@ -2294,6 +2690,19 @@ class APIPool:
                                             idx = (i + 1) % len(active)
                                             break
                 tried += 1
+        # bg → main 轮转耗尽兜底（触发点 2）：bg 组内轮转完仍失败 → 追加 main 组一轮；
+        # 再失败才报 AllEndpointsFailed 交 Hermes。530s 预算跨组共享不翻倍（剩余预算内执行）。
+        # 仅当请求原生属于非 main 组且尚未 fallback 过（入口触发点 1 会改写 group）。
+        if group != self.MAIN_GROUP and not group_fallback_used and errors:
+            with self._lock:
+                self._group_fallback_count[group] = self._group_fallback_count.get(group, 0) + 1
+            sys_log(f"组 '{group}' 轮转耗尽仍失败，fallback 到 main 组追加一轮（组内 fallback 计数+1）", "WARN")
+            try:
+                return self.chat(messages, model=None, extra_payload=extra_payload,
+                                 timeout=timeout, return_endpoint=return_endpoint)
+            except (AllEndpointsFailed, ValueError):
+                # main 组也失败：合并两组错误原样上报（errors 已含本组失败详情）
+                pass
         if _DEBUG_LOGGING:
             try:
                 _fail_elapsed = int((time.time() - _chat_start) * 1000)
@@ -3001,17 +3410,32 @@ _runtime_state_lock = threading.Lock()
 
 
 def load_runtime_state():
+    """读取运行态：新格式 {"groups": {grp: ep_id}}；兼容旧扁平 {"last_success_endpoint_id"}。"""
     try:
         with open(RUNTIME_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+        groups = data.get("groups")
+        if isinstance(groups, dict) and groups:
+            return {"groups": {str(k): v for k, v in groups.items() if isinstance(v, str) and v}}
         endpoint_id = data.get("last_success_endpoint_id")
-        return endpoint_id if isinstance(endpoint_id, str) and endpoint_id else None
+        if isinstance(endpoint_id, str) and endpoint_id:
+            return {"groups": {APIPool.MAIN_GROUP: endpoint_id}}
+        return {}
     except (OSError, ValueError, TypeError):
-        return None
+        return {}
 
 
 def save_runtime_state(endpoint_id):
-    state = {"last_success_endpoint_id": endpoint_id}
+    """旧签名兼容：写入 main 组指针（外部仅 /api/switch-endpoint 使用）。"""
+    state = load_runtime_state() or {}
+    loaded = state.get("groups") if isinstance(state.get("groups"), dict) else None
+    groups_state: dict = dict(loaded) if loaded is not None else {}
+    groups_state[APIPool.MAIN_GROUP] = endpoint_id
+    return save_runtime_state_groups(groups_state)
+
+
+def save_runtime_state_groups(groups_state):
+    state = {"groups": groups_state}
     tmp_file = f"{RUNTIME_STATE_FILE}.tmp"
     try:
         with _runtime_state_lock:
@@ -3063,21 +3487,32 @@ pool = APIPool()
 for ep_data in load_config():
     if "in_pool" not in ep_data: ep_data["in_pool"] = True
     pool.add_endpoint(ep_data)
-restored_endpoint_id = load_runtime_state()
-restored_endpoint = next(
-    (
-        ep for ep in pool._endpoints
-        if ep.id == restored_endpoint_id and ep.enabled and ep.in_pool
-        and not ep._manual_unlock_required
-    ),
-    None,
-)
-if restored_endpoint is not None:
-    pool._current_endpoint_id = restored_endpoint.id
-    # 重启恢复的是“当前端点”而非一次性首请求偏好。复用手动覆盖路径，
-    # 直到该端点失败/进入冷却或用户主动切换，才允许离开该端点。
-    pool._manual_override_id = restored_endpoint.id
-    pool._persisted_endpoint_id = restored_endpoint.id
+# 分组池：旧扁平路由状态（若有）迁移为 main 组状态
+pool._migrate_legacy_state()
+# 按组恢复重启前的粘性指针（runtime_state 新格式 {"groups": {...}}，兼容旧扁平格式→main）。
+restored_state = load_runtime_state()
+restored_groups = restored_state.get("groups") if isinstance(restored_state, dict) else {}
+if isinstance(restored_groups, dict):
+    for grp, ep_id in restored_groups.items():
+        if not isinstance(ep_id, str) or not ep_id:
+            continue
+        restored_endpoint = next(
+            (
+                ep for ep in pool._endpoints
+                if ep.id == ep_id and ep.enabled and ep.in_pool
+                and not ep._manual_unlock_required
+                and grp in pool._ep_groups(ep)
+            ),
+            None,
+        )
+        if restored_endpoint is not None:
+            # 重启恢复的是"当前端点"而非一次性首请求偏好。复用手动覆盖路径，
+            # 直到该端点失败/进入冷却或用户主动切换，才允许离开该端点。
+            pool._set_current(grp, restored_endpoint.id)
+            pool._set_manual(grp, restored_endpoint.id)
+            pool._set_persisted(grp, restored_endpoint.id)
+        else:
+            sys_log(f"组 '{grp}' 的恢复端点 {ep_id} 不存在或不可用，忽略", "WARN")
 
 
 def api_handler(method, path, body):
@@ -3086,14 +3521,20 @@ def api_handler(method, path, body):
 
     # ================= OpenAI 兼容模型目录 =================
     if method == "GET" and cp in ("/v1/models", "/models"):
+        # 分组池（2026-08-29）：目录列出全部组选择器 id（api-pool 历史别名 + 各组名），
+        # dedicated 组名=模型名时即真实可用模型列表。
+        selector_ids = ["api-pool"]
+        for grp in pool._all_group_names():
+            if grp not in selector_ids:
+                selector_ids.append(grp)
         return 200, {
             "object": "list",
             "data": [{
-                "id": "api-pool",
+                "id": mid,
                 "object": "model",
                 "created": 0,
                 "owned_by": "api-pool",
-            }],
+            } for mid in selector_ids],
         }, False
 
     # ================= 代理接口 =================
@@ -3115,7 +3556,9 @@ def api_handler(method, path, body):
         extra_payload.pop("response_format", None)
         
         try:
-            result = pool.chat(messages, extra_payload=extra_payload)
+            # 分组池：model 字段作为组选择器传入 chat()（api-pool→main 别名，
+            # 精确匹配组名，无匹配→main；Hermes 侧配置 api-pool-bg 即路由 bg 组）
+            result = pool.chat(messages, model=body.get("model"), extra_payload=extra_payload)
             if is_stream: return 200, result, True 
             
             # result is the full upstream response body (preserves reasoning_content etc.)
@@ -3170,23 +3613,67 @@ def api_handler(method, path, body):
         return 200, {"ok": True}, False
 
     if method == "GET" and cp == "/api/endpoints": return 200, pool.list_endpoints(), False
-    if method == "GET" and cp == "/api/chain": return 200, pool.get_active_chain(), False
+    if method == "GET" and cp == "/api/chain":
+        chain = pool.get_active_chain()
+        # 分组池：附加 per-group 汇总（各组当前指针 + fallback 计数），驱动 UI 组视图
+        group_summary = {}
+        for grp in pool._all_group_names():
+            cur = pool._get_manual(grp) or pool._get_current(grp)
+            cur_ep = next((e for e in pool._endpoints if e.id == cur), None)
+            group_summary[grp] = {
+                "current_endpoint": cur_ep.name if cur_ep else None,
+                "current_endpoint_id": cur,
+                "fallback_count": pool._group_fallback_count.get(grp, 0),
+                "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)),
+            }
+        return 200, {"chain": chain, "groups": group_summary}, False
     # ================= 聚合池管理 =================
     if method == "GET" and cp == "/api/pool":
         return 200, [ep for ep in pool.list_endpoints() if ep.get("in_pool")], False
     if method == "POST" and cp.startswith("/api/pool/"):
         ep_id = unquote(cp.split("/")[-1])
-        pool.set_pool(ep_id, True); _sync_to_config()
+        # 分组池：?groups=main,bg 入池同时指定组（缺省保持原组不变；兼容旧调用）
+        qs_groups = None
+        if parsed.query:
+            for kv in parsed.query.split("&"):
+                if kv.startswith("groups="):
+                    qs_groups = [g for g in unquote(kv[7:]).split(",") if g.strip()]
+                    break
+        pool.set_pool(ep_id, True, groups=qs_groups); _sync_to_config()
         return 200, {"ok": True}, False
     if method == "DELETE" and cp.startswith("/api/pool/"):
         ep_id = unquote(cp.split("/")[-1])
-        pool.set_pool(ep_id, False); _sync_to_config()
+        # 分组池：?group=xxx 仅从该组移出（其他组不动）；缺省=整体出池
+        qs_group = None
+        if parsed.query:
+            for kv in parsed.query.split("&"):
+                if kv.startswith("group="):
+                    qs_group = unquote(kv[6:])
+                    break
+        if qs_group:
+            pool.remove_from_group(ep_id, qs_group)
+        else:
+            pool.set_pool(ep_id, False)
+        _sync_to_config()
         return 200, {"ok": True}, False
     if method == "POST" and cp.startswith("/api/switch-endpoint/"):
         ep_id = unquote(cp.split("/")[-1])
-        ok = pool.switch_to_endpoint(ep_id)
-        if ok and save_runtime_state(ep_id):
-            pool._persisted_endpoint_id = ep_id
+        # 分组池：支持 ?group= 查询参数指定目标组（默认 main）
+        qs_group = None
+        if parsed.query:
+            for kv in parsed.query.split("&"):
+                if kv.startswith("group="):
+                    qs_group = unquote(kv[6:])
+                    break
+        ok = pool.switch_to_endpoint(ep_id, group=qs_group)
+        if ok:
+            grp = qs_group or pool.MAIN_GROUP
+            state = load_runtime_state() or {}
+            loaded = state.get("groups") if isinstance(state.get("groups"), dict) else None
+            groups_state: dict = dict(loaded) if loaded is not None else {}
+            groups_state[grp] = ep_id
+            if save_runtime_state_groups(groups_state):
+                pool._set_persisted(grp, ep_id)
         return 200, {"ok": ok}, False
     if method == "POST" and cp == "/api/endpoints":
         pool.add_endpoint(body); _sync_to_config(); return 201, {"ok": True}, False
@@ -3207,6 +3694,7 @@ def api_handler(method, path, body):
                   "is_vision": item.get("is_vision", base.get("is_vision", True)),
                   "in_pool": item.get("in_pool", base.get("in_pool", False)),
                   "enabled": item.get("enabled", True),
+                  "pool_groups": item.get("pool_groups", base.get("pool_groups", ["main"])),
             }
             if ep["model"]: pool.add_endpoint(ep); added += 1
         _sync_to_config(); return 201, {"ok": True, "added": added}, False
@@ -3277,13 +3765,40 @@ def api_handler(method, path, body):
         except AllEndpointsFailed as e: return 200, {"ok": False, "errors": e.errors}, False
         except Exception as e: return 200, {"ok": False, "error": str(e)}, False
     if method == "POST" and cp == "/api/reset": pool.reset(); return 200, {"ok": True}, False
-    if method == "POST" and cp == "/api/reset-priority": pool.reset_to_priority_mode(); return 200, {"ok": True}, False
+    if method == "POST" and cp.startswith("/api/priority/"):
+        # 分组隔离（2026-08-29）：组内优先级调整 ?group=xxx&priority=N（缺省组=main）
+        ep_id = unquote(cp.split("/")[-1])
+        qs_group, qs_priority = None, None
+        if parsed.query:
+            for kv in parsed.query.split("&"):
+                if kv.startswith("group="):
+                    qs_group = unquote(kv[6:])
+                elif kv.startswith("priority="):
+                    try:
+                        qs_priority = int(kv[9:])
+                    except ValueError:
+                        pass
+        if qs_priority is None:
+            return 400, {"error": "需要 priority 参数"}, False
+        pool.set_group_priority(ep_id, qs_group or pool.MAIN_GROUP, qs_priority)
+        _sync_to_config()
+        return 200, {"ok": True}, False
+    if method == "POST" and cp == "/api/reset-priority":
+        # 分组池：支持 ?group= 只重置指定组（默认全部组，兼容旧行为）
+        qs_group = None
+        if parsed.query:
+            for kv in parsed.query.split("&"):
+                if kv.startswith("group="):
+                    qs_group = unquote(kv[6:])
+                    break
+        pool.reset_to_priority_mode(group=qs_group)
+        return 200, {"ok": True}, False
 
     return 404, {"error": "Not found"}, False
 
 def _sync_to_config():
-    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "default_headers": ep.get("default_headers", {}), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
-            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120)} for ep in pool.list_endpoints()])
+    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "default_headers": ep.get("default_headers", {}), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
+            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()])
 
 
 GUI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")

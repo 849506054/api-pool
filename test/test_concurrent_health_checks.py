@@ -142,10 +142,15 @@ class ConcurrentHealthCheckTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertFalse(is_stream)
         self.assertEqual(body["object"], "list")
-        self.assertEqual(
-            body["data"],
-            [{"id": "api-pool", "object": "model", "created": 0, "owned_by": "api-pool"}],
-        )
+        # 分组池（2026-08-29）：目录 = api-pool 历史别名 + 各组选择器 id
+        # （dedicated 组名=模型名时即真实可用模型列表），且不查上游。
+        model_ids = [m["id"] for m in body["data"]]
+        self.assertEqual(model_ids[0], "api-pool")
+        self.assertIn("main", model_ids)
+        for entry in body["data"]:
+            self.assertEqual(entry["object"], "model")
+            self.assertEqual(entry["created"], 0)
+            self.assertEqual(entry["owned_by"], "api-pool")
 
     def test_models_alias_matches_v1_models(self):
         v1_response = self.module.api_handler("GET", "/v1/models", {})
