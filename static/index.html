@@ -752,7 +752,7 @@ function renderPoolList(eps){
       +'<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">'
         +'<span style="color:var(--text-dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(ep.model||'')+'</span>'
         +'<div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">'
-          +'<select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority(\''+ep.id+'\', this.value)" title="修改优先级">'
+          +'<select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority(\''+ep.id+'\', this.value);this.blur()" title="修改优先级">'
             +options
           +'</select>'
           +'<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="'+(ep.enabled?'暂停端点':'恢复端点')+'" onclick="toggleEndpoint(\''+ep.id+'\')">'+(ep.enabled?'⏸':'▶')+'</button>'
