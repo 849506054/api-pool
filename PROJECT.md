@@ -110,6 +110,8 @@
 | 2026-08-22 | **Anthropic 缓存修复：顶层 cache_control → 块级显式 breakpoint** | `ps.air-outer.com` 网关无视顶层缓存字段，只认消息块级显式 `cache_control`。2026-08-21 旧结论（326 token 小前缀假阴性）已更正。同时补全流式 usage chunk 的 `prompt_tokens_details`。提交：`47a2bf3` |
 | 2026-08-21 | API Pool 1.0 生命周期终局 | 1.0 服务、目录、备份与封存分支全部删除；2.0 成为唯一正式实例，`main` 成为唯一正式分支。 |
 | 2026-08-28 | quota_markers 补齐 AgentRouter 402 文案（commit 8751b32，已部署） | AgentRouter "Budget pool quota has been exhausted" 402 不匹配既有 quota 词典（差 "has been"），只走 5 分钟短冷却；UI 5s 轮询触发冷却过期探活 → 每 5 分钟刷两条 WARN。补一个 marker 后按 quota_exceeded 默认 5h 冷却。测试 78 OK；宿主机 hash=`13a1dd00a681c98247fc598dc8d08195`。 |
+| 2026-08-29 | UI 聚合池优先级实时刷新修复（commit 4d4fef0） | 焦点守卫（防 5s 自动刷新收回下拉框）无法区分「下拉展开中」与「选择已完成」——change 触发后 `<select>` 仍持焦点，`setPriority()` 末尾的主动 refresh 与后续 5s 轮询全部被守卫拦截，卡片一直显示旧顺序。修复：优先级下拉框 onchange 末尾追加 `this.blur()`，选择完成即释放焦点、立即重绘；下拉展开期间不触发 change，原防收回功能不受影响。纯前端静态文件 mtime 热更新，无需重启服务。 |
+| 2026-08-29 | Git 历史清洗：移除误推的已否决提交 | 工作区 ahead 2 时直接 push，把一条用户已否决的提交连带推上远端。处理：rebase 重放保留有效修复（哈希 441c3f6→4d4fef0）+ force-with-lease 推送 + reflog expire/gc 清理本地残留，全历史验证特征串零残留；同步清理引用旧哈希的文档记录。沉淀为「推送前检查 ahead N」流程。 |
 
 ## 📌 活跃事项
 
