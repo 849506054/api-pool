@@ -1439,23 +1439,6 @@ class APIPool:
             self._current_endpoint_by_group.clear()
             self._manual_override_by_group.clear()
 
-    def reset_to_priority_mode(self, group=None):
-        with self._lock:
-            target_groups = [group] if group else self._all_group_names()
-            for grp in target_groups:
-                active = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
-                          and grp in self._ep_groups(ep)
-                          and not ep._manual_unlock_required
-                          and not self._is_in_cooldown(ep)
-                          and not self._is_quota_exceeded(ep)
-                          and not self._is_rpm_limited(ep)]
-                if not active:
-                    continue
-                best = min(active, key=lambda ep: self._ep_priority(ep, grp))
-                self._set_current(grp, best.id)
-                self._set_manual(grp, None)
-            return True
-
     def _check_one_health(self, ep):
         if ep.health_mode == "none":
             return ep.id, "unknown", -1, "已禁用健康检测"
@@ -3782,16 +3765,6 @@ def api_handler(method, path, body):
             return 400, {"error": "需要 priority 参数"}, False
         pool.set_group_priority(ep_id, qs_group or pool.MAIN_GROUP, qs_priority)
         _sync_to_config()
-        return 200, {"ok": True}, False
-    if method == "POST" and cp == "/api/reset-priority":
-        # 分组池：支持 ?group= 只重置指定组（默认全部组，兼容旧行为）
-        qs_group = None
-        if parsed.query:
-            for kv in parsed.query.split("&"):
-                if kv.startswith("group="):
-                    qs_group = unquote(kv[6:])
-                    break
-        pool.reset_to_priority_mode(group=qs_group)
         return 200, {"ok": True}, False
 
     return 404, {"error": "Not found"}, False

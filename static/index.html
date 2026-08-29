@@ -372,7 +372,7 @@ select option { background: var(--bg); color: var(--text); }
       </div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
         <div style="font-size:10px;color:var(--text-dim);">从左侧端点列表添加，参与 API 调用轮换</div>
-        <button class="btn btn-ghost btn-sm" onclick="resetPriority()" title="忽略手动切换，当前查看的组按优先级自动选择最优端点">⬆️ 按优先级</button>
+        <button class="btn btn-ghost btn-sm" onclick="createPoolGroup()" title="新建分组（暂未开放）">➕ 新建分组</button>
       </div>
       <div id="poolList"></div>
     </div>
@@ -842,6 +842,11 @@ function editPoolGroup(g){
   toast('⚙️ 分组编辑（类型：混合/专用）暂未开放，当前组：'+g,'info');
 }
 
+// 新建分组（预留）：后端组实体创建接口未实施前，仅弹提示不执行写操作。
+function createPoolGroup(){
+  toast('➕ 新建分组暂未开放','info');
+}
+
 
 // 分组池：聚合链组筛选（与聚合池管理一致的标签交互，默认 main）
 let chainGroupFilter='main';
@@ -1035,7 +1040,6 @@ async function sendTest() {
   refresh();
 }
 async function resetPool(){await api('POST','/api/reset');toast('已重置','success');refresh();}
-async function resetPriority(){const g=poolGroupFilter||'main';await api('POST','/api/reset-priority?group='+encodeURIComponent(g));toast('✅ 组 '+g+' 已按优先级运行','success');refresh();}
 
 function checkFetchBtn(){
     const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
