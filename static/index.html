@@ -372,7 +372,6 @@ select option { background: var(--bg); color: var(--text); }
       </div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
         <div style="font-size:10px;color:var(--text-dim);">从左侧端点列表添加，参与 API 调用轮换</div>
-        <button class="btn btn-ghost btn-sm" onclick="createPoolGroup()" title="新建分组（暂未开放）">➕ 新建分组</button>
       </div>
       <div id="poolList"></div>
     </div>
@@ -831,6 +830,7 @@ function renderPoolList(eps){
       <span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="该组当前端点">● ${info.current_endpoint?esc(info.current_endpoint):'无'}</span>
       ${info.fallback_count>0?`<span class="badge badge-cooldown" style="font-size:9px;padding:1px 5px" title="fallback 到 main 累计次数（扩容信号）">↩${info.fallback_count}</span>`:''}
     </div>
+    <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:10px" title="新建分组（暂未开放）" onclick="createPoolGroup()">＋ 新建分组</button>
     <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:10px" title="编辑分组属性（类型：混合/专用，暂未开放）" onclick="editPoolGroup('${esc(poolGroupFilter)}')">⚙️ 编辑分组</button>
   </div>`;
   el.innerHTML=`<div class="filter-bar" style="margin-bottom:8px">${barHtml}</div>`+statusHtml+members.map(cardOf).join('');
