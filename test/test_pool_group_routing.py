@@ -3,8 +3,8 @@
 覆盖：
 - 组选择器解析（api-pool 别名 / 精确组名 / 无匹配→main）
 - 各组独立粘性（并发零串扰）
-- 跨组互斥（粘性半 + 在途半；归属流转）
-- main 组饥饿特权（互斥过滤后无可用 → 忽略互斥）
+- 单向跨组互斥（main 无约束；子组避让 main 粘性与在途端点）
+- 子组被 main 占用当前端点后，从剩余候选的组内优先级 1 重新选择
 - bg→main 双触发 fallback（入口 + 轮转耗尽）
 - 旧配置回归（无 pool_groups 字段 → 全部 main）
 - runtime_state 按组持久化与重启恢复
@@ -106,8 +106,8 @@ class PoolGroupRoutingTests(unittest.TestCase):
 
     # ── 跨组互斥 ──
 
-    def test_cross_group_mutex_sticky(self):
-        """bg 组粘性占用 b_shared 后，main 组选端点时避开它（粘性半）。"""
+    def test_main_ignores_subgroup_sticky(self):
+        """bg 组粘性占用共享端点，不约束 main 使用该端点。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             shared = self.endpoint(module, "shared", 1, "glm-5.3-flash", groups=["main", "bg"])
@@ -119,22 +119,21 @@ class PoolGroupRoutingTests(unittest.TestCase):
             pool.chat([{"role": "user", "content": "x"}], model="bg")
             self.assertEqual(pool._get_current("bg"), "shared")
 
-            # main 组请求：shared 被bg 粘性占用 → 只剩 m2 可用（互斥过滤）
+            # main 不受子组指针约束，shared 仍在候选集。
             active, starved = pool._group_sticky_candidates("main")
-            self.assertEqual([e.id for e in active], ["m2"])
+            self.assertEqual([e.id for e in active], ["shared", "m2"])
             self.assertFalse(starved)
 
-    def test_main_starvation_privilege(self):
-        """main 组互斥过滤后无可用 → 忽略互斥强行使用 + starved 标记。"""
+    def test_main_ignores_subgroup_inflight(self):
+        """bg 在途占用共享端点，不约束 main 使用该端点。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             shared = self.endpoint(module, "shared", 1, "glm-5.3", groups=["main", "bg"])
             pool = self.make_pool(module, [shared])
-            # bg 粘性占用唯一端点
-            pool._set_current("bg", "shared")
+            pool._acquire_inflight("shared", "bg")
             active, starved = pool._group_sticky_candidates("main")
             self.assertEqual(len(active), 1)
-            self.assertTrue(starved)
+            self.assertFalse(starved)
 
     def test_bg_no_starvation_privilege(self):
         """非 main 组互斥过滤后无可用 → 返回空（走 fallback 而非强行使用）。"""
@@ -146,6 +145,28 @@ class PoolGroupRoutingTests(unittest.TestCase):
             active, starved = pool._group_sticky_candidates("bg")
             self.assertEqual(active, [])
             self.assertFalse(starved)
+
+    def test_bg_reselects_from_priority_one_when_main_takes_current(self):
+        """main 占用 bg 当前端点后，bg 从剩余候选的组内最高优先级重选。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            b1 = self.endpoint(module, "b1", 1, "deepseek-v4-flash", groups=["bg"])
+            b2 = self.endpoint(module, "b2", 2, "deepseek-v4-flash", groups=["bg"])
+            shared = self.endpoint(module, "shared", 3, "deepseek-v4-flash", groups=["main", "bg"])
+            b4 = self.endpoint(module, "b4", 4, "deepseek-v4-flash", groups=["bg"])
+            pool = self.make_pool(module, [b1, b2, shared, b4])
+            pool._set_current("bg", "shared")
+            pool._set_current("main", "shared")
+            calls = []
+
+            def fake_try(ep, payload, timeout, **kwargs):
+                calls.append(ep.id)
+                return {"choices": [{"message": {"content": "ok"}}]}, ""
+
+            pool._try_endpoint = fake_try
+            pool.chat([{"role": "user", "content": "x"}], model="bg")
+            self.assertEqual(calls, ["b1"])
+            self.assertEqual(pool._get_current("bg"), "b1")
 
     # ── bg → main 双触发 fallback ──
 
@@ -254,20 +275,38 @@ class PoolGroupRoutingTests(unittest.TestCase):
             pool.chat([{"role": "user", "content": "y"}], model="api-pool")
             self.assertNotIn("m1", pool._inflight_owner)  # 非流式成功即释放
 
-    def test_inflight_blocks_other_group(self):
-        """端点在途被 bg 占用时，main 组互斥过滤将其排除（在途半）。"""
+    def test_main_inflight_blocks_subgroup(self):
+        """main 在途占用共享端点时，子组将其排除。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             shared = self.endpoint(module, "shared", 1, "glm-5.3", groups=["main", "bg"])
-            m2 = self.endpoint(module, "m2", 2, "glm-5.3")
-            pool = self.make_pool(module, [shared, m2])
-            pool._acquire_inflight("shared", "bg")
+            b2 = self.endpoint(module, "b2", 2, "glm-5.3", groups=["bg"])
+            pool = self.make_pool(module, [shared, b2])
+            pool._acquire_inflight("shared", "main")
 
-            active, _ = pool._group_sticky_candidates("main")
-            self.assertEqual([e.id for e in active], ["m2"])
-            pool._release_inflight("shared", "bg")
-            active, _ = pool._group_sticky_candidates("main")
+            active, _ = pool._group_sticky_candidates("bg")
+            self.assertEqual([e.id for e in active], ["b2"])
+            pool._release_inflight("shared", "main")
+            active, _ = pool._group_sticky_candidates("bg")
             self.assertIn("shared", [e.id for e in active])  # 释放后回到可用集
+
+    def test_inflight_counts_preserve_parallel_groups_and_requests(self):
+        """main 抢占子组端点时，不覆盖子组 owner；同组并发按计数释放。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            shared = self.endpoint(module, "shared", 1, "glm-5.3", groups=["main", "bg"])
+            pool = self.make_pool(module, [shared])
+            pool._acquire_inflight("shared", "bg")
+            pool._acquire_inflight("shared", "main")
+            pool._acquire_inflight("shared", "main")
+            self.assertEqual(pool._inflight_owner["shared"], {"bg": 1, "main": 2})
+
+            pool._release_inflight("shared", "main")
+            self.assertEqual(pool._inflight_owner["shared"], {"bg": 1, "main": 1})
+            pool._release_inflight("shared", "main")
+            self.assertEqual(pool._inflight_owner["shared"], {"bg": 1})
+            pool._release_inflight("shared", "bg")
+            self.assertNotIn("shared", pool._inflight_owner)
 
     # ── /v1/models 目录 ──
 
@@ -330,7 +369,7 @@ class GroupAwareRemoveTests(unittest.TestCase):
             pool.remove_from_group("e1", "bg")
 
             self.assertFalse(ep.in_pool)
-            self.assertEqual(ep.pool_groups, ["main"])  # 组重置默认
+            self.assertEqual(ep.pool_groups, [])  # 出池后组绑定清空
             self.assertIsNone(pool._get_current("bg"))
 
     def test_full_exit_clears_all_pointers(self):

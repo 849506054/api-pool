@@ -669,20 +669,33 @@ class ChatLogger:
                 prompt TEXT,
                 completion TEXT,
                 total_tokens INTEGER,
-                latency_ms INTEGER
+                latency_ms INTEGER,
+                pool_group TEXT,
+                prompt_tokens INTEGER,
+                cached_tokens INTEGER
             )''')
+            # 存量库迁移：老表缺列时补齐（pool_group 2026-08-30 分组调用区分；prompt/cached tokens 同日命中统计）
+            c.execute("PRAGMA table_info(chat_logs)")
+            _cols = {row[1] for row in c.fetchall()}
+            for _col, _ddl in (
+                ("pool_group", "TEXT"),
+                ("prompt_tokens", "INTEGER"),
+                ("cached_tokens", "INTEGER"),
+            ):
+                if _col not in _cols:
+                    c.execute(f"ALTER TABLE chat_logs ADD COLUMN {_col} {_ddl}")
             conn.commit()
             conn.close()
 
-    def add_log(self, endpoint_name, model, prompt, completion, total_tokens, latency_ms):
+    def add_log(self, endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group=None, prompt_tokens=None, cached_tokens=None):
         def _write():
             with self._lock:
                 try:
                     conn = sqlite3.connect(self.db_path)
                     c = conn.cursor()
                     c.execute(
-                        "INSERT INTO chat_logs (endpoint_name, model, prompt, completion, total_tokens, latency_ms) VALUES (?, ?, ?, ?, ?, ?)",
-                        (endpoint_name, model, prompt, completion, total_tokens, latency_ms)
+                        "INSERT INTO chat_logs (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens)
                     )
                     conn.commit()
                     conn.close()
@@ -690,15 +703,37 @@ class ChatLogger:
                     sys_log(f"记录对话日志失败: {e}", "ERROR")
         threading.Thread(target=_write, daemon=True).start()
 
-    def get_logs(self, limit=50, offset=0):
+    def get_logs(self, limit=50, offset=0, detail=True):
         with self._lock:
             try:
                 conn = sqlite3.connect(self.db_path)
                 c = conn.cursor()
-                c.execute(
-                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
-                    (limit, offset)
-                )
+                # detail=False：SQL 层不取 prompt/completion（避免从磁盘读 32MB 正文再丢弃）
+                if detail:
+                    c.execute(
+                        "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
+                        (limit, offset)
+                    )
+                else:
+                    c.execute(
+                        "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
+                        (limit, offset)
+                    )
+                    rows = [r[:4] + (None, None) + r[4:] for r in c.fetchall()]
+                    c.execute("SELECT COUNT(*) FROM chat_logs")
+                    total = c.fetchone()[0]
+                    conn.close()
+                    return {
+                        "total": total,
+                        "logs": [
+                            {
+                                "id": r[0], "timestamp": r[1], "endpoint_name": r[2], "model": r[3],
+                                "prompt": None, "completion": None,
+                                "total_tokens": r[6], "latency_ms": r[7], "pool_group": r[8],
+                                "prompt_tokens": r[9], "cached_tokens": r[10]
+                            } for r in rows
+                        ]
+                    }
                 rows = c.fetchall()
                 
                 c.execute("SELECT COUNT(*) FROM chat_logs")
@@ -713,15 +748,49 @@ class ChatLogger:
                             "timestamp": r[1],
                             "endpoint_name": r[2],
                             "model": r[3],
-                            "prompt": r[4],
-                            "completion": r[5],
+                            # 列表页不需要正文：detail=False 时不返回 prompt/completion（33MB→KB 级）
+                            "prompt": r[4] if detail else None,
+                            "completion": r[5] if detail else None,
                             "total_tokens": r[6],
-                            "latency_ms": r[7]
+                            "latency_ms": r[7],
+                            "pool_group": r[8],
+                            "prompt_tokens": r[9],
+                            "cached_tokens": r[10]
                         } for r in rows
                     ]
                 }
             except Exception as e:
                 return {"total": 0, "logs": [], "error": str(e)}
+
+    def get_log_by_id(self, log_id):
+        """单条详情（含正文）：列表页 detail=false 不拉正文，点击行时按 id 取全文。"""
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                c = conn.cursor()
+                c.execute(
+                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens FROM chat_logs WHERE id = ?",
+                    (int(log_id),)
+                )
+                r = c.fetchone()
+                conn.close()
+                if r is None:
+                    return None
+                return {
+                    "id": r[0],
+                    "timestamp": r[1],
+                    "endpoint_name": r[2],
+                    "model": r[3],
+                    "prompt": r[4],
+                    "completion": r[5],
+                    "total_tokens": r[6],
+                    "latency_ms": r[7],
+                    "pool_group": r[8],
+                    "prompt_tokens": r[9],
+                    "cached_tokens": r[10]
+                }
+            except Exception as e:
+                return None
 
     def clear_logs(self):
         with self._lock:
@@ -819,6 +888,8 @@ def _anthropic_tool_choice_from_chat(tool_choice):
 class Endpoint:
     id: str = ""
     name: str = "unnamed"
+    site_name: str = ""
+    site_id: str = ""  # 缓存账户 ID：base_url+API Key 相同则共享，不同 Key 硬隔离
     base_url: str = ""
     api_key: str = ""
     model: str = "gpt-4o-mini"
@@ -843,7 +914,7 @@ class Endpoint:
     stream_max_duration: int = 120  # 流总时长上限（秒），0=禁用；防 keep-alive 型无限挂起（2026-08-14 缩短至120s）
     deferrable: bool = True  # 是否保护本端点缓存（true=本端点工作时延迟切走）
     max_context_k: int = 0  # 最大上下文长度（K=1000 tokens），0=不限
-    pool_groups: list = field(default_factory=lambda: ["main"])  # 所属路由组（2026-08-29 分组池方案）
+    pool_groups: list = field(default_factory=list)  # 未入池端点默认无池组；入池时再绑定组
 
     _fail_count: int = field(default=0, repr=False)
     _req_timestamps: deque = field(default_factory=deque, repr=False)
@@ -883,6 +954,9 @@ class APIPool:
     def __init__(self, endpoints=None):
         self._lock = threading.RLock()
         self._endpoints: list[Endpoint] = []
+        # 状态持久化开关（True=禁用）：测试抽屉的临时池不写 api_runtime_state.json，
+        # 其端点 id 是运行时 uuid4，写入会污染重启恢复指针（2026-08-30 修复）。
+        self._state_persistence_disabled: bool = False
         self._restored_endpoint_id: str | None = None  # 兼容旧状态字段；恢复后转为持续手动覆盖
         self._last_reasoning_content = None  # 缓存上一轮返回的 reasoning_content，用于多轮对话补全
         self._last_reasoning_text = None  # 缓存上一轮返回的 reasoning_text（DeepSeek V4 request 字段名），用于多轮对话补全
@@ -893,11 +967,14 @@ class APIPool:
         self._manual_override_by_group: dict[str, str | None] = {}
         self._persisted_endpoint_by_group: dict[str, str | None] = {}
         self._fallback_lock_until_by_group: dict[str, float] = {}
-        # 端点在途归属：ep.id → 该请求所属组名（同一时刻每端点仅记录一个组的在途请求；
-        # 多组共享端点的其他组在互斥过滤时视其为被占用）。值恒为当前真实持有者，无需清理。
-        self._inflight_owner: dict[str, str] = {}
+        # 端点在途归属：ep.id → {组名: 在途请求数}。main 可抢占子组共享端点，
+        # 因此必须按组计数，避免并发请求覆盖 owner 或提前释放仍在途的占用。
+        self._inflight_owner: dict[str, dict[str, int]] = {}
         # per-group fallback 到 main 的累计次数（bg 组扩容信号，/api/endpoints 暴露）
         self._group_fallback_count: dict[str, int] = {}
+        # 每组最近一次成功写入 usage 的站点账户 ID；用于识别手动切换、恢复回切
+        # 和故障轮转形成的缓存账户边界。仅保存不敏感的 site_id。
+        self._cache_stats_site_id_by_group: dict[str, str] = {}
         # ── 组实体定义（2026-08-30 组管理）：name → {"type": "mixed"|"dedicated", "model": selector} ──
         # mixed 组 model = Hermes 侧配置的选择器名（如 api-pool-bg）；dedicated 组 model = 绑定的
         # 真实上游模型名（兼作选择器）。main 恒为 mixed，选择器固定 api-pool（历史别名）。
@@ -917,22 +994,24 @@ class APIPool:
             ep_dict = {k: v for k, v in raw_ep.items() if k in Endpoint.__dataclass_fields__}
             if raw_ep.get("user_agent") and "default_headers" not in ep_dict:
                 ep_dict["default_headers"] = {"User-Agent": raw_ep["user_agent"]}
-            # pool_groups 归一化：旧配置无此字段 → 默认 ["main"]；去重保序，剔除空串
+            # pool_groups 归一化：未入池默认无组；旧的已入池配置缺字段时兼容 main。
             raw_groups = ep_dict.get("pool_groups")
-            if not isinstance(raw_groups, list) or not raw_groups:
-                ep_dict["pool_groups"] = ["main"]
+            if not isinstance(raw_groups, list):
+                ep_dict["pool_groups"] = ["main"] if ep_dict.get("in_pool", False) else []
             else:
                 seen = []
                 for g in raw_groups:
                     gs = str(g).strip()
                     if gs and gs not in seen:
                         seen.append(gs)
-                ep_dict["pool_groups"] = seen or ["main"]
+                ep_dict["pool_groups"] = seen
             # 新增时按组别自动设置健康检测模式（未显式指定时生效）
             if "health_mode" not in ep_dict:
                 ep_dict["health_mode"] = "models" if ep_dict.get("billing_mode", "subscription") == "pay_per_use" else ("chat" if ep_dict.get("in_pool", False) else "models")
             if "billing_mode" not in ep_dict:
                 ep_dict["billing_mode"] = "subscription"
+            if not str(ep_dict.get("site_id", "") or "").strip():
+                ep_dict["site_id"] = self._resolve_site_id(ep_dict.get("base_url", ""), ep_dict.get("api_key", ""))
             ep = Endpoint(**ep_dict)
             ep._manual_unlock_required = bool(raw_ep.get("manual_unlock_required", False))
         elif not ep.health_mode:
@@ -940,6 +1019,8 @@ class APIPool:
         if not ep.id:
             import uuid
             ep.id = str(uuid.uuid4())
+        if not ep.site_id:
+            ep.site_id = self._resolve_site_id(ep.base_url, ep.api_key)
         ep._today_date = datetime.now().strftime("%Y-%m-%d")
         ep._today_used = token_tracker.get_today_usage_by_endpoint(ep.name)
         with self._lock:
@@ -959,6 +1040,21 @@ class APIPool:
                     self._set_manual(grp, None)
             self._inflight_owner.pop(ep_id, None)
 
+    @staticmethod
+    def _site_identity(base_url, api_key):
+        """站点账户身份：规范化 URL + 完整 Key，仅用于进程内相等比较。"""
+        return (str(base_url or "").strip().rstrip("/").lower(), str(api_key or ""))
+
+    def _resolve_site_id(self, base_url, api_key, exclude_ep_id=None):
+        """相同 base_url+Key 复用 site_id，否则生成新 ID。"""
+        identity = self._site_identity(base_url, api_key)
+        for existing in self._endpoints:
+            if existing.id != exclude_ep_id and self._site_identity(existing.base_url, existing.api_key) == identity:
+                if existing.site_id:
+                    return existing.site_id
+        import uuid
+        return str(uuid.uuid4())
+
     def set_enabled(self, ep_id, enabled):
         with self._lock:
             for ep in self._endpoints:
@@ -976,9 +1072,11 @@ class APIPool:
                         sanitized = self._sanitize_groups(groups)
                         enforced = self._enforce_dedicated_membership(ep, sanitized)
                         ep.pool_groups = enforced or [self.MAIN_GROUP]
+                    elif in_pool and not ep.pool_groups:
+                        ep.pool_groups = [self.MAIN_GROUP]
                     # 出池清组绑定，避免残留（全量出池路径；单组移除走 remove_from_group）
                     if not in_pool:
-                        ep.pool_groups = [self.MAIN_GROUP]
+                        ep.pool_groups = []
                         self._clear_pointers_for(ep_id)
                     # 手动移出池再移回 = 显式信任该端点 → 清除延迟回迁状态，恢复最高优先级
                     if in_pool:
@@ -1005,7 +1103,7 @@ class APIPool:
                 else:
                     # 最后一组 → 整体出池
                     ep.in_pool = False
-                    ep.pool_groups = [self.MAIN_GROUP]
+                    ep.pool_groups = []
                     self._clear_pointers_for(ep_id)
                     sys_log(f"端点 '{ep.name}' 从组 '{group}' 移除后无剩余组，已整体移出聚合池", "INFO")
                 break
@@ -1035,6 +1133,8 @@ class APIPool:
                     for k, v in updates.items():
                         if hasattr(ep, k) and not k.startswith("_") and k != "id":
                             setattr(ep, k, v)
+                    if updates.get("base_url") is not None or updates.get("api_key") is not None:
+                        ep.site_id = self._resolve_site_id(ep.base_url, ep.api_key, exclude_ep_id=ep.id)
                     # pool_groups 归一化（分组池 2026-08-29）：去重/去空/空列表回退 main
                     if updates.get("pool_groups") is not None:
                         sanitized = self._sanitize_groups(ep.pool_groups)
@@ -1076,6 +1176,133 @@ class APIPool:
 
                     self._endpoints.sort(key=lambda e: e.priority)
                     break
+
+    def fetch_endpoint_models(self, ep_id):
+        """使用指定端点自身的连接配置读取上游模型目录。"""
+        with self._lock:
+            ep = next((item for item in self._endpoints if item.id == ep_id), None)
+            if ep is None:
+                raise KeyError("端点不存在")
+            connection = {
+                "base_url": ep.base_url,
+                "api_key": ep.api_key,
+                "timeout": min(max(int(ep.timeout or 10), 1), 30),
+                "use_proxy": ep.use_proxy,
+                "protocol": ep.protocol,
+                "default_headers": dict(ep.default_headers or {}),
+                "extra_headers": dict(ep.extra_headers or {}),
+            }
+        return self.fetch_models(**connection)
+
+    def replace_group_model(self, group, source_ep_id, model):
+        """原子地把组内一个端点替换为同站点的另一模型端点。
+
+        优先复用已有的 site_name+model+protocol 端点；没有时从源端点复制全部
+        配置字段，仅生成新 id/name 并改 model。运行态字段不会被复制。
+        """
+        import uuid
+
+        group = str(group or "").strip()
+        model = str(model or "").strip()
+        if not group or not model:
+            raise ValueError("需要 group、endpoint_id 和 model")
+
+        with self._lock:
+            if group not in self._all_group_names():
+                raise KeyError("分组不存在")
+            dedicated_model = self._dedicated_model(group)
+            if dedicated_model and model != dedicated_model:
+                raise ValueError(f"专用组 '{group}' 仅允许模型 '{dedicated_model}'")
+
+            source = next((ep for ep in self._endpoints if ep.id == source_ep_id), None)
+            if source is None:
+                raise KeyError("源端点不存在")
+            if not source.in_pool or group not in self._ep_groups(source):
+                raise ValueError(f"源端点不属于组 '{group}'")
+            if not str(source.site_name or "").strip():
+                raise ValueError("源端点缺少 site_name，请先完成站点标识迁移")
+            if source.model == model:
+                raise ValueError("目标模型与当前模型相同")
+
+            source_priority = self._ep_priority(source, group)
+            now = time.time()
+
+            def candidate_rank(item):
+                ep, config_index = item
+                exact_connection = (
+                    ep.base_url == source.base_url
+                    and ep.api_key == source.api_key
+                    and (ep.default_headers or {}) == (source.default_headers or {})
+                    and (ep.extra_headers or {}) == (source.extra_headers or {})
+                    and ep.use_proxy == source.use_proxy
+                )
+                noncooldown = ep._cooldown_until <= now and not ep._manual_unlock_required
+                return (
+                    0 if exact_connection else 1,
+                    0 if ep.enabled else 1,
+                    0 if noncooldown else 1,
+                    self._ep_priority(ep, group),
+                    config_index,
+                )
+
+            matches = [
+                (ep, index) for index, ep in enumerate(self._endpoints)
+                if ep.id != source.id
+                and ep.site_name == source.site_name
+                and ep.model == model
+                and ep.protocol == source.protocol
+            ]
+            created = not matches
+            if matches:
+                replacement = min(matches, key=candidate_rank)[0]
+            else:
+                config = {
+                    field_name: _copy.deepcopy(getattr(source, field_name))
+                    for field_name in Endpoint.__dataclass_fields__
+                    if not field_name.startswith("_")
+                }
+                config["id"] = str(uuid.uuid4())
+                config["model"] = model
+                config["in_pool"] = True
+                config["pool_groups"] = [group]
+                base_name = f"{source.site_name}-{model}".strip("-") or model
+                used_names = {ep.name for ep in self._endpoints}
+                name = base_name
+                suffix = 2
+                while name in used_names:
+                    name = f"{base_name}-{suffix}"
+                    suffix += 1
+                config["name"] = name
+                replacement = Endpoint(**config)
+                self._endpoints.append(replacement)
+
+            replacement_groups = list(self._ep_groups(replacement)) if replacement.in_pool else []
+            if group not in replacement_groups:
+                replacement_groups.append(group)
+            replacement.pool_groups = replacement_groups
+            replacement.in_pool = True
+
+            remaining = [g for g in self._ep_groups(source) if g != group]
+            if remaining:
+                source.pool_groups = remaining
+            else:
+                source.in_pool = False
+                source.pool_groups = [self.MAIN_GROUP]
+
+            # 先重新编号，再恢复源端点在当前组的位置，避免影响同组其他成员次序。
+            self._renumber_pool_priorities()
+            self.set_group_priority(replacement.id, group, source_priority)
+            pointer_moved = False
+            for getter, setter in (
+                (self._get_current, self._set_current),
+                (self._get_manual, self._set_manual),
+                (self._get_persisted, self._set_persisted),
+            ):
+                if getter(group) == source.id:
+                    setter(group, replacement.id)
+                    pointer_moved = True
+            self._endpoints.sort(key=lambda ep: ep.priority)
+            return replacement, created, pointer_moved
 
     def _renumber_pool_priorities(self):
         """对每组内端点分配该组独立的连续优先级（2026-08-29 分组隔离）。
@@ -1120,6 +1347,12 @@ class APIPool:
 
     MAIN_GROUP = "main"
 
+    @classmethod
+    def _endpoint_log_label(cls, ep, group=None, model=None):
+        """池内端点日志统一标识：[池名]端点名[: 模型名]。"""
+        label = f"[{group or cls.MAIN_GROUP}]{ep.name}"
+        return f"{label}: {model}" if model else label
+
     def _sanitize_groups(self, raw):
         """候选组名列表归一化：去重保序、剔除空串、非法类型忽略。"""
         if not isinstance(raw, list):
@@ -1133,7 +1366,8 @@ class APIPool:
 
     def _ep_groups(self, ep):
         """端点归属组（运行时归一化，兼容字段缺失/空列表）。"""
-        return getattr(ep, "pool_groups", None) or [self.MAIN_GROUP]
+        groups = getattr(ep, "pool_groups", None)
+        return groups if groups else ([self.MAIN_GROUP] if ep.in_pool else [])
 
     # ── 组实体管理（2026-08-30 组管理功能）──
     _GROUP_NAME_RE = None  # 延迟初始化（模块顶部 import re）
@@ -1422,17 +1656,37 @@ class APIPool:
     def _is_fallback_locked_group(self, group):
         return self._fallback_lock_until_by_group.get(group, 0) > time.time()
 
+    def _should_reset_cached_stats(self, group, site_id):
+        """本组上次成功 usage 属于不同站点账户时，首条统计按冷启动处理。"""
+        previous = self._cache_stats_site_id_by_group.get(group)
+        return previous is not None and previous != site_id
+
+    def _mark_cache_stats_account(self, group, site_id):
+        """usage 成功落库后更新本组统计账户边界。"""
+        with self._lock:
+            self._cache_stats_site_id_by_group[group] = site_id
+
     def _is_ep_inflight_elsewhere(self, ep, group):
-        """端点是否被其他组的在途请求占用。"""
-        owner = self._inflight_owner.get(ep.id)
-        return bool(owner) and owner != group
+        """子组仅受 main 在途占用约束；main 不受任何子组约束。"""
+        if group == self.MAIN_GROUP:
+            return False
+        owners = self._inflight_owner.get(ep.id) or {}
+        return owners.get(self.MAIN_GROUP, 0) > 0
 
     def _acquire_inflight(self, ep_id, group):
-        self._inflight_owner[ep_id] = group
+        owners = self._inflight_owner.setdefault(ep_id, {})
+        owners[group] = owners.get(group, 0) + 1
 
     def _release_inflight(self, ep_id, group):
-        """释放端点在途归属：仅当持有者仍是本组时清除（防误删并发新持有者）。"""
-        if self._inflight_owner.get(ep_id) == group:
+        """按组递减在途计数，保留其他组及本组剩余并发请求。"""
+        owners = self._inflight_owner.get(ep_id)
+        if not owners or group not in owners:
+            return
+        if owners[group] > 1:
+            owners[group] -= 1
+        else:
+            owners.pop(group, None)
+        if not owners:
             self._inflight_owner.pop(ep_id, None)
 
     def _wrap_stream_release(self, gen, ep_id, group):
@@ -1449,20 +1703,16 @@ class APIPool:
                 self._release_inflight(ep_id, group)
 
     def _is_ep_sticky_elsewhere(self, ep, group):
-        """端点是否是其他组的粘性指针目标（跨组互斥的静态半）。"""
-        for other, ep_id in self._current_endpoint_by_group.items():
-            if other != group and ep_id == ep.id:
-                return True
-        for other, ep_id in self._manual_override_by_group.items():
-            if other != group and ep_id == ep.id:
-                return True
-        return False
+        """子组仅避让 main 粘性/手动端点；main 不受子组指针约束。"""
+        if group == self.MAIN_GROUP:
+            return False
+        return ep.id in {
+            self._get_current(self.MAIN_GROUP),
+            self._get_manual(self.MAIN_GROUP),
+        }
 
     def _group_sticky_candidates(self, group):
-        """组内可用端点：健康过滤 + 跨组互斥（粘性半 + 在途半）。
-
-        main 组互斥饿死时忽略互斥强行使用（主组保底特权）。
-        """
+        """组内可用端点：main 无跨组约束；子组避让 main 粘性与在途端点。"""
         base = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
                 and group in self._ep_groups(ep)
                 and not ep._manual_unlock_required
@@ -1471,14 +1721,13 @@ class APIPool:
                 and not self._is_rpm_limited(ep)]
         if not base:
             return [], False
+        if group == self.MAIN_GROUP:
+            return base, False
         free = [ep for ep in base
                 if not self._is_ep_sticky_elsewhere(ep, group)
                 and not self._is_ep_inflight_elsewhere(ep, group)]
         if free:
             return free, False
-        if group == self.MAIN_GROUP:
-            # main 互斥过滤后无可用 → 忽略互斥强行使用（WARN 在调用方记录频率）
-            return base, True
         return [], False
 
     def switch_to_endpoint(self, ep_id, group=None):
@@ -1493,7 +1742,7 @@ class APIPool:
                     grp = group or self.MAIN_GROUP
                     self._set_manual(grp, ep_id)
                     self._set_current(grp, ep_id)
-                    sys_log(f"手动切换端点: '{ep.name}' → 组 '{grp}'（清除其 defer，保留冷却/配额/余额状态）", "INFO")
+                    sys_log(f"手动切换端点: '{self._endpoint_log_label(ep, grp)}'（清除其 defer，保留冷却/配额/余额状态）", "INFO")
                     return True
         return False
 
@@ -1512,8 +1761,8 @@ class APIPool:
             ]
 
     def _all_group_names(self):
-        """全部已知组名：端点声明 ∪ 指针态出现过的组（含手动设置但暂无成员的组）。"""
-        names = []
+        """全部已知组名：实体定义 ∪ 端点声明 ∪ 指针态，包含零成员新组。"""
+        names = list(self._group_defs)
         for ep in self._endpoints:
             for g in self._ep_groups(ep):
                 if g not in names:
@@ -1540,6 +1789,8 @@ class APIPool:
         return {
             "id": ep.id,
             "name": ep.name,
+            "site_name": ep.site_name,
+            "site_id": ep.site_id,
             "base_url": ep.base_url,
             "api_key": ep.api_key[:8] + "***" if len(ep.api_key) > 8 else "***",
             "api_key_full": ep.api_key,
@@ -1555,6 +1806,7 @@ class APIPool:
             "rpm_limit": ep.rpm_limit,
             "use_proxy": ep.use_proxy,
             "protocol": ep.protocol,
+            "extra_headers": ep.extra_headers,
             "default_headers": ep.default_headers,
             "health_mode": ep.health_mode,
             "billing_mode": ep.billing_mode,
@@ -1719,7 +1971,7 @@ class APIPool:
                     if c.get("type") == "image_url": return True
         return False
 
-    def _translate_images_sync(self, messages, active_eps):
+    def _translate_images_sync(self, messages, active_eps, pool_group=None):
         vision_eps = [e for e in active_eps if getattr(e, "is_vision", True)]
         if not vision_eps:
             return messages
@@ -1743,11 +1995,12 @@ class APIPool:
         
         description = ""
         for v_ep in vision_eps:
-            sys_log(f"启动图片解析 -> 尝试端点 {v_ep.name} ({v_ep.model})", "INFO")
+            v_label = self._endpoint_log_label(v_ep, pool_group, v_ep.model)
+            sys_log(f"启动图片解析 -> 尝试请求端点 '{v_label}'", "INFO")
             payload = {"model": v_ep.model, "messages": translation_msgs, "stream": False, "max_tokens": 4096}
-            result, error = self._try_endpoint(v_ep, payload, timeout=60, log_usage=True, force_no_retry=True)
+            result, error = self._try_endpoint(v_ep, payload, timeout=60, log_usage=True, force_no_retry=True, pool_group=pool_group)
             if error:
-                sys_log(f"图片解析失败 ({v_ep.name} - {v_ep.model}): {error}", "WARNING")
+                sys_log(f"图片解析端点 '{v_label}' 请求失败: {error}", "WARNING")
                 continue
                 
             if isinstance(result, str):
@@ -2110,8 +2363,8 @@ class APIPool:
                     if protect_current_cache:
                         with self._lock:
                             ep._defer_until = now + 300
-                        current_name = current_ep.name if current_ep else "无"
-                        sys_log(f"端点 '{ep.name}' 冷却过期探活通过（组 '{grp}'）；当前端点 '{current_name}' 已开启缓存保护，延迟回切 5 分钟", "INFO")
+                        current_label = self._endpoint_log_label(current_ep, grp) if current_ep else f"[{grp}]无"
+                        sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 冷却过期探活通过；当前端点 '{current_label}' 已开启缓存保护，延迟回切 5 分钟", "INFO")
                     else:
                         with self._lock:
                             ep._defer_until = 0
@@ -2120,9 +2373,9 @@ class APIPool:
                             if not self._get_manual(grp):
                                 self._set_current(grp, ep.id)
                         if current_ep is not None and current_ep is not ep and not current_ep.deferrable:
-                            sys_log(f"端点 '{ep.name}' 冷却过期探活通过（组 '{grp}'）；当前端点 '{current_ep.name}' 未开启缓存保护，立即回切", "INFO")
+                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 冷却过期探活通过；当前端点 '{self._endpoint_log_label(current_ep, grp)}' 未开启缓存保护，立即回切", "INFO")
                         else:
-                            sys_log(f"端点 '{ep.name}' 冷却过期探活通过（组 '{grp}'），已恢复", "INFO")
+                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 冷却过期探活通过，已恢复", "INFO")
                     # 仅在该组当前端点不存在或已不可用时更新指针；恢复一个端点不应
                     # 在池仍使用其他健康端点时把路由无故改回 priority 最小端点。
                     with self._lock:
@@ -2151,16 +2404,16 @@ class APIPool:
                 with self._lock:
                     capacity_kind, capacity_seconds = self._set_capacity_cooldown(ep, probe_error or "探活失败")
                 if capacity_kind == "balance_insufficient":
-                    sys_log(f"端点 '{ep.name}' 后台探活发现余额不足，已冻结，仅支持手动解冻", "WARN")
+                    sys_log(f"端点 '{self._endpoint_log_label(ep, self._ep_groups(ep)[0])}' 后台探活发现余额不足，已冻结，仅支持手动解冻", "WARN")
                 elif capacity_kind == "quota_exceeded":
                     detail = f"{capacity_seconds} 秒" if capacity_seconds is not None else "默认 5 小时"
-                    sys_log(f"端点 '{ep.name}' 后台探活发现配额不足，冻结 {detail}", "WARN")
+                    sys_log(f"端点 '{self._endpoint_log_label(ep, self._ep_groups(ep)[0])}' 后台探活发现配额不足，冻结 {detail}", "WARN")
                 else:
                     with self._lock:
                         self._set_cooldown(ep)
-                sys_log(f"端点 '{ep.name}' 冷却过期探活未通过，继续冷却", "WARN")
+                sys_log(f"端点 '{self._endpoint_log_label(ep, self._ep_groups(ep)[0])}' 冷却过期探活未通过，继续冷却", "WARN")
         except Exception as e:
-            sys_log(f"端点 '{ep.name}' 后台探活异常: {e}", "ERROR")
+            sys_log(f"端点 '{self._endpoint_log_label(ep, self._ep_groups(ep)[0])}' 后台探活异常: {e}", "ERROR")
         finally:
             with self._lock:
                 self._probe_inflight.discard(ep.id)
@@ -2201,7 +2454,8 @@ class APIPool:
                     ep._defer_until = 0
                     released.append(ep)
                     reason = "池空闲" if not pool_active else "当前端点未开启缓存保护"
-                    sys_log(f"端点 '{ep.name}' 延迟回切解除（{reason}）", "INFO")
+                    for grp in self._ep_groups(ep):
+                        sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 延迟回切解除（{reason}）", "INFO")
             if released:
                 for grp in self._all_group_names():
                     if self._get_manual(grp):
@@ -2319,7 +2573,7 @@ class APIPool:
             failed_ep._total_failures += 1
             failed_ep._last_error = error_msg
             failed_ep._last_error_ts = time.time()
-            sys_log(f"端点 '{failed_ep.name}' 请求失败: {error_msg}", "ERROR")
+            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 请求失败: {error_msg}", "ERROR")
         else:
             # 客户端类错误：请求形状问题，非端点故障。不冻结、fail_count 不增、
             # 不探活（探活小请求必然通过，无信息量），仅记录最后错误便于排查。
@@ -2327,28 +2581,28 @@ class APIPool:
             # 候选轮转由 chat() 的 client_error_tried 集合控制）。
             failed_ep._last_error = error_msg
             failed_ep._last_error_ts = time.time()
-            sys_log(f"端点 '{failed_ep.name}' 客户端类错误(不冻结/不记账)，同请求继续轮转: {error_msg}", "WARN")
+            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 客户端类错误(不冻结/不记账)，同请求继续轮转: {error_msg}", "WARN")
             return
         capacity_kind, capacity_seconds = self._set_capacity_cooldown(failed_ep, error_msg)
         if capacity_kind == "balance_insufficient":
-            sys_log(f"端点 '{failed_ep.name}' 余额不足，已冻结，仅支持手动解冻", "WARN")
+            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 余额不足，已冻结，仅支持手动解冻", "WARN")
         elif capacity_kind == "quota_exceeded":
             detail = f"{capacity_seconds} 秒" if capacity_seconds is not None else "默认 5 小时"
-            sys_log(f"端点 '{failed_ep.name}' 配额不足，冻结 {detail}", "WARN")
+            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 配额不足，冻结 {detail}", "WARN")
         elif probe_failed:
             # 探活失败：只设短冷却（30秒），避免误杀冷启动端点
             failed_ep._cooldown_until = time.time() + 30
-            sys_log(f"端点 '{failed_ep.name}' 探活失败，短冷却 30 秒", "WARN")
+            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 探活失败，短冷却 30 秒", "WARN")
         elif skip_cooldown:
             # 端点级活跃判定：超时类失败但端点在 timeout 窗口内有成功响应
             # → 单请求饿死，非端点故障；不冻结、不切换当前端点。
-            sys_log(f"端点 '{failed_ep.name}' 活跃(窗口内有成功)，判定单请求饿死，不冻结不切换", "WARN")
+            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 活跃(窗口内有成功)，判定单请求饿死，不冻结不切换", "WARN")
             return
         else:
             self._set_cooldown(failed_ep)
             # 抖动后实际窗口为 cooldown_minutes×[80%,120%]，日志展示真实值
             actual = max(0, (failed_ep._cooldown_until - time.time()) / 60)
-            sys_log(f"端点 '{failed_ep.name}' 触发冷却机制，下次可用时间在 {actual:.1f} 分钟后", "WARN")
+            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 触发冷却机制，下次可用时间在 {actual:.1f} 分钟后", "WARN")
         # 分组池：轮转切换限定在失败请求所属组内（含 bg 组 fallback 逻辑见 chat()）。
         active = [e for e in self._failover_endpoints() if grp in self._ep_groups(e)]
         candidates = self._ordered_failover_candidates(failed_ep, active, group=grp)
@@ -2379,8 +2633,9 @@ class APIPool:
         if not self._is_in_cooldown(ep):
             self._clear_cooldown(ep)
         # 分组池：请求成功只更新该组粘性指针；runtime_state 按组持久化。
+        # 测试临时池（_state_persistence_disabled）只更新内存指针，永不写盘。
         self._set_current(grp, ep.id)
-        if self._get_persisted(grp) != ep.id:
+        if not self._state_persistence_disabled and self._get_persisted(grp) != ep.id:
             state = load_runtime_state() or {}
             groups_state = state.get("groups") if isinstance(state, dict) else None
             groups_state = dict(groups_state) if isinstance(groups_state, dict) else {}
@@ -2571,6 +2826,7 @@ class APIPool:
                 active.insert(0, current_ep)
 
         idx = 0
+        previous_attempt_site_id = None
         while tried < total:
             ep = active[idx]
             # 客户端类错误轮转终止：不冻结路径没有冷却收缩 total，靠请求级已试集合收口。
@@ -2630,13 +2886,13 @@ class APIPool:
                 has_vision = any(getattr(e, "is_vision", True) for e in active)
                 if has_vision:
                     if payload.get("stream"):
-                        def vision_wrapper(tgt_ep, pld, t_out, a_eps):
+                        def vision_wrapper(tgt_ep, pld, t_out, a_eps, _grp=group):
                             import json
                             yield f"data: {{'choices':[{{'delta':{{'content':'[API Pool: 检测到图片，当前目标不支持视觉，正在调用视觉模型进行解析...]\\n\\n'}}}}]}}\n\n".replace("'", '"')
-                            translated_msgs = self._translate_images_sync(pld["messages"], a_eps)
+                            translated_msgs = self._translate_images_sync(pld["messages"], a_eps, _grp)
                             yield f"data: {{'choices':[{{'delta':{{'content':'[图片解析完成，交由目标模型继续处理...]\\n\\n'}}}}]}}\n\n".replace("'", '"')
                             pld["messages"] = translated_msgs
-                            gen, err = self._try_endpoint(tgt_ep, pld, t_out)
+                            gen, err = self._try_endpoint(tgt_ep, pld, t_out, pool_group=group)
                             if err:
                                 yield f"data: {{'choices':[{{'delta':{{'content':'\\n\\n[API Pool Error: 请求最终目标失败: {err}]'}}}}]}}\n\n".replace("'", '"')
                             else:
@@ -2649,24 +2905,33 @@ class APIPool:
                                     self._release_inflight(tgt_ep.id, group)
                         return vision_wrapper(ep, payload, ep_timeout, active)
                     else:
-                        payload["messages"] = self._translate_images_sync(payload["messages"], active)
+                        payload["messages"] = self._translate_images_sync(payload["messages"], active, group)
             
             if tried == 0:
-                sys_log(f"收到 API 请求，尝试请求端点 '{ep.name}' (模型: {ep_model})", "INFO")
+                sys_log(f"收到 API 请求，尝试请求端点 '{self._endpoint_log_label(ep, group, ep_model)}'", "INFO")
             else:
-                sys_log(f"重试请求，尝试请求端点 '{ep.name}' (模型: {ep_model})", "INFO")
+                sys_log(f"重试请求，尝试请求端点 '{self._endpoint_log_label(ep, group, ep_model)}'", "INFO")
             # 上下文长度检查：超过限制时跳过该端点（不冻结、不记失败），轮转到下一个
             if ep.max_context_k > 0:
                 estimated = self._estimate_context_tokens(loop_messages)
                 if estimated > ep.max_context_k * 1000:
-                    sys_log(f"端点 '{ep.name}' 上下文约 {estimated}t 超过限制 {ep.max_context_k}K，跳过", "INFO")
+                    sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 上下文约 {estimated}t 超过限制 {ep.max_context_k}K，跳过", "INFO")
                     tried += 1
                     idx = (idx + 1) % total
                     continue
 
             force_no_retry = getattr(ep, "priority", 0) == 99
+            # 每组最近成功 usage 的 site_id 与当前不同 = 新缓存账户。覆盖同请求
+            # 故障轮转、手动切换和恢复回切；只修正本地统计，不改客户端 usage。
+            reset_cached_stats = (
+                self._should_reset_cached_stats(group, ep.site_id)
+                or (previous_attempt_site_id is not None and previous_attempt_site_id != ep.site_id)
+            )
             if debug_trace is None:
-                result, error = self._try_endpoint(ep, payload, ep_timeout, force_no_retry=force_no_retry)
+                result, error = self._try_endpoint(
+                    ep, payload, ep_timeout, force_no_retry=force_no_retry,
+                    pool_group=group, reset_cached_stats=reset_cached_stats,
+                )
             else:
                 result, error = self._try_endpoint(
                     ep,
@@ -2674,7 +2939,10 @@ class APIPool:
                     ep_timeout,
                     force_no_retry=force_no_retry,
                     debug_trace=debug_trace,
+                    pool_group=group,
+                    reset_cached_stats=reset_cached_stats,
                 )
+            previous_attempt_site_id = ep.site_id
             if debug_trace is not None:
                 if result is not None:
                     outcome = "stream_opened" if payload.get("stream") else "success"
@@ -2706,7 +2974,7 @@ class APIPool:
                         # 非流式（或流已由 _try_endpoint 内部消费完）→ 立即释放在途占用；
                         # 流式 generator 的占用由消费方迭代结束时释放（见 stream close 路径）。
                         self._release_inflight(ep.id, group)
-                sys_log(f"端点 '{ep.name}' 请求成功 (延迟: 正常)", "INFO")
+                sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 请求成功", "INFO")
                 # 请求耗时 DEBUG（API_POOL_DEBUG / /api/debug 开关控制）
                 if _DEBUG_LOGGING:
                     try:
@@ -2731,7 +2999,7 @@ class APIPool:
                     return self._wrap_stream_release(result, ep.id, group)
                 return result
             errors.append(f"[{ep.name}] {error}")
-            sys_log(f"端点 '{ep.name}' 请求失败: {error}", "ERROR")
+            sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 请求失败: {error}", "ERROR")
             # 敏感词诊断只在 DEBUG 且确实出现相关拦截错误时执行；使用当前失败尝试的 payload，避免共享状态串扰。
             if _DEBUG_LOGGING and "sensitive" in str(error).lower():
                 d = self._build_cf_diag(payload)
@@ -2758,7 +3026,7 @@ class APIPool:
                     since_success = time.time() - ep._last_success_ts
                     if since_success < ep.timeout:
                         skip_cooldown = True
-                        sys_log(f"端点 '{ep.name}' 超时失败但 {since_success:.0f}s 前有成功响应（<timeout {ep.timeout}s），判定单请求饿死，不冻结", "WARN")
+                        sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 超时失败但 {since_success:.0f}s 前有成功响应（<timeout {ep.timeout}s），判定单请求饿死，不冻结", "WARN")
                 # 客户端类错误（改动二 A′）：不冻结、fail_count 不增、不探活，
                 # 同请求内继续轮转其余候选；全部候选同类失败时按现状把错误返回给客户端。
                 client_error = self._classify_client_error(error)
@@ -2795,16 +3063,16 @@ class APIPool:
                     if gateway_error or client_error:
                         # 网关错误：跳过候选探活直接重试（探活小请求无法鉴别网关故障）
                         # 客户端类错误：探活必然通过（小请求不带畸形 payload），无信息量，直接轮转
-                        sys_log(f"跳过候选端点 '{next_ep.name}' 探活直接重试", "INFO")
+                        sys_log(f"跳过候选端点 '{self._endpoint_log_label(next_ep, group)}' 探活直接重试", "INFO")
                         continue
                     # 对候选端点做探活
-                    sys_log(f"对候选端点 '{next_ep.name}' 进行探活...", "INFO")
+                    sys_log(f"对候选端点 '{self._endpoint_log_label(next_ep, group)}' 进行探活...", "INFO")
                     probe_ok, probe_error = self._probe_endpoint(next_ep)
                     if probe_ok:
-                        sys_log(f"候选端点 '{next_ep.name}' 探活通过，准备重试请求", "INFO")
+                        sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' 探活通过，准备重试请求", "INFO")
                         continue  # 探活通过，回到循环顶部用 next_ep 发起实际请求
                     else:
-                        sys_log(f"候选端点 '{next_ep.name}' 探活失败，跳过", "WARN")
+                        sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' 探活失败，跳过", "WARN")
                         self._rotate(next_ep, probe_error or "探活失败", probe_failed=True, group=group)
                         # 下一级探活也失败 → 并发探活剩余所有候选端点。
                         # 用 _check_one_health（含 Attempt 2 重试，最坏 20s）做参考性探测；
@@ -2969,8 +3237,10 @@ class APIPool:
     def _try_endpoint(
         self, ep, payload, timeout, log_usage=True, force_no_retry=False,
         is_probe=False, stream_stall_retry_used=False, debug_trace=None,
+        pool_group=None, reset_cached_stats=False,
     ):
         req_t0 = time.time()
+        endpoint_log_label = self._endpoint_log_label(ep, pool_group)
         prompt_text_to_log = extract_prompt_text(payload) if log_usage and not ep.name.startswith("test_") else ""
         
         # 协议层处理：Anthropic 端点做完整格式转换以保证 Kcne 缓存 key 一致性
@@ -3139,7 +3409,7 @@ class APIPool:
                                 _sock1.settimeout(_effective_pkt_timeout)
                                 first_line = resp.readline()
                             except socket.timeout:
-                                sys_log(f"endpoint {chr(39)}{ep.name}{chr(39)} stream first packet timeout ({_effective_pkt_timeout}s) attempt {attempt+1}", "WARN")
+                                sys_log(f"端点 '{endpoint_log_label}' 流式首包超时（{_effective_pkt_timeout}s，第 {attempt+1} 次）", "WARN")
                                 try:
                                     resp.close()
                                 except Exception:
@@ -3151,11 +3421,11 @@ class APIPool:
                                     continue
                                 return None, f"stream first packet timeout ({_effective_pkt_timeout}s)"
                             except Exception as e:
-                                sys_log(f"端点 '{ep.name}' 首包预读 socket 不可用({e})，依赖请求超时/总时长兜底", "WARN")
+                                sys_log(f"端点 '{endpoint_log_label}' 首包预读 socket 不可用({e})，依赖请求超时/总时长兜底", "WARN")
                         else:
                             # 2026-08-15: _get_resp_socket 失败时无法设 socket 超时，
                             # 只能依赖 urllib 的 timeout 参数（=ep.timeout），显式记录避免排障盲区
-                            sys_log(f"端点 '{ep.name}' 首包预读未取得 socket，依赖 urllib timeout({timeout or ep.timeout}s) 兜底", "WARN")
+                            sys_log(f"端点 '{endpoint_log_label}' 首包预读未取得 socket，依赖 urllib timeout({timeout or ep.timeout}s) 兜底", "WARN")
                     def stream_generator():
                         stream_id = f"chatcmpl-{int(time.time()*1000)}"
                         final_prompt_tokens = 0
@@ -3184,12 +3454,12 @@ class APIPool:
                             try:
                                 _sock2.settimeout(stall_timeout)
                             except Exception as e:
-                                sys_log(f"端点 '{ep.name}' 设置 stream_stall_timeout 失败({e})，依赖 stream_max_duration 兜底", "WARN")
+                                sys_log(f"端点 '{endpoint_log_label}' 设置 stream_stall_timeout 失败({e})，依赖 stream_max_duration 兜底", "WARN")
 
                         def _timeout_abort(reason):
                             """Handle an upstream stream stall without treating it as endpoint failure."""
                             has_output = bool(final_completion_text.strip() or final_reasoning_text.strip())
-                            sys_log(f"端点 '{ep.name}' {reason}（流式事务失败，不冻结端点）", "ERROR")
+                            sys_log(f"端点 '{endpoint_log_label}' {reason}（流式事务失败，不冻结端点）", "ERROR")
                             if not has_output and not stream_stall_retry_used:
                                 # Before any downstream bytes were emitted, retry the
                                 # same upstream endpoint inside API Pool. Hermes must
@@ -3202,6 +3472,7 @@ class APIPool:
                                     ep, payload, timeout, log_usage=log_usage,
                                     force_no_retry=True, is_probe=is_probe,
                                     stream_stall_retry_used=True,
+                                    pool_group=pool_group,
                                 )
                                 if retry_result is not None:
                                     yield from retry_result
@@ -3379,13 +3650,15 @@ class APIPool:
                             # 2026-08-15: 原逻辑静默吞掉流内所有异常——23:58:26 假死请求
                             # "收到后无任何日志"的直接原因。区分客户端断开(常见噪音)与上游异常(需记录)。
                             if isinstance(e, (ConnectionResetError, BrokenPipeError)):
-                                sys_log(f"端点 '{ep.name}' 流式响应客户端断开: {type(e).__name__}", "WARN")
+                                sys_log(f"端点 '{endpoint_log_label}' 流式响应客户端断开: {type(e).__name__}", "WARN")
                             else:
-                                sys_log(f"端点 '{ep.name}' 流式响应异常: {type(e).__name__}: {e}", "ERROR")
+                                sys_log(f"端点 '{endpoint_log_label}' 流式响应异常: {type(e).__name__}: {e}", "ERROR")
                         finally:
                             if has_usage and log_usage and not ep.name.startswith("test_"):
-                                token_tracker.add_usage(ep.name, ep.model, final_prompt_tokens, final_completion_tokens, final_total_tokens, final_cached_tokens)
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, final_completion_text.strip() or final_reasoning_text.strip(), final_total_tokens, int((time.time() - req_t0) * 1000))
+                                stats_cached_tokens = 0 if reset_cached_stats else final_cached_tokens
+                                token_tracker.add_usage(ep.name, ep.model, final_prompt_tokens, final_completion_tokens, final_total_tokens, stats_cached_tokens)
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, final_completion_text.strip() or final_reasoning_text.strip(), final_total_tokens, int((time.time() - req_t0) * 1000), pool_group, final_prompt_tokens, stats_cached_tokens)
+                                self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
                                 ep._today_used += final_total_tokens
                             resp.close()
                     return stream_generator(), ""
@@ -3416,8 +3689,10 @@ class APIPool:
                             tot = prompt_t + u.get("output_tokens", 0)
                             cached = u.get("cache_read_input_tokens", 0)
                             if log_usage and not ep.name.startswith("test_"):
-                                token_tracker.add_usage(ep.name, ep.model, prompt_t, u.get("output_tokens", 0), tot, cached)
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, reply.strip() or reasoning.strip(), tot, int((time.time() - req_t0) * 1000))
+                                stats_cached = 0 if reset_cached_stats else cached
+                                token_tracker.add_usage(ep.name, ep.model, prompt_t, u.get("output_tokens", 0), tot, stats_cached)
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, reply.strip() or reasoning.strip(), tot, int((time.time() - req_t0) * 1000), pool_group, prompt_t, stats_cached)
+                                self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
                                 ep._today_used += tot
                         stop_reason = body.get("stop_reason")
                         finish_reason = {
@@ -3455,7 +3730,7 @@ class APIPool:
                         if ep.check_fake_success:
                             _reply_text = reply.strip()
                             if _reply_text and any(p in _reply_text for p in FAKE_SUCCESS_PATTERNS):
-                                sys_log(f"端点 '{ep.name}' 假成功（内容匹配拒绝模式）", "WARNING")
+                                sys_log(f"端点 '{endpoint_log_label}' 假成功（内容匹配拒绝模式）", "WARNING")
                                 return None, "fake-success: 内容匹配拒绝模式"
                         return o_body, ""
                     else:
@@ -3468,15 +3743,17 @@ class APIPool:
                             if "prompt_tokens_details" in u and isinstance(u["prompt_tokens_details"], dict):
                                 cached = u["prompt_tokens_details"].get("cached_tokens", 0)
                             if log_usage and not ep.name.startswith("test_"):
-                                token_tracker.add_usage(ep.name, ep.model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), tot, cached)
+                                stats_cached = 0 if reset_cached_stats else cached
+                                token_tracker.add_usage(ep.name, ep.model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), tot, stats_cached)
                                 log_text = content.strip() or reasoning.strip()
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000))
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000), pool_group, u.get("prompt_tokens", 0), stats_cached)
+                                self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
                                 ep._today_used += tot
                         # 假成功检测（仅端点启用时）
                         if ep.check_fake_success:
                             _content_text = (content or reasoning or "").strip()
                             if _content_text and any(p in _content_text for p in FAKE_SUCCESS_PATTERNS):
-                                sys_log(f"端点 '{ep.name}' 假成功（内容匹配拒绝模式）", "WARNING")
+                                sys_log(f"端点 '{endpoint_log_label}' 假成功（内容匹配拒绝模式）", "WARNING")
                                 return None, "fake-success: 内容匹配拒绝模式"
                         return body, ""
                     
@@ -3501,6 +3778,8 @@ class APIPool:
                         log_usage=log_usage,
                         force_no_retry=True,
                         debug_trace=debug_trace,
+                        pool_group=pool_group,
+                        reset_cached_stats=reset_cached_stats,
                     )
                 if e.code == 429: return None, msg + " (429 rate-limited)"
                 if e.code in (401, 403): return None, msg + " (auth error)"
@@ -3809,7 +4088,18 @@ def api_handler(method, path, body):
         qs = dict(q.split("=") for q in parsed.query.split("&") if "=" in q) if parsed.query else {}
         limit = int(qs.get("limit", 50))
         offset = int(qs.get("offset", 0))
-        return 200, chat_logger.get_logs(limit=limit, offset=offset), False
+        # 列表页 detail=false 不拉正文（33MB→KB 级）；详情面板按 id 单独取
+        detail = qs.get("detail", "true").lower() != "false"
+        return 200, chat_logger.get_logs(limit=limit, offset=offset, detail=detail), False
+    if method == "GET" and cp == "/api/chat-log":
+        qs = dict(q.split("=") for q in parsed.query.split("&") if "=" in q) if parsed.query else {}
+        log_id = qs.get("id", "")
+        if not log_id:
+            return 400, {"error": "缺少 id 参数"}, False
+        one = chat_logger.get_log_by_id(log_id)
+        if one is None:
+            return 404, {"error": "记录不存在"}, False
+        return 200, one, False
 
     if method == "DELETE" and cp == "/api/chat-logs":
         chat_logger.clear_logs()
@@ -3827,6 +4117,24 @@ def api_handler(method, path, body):
         return 200, {"ok": True}, False
 
     if method == "GET" and cp == "/api/endpoints": return 200, pool.list_endpoints(), False
+    if method == "GET" and cp.startswith("/api/endpoints/") and cp.endswith("/models"):
+        ep_id = unquote(cp[len("/api/endpoints/"):-len("/models")]).strip("/")
+        if not ep_id:
+            return 400, {"error": "缺少端点 id"}, False
+        try:
+            models = pool.fetch_endpoint_models(ep_id)
+            return 200, {"ok": True, "models": models, "count": len(models)}, False
+        except KeyError as exc:
+            return 404, {"error": str(exc.args[0])}, False
+        except urllib.error.HTTPError as exc:
+            err_body = ""
+            try:
+                err_body = exc.read().decode("utf-8", errors="ignore")[:200]
+            except Exception:
+                pass
+            return 200, {"ok": False, "error": f"HTTP {exc.code}: {err_body}"}, False
+        except Exception as exc:
+            return 200, {"ok": False, "error": str(exc)}, False
     if method == "GET" and cp == "/api/chain":
         chain = pool.get_active_chain()
         # 分组池：附加 per-group 汇总（各组当前指针 + fallback 计数），驱动 UI 组视图
@@ -3866,6 +4174,31 @@ def api_handler(method, path, body):
             return 400, {"error": msg}, False
         _sync_to_config()
         return 201, {"ok": True, "name": msg}, False
+    if method == "POST" and cp.startswith("/api/groups/") and cp.endswith("/replace-model"):
+        gname = unquote(cp[len("/api/groups/"):-len("/replace-model")]).strip("/")
+        source_ep_id = str(body.get("endpoint_id", "") or "").strip()
+        model = str(body.get("model", "") or "").strip()
+        if not gname or not source_ep_id or not model:
+            return 400, {"error": "需要分组、endpoint_id 和 model"}, False
+        try:
+            replacement, created, pointer_moved = pool.replace_group_model(gname, source_ep_id, model)
+            _sync_to_config()
+            if pointer_moved:
+                state = load_runtime_state() or {}
+                loaded = state.get("groups") if isinstance(state.get("groups"), dict) else None
+                groups_state: dict = dict(loaded) if loaded is not None else {}
+                groups_state[gname] = replacement.id
+                if not save_runtime_state_groups(groups_state):
+                    return 500, {"error": "运行态指针持久化失败"}, False
+            return 200, {
+                "ok": True,
+                "created": created,
+                "endpoint": pool._ep_to_dict(replacement, False, time.time()),
+            }, False
+        except KeyError as exc:
+            return 404, {"error": str(exc.args[0])}, False
+        except ValueError as exc:
+            return 400, {"error": str(exc)}, False
     if method == "PUT" and cp.startswith("/api/groups/"):
         gname = unquote(cp[len("/api/groups/"):])
         ok, msg = pool.update_group(gname, body)
@@ -3884,6 +4217,32 @@ def api_handler(method, path, body):
     # ================= 聚合池管理 =================
     if method == "GET" and cp == "/api/pool":
         return 200, [ep for ep in pool.list_endpoints() if ep.get("in_pool")], False
+    if method == "POST" and cp.startswith("/api/pool/") and cp.endswith("/select-model"):
+        source_ep_id = unquote(cp[len("/api/pool/"):-len("/select-model")]).strip("/")
+        group = str(body.get("group", "") or "").strip()
+        model = str(body.get("model", "") or "").strip()
+        if not source_ep_id or not group or not model:
+            return 400, {"error": "需要端点、group 和 model"}, False
+        try:
+            replacement, created, pointer_moved = pool.replace_group_model(group, source_ep_id, model)
+            _sync_to_config()
+            if pointer_moved:
+                state = load_runtime_state() or {}
+                loaded = state.get("groups") if isinstance(state.get("groups"), dict) else None
+                groups_state: dict = dict(loaded) if loaded is not None else {}
+                groups_state[group] = replacement.id
+                if not save_runtime_state_groups(groups_state):
+                    return 500, {"error": "运行态指针持久化失败"}, False
+            return 200, {
+                "ok": True,
+                "action": "cloned" if created else "reused",
+                "endpoint_id": replacement.id,
+                "endpoint_name": replacement.name,
+            }, False
+        except KeyError as exc:
+            return 404, {"error": str(exc.args[0])}, False
+        except ValueError as exc:
+            return 400, {"error": str(exc)}, False
     if method == "POST" and cp.startswith("/api/pool/"):
         ep_id = unquote(cp.split("/")[-1])
         # 分组池：?groups=main,bg 入池同时指定组（缺省保持原组不变；兼容旧调用）
@@ -3936,6 +4295,7 @@ def api_handler(method, path, body):
         for i, item in enumerate(items):
             ep = {
                 "name": item.get("name", base.get("name", f"ep_{i}")), "base_url": item.get("base_url", base.get("base_url", "")),
+                "site_name": item.get("site_name", base.get("site_name", "")),
                 "api_key": item.get("api_key", base.get("api_key", "")), "model": item.get("model", ""),
                 "priority": item.get("priority", start_priority + i), "timeout": item.get("timeout", base.get("timeout", 60)),
                 "max_retries": item.get("max_retries", base.get("max_retries", 1)), "cooldown_minutes": item.get("cooldown_minutes", base.get("cooldown_minutes", 5)),
@@ -3996,6 +4356,7 @@ def api_handler(method, path, body):
             if ep["id"] == ep_id: target_ep = ep; break
         if not target_ep: return 404, {"error": "端点不存在"}, False
         test_pool = APIPool()
+        test_pool._state_persistence_disabled = True  # 测试池不污染 api_runtime_state.json
         test_pool.add_endpoint({"name": target_ep["name"], "base_url": target_ep["base_url"], "api_key": target_ep["api_key_full"], "model": target_ep["model"], "priority": 1, "timeout": target_ep["timeout"], "max_retries": target_ep["max_retries"], "enabled": True, "in_pool": True, "use_proxy": target_ep.get("use_proxy", True), "protocol": target_ep.get("protocol", "openai"), "default_headers": target_ep.get("default_headers", {}), "is_vision": target_ep.get("is_vision", True)})
         
         img = body.get("image")
@@ -4046,7 +4407,7 @@ def _sync_to_config():
     for gname, gd in pool._group_defs.items():
         if gname != pool.MAIN_GROUP:
             defs_list.append({"name": gname, "type": gd.get("type", "mixed"), "model": gd.get("model", gname)})
-    save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "default_headers": ep.get("default_headers", {}), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
+    save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
             "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list)
 
 
@@ -4104,6 +4465,8 @@ class Handler(BaseHTTPRequestHandler):
             body = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            # no-cache：允许浏览器缓存但每次回源校验（配合 mtime 热更新，前端改动普通刷新即见）
+            self.send_header("Cache-Control", "no-cache")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

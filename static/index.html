@@ -106,6 +106,24 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
   .modal-overlay .modal .form-actions{flex-direction:column;gap:6px}
   .modal-overlay .modal .form-actions .btn{width:100%}
 }
+@media(max-width:768px){
+  /* 对话日志：列表/详情纵向堆叠。行布局保持 PC 端 7 列不变，窄屏横向滚动查看 */
+  .chatlog-layout{flex-direction:column!important;height:auto!important;min-height:0!important}
+  .chatlog-listwrap{min-height:0}
+  /* 表头已搬入滚动容器，listwrap 首个子元素即滚动区；flex:1(inline) basis:0 会架空高度 */
+  .chatlog-listwrap>div:first-child{flex:0 0 200px!important}
+  .chatlog-detail{margin-top:12px;overflow:visible!important}
+  .chatlog-detail>div{flex:0 0 auto!important;height:260px!important;min-height:0!important}
+  /* Prompt/Completion 内容超高时在面板内纵向滚动；禁横向滚动（内容已 wrap，横滑无意义） */
+  .chatlog-detail pre{max-height:212px!important;overflow-y:auto!important;overflow-x:hidden!important}
+  /* 横向滚动分层：chatLogsList 只管纵向，chatLogsX 管横向，避免 touch 纵向滚动连带横移 */
+  #chatLogsList{overflow-x:hidden!important}
+  #chatLogsX{overflow-x:auto!important;-webkit-overflow-scrolling:touch!important;scrollbar-width:none!important}
+  #chatLogsX::-webkit-scrollbar{display:none!important}
+  .chatlog-grid{grid-template-columns:60px repeat(6,minmax(96px,1fr))!important;min-width:700px!important;box-sizing:border-box}
+  .cl-ep{display:block}
+  .cl-model{display:block}
+}
 @media(max-width:480px){
   body{padding:8px 6px;font-size:12px}
   .dash-stats{grid-template-columns:1fr 1fr;gap:6px}
@@ -176,6 +194,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .filter-btn:hover{border-color:var(--accent);color:var(--accent-light)}
 .filter-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
 .filter-count{font-size:11px;color:var(--text-dim);margin-left:auto}
+.pool-model-select{max-width:240px;padding:2px 5px;cursor:pointer;font-size:11px;color:var(--text-dim)}
 
 .ep-list{display:flex;flex-direction:column;gap:6px;flex:1;overflow-y:auto;min-height:0;overscroll-behavior:contain;padding-right:2px}
 .ep-item{background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:12px;padding:12px 14px;transition:all .2s cubic-bezier(0.2,0.8,0.2,1)}
@@ -398,23 +417,32 @@ select option { background: var(--bg); color: var(--text); }
       <div class="card-title" style="margin-bottom:0;"><span class="icon">💬</span> 对话日志 (Audit Logs)</div>
       <button class="btn btn-ghost btn-sm" onclick="clearChatLogs()" style="color:var(--red); padding:2px 8px;">🗑 清空记录</button>
     </div>
-    <div style="display:flex; gap:15px; height:450px; min-height:300px;">
+    <div class="chatlog-layout" style="display:flex; gap:15px; height:450px; min-height:300px;">
       <!-- List View -->
-      <div style="flex:1; display:flex; flex-direction:column; border:1px solid var(--border); border-radius:8px; overflow:hidden;">
-        <div style="background:rgba(255,255,255,0.05); padding:8px 12px; font-weight:bold; border-bottom:1px solid var(--border); display:grid; grid-template-columns: 80px 1fr 1fr 80px; gap:8px; font-size:12px;">
-          <span>时间</span><span>端点</span><span>模型</span><span>Tokens</span>
+      <div class="chatlog-listwrap" style="flex:1; display:flex; flex-direction:column; border:1px solid var(--border); border-radius:8px; overflow:hidden;">
+        <div class="chatlog-grid chatlog-header" style="background:rgba(255,255,255,0.05); padding:8px 12px; font-weight:bold; border-bottom:1px solid var(--border); display:grid; grid-template-columns: 80px repeat(6, 1fr); gap:8px; font-size:12px;">
+          <span>时间</span><span>池组</span><span>端点</span><span>模型</span><span>延迟</span><span>缓存命中</span><span>Tokens</span>
         </div>
-        <div id="chatLogsList" style="flex:1; overflow-y:auto;">
-          <!-- Items inserted here -->
+        <div style="flex:1; position:relative; overflow:hidden;">
+          <div id="chatLogsList" style="position:absolute; top:0; left:0; right:0; bottom:0; overflow-y:auto; scrollbar-width:none; -ms-overflow-style:none;">
+            <!-- 移动端由 arrangeChatHeader() 把表头搬入此处，横向滚动同步、纵向 sticky 吸顶 -->
+            <div id="chatLogsX"><!-- 横向滚动层：表头+数据行共用 -->
+              <div id="chatLogsRows"><!-- Items inserted here --></div>
+            </div>
+          </div>
+          <!-- 自绘悬浮滚动条：绝对定位浮于内容之上，不占布局（列宽与表头恒一致） -->
+          <div id="clSbTrack" style="position:absolute; top:2px; right:2px; bottom:2px; width:6px; border-radius:3px; z-index:3; display:none;">
+            <div id="clSbThumb" style="width:100%; border-radius:3px; background:rgba(255,255,255,.18); cursor:pointer; position:absolute; top:0;"></div>
+          </div>
         </div>
         <div style="padding:8px; text-align:center; border-top:1px solid var(--border);">
-            <button class="btn btn-ghost btn-sm" onclick="loadChatLogs(chatLogsPage-1)" id="clPrevBtn">上一页</button>
+            <button class="btn btn-ghost btn-sm" onclick="loadChatLogs(chatLogsPage-1, {resetScroll:true})" id="clPrevBtn">上一页</button>
             <span style="margin:0 10px;font-size:12px;" id="clPageSpan">1</span>
-            <button class="btn btn-ghost btn-sm" onclick="loadChatLogs(chatLogsPage+1)" id="clNextBtn">下一页</button>
+            <button class="btn btn-ghost btn-sm" onclick="loadChatLogs(chatLogsPage+1, {resetScroll:true})" id="clNextBtn">下一页</button>
         </div>
       </div>
       <!-- Detail View -->
-      <div style="flex:1; display:flex; flex-direction:column; gap:15px; overflow:hidden; min-height:0;">
+      <div class="chatlog-detail" style="flex:1; display:flex; flex-direction:column; gap:15px; overflow:hidden; min-height:0;">
         <div style="flex:1; display:flex; flex-direction:column; border:1px solid var(--border); border-radius:8px; background:rgba(0,0,0,0.3); min-height:0;">
           <div style="padding:6px 10px; background:var(--card); font-size:12px; color:var(--text-dim); border-bottom:1px solid var(--border);">Prompt</div>
           <pre id="clPrompt" style="flex:1; overflow-y:auto; padding:10px; margin:0; font-size:12px; white-space:pre-wrap; word-break:break-all; min-height:0;"></pre>
@@ -499,7 +527,10 @@ select option { background: var(--bg); color: var(--text); }
   <div class="modal">
     <h2 id="modalTitle">添加端点</h2>
     <input type="hidden" id="editName">
-    <div class="form-group"><label>名称</label><input type="text" id="fName" placeholder="如 OpenAI 或 DeepSeek" oninput="this.dataset.autofilled='false'"></div>
+    <div class="form-row">
+      <div class="form-group"><label>名称</label><input type="text" id="fName" placeholder="如 OpenAI 或 DeepSeek" oninput="this.dataset.autofilled='false'"></div>
+      <div class="form-group"><label title="用于端点列表按站点筛选；同一站点的多个端点填写相同名称">站点名称</label><input type="text" id="fSiteName" placeholder="如 OpenAI"></div>
+    </div>
     <div class="form-group"><label>Base URL</label><input type="text" id="fUrl" placeholder="https://api.openai.com/v1" oninput="checkFetchBtn()"></div>
     <div class="form-group"><label>API Key</label><input type="text" id="fKey" placeholder="sk-..." oninput="checkFetchBtn()"></div>
     <div class="form-group"><label title="发送给该端点的自定义 User-Agent；留空使用默认值">User-Agent（可选）</label><input type="text" id="fUserAgent" placeholder="如 hermes-agent/0.20.1"></div>
@@ -525,8 +556,6 @@ select option { background: var(--bg); color: var(--text); }
         <select id="fVision"><option value="true">👁️ 原生支持</option><option value="false">🚫 不支持 (触发自动转译)</option></select>
       </div>
     <div class="form-row">
-      <div class="form-group"><label>启用</label><select id="fEnabled"><option value="true">是</option><option value="false">否</option></select></div>
-      <div class="form-group"><label>加入聚合池</label><select id="fPool"><option value="false">否（仅保存）</option><option value="true">是（参与轮换）</option></select></div>
       <div class="form-group"><label title="检测上游返回内容是否含拒绝信息，从而触发自动轮转">假成功检测</label><select id="fFakeCheck"><option value="false">关闭</option><option value="true">开启</option></select></div>
       <div class="form-group"><label title="开启后，本端点工作时会保护其缓存：其他端点恢复后暂不切走；关闭后允许立即回切到恢复端点">缓存保护</label><select id="fDeferrable"><option value="true">开启（延迟切走）</option><option value="false">关闭（允许立即回切）</option></select></div>
       <div class="form-group"><label title="最大上下文长度（K=1000 tokens），0=不限。超过此长度时自动跳过该端点，避免账号被限制">上下文限制</label><input type="number" id="fMaxContext" value="0" min="0" placeholder="0=不限, 如 128"></div>
@@ -550,7 +579,7 @@ select option { background: var(--bg); color: var(--text); }
       <div class="form-group"><label title="流式首包超时（秒），0=禁用独立超时。超过视为端点故障并重试">首包超时 (秒)</label><input type="number" id="fStreamFirstPacket" value="120" min="0" placeholder="0=禁用, 默认120"></div>
       <div class="form-group"><label title="流式无新数据停滞判定（秒），0=禁用停滞检测。停滞不冻结端点，仅事务失败">停滞判定 (秒)</label><input type="number" id="fStreamStall" value="60" min="0" placeholder="0=禁用, 默认60"></div>
       <div class="form-group"><label title="流式总时长上限（秒），0=禁用。超过后截断并标记事务失败，不冻结端点">总时长上限 (秒)</label><input type="number" id="fStreamMaxDuration" value="120" min="0" placeholder="0=禁用, 默认120"></div>
-      <div class="form-group"><label title="所属路由组（逗号分隔，2026-08-29 分组池）。请求 model 字段精确匹配组名即路由到该组；main=默认主组；跨组共享端点在其他组占用时自动避让">路由组</label><input type="text" id="fPoolGroups" placeholder="main（默认），如 bg 或 main,bg" value="main"></div>
+
     </div>
     <div class="form-group">
       <label>后台探针</label>
@@ -581,6 +610,9 @@ async function api(method,path,body){const opts={method,headers:{'Content-Type':
 
 let allModels=[],selectedModels=new Set(),latencyResults={},visionResults={};
 let epFilter='all',modelPage=1,PP=50;
+const endpointModelsCache=new Map();
+const ENDPOINT_MODELS_CACHE_MS=5*60*1000;
+let loadingPoolModelSelect=null;
 
 async function refresh(){
   const[eps,chainRes,groupsRes]=await Promise.all([api('GET','/api/endpoints'),api('GET','/api/chain'),api('GET','/api/groups')]);
@@ -590,9 +622,9 @@ async function refresh(){
   window._groupDefs = (groupsRes && groupsRes.groups) ? groupsRes.groups : []; // 组实体（2026-08-30 组管理弹窗）
   window._allEps = eps; // 入池弹层读取端点当前组（回显勾选）
   renderStats(eps);renderFilterBar(eps);renderEndpoints(eps);
-  // 优先级下拉框展开/操作期间，避免 5s 自动刷新重建 DOM 导致下拉框收回
+  // 优先级下拉框或模型选择器展开期间，避免自动刷新重建 DOM 导致控件收回
   const active = document.activeElement;
-  if (!(active && active.tagName === 'SELECT' && active.closest('#poolList'))) {
+  if (!loadingPoolModelSelect && !(active && active.tagName === 'SELECT' && active.closest('#poolList'))) {
     renderPoolList(eps);
   }
   renderChain(chain);
@@ -630,50 +662,19 @@ function renderStats(eps){
 }
 
 function renderFilterBar(eps){
-  const en=eps.filter(e=>e.enabled).length;
-  const vision=eps.filter(e=>e.is_vision!==false).length;
-  const payperuse=eps.filter(e=>e.billing_mode==='pay_per_use').length;
+  const sites=new Map();
+  for(const ep of eps){
+    const site=String(ep.site_name||'').trim();
+    if(site)sites.set(site,(sites.get(site)||0)+1);
+  }
+  if(epFilter!=='all'&&!sites.has(epFilter))epFilter='all';
   document.getElementById('filterBar').innerHTML=`
     <button class="filter-btn ${epFilter==='all'?'active':''}" onclick="setFilter('all')">全部 ${eps.length}</button>
-    <button class="filter-btn ${epFilter==='enabled'?'active':''}" onclick="setFilter('enabled')">启用 ${en}</button>
-    <button class="filter-btn ${epFilter==='disabled'?'active':''}" onclick="setFilter('disabled')">禁用 ${eps.length-en}</button>
-    <button class="filter-btn ${epFilter==='pooled'?'active':''}" onclick="setFilter('pooled')">已聚合 ${eps.filter(e=>e.in_pool).length}</button>
-    <button class="filter-btn ${epFilter==='vision'?'active':''}" onclick="setFilter('vision')">视觉 ${vision}</button>
-    <button class="filter-btn ${epFilter==='payperuse'?'active':''}" onclick="setFilter('payperuse')">按次 ${payperuse}</button>
-    ${(()=>{const vc=vendorCounts(eps);const names=Object.keys(vc).filter(v=>v!=='其他').sort((a,b)=>vc[b]-vc[a]||a.localeCompare(b));if(vc['其他'])names.push('其他');return names.map(v=>`<button class="filter-btn ${epFilter==='vendor:'+v?'active':''}" onclick="setFilter('vendor:${v}')">${esc(v)} ${vc[v]}</button>`).join('');})()}
-
+    ${[...sites.entries()].sort((a,b)=>a[0].localeCompare(b[0])).map(([site,count])=>`<button class="filter-btn ${epFilter===site?'active':''}" data-site="${escAttr(site)}">${esc(site)} ${count}</button>`).join('')}
     <span class="filter-count" id="filterCount"></span>`;
+  document.querySelectorAll('#filterBar [data-site]').forEach(btn=>btn.addEventListener('click',()=>setFilter(btn.dataset.site)));
 }
 function setFilter(f){epFilter=f;refresh();}
-
-// ── 厂商过滤：按 model 前缀映射厂商，未匹配归「其他」 ──
-const VENDOR_PREFIXES = [
-  ['deepseek', 'DeepSeek'],
-  ['glm', '智谱'],
-  ['gpt', 'OpenAI'],
-  ['claude', 'Anthropic'],
-  ['qwen', 'Qwen'],
-  ['step', '阶跃星辰'],
-  ['grok', 'xAI'],
-  ['kimi', '月之暗面'],
-  ['minimax', 'MiniMax'],
-  ['mimo', '小米'],
-  ['hy3', 'Hy3'],
-  ['seed', '字节'],
-  ['muse', 'Muse'],
-  ['ox-', 'OX'],
-];
-function vendorOf(model){
-  const m = String(model || '').toLowerCase();
-  for(const [p, v] of VENDOR_PREFIXES){ if(m.startsWith(p)) return v; }
-  return '其他';
-}
-function vendorCounts(eps){
-  const c = {};
-  for(const e of eps){ const v = vendorOf(e.model); c[v] = (c[v] || 0) + 1; }
-  return c;
-}
-function isVendorFilter(f){ return typeof f === 'string' && f.startsWith('vendor:'); }
 
 function hBadge(h,lat){
   const m={ok:['badge-h-ok','✅'],slow:['badge-h-slow','🐢'],bad:['badge-h-bad','❌'],unknown:['badge-h-unknown','❓'],testing:['badge-h-unknown','⏳']};
@@ -682,12 +683,7 @@ function hBadge(h,lat){
 }
 
 function renderEndpoints(eps){
-  if(epFilter==='enabled')eps=eps.filter(e=>e.enabled);
-  else if(epFilter==='disabled')eps=eps.filter(e=>!e.enabled);
-  else if(epFilter==='pooled')eps=eps.filter(e=>e.in_pool);
-  else if(epFilter==='vision')eps=eps.filter(e=>e.is_vision!==false);
-  else if(epFilter==='payperuse')eps=eps.filter(e=>e.billing_mode==='pay_per_use');
-  else if(isVendorFilter(epFilter))eps=eps.filter(e=>vendorOf(e.model)===epFilter.slice(7));
+  if(epFilter!=='all')eps=eps.filter(e=>String(e.site_name||'').trim()===epFilter);
 
   const c=document.getElementById('filterCount');if(c)c.textContent=`${eps.length} 个`;
   const el=document.getElementById('epList');
@@ -757,12 +753,13 @@ function renderPoolList(eps){
   if(cnt)cnt.textContent=poolEps.length+' 个成员';
   if(!poolEps.length){el.innerHTML='<div class="empty">聚合池为空，从左侧添加端点</div>';return;}
   const groupsInfo=window._poolGroups||{};
+  const groupDefs=window._groupDefs||[];
   const groupsOf=(e)=>((e.pool_groups&&e.pool_groups.length)?e.pool_groups:['main']);
-  const groups=[];
+  const groups=['main'];
+  for(const gd of groupDefs) if(gd.name&&gd.name!=='main'&&!groups.includes(gd.name)) groups.push(gd.name);
   for(const e of poolEps){
     for(const g of groupsOf(e)) if(g!=='main'&&!groups.includes(g)) groups.push(g);
   }
-  groups.unshift('main');
   const multiGroup=groups.length>1||groups[0]!=='main';
   const displayGroup=multiGroup?poolGroupFilter:'main';
   const cardOf=(ep)=>{
@@ -800,7 +797,7 @@ function renderPoolList(eps){
         </div>
       </div>
       <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
-        <span style="color:var(--text-dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(ep.model||'')}</span>
+        <select class="btn btn-ghost btn-sm pool-model-select" data-loaded="false" data-current-model="${escAttr(ep.model||'')}" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onfocus="loadPoolModelOptions(this,'${escAttr(ep.id)}')" onchange="changePoolModel(this,'${escAttr(ep.id)}','${escAttr(displayGroup)}')" title="修改当前组使用的模型"><option value="${escAttr(ep.model||'')}">${esc(ep.model||'未设置模型')}</option></select>
         <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
           <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority('${ep.id}', this.value, '${esc(displayGroup)}');this.blur()" title="修改组内优先级">${options}</select>
           <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="${ep.enabled?'暂停端点':'恢复端点'}" onclick="toggleEndpoint('${ep.id}')">${ep.enabled?'⏸':'▶'}</button>
@@ -822,7 +819,7 @@ function renderPoolList(eps){
   const barHtml=groups.map(gr=>{
     const gi=groupsInfo[gr]||{};
     const memN=poolEps.filter(e=>groupsOf(e).includes(gr)).length;
-    const icon=gr==='main'?'🏊':'🗂';
+    const icon=gr==='main'?'🏊':'';
     const gDef=(window._groupDefs||[]).find(x=>x.name===gr)||{};
     const selTip=gDef.model&&gDef.model!==gr?` · 选择器：${esc(gDef.model)}`:'';
     const typeTip=gDef.type==='dedicated'?' · 专用型（绑定 '+esc(gDef.model)+'）':'';
@@ -840,6 +837,48 @@ function renderPoolList(eps){
     </div>
   </div>`;
   el.innerHTML=`<div class="filter-bar" style="margin-bottom:8px">${barHtml}</div>`+statusHtml+members.map(cardOf).join('');
+}
+
+async function endpointModels(endpointId){
+  const now=Date.now(),cached=endpointModelsCache.get(endpointId);
+  if(cached&&now-cached.at<ENDPOINT_MODELS_CACHE_MS)return cached.models;
+  const res=await api('GET',`/api/endpoints/${encodeURIComponent(endpointId)}/models`);
+  if(!res.ok)throw new Error(res.error||'获取模型失败');
+  const models=[...new Set((Array.isArray(res.models)?res.models:[]).map(item=>typeof item==='string'?item:item&&item.id).filter(Boolean).map(String))].sort((a,b)=>a.localeCompare(b));
+  endpointModelsCache.set(endpointId,{at:now,models});
+  return models;
+}
+async function loadPoolModelOptions(select,endpointId){
+  if(select.dataset.loaded==='true'||loadingPoolModelSelect===select)return;
+  loadingPoolModelSelect=select;
+  const current=select.dataset.currentModel||select.value;
+  select.innerHTML=`<option value="${escAttr(current)}">${esc(current||'当前模型')}</option><option disabled>加载模型中...</option>`;
+  try{
+    const models=await endpointModels(endpointId);
+    if(!models.includes(current))models.unshift(current);
+    select.innerHTML=models.map(model=>`<option value="${escAttr(model)}" ${model===current?'selected':''}>${esc(model)}</option>`).join('');
+    select.dataset.loaded='true';
+  }catch(err){
+    select.innerHTML=`<option value="${escAttr(current)}">${esc(current||'获取失败')}</option>`;
+    toast(err.message||'获取模型失败','error');
+  }finally{
+    loadingPoolModelSelect=null;
+  }
+}
+async function changePoolModel(select,endpointId,group){
+  const model=select.value,current=select.dataset.currentModel||'';
+  if(!model||model===current){select.blur();return;}
+  select.disabled=true;
+  try{
+    const res=await api('POST',`/api/pool/${encodeURIComponent(endpointId)}/select-model`,{group,model});
+    if(!res.ok)throw new Error(res.error||'切换模型失败');
+    toast(`已切换为 ${model}`,'success');
+    await refresh();
+  }catch(err){
+    select.value=current;
+    select.disabled=false;
+    toast(err.message||'切换模型失败','error');
+  }
 }
 
 // ── 组管理（2026-08-30）：新建/编辑分组弹窗 ──
@@ -869,7 +908,7 @@ function openGroupModal(editName){
         </select></div>
       <div class="form-group"><label id="gModelLabel">${modelLabel}</label><input type="text" id="gModel" value="${esc(g.model||'')}" placeholder="${g.type==='dedicated'?'如 deepseek-v4-flash':'缺省=组名'}"></div>
       ${g.is_main?'<div style="font-size:11px;color:var(--text-dim)">main 组为保留主组：名称/类型/选择器均锁定</div>':''}
-      ${editing&&!g.is_main?'<button class="btn btn-ghost" style="color:var(--red);justify-content:flex-start" onclick="deletePoolGroup(\'${esc(g.name)}\')">🗑 删除该分组（成员移出）</button>':''}
+      ${editing&&!g.is_main?`<button class="btn btn-ghost" style="color:var(--red);justify-content:flex-start" onclick="deletePoolGroup('${esc(g.name)}')">🗑 删除该分组（成员移出）</button>`:''}
     </div>
     <div class="form-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
       <button class="btn btn-ghost" onclick="closeGroupModal()">取消</button>
@@ -935,7 +974,7 @@ function renderChain(chain){
       gEl.innerHTML=`<div class="filter-bar" style="margin-bottom:8px">`+allGroups.map(g=>{
         const info=gs[g]||{};
         const memN=chain.filter(it=>chainGroupsOf(it).includes(g)).length;
-        const icon=g==='main'?'🏊':'🗂';
+        const icon=g==='main'?'🏊':'';
         const tip=`当前端点：${info.current_endpoint?esc(info.current_endpoint):'无'}${info.fallback_count>0?' · 已 fallback '+info.fallback_count+' 次':''}`;
         return `<button class="filter-btn ${g===chainGroupFilter?'active':''}" onclick="setChainGroupFilter('${esc(g)}')" title="${tip}">${icon}${esc(g)} ${memN}</button>`;
       }).join('')+`</div>`+
@@ -958,7 +997,7 @@ function renderChain(chain){
     else if(it.is_deferred)cls+=' deferred';
     else if(isCurHere)cls+=' active';
     else if(it.health==='bad'||it.fail_count>0)cls+=' failed';
-    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">💳余额不足·手动解冻</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(it.is_deferred?'<span class="badge badge-deferred">⏳延迟回切 '+fmtTime(it.defer_remaining)+'</span>':(isCurHere?'<span class="badge badge-success">服务中</span>':(it.is_current?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:9px;padding:1px 5px" title="本组未使用：它是其他组的当前端点">🗂${esc(cg.filter(g=>g!==chainGroupFilter).join('·'))} 当前</span>`:''))));
+    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">💳余额不足·手动解冻</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(it.is_deferred?'<span class="badge badge-deferred">⏳延迟回切 '+fmtTime(it.defer_remaining)+'</span>':(isCurHere?'<span class="badge badge-success">服务中</span>':(it.is_current?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:9px;padding:1px 5px" title="本组未使用：它是其他组的当前端点">${esc(cg.filter(g=>g!==chainGroupFilter).join('·'))} 当前</span>`:''))));
     const h=it.health, lat=it.health_latency_ms;
     let rh='';
     if(h==='ok')rh=`<div class="chain-health" style="color:var(--green)">✓${lat>=0?' '+lat+'ms':''}</div>`;
@@ -979,12 +1018,13 @@ async function toggleEndpoint(id){await api('POST',`/api/endpoints/${encodeURICo
 function openJoinPoolModal(id,name){
   const gs=window._poolGroups||{};
   const groups=['main'];
+  for(const gd of (window._groupDefs||[])) if(gd.name&&gd.name!=='main'&&!groups.includes(gd.name)) groups.push(gd.name);
   for(const g of Object.keys(gs)) if(g!=='main'&&!groups.includes(g)) groups.push(g);
   const ep=(window._allEps||[]).find(e=>e.id===id);
   const cur=(ep&&ep.pool_groups&&ep.pool_groups.length)?ep.pool_groups:[];
   const rows=groups.map(g=>`
     <div onclick="joinPoolGroup('${id}','${esc(g)}')" style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;cursor:pointer;font-size:13px;transition:all .12s" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
-      <span>${g==='main'?'🏊':'🗂'}</span>
+      <span>${g==='main'?'🏊':''}</span>
       <span><b>${esc(g)}</b></span>
       ${(ep&&ep.in_pool&&cur.includes(g))?`<span class="badge badge-current" style="font-size:9px">已在该组</span>`:''}
       ${gs[g]&&gs[g].members?`<span class="badge badge-h-unknown" style="font-size:9px;margin-left:auto">${gs[g].members} 成员</span>`:''}
@@ -1262,8 +1302,8 @@ async function testSelectedVision(){
 
 function openAddModal(){
     document.getElementById('editName').value='';document.getElementById('modalTitle').textContent='添加端点';
-    ['fName','fUrl','fKey','fModel','fUserAgent'].forEach(id=>document.getElementById(id).value='');
-    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fEnabled').value='true';document.getElementById('fPool').value='false';document.getElementById('fDeferrable').value='true';document.getElementById('fMaxContext').value=0;document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';document.getElementById('fFakeCheck').value='false';document.getElementById('fToolCallPrefix').value='';document.getElementById('fStreamFirstPacket').value=120;document.getElementById('fStreamStall').value=60;document.getElementById('fStreamMaxDuration').value=120;
+    ['fName','fSiteName','fUrl','fKey','fModel','fUserAgent'].forEach(id=>document.getElementById(id).value='');
+    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fDeferrable').value='true';document.getElementById('fMaxContext').value=0;document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';document.getElementById('fFakeCheck').value='false';document.getElementById('fToolCallPrefix').value='';document.getElementById('fStreamFirstPacket').value=120;document.getElementById('fStreamStall').value=60;document.getElementById('fStreamMaxDuration').value=120;
     document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';
     document.getElementById('fetchModelsBtn').disabled=true;document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
     allModels=[];selectedModels=new Set();latencyResults={};visionResults={};
@@ -1272,8 +1312,8 @@ function openAddModal(){
 function editEndpoint(id){
     api('GET','/api/endpoints').then(eps=>{const ep=eps.find(e=>e.id===id);if(!ep)return;
         document.getElementById('editName').value=id;document.getElementById('modalTitle').textContent='编辑端点';
-        document.getElementById('fName').value=ep.name;document.getElementById('fUrl').value=ep.base_url;document.getElementById('fKey').value=ep.api_key_full||'';document.getElementById('fModel').value=ep.model;document.getElementById('fUserAgent').value=ep.default_headers?.['User-Agent']||'';
-        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fEnabled').value=String(ep.enabled);document.getElementById('fPool').value=String(ep.in_pool!==false);document.getElementById('fDeferrable').value=String(ep.deferrable!==false);document.getElementById('fMaxContext').value=ep.max_context_k||0;document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);document.getElementById('fToolCallPrefix').value=ep.tool_call_id_prefix||'';document.getElementById('fStreamFirstPacket').value=ep.stream_first_packet_timeout||0;document.getElementById('fStreamStall').value=ep.stream_stall_timeout||0;document.getElementById('fStreamMaxDuration').value=ep.stream_max_duration||0;document.getElementById('fPoolGroups').value=((ep.pool_groups&&ep.pool_groups.length)?ep.pool_groups:['main']).join(',');
+        document.getElementById('fName').value=ep.name;document.getElementById('fSiteName').value=ep.site_name||'';document.getElementById('fUrl').value=ep.base_url;document.getElementById('fKey').value=ep.api_key_full||'';document.getElementById('fModel').value=ep.model;document.getElementById('fUserAgent').value=ep.default_headers?.['User-Agent']||'';
+        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fDeferrable').value=String(ep.deferrable!==false);document.getElementById('fMaxContext').value=ep.max_context_k||0;document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);document.getElementById('fToolCallPrefix').value=ep.tool_call_id_prefix||'';document.getElementById('fStreamFirstPacket').value=ep.stream_first_packet_timeout??120;document.getElementById('fStreamStall').value=ep.stream_stall_timeout??60;document.getElementById('fStreamMaxDuration').value=ep.stream_max_duration??120;
         document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
         allModels=[];selectedModels=new Set();latencyResults={};visionResults={};checkFetchBtn();document.getElementById('modal').classList.add('show');
     });
@@ -1283,26 +1323,28 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 async function saveEndpoint(){
     const ep_id=document.getElementById('editName').value;
     const ua=document.getElementById('fUserAgent').value.trim();
-    const d={name:document.getElementById('fName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),enabled:document.getElementById('fEnabled').value==='true',deferrable:document.getElementById('fDeferrable').value==='true',max_context_k:parseInt(document.getElementById('fMaxContext').value)||0,daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',default_headers:ua?{'User-Agent':ua}:{},health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',in_pool:document.getElementById('fPool').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true',tool_call_id_prefix:document.getElementById('fToolCallPrefix').value.trim(),stream_first_packet_timeout:parseInt(document.getElementById('fStreamFirstPacket').value)||0,stream_stall_timeout:parseInt(document.getElementById('fStreamStall').value)||0,stream_max_duration:parseInt(document.getElementById('fStreamMaxDuration').value)||0,pool_groups:document.getElementById('fPoolGroups').value.split(',').map(x=>x.trim()).filter(x=>x)};
+    const d={name:document.getElementById('fName').value.trim(),site_name:document.getElementById('fSiteName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),deferrable:document.getElementById('fDeferrable').value==='true',max_context_k:parseInt(document.getElementById('fMaxContext').value)||0,daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',default_headers:ua?{'User-Agent':ua}:{},health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true',tool_call_id_prefix:document.getElementById('fToolCallPrefix').value.trim(),stream_first_packet_timeout:parseInt(document.getElementById('fStreamFirstPacket').value)||0,stream_stall_timeout:parseInt(document.getElementById('fStreamStall').value)||0,stream_max_duration:parseInt(document.getElementById('fStreamMaxDuration').value)||0};
     if(!d.name||!d.base_url||!d.api_key){toast('填写名称/URL/Key','error');return;}
     if(!d.model){toast('选择模型','error');return;}
     if(ep_id){await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d);toast('已更新','success');}
-    else{await api('POST','/api/endpoints',d);toast('已添加','success');}
+    else{d.enabled=true;d.in_pool=false;d.pool_groups=[];await api('POST','/api/endpoints',d);toast('已添加','success');}
     closeModal();refresh();
 }
 
 async function batchAddEndpoints(){
     const fn=document.getElementById('fName').value.trim();
+    const siteName=document.getElementById('fSiteName').value.trim();
     const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
     const sp=parseInt(document.getElementById('fPriority').value)||1,to=parseInt(document.getElementById('fTimeout').value)||60,re=parseInt(document.getElementById('fRetries').value)||0,cd=Math.max(1,parseInt(document.getElementById('fCooldown').value)||5),dl=parseInt(document.getElementById('fDailyLimit').value)||0,rl=parseInt(document.getElementById('fRpmLimit').value)||0,up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',ua=document.getElementById('fUserAgent').value.trim(),hm=document.getElementById('fHealthMode').value||'chat',bm=document.getElementById('fBillingMode').value||'subscription';
     if(!u||!k){toast('填写 URL 和 Key','error');return;}
     if(!selectedModels.size){toast('选择模型','error');return;}
     const ms=[...selectedModels];toast(`添加 ${ms.length} 个...`,'info');
-    const r=await api('POST','/api/endpoints/batch',{endpoints:ms.map((m,i)=>({name:fn?fn:m,model:m,priority:sp+i,is_vision:visionResults[m]?visionResults[m].supports_vision:true})),base:{base_url:u,api_key:k,default_headers:ua?{'User-Agent':ua}:{},timeout:to,max_retries:re,cooldown_minutes:cd,daily_limit:dl,rpm_limit:rl,use_proxy:up,protocol:pt,start_priority:sp,health_mode:hm,billing_mode:bm}});
+    const r=await api('POST','/api/endpoints/batch',{endpoints:ms.map((m,i)=>({name:fn?fn:m,model:m,priority:sp+i,is_vision:visionResults[m]?visionResults[m].supports_vision:true})),base:{site_name:siteName,base_url:u,api_key:k,default_headers:ua?{'User-Agent':ua}:{},timeout:to,max_retries:re,cooldown_minutes:cd,daily_limit:dl,rpm_limit:rl,use_proxy:up,protocol:pt,start_priority:sp,health_mode:hm,billing_mode:bm,enabled:true,in_pool:false,pool_groups:[]}});
     if(r.ok){toast(`✅ ${r.added} 个`,'success');closeModal();refresh();}else toast('失败','error');
 }
 
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+function escAttr(s){return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function timeAgo(ts){if(!ts)return'—';const s=Math.floor(Date.now()/1000-ts);if(s<60)return s+'s前';if(s<3600)return Math.floor(s/60)+'m前';if(s<86400)return Math.floor(s/3600)+'h前';return Math.floor(s/86400)+'d前';}
 function fmtTime(s){if(s<=0)return'';if(s<60)return s+'s';const m=Math.floor(s/60);return(s%60)?`${m}m${s%60}s`:`${m}m`;}
 function toast(msg,type){const el=document.getElementById('toast');el.textContent=msg;el.className='toast toast-'+type+' show';setTimeout(()=>el.classList.remove('show'),2500);}
@@ -1667,7 +1709,7 @@ setInterval(() => {
     loadChatLogs(chatLogsPage);
 }, 3000);
 let chatLogsPage = 0;
-let currentChatLogs = [];
+let currentChatLogs = []
 async function initChatLogs() {
   document.getElementById('clPrompt').textContent = '';
   document.getElementById('clCompletion').textContent = '';
@@ -1675,12 +1717,92 @@ async function initChatLogs() {
   chatLogsPage = 0;
   await loadChatLogs(0);
 }
-initChatLogs();
-async function loadChatLogs(page) {
+
+// ── 表头移动端搬移：≤768px 时表头移入纵向滚动容器（sticky 吸顶），横向由 JS 同步表头位移 ──
+function arrangeChatHeader() {
+  const hdr = document.querySelector('.chatlog-header');
+  const list = document.getElementById('chatLogsList');
+  const wrap = document.querySelector('.chatlog-listwrap');
+  if (!hdr || !list || !wrap) return;
+  const mobile = window.matchMedia('(max-width:768px)').matches;
+  if (mobile && hdr.parentElement !== list) {
+    list.prepend(hdr);
+    hdr.style.position = 'sticky';
+    hdr.style.top = '0';
+    hdr.style.zIndex = '2';
+    hdr.style.background = 'rgba(255,255,255,0.05)';
+    hdr.style.backdropFilter = 'blur(14px)';
+    hdr.style.webkitBackdropFilter = 'blur(14px)';
+  } else if (!mobile && hdr.parentElement !== wrap) {
+    wrap.insertBefore(hdr, wrap.firstChild);
+    hdr.style.position = '';
+    hdr.style.top = '';
+    hdr.style.zIndex = '';
+    hdr.style.background = '';
+    hdr.style.backdropFilter = '';
+    hdr.style.webkitBackdropFilter = '';
+    hdr.style.transform = '';
+  }
+  updateChatScrollbar();
+}
+window.addEventListener('resize', arrangeChatHeader);
+arrangeChatHeader();
+// 移动端横向滚动 → 表头同步位移（表头在纵向容器内 sticky，横向由 transform 跟随）
+(function () {
+  const x = document.getElementById('chatLogsX');
+  if (!x) return;
+  x.addEventListener('scroll', () => {
+    const hdr = document.querySelector('.chatlog-header');
+    if (hdr && window.matchMedia('(max-width:768px)').matches) {
+      hdr.style.transform = `translateX(${-x.scrollLeft}px)`;
+    }
+  });
+})();
+
+// ── 自绘悬浮滚动条（不占布局，列宽与表头恒一致）──
+function updateChatScrollbar() {
+  const el = document.getElementById('chatLogsList');
+  const track = document.getElementById('clSbTrack');
+  const thumb = document.getElementById('clSbThumb');
+  if (!el || !track || !thumb) return;
+  const need = el.scrollHeight > el.clientHeight + 2;
+  track.style.display = need ? 'block' : 'none';
+  if (!need) return;
+  const h = Math.max(24, el.clientHeight * el.clientHeight / el.scrollHeight);
+  const maxTop = el.clientHeight - h;
+  const top = maxTop * (el.scrollTop / (el.scrollHeight - el.clientHeight));
+  thumb.style.height = h + 'px';
+  thumb.style.top = top + 'px';
+}
+(function () {
+  const el = document.getElementById('chatLogsList');
+  const thumb = document.getElementById('clSbThumb');
+  if (!el || !thumb) return;
+  el.addEventListener('scroll', updateChatScrollbar);
+  if (window.ResizeObserver) new ResizeObserver(updateChatScrollbar).observe(el);
+  let dragging = false, startY = 0, startTop = 0;
+  thumb.addEventListener('mousedown', e => {
+    dragging = true; startY = e.clientY; startTop = parseFloat(thumb.style.top) || 0;
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const h = parseFloat(thumb.style.height) || 24;
+    const maxTop = el.clientHeight - h;
+    const top = Math.max(0, Math.min(maxTop, startTop + (e.clientY - startY)));
+    thumb.style.top = top + 'px';
+    el.scrollTop = (top / maxTop) * (el.scrollHeight - el.clientHeight);
+  });
+  document.addEventListener('mouseup', () => { dragging = false; });
+})();
+let chatLogsReqSeq = 0;
+async function loadChatLogs(page, opts = {}) {
   if (page < 0) return;
+  const seq = ++chatLogsReqSeq; // 竞态守卫：轮询/翻页并发时只认最后一次请求
   const limit = 50;
   const offset = page * limit;
-  const res = await api('GET', `/api/chat-logs?limit=${limit}&offset=${offset}`);
+  const res = await api('GET', `/api/chat-logs?limit=${limit}&offset=${offset}&detail=false`);
+  if (seq !== chatLogsReqSeq) return; // 过期响应丢弃
   if (!res.ok && res.error) { toast('加载失败', 'error'); return; }
   chatLogsPage = page;
   currentChatLogs = res.logs || [];
@@ -1692,27 +1814,42 @@ async function loadChatLogs(page) {
   document.getElementById('clPrevBtn').disabled = page <= 0;
   document.getElementById('clNextBtn').disabled = page >= maxPage;
   
-  const listEl = document.getElementById('chatLogsList');
+  const listEl = document.getElementById('chatLogsRows');
   if (currentChatLogs.length === 0) {
     listEl.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-dim);">暂无日志记录</div>';
+    updateChatScrollbar();
     return;
   }
   
   listEl.innerHTML = currentChatLogs.map((log, i) => `
-    <div style="padding:8px 12px; border-bottom:1px solid var(--border); display:grid; grid-template-columns: 80px 1fr 1fr 80px; gap:8px; font-size:12px; cursor:pointer; transition:background 0.2s;" class="hover-bg" onclick="viewChatLog(${i})">
-      <div style="color:var(--text-dim);">${log.timestamp.split(' ')[1]}</div>
-      <div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${log.endpoint_name}">${log.endpoint_name}</div>
-      <div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--accent-light);" title="${log.model}">${log.model}</div>
-      <div style="color:var(--green);">${log.total_tokens}</div>
+    <div class="chatlog-grid chatlog-row hover-bg" style="padding:8px 12px; border-bottom:1px solid var(--border); display:grid; grid-template-columns: 80px repeat(6, 1fr); gap:8px; font-size:12px; cursor:pointer; transition:background 0.2s;" onclick="viewChatLog(${i})">
+      <div class="cl-cell cl-time" style="color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${log.timestamp.split(' ')[1]}</div>
+      <div class="cl-cell cl-group" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--accent-light);" title="${log.pool_group || ''}">${log.pool_group || ''}</div>
+      <div class="cl-cell cl-ep" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${log.endpoint_name}">${log.endpoint_name}</div>
+      <div class="cl-cell cl-model" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text-dim);" title="${log.model}">${log.model}</div>
+      <div class="cl-cell cl-lat" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text-dim);">${log.latency_ms ? (log.latency_ms/1000).toFixed(1)+'s' : '—'}</div>
+      <div class="cl-cell cl-cache" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--yellow);" title="${log.cached_tokens>0&&log.prompt_tokens>0 ? 'cached '+log.cached_tokens+' / prompt '+log.prompt_tokens : ''}">${(log.cached_tokens>0 && log.prompt_tokens>0) ? (log.cached_tokens/log.prompt_tokens*100).toFixed(1)+'%' : '—'}</div>
+      <div class="cl-cell cl-tok" style="color:var(--green);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${log.total_tokens}</div>
     </div>
   `).join('');
+  // 翻页后回到顶部（轮询刷新不打扰当前滚动位置）
+  if (opts.resetScroll) {
+    const list = document.getElementById('chatLogsList');
+    if (list) list.scrollTop = 0;
+    const x = document.getElementById('chatLogsX');
+    if (x) x.scrollLeft = 0;
+  }
+  updateChatScrollbar();
 }
-function viewChatLog(idx) {
+async function viewChatLog(idx) {
   const log = currentChatLogs[idx];
   if (!log) return;
-  document.getElementById('clPrompt').textContent = log.prompt || '';
-  document.getElementById('clCompletion').textContent = log.completion || '';
-  document.getElementById('clMeta').innerHTML = `<span style="color:var(--green)">${log.total_tokens} Tokens</span> <span style="margin-left:10px;color:var(--yellow)">${log.latency_ms}ms</span>`;
+  // 列表页不载正文：点击后按 id 单独拉取详情（含 prompt/completion）
+  const res = await api('GET', `/api/chat-log?id=${encodeURIComponent(log.id)}`);
+  const full = (res && res.id) ? res : log;
+  document.getElementById('clPrompt').textContent = full.prompt || '';
+  document.getElementById('clCompletion').textContent = full.completion || '';
+  document.getElementById('clMeta').innerHTML = `<span style="color:var(--green)">${full.total_tokens} Tokens</span> <span style="margin-left:10px;color:var(--yellow)">${full.latency_ms}ms</span>${full.pool_group ? ` <span style="margin-left:10px;color:var(--accent-light)">组: ${esc(full.pool_group)}</span>` : ''}`;
 }
 async function clearChatLogs() {
   if (!confirm('确定要清空所有对话日志记录吗？此操作不可逆。')) return;
@@ -1725,6 +1862,8 @@ async function clearChatLogs() {
 const style = document.createElement('style');
 style.innerHTML = `
   .hover-bg:hover { background: rgba(255,255,255,0.05); }
+  #chatLogsList::-webkit-scrollbar { display: none; }
+  #clSbThumb:hover { background: rgba(255,255,255,.35); }
 `;
 document.head.appendChild(style);
 
@@ -1741,6 +1880,10 @@ async function clearTokenStats() {
   toast('统计数据已清空', 'success');
   loadAnalytics();
 }
+
+// 首次加载放脚本末尾：loadChatLogs 内引用的 let 声明（chatLogsReqSeq 等）此时已全部初始化，
+// 否则 TDZ ReferenceError 变成静默 unhandled rejection，首屏只能等 3s 轮询救场（2026-08-30 实测修复）
+initChatLogs();
 
 </script>
 

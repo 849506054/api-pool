@@ -234,6 +234,23 @@ class GroupManagementTests(unittest.TestCase):
             self.assertEqual(pool2._group_defs["ds"], {"type": "dedicated", "model": "deepseek-v4-flash"})
             self.assertEqual(pool2._group_defs["main"]["model"], "api-pool")
 
+    def test_zero_member_group_is_visible_in_group_apis(self):
+        """新建组尚无成员时，组目录和链摘要仍必须立即返回该实体。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            module.pool.create_group("vision", "mixed", "api-pool-vision")
+
+            status, resp, _ = module.api_handler("GET", "/api/groups", None)
+            self.assertEqual(status, 200)
+            vision = next(g for g in resp["groups"] if g["name"] == "vision")
+            self.assertEqual(vision["members"], 0)
+            self.assertEqual(vision["model"], "api-pool-vision")
+
+            status, resp, _ = module.api_handler("GET", "/api/chain", None)
+            self.assertEqual(status, 200)
+            self.assertIn("vision", resp["groups"])
+            self.assertEqual(resp["groups"]["vision"]["members"], 0)
+
     def test_legacy_config_derives_defs_without_persist(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
