@@ -114,6 +114,9 @@
 | 2026-08-29 | Git 历史清洗：移除误推的已否决提交 | 工作区 ahead 2 时直接 push，把一条用户已否决的提交连带推上远端。处理：rebase 重放保留有效修复（哈希 441c3f6→4d4fef0）+ force-with-lease 推送 + reflog expire/gc 清理本地残留，全历史验证特征串零残留；同步清理引用旧哈希的文档记录。沉淀为「推送前检查 ahead N」流程。 |
 | 2026-08-30 | 分组路由（priority_by_group 分组隔离）实施部署 + UI 优先级接线修复 | 分组池实施已部署生产，bg 组真实流量（background_review / knowledge-sync cron）验证通过。诊断发现 UI 下拉框从未接线到分组接口：仍走旧全局 `priority` PUT 路径，而路由只读 `priority_by_group`——全局改动零效果且被 `_renumber` 静默回滚。修复：`setPriority()` 改为带组参数 `POST /api/priority/<id>?group=&priority=`。遗留：编辑表单 saveEndpoint() 的「优先级」字段仍走全局 PUT，被遮蔽未修。 |
 | 2026-08-30 | 越权组筛选功能回滚删除 | 端点列表的 `🏷️组名` 筛选标签（groupCounts/isGroupFilter/renderEndpoint 组标签）不在 8/29 批准终态清单范围内（组筛选标签栏仅授权于聚合池/聚合链两处），用户追问后 3 处全部删除并部署。沉淀「UI 实现范围铁律」：清单外功能须先请示或显式标注，不得默认保留。 |
+| 2026-08-30 | 移除聚合池「⬆️ 按优先级」按钮及功能链路，原位预留「➕ 新建分组」按钮 | 用户决策：分组池上线后手动按优先级重置入口已无必要。同步移出前端 `resetPriority()`、后端 `POST /api/reset-priority` 路由与 `reset_to_priority_mode()` 方法（互为唯一调用方，无测试引用）；原按钮位置新增 `➕ 新建分组` 预留位（`createPoolGroup()` 仅 toast 提示暂未开放，沿用 ⚙️ 编辑分组占位惯例）。117 测试全绿 + mock E2E（旧路由 404）+ 5200 生产验证。 |
+| 2026-08-30 | 聚合池卡片跨组端点标识简化：跨组当前端点紫色 badge 由组名标签形态改为 `● 组名` | 用户决策：去图标与「当前」文字，用 ● 前缀+空格区分其他组当前端点。仅聚合池成员卡片；聚合链标识不变。前端热更新直接部署（无需重启）。 |
+| 2026-08-30 | 分组实体（mixed/dedicated + model 选择器）部署生产 | 组实体 `pool_group_defs`：{name, type: mixed\|dedicated, model}；main 恒存（selector 固定 api-pool）。路由解析升级：请求 model 先匹配组选择器→再匹配组名→未命中回 main，现网路由零变化。REST `GET/POST /api/groups`、`PUT/DELETE /api/groups/<name>`；dedicated 组入组模型校验（不匹配自动过滤/端点改模型自动移出）；删组成员逐个移出+指针/计数清理；改名同步端点 pool_groups、三个指针态、fallback 计数。前端新建/编辑分组弹窗（main 锁定禁用）。133 测试全绿 + 本地 mock E2E 后部署：宿主机 hash 后端 `5ce04097` / 前端 `3a38ed86`，服务重启正常，`/api/groups` 返回 main(6 成员)+api-pool-bg(4 成员)，`/v1/models`=`['api-pool','api-pool-bg']`（main 条目消失=预期语义变化，selector 列表取代组名列表）。旧配置零迁移（无 defs 时从端点声明派生，首次编辑才落盘）。设计详情见 skill references/pool-group-implementation-status-2026-08-30.md。 |
 
 ## 📌 活跃事项
 

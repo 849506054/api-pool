@@ -583,10 +583,11 @@ let allModels=[],selectedModels=new Set(),latencyResults={},visionResults={};
 let epFilter='all',modelPage=1,PP=50;
 
 async function refresh(){
-  const[eps,chainRes]=await Promise.all([api('GET','/api/endpoints'),api('GET','/api/chain')]);
+  const[eps,chainRes,groupsRes]=await Promise.all([api('GET','/api/endpoints'),api('GET','/api/chain'),api('GET','/api/groups')]);
   // 分组池：/api/chain 返回 {chain, groups}（groups = 各组指针与 fallback 统计）
   const chain = Array.isArray(chainRes) ? chainRes : (chainRes.chain || []);
   window._poolGroups = (chainRes && chainRes.groups) ? chainRes.groups : {};
+  window._groupDefs = (groupsRes && groupsRes.groups) ? groupsRes.groups : []; // 组实体（2026-08-30 组管理弹窗）
   window._allEps = eps; // 入池弹层读取端点当前组（回显勾选）
   renderStats(eps);renderFilterBar(eps);renderEndpoints(eps);
   // 优先级下拉框展开/操作期间，避免 5s 自动刷新重建 DOM 导致下拉框收回
@@ -822,7 +823,10 @@ function renderPoolList(eps){
     const gi=groupsInfo[gr]||{};
     const memN=poolEps.filter(e=>groupsOf(e).includes(gr)).length;
     const icon=gr==='main'?'🏊':'🗂';
-    const tip=`当前端点：${gi.current_endpoint?esc(gi.current_endpoint):'无'}${gi.fallback_count>0?' · 已 fallback '+gi.fallback_count+' 次':''}`;
+    const gDef=(window._groupDefs||[]).find(x=>x.name===gr)||{};
+    const selTip=gDef.model&&gDef.model!==gr?` · 选择器：${esc(gDef.model)}`:'';
+    const typeTip=gDef.type==='dedicated'?' · 专用型（绑定 '+esc(gDef.model)+'）':'';
+    const tip=`当前端点：${gi.current_endpoint?esc(gi.current_endpoint):'无'}${gi.fallback_count>0?' · 已 fallback '+gi.fallback_count+' 次':''}${selTip}${typeTip}`;
     return `<button class="filter-btn ${gr===poolGroupFilter?'active':''}" onclick="setPoolGroupFilter('${esc(gr)}')" title="${tip}">${icon}${esc(gr)} ${memN}</button>`;
   }).join('');
   const statusHtml=`<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;margin:2px 0 10px">
@@ -838,15 +842,79 @@ function renderPoolList(eps){
   el.innerHTML=`<div class="filter-bar" style="margin-bottom:8px">${barHtml}</div>`+statusHtml+members.map(cardOf).join('');
 }
 
-// 分组属性编辑（预留）：混合型 mixed / 专用型 dedicated（绑定单一模型）。
-// 后端组实体存储与校验未实施前，仅弹提示不执行写操作。
+// ── 组管理（2026-08-30）：新建/编辑分组弹窗 ──
+// 组实体：name=显示名；type=mixed（选择器=Hermes 配置的 model 名）/dedicated（绑定真实模型名，兼作选择器）
+function openGroupModal(editName){
+  const editing=!!editName;
+  let g={name:'',type:'mixed',model:'',is_main:false};
+  if(editing){
+    const gs=window._groupDefs||[];
+    g=gs.find(x=>x.name===editName)||g;
+  }
+  const title=editing?`编辑分组${g.is_main?'（main）':''}`:'新建分组';
+  const nameDisabled=g.is_main?'disabled':'';
+  const typeDisabled=g.is_main?'disabled':'';
+  const modelLabel=g.type==='dedicated'?'绑定模型（真实模型名，兼作选择器）':'选择器（Hermes 侧配置的 model 名）';
+  const overlay=document.createElement('div');
+  overlay.className='modal-overlay show';
+  overlay.id='groupEditOverlay';
+  overlay.innerHTML=`<div class="modal" style="width:420px">
+    <h2>${editing?'✏️':'➕'} ${title}</h2>
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <div class="form-group"><label>分组名称</label><input type="text" id="gName" value="${esc(g.name)}" placeholder="如 bg、deepseek-v4-flash" ${nameDisabled}></div>
+      <div class="form-group"><label title="mixed=任意模型端点可入组；dedicated=仅允许绑定模型的端点入组">分组类型</label>
+        <select id="gType" ${typeDisabled} onchange="document.getElementById('gModelLabel').textContent=this.value==='dedicated'?'绑定模型（真实模型名，兼作选择器）':'选择器（Hermes 侧配置的 model 名）'">
+          <option value="mixed" ${g.type!=='dedicated'?'selected':''}>混合型（mixed）</option>
+          <option value="dedicated" ${g.type==='dedicated'?'selected':''}>专用型（dedicated）</option>
+        </select></div>
+      <div class="form-group"><label id="gModelLabel">${modelLabel}</label><input type="text" id="gModel" value="${esc(g.model||'')}" placeholder="${g.type==='dedicated'?'如 deepseek-v4-flash':'缺省=组名'}"></div>
+      ${g.is_main?'<div style="font-size:11px;color:var(--text-dim)">main 组为保留主组：名称/类型/选择器均锁定</div>':''}
+      ${editing&&!g.is_main?'<button class="btn btn-ghost" style="color:var(--red);justify-content:flex-start" onclick="deletePoolGroup(\'${esc(g.name)}\')">🗑 删除该分组（成员移出）</button>':''}
+    </div>
+    <div class="form-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn btn-ghost" onclick="closeGroupModal()">取消</button>
+      <button class="btn" id="gSaveBtn" onclick="savePoolGroup(${editing?`'${esc(g.name)}'`:'null'})">${editing?'保存':'创建'}</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+}
+function closeGroupModal(){
+  const o=document.getElementById('groupEditOverlay');
+  if(o)o.remove();
+}
+async function savePoolGroup(editName){
+  const name=document.getElementById('gName').value.trim();
+  const type=document.getElementById('gType').value;
+  const model=document.getElementById('gModel').value.trim();
+  if(!name){toast('填写分组名称','error');return;}
+  const btn=document.getElementById('gSaveBtn');
+  if(btn){btn.disabled=true;btn.textContent='保存中...';}
+  try{
+    let r;
+    if(editName){
+      r=await api('PUT',`/api/groups/${encodeURIComponent(editName)}`,{name,type,model});
+    }else{
+      r=await api('POST','/api/groups',{name,type,model});
+    }
+    if(r.ok){toast(editName?'✅ 分组已更新':'✅ 分组已创建','success');closeGroupModal();refresh();}
+    else{toast(r.error||'操作失败','error');if(btn){btn.disabled=false;btn.textContent=editName?'保存':'创建';}}
+  }catch(e){
+    toast('请求失败','error');
+    if(btn){btn.disabled=false;btn.textContent=editName?'保存':'创建';}
+  }
+}
+async function deletePoolGroup(name){
+  if(!confirm(`删除分组「${name}」？其成员将移出该组（最后一组的端点整体出池）。`))return;
+  const r=await api('DELETE',`/api/groups/${encodeURIComponent(name)}`);
+  if(r.ok){toast('已删除分组','success');closeGroupModal();refresh();}
+  else{toast(r.error||'删除失败','error');}
+}
 function editPoolGroup(g){
-  toast('⚙️ 分组编辑（类型：混合/专用）暂未开放，当前组：'+g,'info');
+  openGroupModal(g);
 }
 
-// 新建分组（预留）：后端组实体创建接口未实施前，仅弹提示不执行写操作。
 function createPoolGroup(){
-  toast('➕ 新建分组暂未开放','info');
+  openGroupModal(null);
 }
 
 

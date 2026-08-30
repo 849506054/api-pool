@@ -144,9 +144,9 @@ class ConcurrentHealthCheckTests(unittest.TestCase):
         self.assertEqual(body["object"], "list")
         # 分组池（2026-08-29）：目录 = api-pool 历史别名 + 各组选择器 id
         # （dedicated 组名=模型名时即真实可用模型列表），且不查上游。
+        # 组管理（2026-08-30）：main 组选择器=api-pool（与历史别名重合，不重复列出）。
         model_ids = [m["id"] for m in body["data"]]
         self.assertEqual(model_ids[0], "api-pool")
-        self.assertIn("main", model_ids)
         for entry in body["data"]:
             self.assertEqual(entry["object"], "model")
             self.assertEqual(entry["created"], 0)

@@ -898,6 +898,10 @@ class APIPool:
         self._inflight_owner: dict[str, str] = {}
         # per-group fallback 到 main 的累计次数（bg 组扩容信号，/api/endpoints 暴露）
         self._group_fallback_count: dict[str, int] = {}
+        # ── 组实体定义（2026-08-30 组管理）：name → {"type": "mixed"|"dedicated", "model": selector} ──
+        # mixed 组 model = Hermes 侧配置的选择器名（如 api-pool-bg）；dedicated 组 model = 绑定的
+        # 真实上游模型名（兼作选择器）。main 恒为 mixed，选择器固定 api-pool（历史别名）。
+        self._group_defs: dict[str, dict] = {self.MAIN_GROUP: {"type": "mixed", "model": "api-pool"}}
         # 后台探活基础设施：冷却过期端点在后台线程探活，不阻塞请求路径
         self._probe_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="apipool-probe")
         self._probe_inflight = set()  # 正在探活的端点 id 集合（后台/批量探活共享，防重复请求）
@@ -968,7 +972,10 @@ class APIPool:
                     ep.in_pool = in_pool
                     # 入池同时指定组（2026-08-29 分组池）：?groups=main,bg 形式
                     if in_pool and groups is not None:
-                        ep.pool_groups = self._sanitize_groups(groups)
+                        # 组管理（2026-08-30）：dedicated 组模型不匹配 → 过滤掉不匹配组
+                        sanitized = self._sanitize_groups(groups)
+                        enforced = self._enforce_dedicated_membership(ep, sanitized)
+                        ep.pool_groups = enforced or [self.MAIN_GROUP]
                     # 出池清组绑定，避免残留（全量出池路径；单组移除走 remove_from_group）
                     if not in_pool:
                         ep.pool_groups = [self.MAIN_GROUP]
@@ -1030,7 +1037,20 @@ class APIPool:
                             setattr(ep, k, v)
                     # pool_groups 归一化（分组池 2026-08-29）：去重/去空/空列表回退 main
                     if updates.get("pool_groups") is not None:
-                        ep.pool_groups = self._sanitize_groups(ep.pool_groups)
+                        sanitized = self._sanitize_groups(ep.pool_groups)
+                        # 组管理（2026-08-30）：dedicated 组模型不匹配 → 过滤
+                        ep.pool_groups = self._enforce_dedicated_membership(ep, sanitized) or [self.MAIN_GROUP]
+                    # 端点改模型 → 所属 dedicated 组重校验（2026-08-30）：
+                    # 模型不再匹配的 dedicated 组自动移出（避免编辑被拒留下脏绑定）
+                    if updates.get("model") is not None and ep.in_pool:
+                        groups_now = self._ep_groups(ep)
+                        keep = [g for g in groups_now
+                                if g == self.MAIN_GROUP or not self._dedicated_model(g)
+                                or ep.model == self._dedicated_model(g)]
+                        if len(keep) != len(groups_now):
+                            dropped = [g for g in groups_now if g not in keep]
+                            ep.pool_groups = keep
+                            sys_log(f"端点 '{ep.name}' 模型改为 {ep.model}，自动移出专用组 {', '.join(dropped)}", "WARN")
                     # cooldown_minutes 最低 1，防止跳过冷却恢复流程
                     if updates.get("cooldown_minutes") is not None and updates["cooldown_minutes"] < 1:
                         ep.cooldown_minutes = 1
@@ -1115,6 +1135,193 @@ class APIPool:
         """端点归属组（运行时归一化，兼容字段缺失/空列表）。"""
         return getattr(ep, "pool_groups", None) or [self.MAIN_GROUP]
 
+    # ── 组实体管理（2026-08-30 组管理功能）──
+    _GROUP_NAME_RE = None  # 延迟初始化（模块顶部 import re）
+
+    def _valid_group_name(self, name):
+        """组名校验：非空、≤32 字符、仅字母数字/连字符/下划线/中文。"""
+        if not isinstance(name, str):
+            return False
+        n = name.strip()
+        return bool(n) and len(n) <= 32 and bool(re.fullmatch(r"[\w\u4e00-\u9fff-]+", n))
+
+    def _valid_group_type(self, gtype):
+        return gtype in ("mixed", "dedicated")
+
+    def _group_selector(self, name):
+        """组选择器（Hermes 侧 model 名）：有实体定义取其 model，否则回退组名。"""
+        gd = self._group_defs.get(name)
+        return gd.get("model") if gd and gd.get("model") else name
+
+    def _dedicated_model(self, group):
+        """dedicated 组绑定的真实模型名；mixed 组返回 None。"""
+        gd = self._group_defs.get(group)
+        if gd and gd.get("type") == "dedicated":
+            return gd.get("model") or None
+        return None
+
+    def _load_group_defs(self, defs_raw):
+        """启动/配置加载：归一化组实体定义（外部传入 list[dict]）。"""
+        self._group_defs = {self.MAIN_GROUP: {"type": "mixed", "model": "api-pool"}}
+        if isinstance(defs_raw, list):
+            for d in defs_raw:
+                if not isinstance(d, dict):
+                    continue
+                name = str(d.get("name", "")).strip()
+                gtype = d.get("type", "mixed")
+                model = str(d.get("model", "")).strip()
+                if not name or name == self.MAIN_GROUP or not self._valid_group_type(gtype):
+                    continue
+                self._group_defs[name] = {"type": gtype, "model": model or name}
+        return self._group_defs
+
+    def _derive_group_defs(self):
+        """旧配置（无 pool_group_defs）派生组实体：selector=组名，type=mixed。
+        仅内存态，不落盘；首次组编辑后 _sync_to_config 才写入 pool_group_defs。"""
+        for grp in self._all_group_names():
+            if grp != self.MAIN_GROUP and grp not in self._group_defs:
+                self._group_defs[grp] = {"type": "mixed", "model": grp}
+        return self._group_defs
+
+    def create_group(self, name, gtype="mixed", model=""):
+        """新建分组。返回 (ok, message)。"""
+        with self._lock:
+            name = str(name or "").strip()
+            if not self._valid_group_name(name):
+                return False, "组名非法（非空、≤32字符、字母数字/连字符/下划线/中文）"
+            if name == self.MAIN_GROUP or name == "api-pool":
+                return False, f"组名 '{name}' 为保留名"
+            if name in self._group_defs or name in self._all_group_names():
+                return False, f"组 '{name}' 已存在"
+            if not self._valid_group_type(gtype):
+                return False, "分组类型必须为 mixed 或 dedicated"
+            model = str(model or "").strip()
+            if gtype == "dedicated":
+                if not model:
+                    return False, "专用分组必须绑定模型"
+                # selector 与其他组冲突检查（选择器是路由键，必须全池唯一）
+                for g, gd in self._group_defs.items():
+                    if g != name and gd.get("model") == model:
+                        return False, f"选择器 '{model}' 已被组 '{g}' 使用"
+            else:
+                model = model or name  # mixed 缺省选择器=组名（向后兼容派生态）
+                for g, gd in self._group_defs.items():
+                    if g != name and gd.get("model") == model:
+                        return False, f"选择器 '{model}' 已被组 '{g}' 使用"
+            self._group_defs[name] = {"type": gtype, "model": model}
+            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}）", "INFO")
+            return True, name
+
+    def update_group(self, name, updates):
+        """编辑分组（名称/类型/绑定模型）。返回 (ok, message)。
+        - main：仅允许改选择器 model（名称/类型锁定）
+        - 改类型 mixed→dedicated：校验现有成员模型全部匹配，否则拒绝
+        - 改类型 dedicated→mixed：原绑定模型解除
+        - 改名：同步端点 pool_groups / 指针态 / defs 键
+        """
+        with self._lock:
+            name = str(name or "").strip()
+            if name not in self._group_defs and name not in self._all_group_names():
+                return False, f"组 '{name}' 不存在"
+            if name not in self._group_defs:
+                # 指针态残留组（无实体）：补一个派生实体再编辑
+                self._group_defs[name] = {"type": "mixed", "model": name}
+            old = dict(self._group_defs[name])
+            new_name = str(updates.get("name", name)).strip() or name
+            new_type = updates.get("type", old["type"])
+            new_model = str(updates.get("model", old.get("model", "")) or "").strip()
+
+            if not self._valid_group_type(new_type):
+                return False, "分组类型必须为 mixed 或 dedicated"
+            if name == self.MAIN_GROUP:
+                if new_name != self.MAIN_GROUP or new_type != "mixed":
+                    return False, "main 组名称与类型不可修改（仅可改选择器）"
+                if new_model and new_model != "api-pool":
+                    # main 选择器改名会让存量 Hermes 配置失配，禁止
+                    return False, "main 组选择器固定为 api-pool（历史别名）"
+                return True, "无变更"
+
+            if new_name != name:
+                if not self._valid_group_name(new_name):
+                    return False, "组名非法（非空、≤32字符、字母数字/连字符/下划线/中文）"
+                if new_name == self.MAIN_GROUP or new_name == "api-pool":
+                    return False, f"组名 '{new_name}' 为保留名"
+                if new_name in self._group_defs or new_name in self._all_group_names():
+                    return False, f"组 '{new_name}' 已存在"
+
+            if new_type == "dedicated" and not new_model:
+                return False, "专用分组必须绑定模型"
+
+            # 选择器跟随规则（2026-08-30）：改名时，若旧选择器=旧组名（派生态）且未显式
+            # 指定新选择器 → 跟随新组名（保持"缺省选择器=组名"语义）；显式设置的选择器不动。
+            if new_name != name and new_type == "mixed" \
+                    and old.get("model") == name and not updates.get("model"):
+                new_model = ""
+
+            # 选择器唯一性（mixed 缺省=新组名）
+            eff_model = new_model or (new_name if new_type == "mixed" else "")
+            for g, gd in self._group_defs.items():
+                if g != name and gd.get("model") == eff_model:
+                    return False, f"选择器 '{eff_model}' 已被组 '{g}' 使用"
+
+            # mixed→dedicated：成员模型必须全部匹配绑定模型
+            if new_type == "dedicated":
+                mismatched = [ep.name for ep in self._endpoints
+                              if ep.in_pool and name in self._ep_groups(ep)
+                              and ep.model != eff_model]
+                if mismatched:
+                    return False, f"成员模型不匹配专用绑定（{', '.join(mismatched[:5])}）"
+
+            # 应用改名：端点 pool_groups / 指针态 / fallback 计数 / defs
+            if new_name != name:
+                for ep in self._endpoints:
+                    if name in self._ep_groups(ep):
+                        ep.pool_groups = [new_name if g == name else g for g in self._ep_groups(ep)]
+                for state in (self._current_endpoint_by_group, self._manual_override_by_group,
+                              self._persisted_endpoint_by_group):
+                    if name in state:
+                        state[new_name] = state.pop(name)
+                if name in self._fallback_lock_until_by_group:
+                    self._fallback_lock_until_by_group[new_name] = self._fallback_lock_until_by_group.pop(name)
+                if name in self._group_fallback_count:
+                    self._group_fallback_count[new_name] = self._group_fallback_count.pop(name)
+                del self._group_defs[name]
+
+            self._group_defs[new_name] = {"type": new_type, "model": eff_model}
+            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}）", "INFO")
+            return True, new_name
+
+    def delete_group(self, name):
+        """删除分组：成员移出该组（最后一组→整体出池），清理指针与计数。main 不可删。
+        返回 (ok, message)。"""
+        with self._lock:
+            name = str(name or "").strip()
+            if name == self.MAIN_GROUP:
+                return False, "main 组不可删除"
+            if name not in self._group_defs and name not in self._all_group_names():
+                return False, f"组 '{name}' 不存在"
+            # 逐成员移出（复用组感知移除语义）
+            for ep in list(self._endpoints):
+                if ep.in_pool and name in self._ep_groups(ep):
+                    self.remove_from_group(ep.id, name)
+            self._group_defs.pop(name, None)
+            for state in (self._current_endpoint_by_group, self._manual_override_by_group,
+                          self._persisted_endpoint_by_group, self._fallback_lock_until_by_group):
+                state.pop(name, None)
+            self._group_fallback_count.pop(name, None)
+            sys_log(f"删除分组 '{name}'（成员已移出）", "INFO")
+            return True, "deleted"
+
+    def _enforce_dedicated_membership(self, ep, groups):
+        """入组列表过滤：剔除模型不匹配的 dedicated 组（入组校验前置）。"""
+        result = []
+        for g in groups:
+            dm = self._dedicated_model(g)
+            if dm and ep.model != dm:
+                continue
+            result.append(g)
+        return result
+
     # ── per-group 优先级访问器（2026-08-29 分组隔离）──
     def _ep_priority(self, ep, group):
         """端点在指定组的优先级：优先 priority_by_group，缺失时回退全局 priority。"""
@@ -1134,6 +1341,7 @@ class APIPool:
 
         - None/空 → main
         - "api-pool"（历史别名）→ main
+        - 优先匹配组选择器（_group_defs 的 model 字段：mixed=Hermes 配置名，dedicated=真实模型名）
         - 精确匹配已知组名（端点声明 ∪ 指针态出现过的组；bg 组全挂时仍可解析到 bg，
           从而正确触发 bg→main fallback 而不是静默落 main）→ 该组
         - 其他 → main（存量流量零感知）
@@ -1143,6 +1351,10 @@ class APIPool:
         name = str(model).strip()
         if not name or name == "api-pool":
             return self.MAIN_GROUP
+        # selector 精确匹配（组实体定义优先于组名）
+        for grp, gd in self._group_defs.items():
+            if gd.get("model") and gd["model"] == name:
+                return grp
         if name in self._all_group_names():
             return name
         return self.MAIN_GROUP
@@ -3442,15 +3654,26 @@ def load_config():
     except Exception:
         return []
 
-def save_config(endpoints_data):
+def load_group_defs_config():
+    """读取组实体定义（2026-08-30 组管理）：pool_group_defs 顶层键。旧配置无此键 → None（走派生）。"""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f: return json.load(f).get("pool_group_defs")
+    except Exception:
+        return None
+
+def save_config(endpoints_data, group_defs=None):
     tmp_file = os.path.join(
         os.path.dirname(os.path.abspath(CONFIG_FILE)),
         f".{os.path.basename(CONFIG_FILE)}.tmp",
     )
+    payload: dict = {"api_endpoints": endpoints_data}
+    # 组管理（2026-08-30）：仅显式传入时写入（None=保持不落盘，旧配置首次编辑前零迁移）
+    if group_defs is not None:
+        payload["pool_group_defs"] = group_defs
     try:
         with _config_lock:
             with open(tmp_file, "w", encoding="utf-8") as f:
-                json.dump({"api_endpoints": endpoints_data}, f, ensure_ascii=False, indent=2)
+                json.dump(payload, f, ensure_ascii=False, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_file, CONFIG_FILE)
@@ -3470,6 +3693,12 @@ pool = APIPool()
 for ep_data in load_config():
     if "in_pool" not in ep_data: ep_data["in_pool"] = True
     pool.add_endpoint(ep_data)
+# 组管理（2026-08-30）：加载组实体定义；旧配置无 defs → 从端点声明派生（selector=组名，mixed；
+# 仅内存态，首次组编辑时 _sync_to_config 才把 pool_group_defs 落盘）
+_defs_raw = load_group_defs_config()
+if isinstance(_defs_raw, list):
+    pool._load_group_defs(_defs_raw)
+pool._derive_group_defs()
 # 分组池：旧扁平路由状态（若有）迁移为 main 组状态
 pool._migrate_legacy_state()
 # 按组恢复重启前的粘性指针（runtime_state 新格式 {"groups": {...}}，兼容旧扁平格式→main）。
@@ -3504,12 +3733,14 @@ def api_handler(method, path, body):
 
     # ================= OpenAI 兼容模型目录 =================
     if method == "GET" and cp in ("/v1/models", "/models"):
-        # 分组池（2026-08-29）：目录列出全部组选择器 id（api-pool 历史别名 + 各组名），
-        # dedicated 组名=模型名时即真实可用模型列表。
+        # 分组池（2026-08-29）：目录列出全部组选择器 id（api-pool 历史别名 + 各组 selector），
+        # dedicated 组 selector=真实模型名时即真实可用模型列表。
+        # 组管理（2026-08-30）：selector 取组实体 model 字段（无实体定义回退组名）。
         selector_ids = ["api-pool"]
         for grp in pool._all_group_names():
-            if grp not in selector_ids:
-                selector_ids.append(grp)
+            sid = pool._group_selector(grp) or grp
+            if sid not in selector_ids:
+                selector_ids.append(sid)
         return 200, {
             "object": "list",
             "data": [{
@@ -3610,6 +3841,46 @@ def api_handler(method, path, body):
                 "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)),
             }
         return 200, {"chain": chain, "groups": group_summary}, False
+    # ================= 组管理（2026-08-30）=================
+    if method == "GET" and cp == "/api/groups":
+        groups = []
+        for grp in pool._all_group_names():
+            gd = pool._group_defs.get(grp, {})
+            cur = pool._get_manual(grp) or pool._get_current(grp)
+            cur_ep = next((e for e in pool._endpoints if e.id == cur), None)
+            groups.append({
+                "name": grp,
+                "type": gd.get("type", "mixed"),
+                "model": gd.get("model", grp),
+                "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)),
+                "current_endpoint": cur_ep.name if cur_ep else None,
+                "is_main": grp == pool.MAIN_GROUP,
+            })
+        return 200, {"groups": groups}, False
+    if method == "POST" and cp == "/api/groups":
+        name = str(body.get("name", "")).strip()
+        gtype = body.get("type", "mixed")
+        model = str(body.get("model", "") or "").strip()
+        ok, msg = pool.create_group(name, gtype, model)
+        if not ok:
+            return 400, {"error": msg}, False
+        _sync_to_config()
+        return 201, {"ok": True, "name": msg}, False
+    if method == "PUT" and cp.startswith("/api/groups/"):
+        gname = unquote(cp[len("/api/groups/"):])
+        ok, msg = pool.update_group(gname, body)
+        if not ok:
+            return 400, {"error": msg}, False
+        _sync_to_config()
+        return 200, {"ok": True, "name": msg}, False
+    if method == "DELETE" and cp.startswith("/api/groups/"):
+        gname = unquote(cp[len("/api/groups/"):])
+        ok, msg = pool.delete_group(gname)
+        if not ok:
+            return 400, {"error": msg}, False
+        _sync_to_config()
+        return 200, {"ok": True}, False
+
     # ================= 聚合池管理 =================
     if method == "GET" and cp == "/api/pool":
         return 200, [ep for ep in pool.list_endpoints() if ep.get("in_pool")], False
@@ -3770,8 +4041,13 @@ def api_handler(method, path, body):
     return 404, {"error": "Not found"}, False
 
 def _sync_to_config():
+    # 组管理（2026-08-30）：组实体定义随配置持久化（dict → list 有序形态，main 恒在首位）
+    defs_list = [{"name": pool.MAIN_GROUP, **pool._group_defs[pool.MAIN_GROUP]}]
+    for gname, gd in pool._group_defs.items():
+        if gname != pool.MAIN_GROUP:
+            defs_list.append({"name": gname, "type": gd.get("type", "mixed"), "model": gd.get("model", gname)})
     save_config([{"id": ep.get("id"), "name": ep["name"], "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "default_headers": ep.get("default_headers", {}), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
-            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()])
+            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list)
 
 
 GUI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
