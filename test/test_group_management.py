@@ -32,6 +32,8 @@ def load_module(tmp_path):
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
+        module.__dict__["CONFIG_FILE"] = os.path.join(tmp_path, "api_config.json")
+        module.__dict__["RUNTIME_STATE_FILE"] = os.path.join(tmp_path, "api_runtime_state.json")
         return module
     finally:
         os.chdir(previous_cwd)
@@ -233,6 +235,60 @@ class GroupManagementTests(unittest.TestCase):
             self.assertEqual(pool2._group_defs["bg"], {"type": "mixed", "model": "api-pool-bg"})
             self.assertEqual(pool2._group_defs["ds"], {"type": "dedicated", "model": "deepseek-v4-flash"})
             self.assertEqual(pool2._group_defs["main"]["model"], "api-pool")
+
+    def test_group_rest_crud_persists_each_state(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+
+            status, response, _ = module.api_handler(
+                "POST", "/api/groups",
+                {"name": "bg", "type": "mixed", "model": "api-pool-bg"},
+            )
+            self.assertEqual((status, response["ok"]), (201, True))
+            with open(module.CONFIG_FILE, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            self.assertIn(
+                {"name": "bg", "type": "mixed", "model": "api-pool-bg"},
+                saved["pool_group_defs"],
+            )
+
+            status, response, _ = module.api_handler(
+                "PUT", "/api/groups/bg",
+                {"name": "background", "type": "mixed", "model": "api-pool-bg"},
+            )
+            self.assertEqual((status, response["ok"]), (200, True))
+            with open(module.CONFIG_FILE, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            names = [group["name"] for group in saved["pool_group_defs"]]
+            self.assertIn("background", names)
+            self.assertNotIn("bg", names)
+
+            status, response, _ = module.api_handler("DELETE", "/api/groups/background", None)
+            self.assertEqual((status, response["ok"]), (200, True))
+            with open(module.CONFIG_FILE, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            self.assertEqual([group["name"] for group in saved["pool_group_defs"]], ["main"])
+
+    def test_restart_restores_defs_priority_and_current_endpoint_together(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            module.pool.create_group("bg", "mixed", "api-pool-bg")
+            module.pool.add_endpoint({
+                "id": "b1", "name": "b1", "base_url": "http://127.0.0.1:1",
+                "api_key": "test", "model": "deepseek-v4-flash", "priority": 9,
+                "priority_by_group": {"bg": 1}, "enabled": True, "in_pool": True,
+                "use_proxy": False, "pool_groups": ["bg"],
+            })
+            module._sync_to_config()
+            self.assertTrue(module.save_runtime_state_groups({"bg": "b1"}))
+
+            restarted = load_module(tmp_path)
+            endpoint = next(ep for ep in restarted.pool._endpoints if ep.id == "b1")
+            self.assertEqual(restarted.pool._group_defs["bg"], {"type": "mixed", "model": "api-pool-bg"})
+            self.assertEqual(endpoint.priority_by_group["bg"], 1)
+            self.assertEqual(restarted.pool._get_current("bg"), "b1")
+            self.assertEqual(restarted.pool._get_manual("bg"), "b1")
+            self.assertEqual(restarted.pool._get_persisted("bg"), "b1")
 
     def test_zero_member_group_is_visible_in_group_apis(self):
         """新建组尚无成员时，组目录和链摘要仍必须立即返回该实体。"""

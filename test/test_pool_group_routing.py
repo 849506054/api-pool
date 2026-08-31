@@ -32,6 +32,8 @@ def load_module(tmp_path):
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
+        module.__dict__["CONFIG_FILE"] = os.path.join(tmp_path, "api_config.json")
+        module.__dict__["RUNTIME_STATE_FILE"] = os.path.join(tmp_path, "api_runtime_state.json")
         return module
     finally:
         os.chdir(previous_cwd)
@@ -387,6 +389,52 @@ class GroupAwareRemoveTests(unittest.TestCase):
             self.assertIsNone(pool._get_current("main"))
             self.assertIsNone(pool._get_manual("bg"))
             self.assertIsNone(pool._get_persisted("main"))
+
+    def test_pool_rest_append_and_group_remove_persist(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            endpoint = module.Endpoint(
+                id="shared", name="shared", base_url="http://127.0.0.1:1",
+                api_key="test", model="glm", priority=1, in_pool=True,
+                use_proxy=False, pool_groups=["main"],
+            )
+            module.pool.add_endpoint(endpoint)
+            module.pool.create_group("bg", "mixed", "api-pool-bg")
+
+            status, response, _ = module.api_handler(
+                "POST", "/api/pool/shared?groups=main%2Cbg", None,
+            )
+            self.assertEqual((status, response["ok"]), (200, True))
+            self.assertEqual(endpoint.pool_groups, ["main", "bg"])
+            with open(module.CONFIG_FILE, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            saved_endpoint = next(ep for ep in saved["api_endpoints"] if ep["id"] == "shared")
+            self.assertEqual(saved_endpoint["pool_groups"], ["main", "bg"])
+
+            status, response, _ = module.api_handler(
+                "DELETE", "/api/pool/shared?group=bg", None,
+            )
+            self.assertEqual((status, response["ok"]), (200, True))
+            self.assertTrue(endpoint.in_pool)
+            self.assertEqual(endpoint.pool_groups, ["main"])
+
+            status, response, _ = module.api_handler(
+                "DELETE", "/api/pool/shared?group=main", None,
+            )
+            self.assertEqual((status, response["ok"]), (200, True))
+            self.assertFalse(endpoint.in_pool)
+            self.assertEqual(endpoint.pool_groups, [])
+
+    def test_frontend_join_pool_contract_is_single_click_and_append_only(self):
+        index_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static", "index.html")
+        with open(index_path, encoding="utf-8") as handle:
+            html = handle.read()
+
+        self.assertIn("onclick=\"joinPoolGroup('${id}','${esc(g)}')\"", html)
+        self.assertIn("const groups=cur.includes(g)?cur:[...cur,g];", html)
+        self.assertIn("groups.join(',')", html)
+        self.assertIn("一次一组，加入其他组再点一次 📥", html)
+        self.assertIn("?group=${encodeURIComponent(g)}", html)
 
 
 class PerGroupPriorityTests(unittest.TestCase):
