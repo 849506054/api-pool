@@ -48,116 +48,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 }
 
 .grid{display:grid;grid-template-columns:7fr 3fr;gap:20px;align-items:start}
-@media(max-width:920px){.grid{grid-template-columns:1fr}.ep-list{max-height:60vh}}
-/* ── 移动端适配 ── */
-@media(max-width:768px){
-  body{padding:12px 10px;font-size:13px}
-  .header h1{font-size:16px}
-  .header h1 .logo{width:26px;height:26px;font-size:13px}
-  .header-actions .btn{font-size:11px;padding:5px 10px}
-  .stats{grid-template-columns:repeat(3,1fr);gap:6px}
-  .stat-item{padding:10px 6px}
-  .stat-item .num{font-size:16px}
-  .ep-item{padding:10px}
-  .ep-header{flex-direction:column;align-items:flex-start;gap:6px}
-  .ep-actions{flex-wrap:wrap;gap:3px;width:100%}
-  .ep-actions .btn{font-size:10px;padding:3px 7px;min-width:26px;text-align:center}
-  .ep-meta{flex-wrap:wrap;gap:4px;font-size:10px}
-  .ep-meta span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%}
-  .ep-name{font-size:13px;width:100%}
-  .ep-name .badge,.ep-name span.badge{font-size:9px;padding:2px 5px}
-  .ep-error{font-size:10px;padding:4px 6px}
-  .chain-item{padding:10px}
-  .card{padding:12px 14px}
-  .card-title{font-size:12px}
-  .filter-bar{flex-wrap:wrap;gap:4px}
-  .filter-bar .filter-btn{font-size:11px;padding:3px 8px}
-  .form-row{grid-template-columns:1fr!important;gap:8px}
-  .form-group{margin-bottom:0}
-  .form-group label{font-size:11px;margin-bottom:2px}
-  .form-group input,.form-group select{font-size:13px;padding:6px 8px}
-  .modal{width:95%;padding:16px;max-height:90vh;overflow-y:auto}
-  .model-row{flex-direction:column;align-items:stretch;gap:6px}
-  .model-row .btn{width:100%}
-  .api-info-card{padding:10px 12px;font-size:12px}
-  .api-info-card code{font-size:11px}
-  .test-drawer{width:95%;right:2.5%}
-  .test-drawer .drawer-header{flex-direction:column;align-items:flex-start;gap:6px}
-  .test-drawer .drawer-header .btn{width:100%}
-  .log-header{flex-wrap:wrap;gap:6px}
-  .log-header select{width:100%}
-  .log-row{flex-direction:column;gap:4px;padding:8px}
-  .log-row .log-time{font-size:10px;min-width:auto}
-  .log-row .log-msg{font-size:11px}
-  .log-row .log-level{font-size:10px;min-width:30px}
-  .seg-ctrl .seg-btn{font-size:10px;padding:3px 8px}
-  .stats-ttl{font-size:12px;padding:10px 0 6px}
-  .stats-ttl .num{font-size:16px}
-  .stats-ttl .label{font-size:10px}
-  table{font-size:10px!important}
-  table th,table td{padding:4px!important}
-  .chat-log-item{font-size:11px;padding:6px 8px}
-  .chat-log-meta{font-size:10px;flex-wrap:wrap}
-  .toast{font-size:12px;padding:8px 16px;bottom:16px;left:10px;right:10px;width:auto}
-  .modal-overlay .modal .form-actions{flex-direction:column;gap:6px}
-  .modal-overlay .modal .form-actions .btn{width:100%}
-}
-@media(max-width:768px){
-  /* 对话日志：列表/详情纵向堆叠。行布局保持 PC 端 7 列不变，窄屏横向滚动查看 */
-  .chatlog-layout{flex-direction:column!important;height:auto!important;min-height:0!important}
-  .chatlog-listwrap{min-height:0}
-  /* 表头已搬入滚动容器，listwrap 首个子元素即滚动区；flex:1(inline) basis:0 会架空高度 */
-  .chatlog-listwrap>div:first-child{flex:0 0 200px!important}
-  .chatlog-detail{margin-top:12px;overflow:visible!important}
-  .chatlog-detail>div{flex:0 0 auto!important;height:260px!important;min-height:0!important}
-  /* Prompt/Completion 内容超高时在面板内纵向滚动；禁横向滚动（内容已 wrap，横滑无意义） */
-  .chatlog-detail pre{max-height:212px!important;overflow-y:auto!important;overflow-x:hidden!important}
-  /* 横向滚动分层：chatLogsList 只管纵向，chatLogsX 管横向，避免 touch 纵向滚动连带横移 */
-  #chatLogsList{overflow-x:hidden!important}
-  #chatLogsX{overflow-x:auto!important;-webkit-overflow-scrolling:touch!important;scrollbar-width:none!important}
-  #chatLogsX::-webkit-scrollbar{display:none!important}
-  .chatlog-grid{grid-template-columns:repeat(7,60px)!important;min-width:492px!important;box-sizing:border-box}
-  .chatlog-grid>*{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .cl-ep{display:block}
-  .cl-model{display:block}
-  /* 数据面板：图表/排行卡窄屏单列堆叠（PC 两列不变） */
-  .analytics-grid{grid-template-columns:1fr!important;gap:12px}
-}
-@media(max-width:480px){
-  body{padding:8px 6px;font-size:12px}
-  .stats{grid-template-columns:repeat(3,1fr);gap:4px}
-  .stat-item{padding:8px 4px;border-radius:8px}
-  .stat-item .num{font-size:14px}
-  .stat-item .label{font-size:9px}
-  .header h1{font-size:14px}
-  .header-actions{gap:4px}
-  .header-actions .btn{font-size:10px;padding:4px 8px}
-  .ep-actions .btn{font-size:9px;padding:2px 5px;min-width:22px}
-  .modal{width:100%;padding:12px;border-radius:12px}
-  .card{padding:10px 12px;border-radius:12px}
-  .ep-meta span{max-width:100%}
-  .filter-bar{gap:3px}
-  .filter-bar .filter-btn{font-size:10px;padding:2px 6px}
-  .api-info-card{padding:8px 10px;font-size:11px}
-  .api-info-card code{font-size:10px}
-  .chain-item{padding:8px;font-size:12px}
-  .chain-item .chain-dot{width:8px;height:8px}
-  .test-drawer{width:98%;right:1%;border-radius:12px;padding:12px}
-  .test-drawer textarea{font-size:12px;min-height:60px}
-  .chat-log-item{font-size:10px;padding:4px 6px}
-  .chat-log-meta{font-size:9px}
-  .log-row{padding:6px}
-  .log-row .log-msg{font-size:10px}
-  .badge{font-size:8px;padding:1px 4px}
-  .ep-name .badge,.ep-name span.badge{font-size:8px;padding:1px 4px}
-  .btn{padding:5px 10px;font-size:11px}
-  .btn-sm{padding:2px 6px;font-size:10px}
-}
-@media(max-width:380px){
-  .stats{grid-template-columns:repeat(2,1fr)}
-  .ep-actions{gap:2px}
-  .ep-actions .btn{font-size:8px;padding:2px 4px;min-width:20px}
-}
 
 .card{background:var(--card);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow)}
 .analytics-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
@@ -345,6 +235,117 @@ select option { background: var(--bg); color: var(--text); }
 *::-webkit-scrollbar-corner{background:transparent}
 /* 端点列表卡片：高度对齐右侧 + 内部滚动 */
 .ep-card{display:flex;flex-direction:column;min-height:0}
+
+@media(max-width:920px){.grid{grid-template-columns:1fr}.ep-list{max-height:60vh}}
+/* ── 移动端适配 ── */
+@media(max-width:768px){
+  body{padding:12px 10px;font-size:13px}
+  .header h1{font-size:16px}
+  .header h1 .logo{width:26px;height:26px;font-size:13px}
+  .header-actions .btn{font-size:11px;padding:5px 10px}
+  .stats{grid-template-columns:repeat(3,1fr);gap:6px}
+  .stat-item{padding:10px 6px}
+  .stat-item .num{font-size:16px}
+  .ep-item{padding:10px}
+  .ep-header{flex-direction:column;align-items:flex-start;gap:6px}
+  .ep-actions{flex-wrap:wrap;gap:3px;width:100%}
+  .ep-actions .btn{font-size:10px;padding:3px 7px;min-width:26px;text-align:center}
+  .ep-meta{flex-wrap:wrap;gap:4px;font-size:10px}
+  .ep-meta span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%}
+  .ep-name{font-size:13px;width:100%}
+  .ep-name .badge,.ep-name span.badge{font-size:9px;padding:2px 5px}
+  .ep-error{font-size:10px;padding:4px 6px}
+  .chain-item{padding:10px}
+  .card{padding:12px 14px}
+  .card-title{font-size:12px}
+  .filter-bar{flex-wrap:wrap;gap:4px}
+  .filter-bar .filter-btn{font-size:11px;padding:3px 8px}
+  .form-row{grid-template-columns:1fr!important;gap:8px}
+  .form-group{margin-bottom:0}
+  .form-group label{font-size:11px;margin-bottom:2px}
+  .form-group input,.form-group select{font-size:13px;padding:6px 8px}
+  .modal{width:95%;padding:16px;max-height:90vh;overflow-y:auto}
+  .model-row{flex-direction:column;align-items:stretch;gap:6px}
+  .model-row .btn{width:100%}
+  .api-info-card{padding:10px 12px;font-size:12px}
+  .api-info-card code{font-size:11px}
+  .test-drawer{width:95%;right:2.5%}
+  .test-drawer .drawer-header{flex-direction:column;align-items:flex-start;gap:6px}
+  .test-drawer .drawer-header .btn{width:100%}
+  .log-header{flex-wrap:wrap;gap:6px}
+  .log-header select{width:100%}
+  .log-row{flex-direction:column;gap:4px;padding:8px}
+  .log-row .log-time{font-size:10px;min-width:auto}
+  .log-row .log-msg{font-size:11px}
+  .log-row .log-level{font-size:10px;min-width:30px}
+  .seg-ctrl .seg-btn{font-size:10px;padding:3px 8px}
+  .stats-ttl{font-size:12px;padding:10px 0 6px}
+  .stats-ttl .num{font-size:16px}
+  .stats-ttl .label{font-size:10px}
+  table{font-size:10px!important}
+  table th,table td{padding:4px!important}
+  .chat-log-item{font-size:11px;padding:6px 8px}
+  .chat-log-meta{font-size:10px;flex-wrap:wrap}
+  .toast{font-size:12px;padding:8px 16px;bottom:16px;left:10px;right:10px;width:auto}
+  .modal-overlay .modal .form-actions{flex-direction:column;gap:6px}
+  .modal-overlay .modal .form-actions .btn{width:100%}
+}
+@media(max-width:768px){
+  /* 对话日志：列表/详情纵向堆叠。行布局保持 PC 端 7 列不变，窄屏横向滚动查看 */
+  .chatlog-layout{flex-direction:column!important;height:auto!important;min-height:0!important}
+  .chatlog-listwrap{min-height:0}
+  /* 表头已搬入滚动容器，listwrap 首个子元素即滚动区；flex:1(inline) basis:0 会架空高度 */
+  .chatlog-listwrap>div:first-child{flex:0 0 200px!important}
+  .chatlog-detail{margin-top:12px;overflow:visible!important}
+  .chatlog-detail>div{flex:0 0 auto!important;height:260px!important;min-height:0!important}
+  /* Prompt/Completion 内容超高时在面板内纵向滚动；禁横向滚动（内容已 wrap，横滑无意义） */
+  .chatlog-detail pre{max-height:212px!important;overflow-y:auto!important;overflow-x:hidden!important}
+  /* 横向滚动分层：chatLogsList 只管纵向，chatLogsX 管横向，避免 touch 纵向滚动连带横移 */
+  #chatLogsList{overflow-x:hidden!important}
+  #chatLogsX{overflow-x:auto!important;-webkit-overflow-scrolling:touch!important;scrollbar-width:none!important}
+  #chatLogsX::-webkit-scrollbar{display:none!important}
+  .chatlog-grid{grid-template-columns:repeat(7,60px)!important;min-width:492px!important;box-sizing:border-box}
+  .chatlog-grid>*{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .cl-ep{display:block}
+  .cl-model{display:block}
+  /* 数据面板：图表/排行卡窄屏单列堆叠（PC 两列不变） */
+  .analytics-grid{grid-template-columns:1fr!important;gap:12px}
+}
+@media(max-width:480px){
+  body{padding:8px 6px;font-size:12px}
+  .stats{grid-template-columns:repeat(3,1fr);gap:4px}
+  .stat-item{padding:8px 4px;border-radius:8px}
+  .stat-item .num{font-size:14px}
+  .stat-item .label{font-size:9px}
+  .header h1{font-size:14px}
+  .header-actions{gap:4px}
+  .header-actions .btn{font-size:10px;padding:4px 8px}
+  .ep-actions .btn{font-size:9px;padding:2px 5px;min-width:22px}
+  .modal{width:100%;padding:12px;border-radius:12px}
+  .card{padding:10px 12px;border-radius:12px}
+  .ep-meta span{max-width:100%}
+  .filter-bar{gap:3px}
+  .filter-bar .filter-btn{font-size:10px;padding:2px 6px}
+  .api-info-card{padding:8px 10px;font-size:11px}
+  .api-info-card code{font-size:10px}
+  .chain-item{padding:8px;font-size:12px}
+  .chain-item .chain-dot{width:8px;height:8px}
+  .test-drawer{width:98%;right:1%;border-radius:12px;padding:12px}
+  .test-drawer textarea{font-size:12px;min-height:60px}
+  .chat-log-item{font-size:10px;padding:4px 6px}
+  .chat-log-meta{font-size:9px}
+  .log-row{padding:6px}
+  .log-row .log-msg{font-size:10px}
+  .badge{font-size:8px;padding:1px 4px}
+  .ep-name .badge,.ep-name span.badge{font-size:8px;padding:1px 4px}
+  .btn{padding:5px 10px;font-size:11px}
+  .btn-sm{padding:2px 6px;font-size:10px}
+}
+@media(max-width:380px){
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .ep-actions{gap:2px}
+  .ep-actions .btn{font-size:8px;padding:2px 4px;min-width:20px}
+}
 </style>
 
 </head>
