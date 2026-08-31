@@ -272,6 +272,14 @@ class ContentFilter:
 
         t0 = time.perf_counter()
         try:
+            # 预扫：无命中直接复用原请求对象（与未启用路径一致），避免每次请求全量深拷贝
+            if not self._has_match(payload):
+                scan_done = time.perf_counter()
+                stats["scan_ms"] = round((scan_done - t0) * 1000, 3)
+                stats["duration_ms"] = stats["scan_ms"]
+                if return_stats:
+                    return payload, stats
+                return payload
             # 深拷贝 payload，确保后续端点/日志共用清洗结果且不污染原请求
             cleaned = _copy.deepcopy(payload)
             copy_done = time.perf_counter()
@@ -376,6 +384,127 @@ class ContentFilter:
                         total += self._walk_descriptions(params)
         return total
 
+    def _has_match(self, payload):
+        """与 _apply 同路径的只读预扫：任一目标字符串命中即返回 True（不复制、不修改）。
+
+        遍历范围必须与 _apply/_walk_* 保持一致，否则预扫假阴性会导致漏过滤。
+        """
+        if not self._enabled or not self._pairs:
+            return False
+        pattern = self._pattern
+        if pattern is None or not isinstance(payload, dict):
+            return False
+        t = self._targets
+        if "all_strings" in t:
+            return self._scan_strings(payload)
+        messages = payload.get("messages")
+        if isinstance(messages, list) and (
+            "messages.content" in t
+            or "messages.text_blocks" in t
+            or "messages.reasoning" in t
+            or "messages.name" in t
+            or "messages.tool_call_arguments" in t
+        ):
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if "messages.content" in t and isinstance(content, str):
+                    if pattern.search(content):
+                        return True
+                elif "messages.text_blocks" in t and isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            tv = part.get("text")
+                            if isinstance(tv, str) and pattern.search(tv):
+                                return True
+                if "messages.reasoning" in t:
+                    for rfield in ("reasoning_content", "reasoning_text"):
+                        rv = msg.get(rfield)
+                        if isinstance(rv, str) and pattern.search(rv):
+                            return True
+                if "messages.name" in t:
+                    mname = msg.get("name")
+                    if isinstance(mname, str) and pattern.search(mname):
+                        return True
+                if "messages.tool_call_arguments" in t:
+                    tool_calls = msg.get("tool_calls")
+                    if isinstance(tool_calls, list):
+                        for tc in tool_calls:
+                            if not isinstance(tc, dict):
+                                continue
+                            fn = tc.get("function")
+                            if not isinstance(fn, dict):
+                                continue
+                            args = fn.get("arguments")
+                            if (
+                                isinstance(args, str) and self._scan_arguments(args)
+                            ) or (
+                                isinstance(args, dict) and self._scan_strings(args)
+                            ):
+                                return True
+        if "tools.descriptions" in t:
+            tools = payload.get("tools")
+            if isinstance(tools, list):
+                for tool in tools:
+                    if not isinstance(tool, dict):
+                        continue
+                    fn = tool.get("function")
+                    if not isinstance(fn, dict):
+                        continue
+                    desc = fn.get("description")
+                    if isinstance(desc, str) and pattern.search(desc):
+                        return True
+                    params = fn.get("parameters")
+                    if isinstance(params, dict) and self._scan_descriptions(params):
+                        return True
+        return False
+
+    def _scan_strings(self, node):
+        """_walk_strings 的只读镜像：任一字符串值命中即返回 True。"""
+        if isinstance(node, dict):
+            for value in node.values():
+                if (
+                    isinstance(value, str) and self._pattern.search(value)
+                ) or (
+                    isinstance(value, (dict, list)) and self._scan_strings(value)
+                ):
+                    return True
+        elif isinstance(node, list):
+            for item in node:
+                if (
+                    isinstance(item, str) and self._pattern.search(item)
+                ) or (
+                    isinstance(item, (dict, list)) and self._scan_strings(item)
+                ):
+                    return True
+        return False
+
+    def _scan_descriptions(self, node):
+        """_walk_descriptions 的只读镜像：description 字符串命中即返回 True。"""
+        if isinstance(node, dict):
+            desc = node.get("description")
+            if isinstance(desc, str) and self._pattern.search(desc):
+                return True
+            for value in node.values():
+                if isinstance(value, (dict, list)) and self._scan_descriptions(value):
+                    return True
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)) and self._scan_descriptions(item):
+                    return True
+        return False
+
+    def _scan_arguments(self, args_str):
+        """_replace_json_arguments 的只读镜像：JSON 解析成功走对象扫描，失败走原串搜索。"""
+        try:
+            obj = json.loads(args_str)
+        except (ValueError, TypeError):
+            return bool(self._pattern.search(args_str))
+        if isinstance(obj, (dict, list)):
+            return self._scan_strings(obj)
+        return False
+
     def _walk_descriptions(self, node):
         """遍历 parameters 中的 description 字符串字段。"""
         count = 0
@@ -452,8 +581,17 @@ class TokenTracker:
         self.db_path = db_path
         self._init_db()
 
+    def _connect(self, timeout=5):
+        """建立连接并应用 WAL 配套 pragma（synchronous 是 per-connection 属性，每次连接都要设置）。"""
+        conn = sqlite3.connect(self.db_path, timeout=timeout)
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
+        # WAL 持久化在 DB 头，幂等；DB 恢复/拷贝后启动时自动回 WAL
+        with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS token_usage (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -477,7 +615,7 @@ class TokenTracker:
     def add_usage(self, endpoint_name, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens=0):
         def _do_insert():
             try:
-                with sqlite3.connect(self.db_path, timeout=5) as conn:
+                with self._connect() as conn:
                     conn.execute(
                         "INSERT INTO token_usage (endpoint_name, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens) VALUES (?, ?, ?, ?, ?, ?)",
                         (endpoint_name, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens)
@@ -488,7 +626,7 @@ class TokenTracker:
 
     def get_today_usage_by_endpoint(self, endpoint_name):
         try:
-            with sqlite3.connect(self.db_path, timeout=5) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT SUM(total_tokens) FROM token_usage WHERE endpoint_name = ? AND timestamp >= datetime(date('now', 'localtime'), 'utc')", (endpoint_name,))
                 return cursor.fetchone()[0] or 0
@@ -497,13 +635,13 @@ class TokenTracker:
 
     def rename_endpoint(self, old_name: str, new_name: str):
         try:
-            with sqlite3.connect(self.db_path, timeout=5) as conn:
+            with self._connect() as conn:
                 conn.execute("UPDATE token_usage SET endpoint_name = ? WHERE endpoint_name = ?", (new_name, old_name))
         except Exception as e:
             sys_log(f"重命名端点统计数据失败: {e}", "WARN")
 
     def get_stats(self, endpoint_filter=None):
-        with sqlite3.connect(self.db_path, timeout=5) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             ep_cond = " AND endpoint_name = ?" if endpoint_filter and endpoint_filter != "all" else ""
             params = (endpoint_filter,) if (endpoint_filter and endpoint_filter != "all") else ()
@@ -603,7 +741,7 @@ class TokenTracker:
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["ID", "Timestamp", "Endpoint", "Model", "Prompt Tokens", "Completion Tokens", "Total Tokens", "Cached Tokens"])
-        with sqlite3.connect(self.db_path, timeout=5) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT id, timestamp, endpoint_name, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens FROM token_usage ORDER BY id DESC")
             for row in cursor.fetchall():
@@ -611,7 +749,7 @@ class TokenTracker:
         return output.getvalue()
 
     def clear_data(self):
-        with sqlite3.connect(self.db_path, timeout=5) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM token_usage")
             conn.commit()
@@ -628,6 +766,13 @@ class ChatLogger:
         # 后台守护线程：每小时滚动清理一次过期日志（daemon 线程，失败不影响主服务）
         threading.Thread(target=self._retention_loop, daemon=True).start()
 
+    def _connect(self, timeout=5):
+        """建立连接并应用 WAL 配套 pragma（synchronous 是 per-connection 属性，每次连接都要设置）。"""
+        conn = sqlite3.connect(self.db_path, timeout=timeout)
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
     def _retention_loop(self):
         while True:
             try:
@@ -640,7 +785,7 @@ class ChatLogger:
         """删除超过 RETENTION_DAYS 天的对话日志（按 UTC 时间戳比较），返回删除行数。"""
         with self._lock:
             try:
-                conn = sqlite3.connect(self.db_path)
+                conn = self._connect()
                 c = conn.cursor()
                 c.execute(
                     "DELETE FROM chat_logs WHERE timestamp < datetime('now', ?)",
@@ -659,7 +804,9 @@ class ChatLogger:
 
     def _init_db(self):
         with self._lock:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._connect()
+            # WAL 持久化在 DB 头，幂等；DB 恢复/拷贝后启动时自动回 WAL
+            conn.execute("PRAGMA journal_mode=WAL")
             c = conn.cursor()
             c.execute('''CREATE TABLE IF NOT EXISTS chat_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -691,7 +838,7 @@ class ChatLogger:
         def _write():
             with self._lock:
                 try:
-                    conn = sqlite3.connect(self.db_path)
+                    conn = self._connect()
                     c = conn.cursor()
                     c.execute(
                         "INSERT INTO chat_logs (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -706,7 +853,7 @@ class ChatLogger:
     def get_logs(self, limit=50, offset=0, detail=True):
         with self._lock:
             try:
-                conn = sqlite3.connect(self.db_path)
+                conn = self._connect()
                 c = conn.cursor()
                 # detail=False：SQL 层不取 prompt/completion（避免从磁盘读 32MB 正文再丢弃）
                 if detail:
@@ -766,7 +913,7 @@ class ChatLogger:
         """单条详情（含正文）：列表页 detail=false 不拉正文，点击行时按 id 取全文。"""
         with self._lock:
             try:
-                conn = sqlite3.connect(self.db_path)
+                conn = self._connect()
                 c = conn.cursor()
                 c.execute(
                     "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens FROM chat_logs WHERE id = ?",
@@ -795,7 +942,7 @@ class ChatLogger:
     def clear_logs(self):
         with self._lock:
             try:
-                conn = sqlite3.connect(self.db_path)
+                conn = self._connect()
                 c = conn.cursor()
                 c.execute("DELETE FROM chat_logs")
                 conn.commit()

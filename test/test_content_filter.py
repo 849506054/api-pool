@@ -482,6 +482,133 @@ class ContentFilterTests(unittest.TestCase):
         self.assertEqual(stats["matched"], 1)
 
 
+class ContentFilterLazyCopyTests(unittest.TestCase):
+    """lazy-copy 预扫：无命中时跳过深拷贝，直接复用原请求对象（与未启用路径一致）。
+
+    预扫遍历范围必须与 _apply/_walk_* 完全一致，否则假阴性会漏过滤。
+    """
+
+    def _make_filter(self, dictionary, enabled=True, targets=None):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        path = os.path.join(td.name, "content_filter.json")
+        section = {
+            "enabled": enabled,
+            "dictionary_version": "lazy",
+            "dictionary": dictionary,
+        }
+        if targets is None:
+            targets = list(module.ContentFilter.KNOWN_TARGETS)
+        section["targets"] = targets
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"content_filter": section}, f, ensure_ascii=False)
+        return module.ContentFilter(file_path=path)
+
+    def test_no_match_returns_same_object(self):
+        f = self._make_filter({"token_a": "token a"})
+        payload = {"model": "m", "messages": [{"role": "user", "content": "hello world"}]}
+        cleaned, stats = f.filter_payload(payload, return_stats=True)
+        self.assertIs(cleaned, payload)  # 未命中：不深拷贝
+        self.assertEqual(stats["matched"], 0)
+        self.assertEqual(payload["messages"][0]["content"], "hello world")
+
+    def test_match_returns_copy_original_preserved(self):
+        f = self._make_filter({"token_a": "token a"})
+        payload = {"messages": [{"role": "user", "content": "do token_a test"}]}
+        cleaned, stats = f.filter_payload(payload, return_stats=True)
+        self.assertIsNot(cleaned, payload)  # 命中：深拷贝路径
+        self.assertEqual(cleaned["messages"][0]["content"], "do token a test")
+        self.assertEqual(payload["messages"][0]["content"], "do token_a test")
+        self.assertEqual(stats["matched"], 1)
+
+    def test_disabled_or_empty_returns_same_object(self):
+        f = self._make_filter({"token_a": "token a"}, enabled=False)
+        payload = {"messages": [{"role": "user", "content": "has token_a"}]}
+        cleaned, _ = f.filter_payload(payload, return_stats=True)
+        self.assertIs(cleaned, payload)  # 未启用：不深拷贝（即使有词）
+        f2 = self._make_filter({})
+        payload2 = {"messages": [{"role": "user", "content": "has token_a"}]}
+        cleaned2, _ = f2.filter_payload(payload2, return_stats=True)
+        self.assertIs(cleaned2, payload2)  # 空词典：不深拷贝
+
+    def test_pre_scan_matches_every_target_path(self):
+        # 每个 target 位置的命中都必须被预扫发现并替换（与 _apply 路径一致）
+        f = self._make_filter({"token_a": "token a"})
+        payload = {
+            "messages": [
+                {"role": "user", "content": "c token_a", "name": "n token_a"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "t token_a"}],
+                    "reasoning_content": "r token_a",
+                },
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"function": {"name": "x", "arguments": '{"q": "a token_a"}'}},
+                        {"function": {"name": "y", "arguments": {"q": "d token_a"}}},
+                    ],
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "t",
+                        "description": "desc token_a",
+                        "parameters": {"properties": {"k": {"description": "p token_a"}}},
+                    },
+                },
+                {"type": "function", "function": {"name": "t2", "description": "desc2"}},
+            ],
+        }
+        cleaned, stats = f.filter_payload(payload, return_stats=True)
+        self.assertIsNot(cleaned, payload)
+        self.assertGreaterEqual(stats["matched"], 7)
+        # 所有目标位置都被替换：原文无残留
+        self.assertNotIn("token_a", json.dumps(cleaned, ensure_ascii=False))
+
+    def test_no_match_outside_target_scope_returns_same_object(self):
+        # 敏感词出现在 target 范围之外：预扫不得误判为命中（不复制，原样返回）
+        f = self._make_filter({"token_a": "token a"}, targets=["messages.content"])
+        payload = {
+            "model": "token_a_model",
+            "messages": [{"role": "user", "content": "hello", "name": "token_a_name"}],
+            "tools": [{"type": "function", "function": {"name": "token_a_fn", "description": "token_a_desc"}}],
+        }
+        cleaned, stats = f.filter_payload(payload, return_stats=True)
+        self.assertIs(cleaned, payload)
+        self.assertEqual(stats["matched"], 0)
+
+    def test_newline_word_matches_real_string_value(self):
+        # 预扫基于真实字符串值（非 JSON 转义文本）：含换行的词必须命中
+        word = "line1\nline2"
+        f = self._make_filter({word: "joined"})
+        payload = {"messages": [{"role": "user", "content": "prefix line1\nline2 suffix"}]}
+        cleaned, stats = f.filter_payload(payload, return_stats=True)
+        self.assertEqual(stats["matched"], 1)
+        self.assertEqual(cleaned["messages"][0]["content"], "prefix joined suffix")
+
+    def test_tool_arguments_json_key_only_no_value_match_returns_same_object(self):
+        # JSON key 不替换：仅 key 命中不算命中 → 不复制
+        f = self._make_filter({"token_a": "token a"}, targets=["messages.tool_call_arguments"])
+        payload = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"function": {"name": "x", "arguments": '{"token_a": "value ok"}'}}
+                    ],
+                }
+            ]
+        }
+        cleaned, stats = f.filter_payload(payload, return_stats=True)
+        self.assertIs(cleaned, payload)
+        self.assertEqual(stats["matched"], 0)
+
+
 class ContentFilterSmokeTests(unittest.TestCase):
     """真实 production 词典冒烟测试：只检查元信息，不打印原文。"""
 
