@@ -629,6 +629,14 @@ async function refresh(){
   }
   renderChain(chain);
   alignCards();
+  // 预取池内端点模型目录：iOS 原生 select 打开时选项必须已就绪（onfocus 懒加载 +
+  // iOS 快照问题：选项未加载完就弹出旧列表，看不到目标模型）。endpointModels 有
+  // 5 分钟缓存，不会重复请求。
+  if (Array.isArray(eps)) {
+    for (const e of eps) {
+      if (e && e.in_pool) endpointModels(e.id).catch(() => {});
+    }
+  }
 }
 
 /* 端点列表卡片高度 = 右侧列（聚合池管理+聚合链）底部对齐，自适应 */
@@ -797,7 +805,7 @@ function renderPoolList(eps){
         </div>
       </div>
       <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
-        <select class="btn btn-ghost btn-sm pool-model-select" data-loaded="false" data-current-model="${escAttr(ep.model||'')}" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onfocus="loadPoolModelOptions(this,'${escAttr(ep.id)}')" onchange="changePoolModel(this,'${escAttr(ep.id)}','${escAttr(displayGroup)}')" title="修改当前组使用的模型"><option value="${escAttr(ep.model||'')}">${esc(ep.model||'未设置模型')}</option></select>
+        <select class="btn btn-ghost btn-sm pool-model-select" data-loaded="false" data-current-model="${escAttr(ep.model||'')}" onmousedown="event.stopPropagation();loadPoolModelOptions(this,'${escAttr(ep.id)}')" onclick="event.stopPropagation()" onfocus="loadPoolModelOptions(this,'${escAttr(ep.id)}')" onchange="changePoolModel(this,'${escAttr(ep.id)}','${escAttr(displayGroup)}')" title="修改当前组使用的模型"><option value="${escAttr(ep.model||'')}">${esc(ep.model||'未设置模型')}</option></select>
         <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
           <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority('${ep.id}', this.value, '${esc(displayGroup)}');this.blur()" title="修改组内优先级">${options}</select>
           <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="${ep.enabled?'暂停端点':'恢复端点'}" onclick="toggleEndpoint('${ep.id}')">${ep.enabled?'⏸':'▶'}</button>
@@ -867,17 +875,21 @@ async function loadPoolModelOptions(select,endpointId){
 }
 async function changePoolModel(select,endpointId,group){
   const model=select.value,current=select.dataset.currentModel||'';
-  if(!model||model===current){select.blur();return;}
+  if(!model||model===current){
+    toast(`模型未变化：当前已是「${current||'未设置'}」`,'info');
+    select.blur();return;
+  }
   select.disabled=true;
   try{
     const res=await api('POST',`/api/pool/${encodeURIComponent(endpointId)}/select-model`,{group,model});
-    if(!res.ok)throw new Error(res.error||'切换模型失败');
+    if(!res.ok)throw new Error(res.error||`后端返回 ${JSON.stringify(res).slice(0,200)}`);
     toast(`已切换为 ${model}`,'success');
     await refresh();
   }catch(err){
+    console.error('[select-model 失败]', {endpointId, group, model}, err);
     select.value=current;
     select.disabled=false;
-    toast(err.message||'切换模型失败','error');
+    toast(`切换失败(${group}→${model}): ${err.message||err}`,'error');
   }
 }
 

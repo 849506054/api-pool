@@ -4222,6 +4222,7 @@ def api_handler(method, path, body):
         group = str(body.get("group", "") or "").strip()
         model = str(body.get("model", "") or "").strip()
         if not source_ep_id or not group or not model:
+            sys_log(f"模型切换失败(400): 参数缺失 group='{group}' model='{model}' source='{source_ep_id}'", "ERROR")
             return 400, {"error": "需要端点、group 和 model"}, False
         try:
             replacement, created, pointer_moved = pool.replace_group_model(group, source_ep_id, model)
@@ -4233,6 +4234,7 @@ def api_handler(method, path, body):
                 groups_state[group] = replacement.id
                 if not save_runtime_state_groups(groups_state):
                     return 500, {"error": "运行态指针持久化失败"}, False
+            sys_log(f"模型切换成功: 组 '{group}' 源端点 {source_ep_id} → 模型 '{model}' → 端点 '{replacement.name}'（{'克隆' if created else '复用'}）", "INFO")
             return 200, {
                 "ok": True,
                 "action": "cloned" if created else "reused",
@@ -4240,8 +4242,10 @@ def api_handler(method, path, body):
                 "endpoint_name": replacement.name,
             }, False
         except KeyError as exc:
+            sys_log(f"模型切换失败(404): 组 '{group}' 源端点 {source_ep_id} 模型 '{model}': {exc}", "ERROR")
             return 404, {"error": str(exc.args[0])}, False
         except ValueError as exc:
+            sys_log(f"模型切换失败(400): 组 '{group}' 源端点 {source_ep_id} 模型 '{model}': {exc}", "ERROR")
             return 400, {"error": str(exc)}, False
     if method == "POST" and cp.startswith("/api/pool/"):
         ep_id = unquote(cp.split("/")[-1])

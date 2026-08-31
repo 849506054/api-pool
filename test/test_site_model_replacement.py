@@ -237,6 +237,48 @@ class SiteModelReplacementTests(unittest.TestCase):
         self.assertEqual(response["endpoint_name"], "site-a-model-b")
         self.assertNotEqual(response["endpoint_id"], source.id)
 
+    def test_select_model_api_logs_success_and_validation_failure(self):
+        source = self.endpoint("source", "model-a")
+        self.pool._set_current("main", source.id)
+        logs = []
+
+        with mock.patch.object(
+            self.module, "sys_log", side_effect=lambda message, level="INFO": logs.append((message, level))
+        ):
+            status, response, _ = self.module.api_handler(
+                "POST", "/api/pool/source/select-model",
+                {"group": "main", "model": "model-b"},
+            )
+            missing_status, _, _ = self.module.api_handler(
+                "POST", "/api/pool/source/select-model",
+                {"group": "main", "model": ""},
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["action"], "cloned")
+        expected_success_log = (
+            "模型切换成功: 组 'main' 源端点 source → 模型 'model-b' → 端点 'site-a-model-b'（克隆）"
+        )
+        self.assertIn((expected_success_log, "INFO"), logs)
+        self.assertEqual(missing_status, 400)
+        self.assertIn(
+            ("模型切换失败(400): 参数缺失 group='main' model='' source='source'", "ERROR"),
+            logs,
+        )
+
+    def test_frontend_prefetches_pool_models_before_native_select_opens(self):
+        index_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static", "index.html")
+        with open(index_path, encoding="utf-8") as handle:
+            html = handle.read()
+
+        self.assertIn("if (e && e.in_pool) endpointModels(e.id).catch(() => {});", html)
+        self.assertIn(
+            "onmousedown=\"event.stopPropagation();loadPoolModelOptions(this,'${escAttr(ep.id)}')\"",
+            html,
+        )
+        self.assertIn("console.error('[select-model 失败]'", html)
+        self.assertIn("切换失败(${group}→${model})", html)
+
 
 if __name__ == "__main__":
     unittest.main()
