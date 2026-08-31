@@ -120,7 +120,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
   #chatLogsList{overflow-x:hidden!important}
   #chatLogsX{overflow-x:auto!important;-webkit-overflow-scrolling:touch!important;scrollbar-width:none!important}
   #chatLogsX::-webkit-scrollbar{display:none!important}
-  .chatlog-grid{grid-template-columns:60px repeat(6,minmax(96px,1fr))!important;min-width:700px!important;box-sizing:border-box}
+  .chatlog-grid{grid-template-columns:repeat(7,60px)!important;min-width:492px!important;box-sizing:border-box}
+  .chatlog-grid>*{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .cl-ep{display:block}
   .cl-model{display:block}
 }
@@ -420,7 +421,7 @@ select option { background: var(--bg); color: var(--text); }
     <div class="chatlog-layout" style="display:flex; gap:15px; height:450px; min-height:300px;">
       <!-- List View -->
       <div class="chatlog-listwrap" style="flex:1; display:flex; flex-direction:column; border:1px solid var(--border); border-radius:8px; overflow:hidden;">
-        <div class="chatlog-grid chatlog-header" style="background:rgba(255,255,255,0.05); padding:8px 12px; font-weight:bold; border-bottom:1px solid var(--border); display:grid; grid-template-columns: 80px repeat(6, 1fr); gap:8px; font-size:12px;">
+        <div class="chatlog-grid chatlog-header" style="background:rgba(255,255,255,0.05); padding:8px 12px; font-weight:bold; border-bottom:1px solid var(--border); display:grid; grid-template-columns:80px repeat(3,minmax(0,1fr)) repeat(3,80px); gap:8px; font-size:12px;">
           <span>时间</span><span>池组</span><span>端点</span><span>模型</span><span>延迟</span><span>缓存命中</span><span>Tokens</span>
         </div>
         <div style="flex:1; position:relative; overflow:hidden;">
@@ -778,13 +779,6 @@ function renderPoolList(eps){
     if(ep.in_cooldown)cls+=' in-cooldown';
     if(ep.manual_unlock_required)cls+=' has-error';
     if(ep.in_pool)cls+=' in-pool';
-    let h=ep.health,lat=ep.health_latency_ms;
-    let rh='';
-    if(h==='ok')rh=`<span style="color:var(--green);font-size:11px">✓${lat>=0?' '+lat+'ms':''}</span>`;
-    else if(h==='slow')rh=`<span style="color:var(--yellow);font-size:11px">🐢${lat>=0?' '+lat+'ms':''}</span>`;
-    else if(h==='bad')rh=`<span style="color:var(--red);font-size:11px">✗${lat>=0?' '+lat+'ms':''}</span>`;
-    else rh=`<span style="color:var(--text-dim);font-size:11px">-</span>`;
-    // 组内优先级：显示该组独立编号（缺省回退全局值）
     const prioOf=(e)=>((e.priority_by_group&&e.priority_by_group[displayGroup]!==undefined)?e.priority_by_group[displayGroup]:e.priority);
     const maxP=Math.max(poolEps.length, Math.max(...poolEps.map(e=>prioOf(e))));
     let options='';
@@ -798,7 +792,6 @@ function renderPoolList(eps){
           ${ep.billing_mode==='pay_per_use'?`<span class="badge" style="background:rgba(255,159,10,.15);color:#ff9f0a;font-size:10px;padding:1px 5px" title="按次计费">💰按次</span>`:''}
         </div>
         <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
-          ${rh}
           ${(()=>{const cg=ep.current_groups||[];if(!ep.is_current||!cg.length)return '';if(cg.includes(displayGroup))return `<span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="当前服务组：${esc(cg.join(', '))}">● 当前</span>`;const others=cg.filter(g=>g!==displayGroup);return `<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:10px;padding:1px 6px" title="本组未使用：它是其他组的当前端点">● ${esc(others.join('·'))}</span>`;})()}
           ${ep.in_cooldown?`<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px">⏳${fmtTime(ep.cooldown_remaining)}</span>`:''}
           ${(ep.in_cooldown||ep.manual_unlock_required)?`<button class="btn btn-yellow btn-sm" style="padding:2px 5px;font-size:11px" title="${ep.manual_unlock_required?'手动解冻余额不足端点':'解除冷却'}" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
@@ -810,7 +803,7 @@ function renderPoolList(eps){
           <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority('${ep.id}', this.value, '${esc(displayGroup)}');this.blur()" title="修改组内优先级">${options}</select>
           <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="${ep.enabled?'暂停端点':'恢复端点'}" onclick="toggleEndpoint('${ep.id}')">${ep.enabled?'⏸':'▶'}</button>
           <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="编辑端点" onclick="editEndpoint('${ep.id}')">✏️</button>
-          ${!ep.is_current?`<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="切换为当前端点（组 ${esc(displayGroup)}）" onclick="switchEndpoint('${ep.id}','${esc(displayGroup)}')">⚡</button>`:''}
+          ${!((ep.current_groups||[]).includes(displayGroup)&&ep.is_current)?`<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="切换为当前端点（组 ${esc(displayGroup)}）" onclick="switchEndpoint('${ep.id}','${esc(displayGroup)}')">⚡</button>`:''}
           <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="从当前组移除（其他组不受影响；最后一组移除时整体出池）" onclick="removeFromPool('${ep.id}','${esc(displayGroup)}')">📤</button>
         </div>
       </div>
@@ -1834,7 +1827,7 @@ async function loadChatLogs(page, opts = {}) {
   }
   
   listEl.innerHTML = currentChatLogs.map((log, i) => `
-    <div class="chatlog-grid chatlog-row hover-bg" style="padding:8px 12px; border-bottom:1px solid var(--border); display:grid; grid-template-columns: 80px repeat(6, 1fr); gap:8px; font-size:12px; cursor:pointer; transition:background 0.2s;" onclick="viewChatLog(${i})">
+    <div class="chatlog-grid chatlog-row hover-bg" style="padding:8px 12px; border-bottom:1px solid var(--border); display:grid; grid-template-columns:80px repeat(3,minmax(0,1fr)) repeat(3,80px); gap:8px; font-size:12px; cursor:pointer; transition:background 0.2s;" onclick="viewChatLog(${i})">
       <div class="cl-cell cl-time" style="color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${log.timestamp.split(' ')[1]}</div>
       <div class="cl-cell cl-group" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--accent-light);" title="${log.pool_group || ''}">${log.pool_group || ''}</div>
       <div class="cl-cell cl-ep" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${log.endpoint_name}">${log.endpoint_name}</div>
