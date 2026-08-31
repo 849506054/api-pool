@@ -1376,11 +1376,11 @@ class APIPool:
     _GROUP_NAME_RE = None  # 延迟初始化（模块顶部 import re）
 
     def _valid_group_name(self, name):
-        """组名校验：非空、≤32 字符、仅字母数字/连字符/下划线/中文。"""
+        """组名校验：非空、≤32 字符、字母数字/连字符/点号/下划线/中文。"""
         if not isinstance(name, str):
             return False
         n = name.strip()
-        return bool(n) and len(n) <= 32 and bool(re.fullmatch(r"[\w\u4e00-\u9fff-]+", n))
+        return bool(n) and len(n) <= 32 and bool(re.fullmatch(r"[\w\u4e00-\u9fff.-]+", n))
 
     def _valid_group_type(self, gtype):
         return gtype in ("mixed", "dedicated")
@@ -1425,7 +1425,7 @@ class APIPool:
         with self._lock:
             name = str(name or "").strip()
             if not self._valid_group_name(name):
-                return False, "组名非法（非空、≤32字符、字母数字/连字符/下划线/中文）"
+                return False, "组名非法（非空、≤32字符、字母数字/连字符/点号/下划线/中文）"
             if name == self.MAIN_GROUP or name == "api-pool":
                 return False, f"组名 '{name}' 为保留名"
             if name in self._group_defs or name in self._all_group_names():
@@ -1480,7 +1480,7 @@ class APIPool:
 
             if new_name != name:
                 if not self._valid_group_name(new_name):
-                    return False, "组名非法（非空、≤32字符、字母数字/连字符/下划线/中文）"
+                    return False, "组名非法（非空、≤32字符、字母数字/连字符/点号/下划线/中文）"
                 if new_name == self.MAIN_GROUP or new_name == "api-pool":
                     return False, f"组名 '{new_name}' 为保留名"
                 if new_name in self._group_defs or new_name in self._all_group_names():

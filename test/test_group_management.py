@@ -67,6 +67,17 @@ class GroupManagementTests(unittest.TestCase):
             self.assertTrue(ok, msg)
             self.assertEqual(pool._group_defs["bg"], {"type": "mixed", "model": "bg"})
 
+    def test_create_group_allows_dot_in_name(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            pool = self.make_pool(module, [])
+            ok, msg = pool.create_group("gpt-5.6-sol", "mixed", "")
+            self.assertTrue(ok, msg)
+            self.assertEqual(
+                pool._group_defs["gpt-5.6-sol"],
+                {"type": "mixed", "model": "gpt-5.6-sol"},
+            )
+
     def test_create_dedicated_requires_model(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
