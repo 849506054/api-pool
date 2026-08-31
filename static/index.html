@@ -55,10 +55,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
   .header h1{font-size:16px}
   .header h1 .logo{width:26px;height:26px;font-size:13px}
   .header-actions .btn{font-size:11px;padding:5px 10px}
-  .dash-stats{grid-template-columns:repeat(2,1fr);gap:10px}
-  .dash-stat{padding:14px}
-  .dash-stat .num{font-size:18px}
-  .dash-stat .label{font-size:10px}
   .stats{grid-template-columns:repeat(3,1fr);gap:6px}
   .stat-item{padding:10px 6px}
   .stat-item .num{font-size:16px}
@@ -129,9 +125,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 }
 @media(max-width:480px){
   body{padding:8px 6px;font-size:12px}
-  .dash-stats{grid-template-columns:1fr 1fr;gap:6px}
-  .dash-stat{padding:10px}
-  .dash-stat .num{font-size:16px}
   .stats{grid-template-columns:repeat(3,1fr);gap:4px}
   .stat-item{padding:8px 4px;border-radius:8px}
   .stat-item .num{font-size:14px}
@@ -161,7 +154,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
   .btn-sm{padding:2px 6px;font-size:10px}
 }
 @media(max-width:380px){
-  .dash-stats{grid-template-columns:1fr;gap:4px}
   .stats{grid-template-columns:repeat(2,1fr)}
   .ep-actions{gap:2px}
   .ep-actions .btn{font-size:8px;padding:2px 4px;min-width:20px}
@@ -187,6 +179,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .dash-stat:hover .stat-icon{opacity:0.4;transform:scale(1.1)}
 .dash-stat .num{font-size:28px;font-weight:800;font-variant-numeric:tabular-nums;margin-bottom:4px;letter-spacing:-0.5px}
 .dash-stat .label{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;font-weight:600}
+/* 统计卡移动端 2 列（2026-09-01 修复：原覆盖写在基础样式之前被后定义覆盖，从未生效；此处必须位于 .dash-stats 基础之后） */
+@media(max-width:768px){
+  .dash-stats{grid-template-columns:repeat(2,1fr)!important;gap:10px}
+  .dash-stat{padding:14px}
+  .dash-stat .num{font-size:18px}
+  .dash-stat .label{font-size:10px}
+}
+@media(max-width:480px){
+  .dash-stats{grid-template-columns:1fr 1fr!important;gap:6px}
+  .dash-stat{padding:10px}
+  .dash-stat .num{font-size:16px}
+  .dash-stat .label{font-size:9px;letter-spacing:.5px}
+}
 
 .tbl-progress-container{position:relative;width:100%;height:100%;display:flex;align-items:center}
 .tbl-progress-bar{position:absolute;left:0;top:0;bottom:0;background:rgba(94,92,230,0.15);border-radius:4px;z-index:0;transition:width 0.5s cubic-bezier(0.2,0.8,0.2,1)}
