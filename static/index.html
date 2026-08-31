@@ -1606,10 +1606,17 @@ async function loadAnalytics(){
     `;
     
     setTimeout(() => {
+        // 先全部显示再绘制：hidden 容器 clientWidth=0 会让 viewBox 回退 800，
+        // 切回显示时 SVG 被等比压缩（未命中/请求数图表变矮，2026-09-01 修复）
+        for (const _cid of ['tokenTodayChart', 'missedTodayChart', 'callsTodayChart']) {
+            document.getElementById(_cid).style.display = 'block';
+        }
         drawSVGChart('tokenTodayChart', r.trend_today_hourly, {key: 'tokens', unit: 'Tokens'});
         drawSVGChart('missedTodayChart', r.trend_today_hourly, {key: 'missed', unit: 'Tokens'});
         drawSVGChart('callsTodayChart', r.trend_today_hourly, {key: 'calls', unit: '次'});
         drawCompositionChart('tokenTrendChart', r.trend_14d);
+        document.getElementById('missedTodayChart').style.display = 'none';
+        document.getElementById('callsTodayChart').style.display = 'none';
     }, 50);
     
     switchTblToday('tokens', true);
