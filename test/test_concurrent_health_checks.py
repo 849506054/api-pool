@@ -278,7 +278,18 @@ class ConcurrentHealthCheckTests(unittest.TestCase):
         self.assertGreaterEqual(endpoint._cooldown_until, before + 5 * 60 * 60 - 1)
         self.assertLessEqual(endpoint._cooldown_until, before + 5 * 60 * 60 + 1)
 
-    def test_plain_rate_limit_keeps_normal_cooldown(self):
+    def test_retry_after_for_plain_rate_limit_controls_cooldown(self):
+        pool, endpoints = self.make_pool(2)
+        endpoint = endpoints[0]
+        before = time.time()
+
+        pool._rotate(endpoint, "HTTP 429: rate limit exceeded; Retry-After: 60")
+
+        self.assertEqual(endpoint._cooldown_reason, "rate_limited")
+        self.assertGreaterEqual(endpoint._cooldown_until, before + 59)
+        self.assertLess(endpoint._cooldown_until, before + 62)
+
+    def test_plain_rate_limit_uses_configured_cooldown(self):
         pool, endpoints = self.make_pool(1)
         endpoint = endpoints[0]
         endpoint.cooldown_minutes = 3

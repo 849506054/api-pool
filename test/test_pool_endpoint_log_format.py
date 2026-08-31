@@ -51,14 +51,14 @@ class PoolEndpointLogFormatTests(unittest.TestCase):
             original = module.sys_log
             setattr(module, "sys_log", lambda msg, level="INFO": logs.append((msg, level)))
             try:
-                pool.chat([{"role": "user", "content": "hi"}], model="api-pool-bg")
+                pool.chat([{"role": "user", "content": "hi"}], model="api-pool-bg", request_id="reqtest")
             finally:
                 setattr(module, "sys_log", original)
             self.assertIn(
-                ("收到 API 请求，尝试请求端点 '[api-pool-bg]Opencode: deepseek-v4-flash'", "INFO"),
+                ("[req=reqtest] 收到 API 请求，尝试请求端点 '[api-pool-bg]Opencode: deepseek-v4-flash'", "INFO"),
                 logs,
             )
-            self.assertIn(("端点 '[api-pool-bg]Opencode' 请求成功", "INFO"), logs)
+            self.assertIn(("[req=reqtest] 端点 '[api-pool-bg]Opencode' 请求成功", "INFO"), logs)
             self.assertTrue(all("延迟: 正常" not in msg for msg, _ in logs))
 
 

@@ -2,6 +2,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import threading
 import unittest
 
 MODULE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "api_pool_server.py")
@@ -227,6 +228,85 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             candidates = pool._failover_endpoints()
 
             self.assertEqual([ep.id for ep in candidates], ["failed", "deferred"])
+
+    def test_late_success_does_not_override_newer_manual_switch(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            old = self.endpoint(module, "old", 1, "claude-opus-5")
+            manual = self.endpoint(module, "manual", 2, "gpt-5.6-sol")
+            pool = module.APIPool([old, manual])
+            pool._set_current(pool.MAIN_GROUP, old.id)
+            request_epoch = pool._get_route_epoch(pool.MAIN_GROUP)
+
+            self.assertTrue(pool.switch_to_endpoint(manual.id))
+            pool._on_success(old, {"choices": []}, expected_route_epoch=request_epoch)
+
+            self.assertEqual(pool._get_current(pool.MAIN_GROUP), manual.id)
+            self.assertEqual(pool._get_manual(pool.MAIN_GROUP), manual.id)
+
+    def test_chat_inflight_success_does_not_override_manual_switch(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            old = self.endpoint(module, "old", 1, "claude-opus-5")
+            manual = self.endpoint(module, "manual", 2, "gpt-5.6-sol")
+            pool = module.APIPool([old, manual])
+            pool._set_current(pool.MAIN_GROUP, old.id)
+            entered = threading.Event()
+            release = threading.Event()
+
+            def fake_try(ep, payload, timeout, **kwargs):
+                entered.set()
+                release.wait(2)
+                return {"choices": [{"message": {"content": "ok"}}]}, ""
+
+            pool._try_endpoint = fake_try
+            worker = threading.Thread(
+                target=pool.chat,
+                args=([{"role": "user", "content": "one"}],),
+            )
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            self.assertTrue(pool.switch_to_endpoint(manual.id))
+            release.set()
+            worker.join(2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(pool._get_current(pool.MAIN_GROUP), manual.id)
+            self.assertEqual(pool._get_manual(pool.MAIN_GROUP), manual.id)
+
+    def test_late_failure_does_not_override_newer_manual_switch(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            old = self.endpoint(module, "old", 1, "claude-opus-5")
+            manual = self.endpoint(module, "manual", 2, "gpt-5.6-sol")
+            candidate = self.endpoint(module, "candidate", 3, "glm-5.3-flash")
+            pool = module.APIPool([old, manual, candidate])
+            pool._set_current(pool.MAIN_GROUP, old.id)
+            request_epoch = pool._get_route_epoch(pool.MAIN_GROUP)
+
+            self.assertTrue(pool.switch_to_endpoint(manual.id))
+            pool._rotate(old, "HTTP 503: simulated", expected_route_epoch=request_epoch)
+
+            self.assertEqual(pool._get_current(pool.MAIN_GROUP), manual.id)
+            self.assertEqual(pool._get_manual(pool.MAIN_GROUP), manual.id)
+
+    def test_late_success_does_not_override_background_failback(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            recovered = self.endpoint(module, "recovered", 1, "gpt-5.6-sol")
+            old = self.endpoint(module, "old", 2, "claude-opus-5")
+            old.deferrable = False
+            pool = module.APIPool([recovered, old])
+            pool._set_current(pool.MAIN_GROUP, old.id)
+            request_epoch = pool._get_route_epoch(pool.MAIN_GROUP)
+            pool._last_pool_activity = module.time.time()
+            pool._probe_endpoint = lambda ep: (True, "")
+
+            pool._background_probe(recovered, old.id)
+            pool._on_success(old, {"choices": []}, expected_route_epoch=request_epoch)
+
+            self.assertEqual(pool._get_current(pool.MAIN_GROUP), recovered.id)
+            self.assertIsNone(pool._get_manual(pool.MAIN_GROUP))
 
 
 if __name__ == "__main__":

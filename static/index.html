@@ -545,10 +545,10 @@ select option { background: var(--bg); color: var(--text); }
     </div>
     <div class="form-row">
       <div class="form-group"><label>优先级</label><input type="number" id="fPriority" value="1" min="1"></div>
-      <div class="form-group"><label>超时 (秒)</label><input type="number" id="fTimeout" value="60" min="1"></div>
+      <div class="form-group"><label title="流式请求的连接、上传请求体及等待响应头超时；非流式正常请求仍受整体请求预算控制">连接/响应头超时 (秒)</label><input type="number" id="fTimeout" value="60" min="1"></div>
     </div>
     <div class="form-row">
-      <div class="form-group"><label>重试次数</label><input type="number" id="fRetries" value="0" min="0"></div>
+      <div class="form-group"><label title="可恢复错误发生后，在同一客户端请求内重新向原端点发送完整请求的额外次数；建议 0-1 次">原端点额外重试次数</label><input type="number" id="fRetries" value="1" min="0" max="3"></div>
       <div class="form-group"><label>冷却 (分钟)</label><input type="number" id="fCooldown" value="5" min="0"></div>
     </div>
       <div class="form-group">
@@ -576,9 +576,9 @@ select option { background: var(--bg); color: var(--text); }
 
     </div>
     <div class="form-row" style="grid-template-columns: 1fr 1fr 1fr;">
-      <div class="form-group"><label title="流式首包超时（秒），0=禁用独立超时。超过视为端点故障并重试">首包超时 (秒)</label><input type="number" id="fStreamFirstPacket" value="120" min="0" placeholder="0=禁用, 默认120"></div>
+      <div class="form-group"><label title="收到响应头后等待第一条 SSE 数据的独立超时，0=不额外设置；仍受整体请求预算约束">流式首条数据超时 (秒)</label><input type="number" id="fStreamFirstPacket" value="120" min="0" placeholder="0=不额外设置, 默认120"></div>
       <div class="form-group"><label title="流式无新数据停滞判定（秒），0=禁用停滞检测。停滞不冻结端点，仅事务失败">停滞判定 (秒)</label><input type="number" id="fStreamStall" value="60" min="0" placeholder="0=禁用, 默认60"></div>
-      <div class="form-group"><label title="流式总时长上限（秒），0=禁用。超过后截断并标记事务失败，不冻结端点">总时长上限 (秒)</label><input type="number" id="fStreamMaxDuration" value="120" min="0" placeholder="0=禁用, 默认120"></div>
+      <div class="form-group"><label title="流式总时长上限（秒），0=不限。正常持续输出默认不截断，仅对确需限制的端点单独设置">总时长上限 (秒)</label><input type="number" id="fStreamMaxDuration" value="0" min="0" placeholder="0=不限（默认）"></div>
 
     </div>
     <div class="form-group">
@@ -1325,7 +1325,7 @@ function editEndpoint(id){
     api('GET','/api/endpoints').then(eps=>{const ep=eps.find(e=>e.id===id);if(!ep)return;
         document.getElementById('editName').value=id;document.getElementById('modalTitle').textContent='编辑端点';
         document.getElementById('fName').value=ep.name;document.getElementById('fSiteName').value=ep.site_name||'';document.getElementById('fUrl').value=ep.base_url;document.getElementById('fKey').value=ep.api_key_full||'';document.getElementById('fModel').value=ep.model;document.getElementById('fUserAgent').value=ep.default_headers?.['User-Agent']||'';
-        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fDeferrable').value=String(ep.deferrable!==false);document.getElementById('fMaxContext').value=ep.max_context_k||0;document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);document.getElementById('fToolCallPrefix').value=ep.tool_call_id_prefix||'';document.getElementById('fStreamFirstPacket').value=ep.stream_first_packet_timeout??120;document.getElementById('fStreamStall').value=ep.stream_stall_timeout??60;document.getElementById('fStreamMaxDuration').value=ep.stream_max_duration??120;
+        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fDeferrable').value=String(ep.deferrable!==false);document.getElementById('fMaxContext').value=ep.max_context_k||0;document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);document.getElementById('fToolCallPrefix').value=ep.tool_call_id_prefix||'';document.getElementById('fStreamFirstPacket').value=ep.stream_first_packet_timeout??120;document.getElementById('fStreamStall').value=ep.stream_stall_timeout??60;document.getElementById('fStreamMaxDuration').value=ep.stream_max_duration??0;
         document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
         allModels=[];selectedModels=new Set();latencyResults={};visionResults={};checkFetchBtn();document.getElementById('modal').classList.add('show');
     });
@@ -1347,11 +1347,11 @@ async function batchAddEndpoints(){
     const fn=document.getElementById('fName').value.trim();
     const siteName=document.getElementById('fSiteName').value.trim();
     const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
-    const sp=parseInt(document.getElementById('fPriority').value)||1,to=parseInt(document.getElementById('fTimeout').value)||60,re=parseInt(document.getElementById('fRetries').value)||0,cd=Math.max(1,parseInt(document.getElementById('fCooldown').value)||5),dl=parseInt(document.getElementById('fDailyLimit').value)||0,rl=parseInt(document.getElementById('fRpmLimit').value)||0,up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',ua=document.getElementById('fUserAgent').value.trim(),hm=document.getElementById('fHealthMode').value||'chat',bm=document.getElementById('fBillingMode').value||'subscription';
+    const sp=parseInt(document.getElementById('fPriority').value)||1,to=parseInt(document.getElementById('fTimeout').value)||60,re=parseInt(document.getElementById('fRetries').value)||0,cd=Math.max(1,parseInt(document.getElementById('fCooldown').value)||5),dl=parseInt(document.getElementById('fDailyLimit').value)||0,rl=parseInt(document.getElementById('fRpmLimit').value)||0,up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',ua=document.getElementById('fUserAgent').value.trim(),hm=document.getElementById('fHealthMode').value||'chat',bm=document.getElementById('fBillingMode').value||'subscription',sf=parseInt(document.getElementById('fStreamFirstPacket').value)||0,ss=parseInt(document.getElementById('fStreamStall').value)||0,sm=parseInt(document.getElementById('fStreamMaxDuration').value)||0;
     if(!u||!k){toast('填写 URL 和 Key','error');return;}
     if(!selectedModels.size){toast('选择模型','error');return;}
     const ms=[...selectedModels];toast(`添加 ${ms.length} 个...`,'info');
-    const r=await api('POST','/api/endpoints/batch',{endpoints:ms.map((m,i)=>({name:fn?fn:m,model:m,priority:sp+i,is_vision:visionResults[m]?visionResults[m].supports_vision:true})),base:{site_name:siteName,base_url:u,api_key:k,default_headers:ua?{'User-Agent':ua}:{},timeout:to,max_retries:re,cooldown_minutes:cd,daily_limit:dl,rpm_limit:rl,use_proxy:up,protocol:pt,start_priority:sp,health_mode:hm,billing_mode:bm,enabled:true,in_pool:false,pool_groups:[]}});
+    const r=await api('POST','/api/endpoints/batch',{endpoints:ms.map((m,i)=>({name:fn?fn:m,model:m,priority:sp+i,is_vision:visionResults[m]?visionResults[m].supports_vision:true})),base:{site_name:siteName,base_url:u,api_key:k,default_headers:ua?{'User-Agent':ua}:{},timeout:to,max_retries:re,cooldown_minutes:cd,daily_limit:dl,rpm_limit:rl,use_proxy:up,protocol:pt,start_priority:sp,health_mode:hm,billing_mode:bm,stream_first_packet_timeout:sf,stream_stall_timeout:ss,stream_max_duration:sm,enabled:true,in_pool:false,pool_groups:[]}});
     if(r.ok){toast(`✅ ${r.added} 个`,'success');closeModal();refresh();}else toast('失败','error');
 }
 

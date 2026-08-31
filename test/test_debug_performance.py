@@ -110,6 +110,72 @@ class DebugPerformanceTests(unittest.TestCase):
             self.assertIsNone(result)
             self.assertIn("连接/超时错误", error)
             self.assertTrue(any(item.get("result") == "retry" for item in trace))
+
+    def test_http_5xx_retry_waits_three_seconds_and_logs(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            ep = module.Endpoint(
+                id="retry", name="retry", base_url="http://127.0.0.1:1", api_key="x",
+                model="m", max_retries=1, use_proxy=True, in_pool=True,
+            )
+            response = mock.Mock()
+            response.read.return_value = b'{"choices":[{"message":{"content":"ok"}}]}'
+            response.__enter__ = mock.Mock(return_value=response)
+            response.__exit__ = mock.Mock(return_value=False)
+            http_error = module.urllib.error.HTTPError(
+                "http://example/v1/chat/completions", 502, "bad gateway", {}, None,
+            )
+            logs = []
+            module.sys_log = lambda msg, level="INFO": logs.append((msg, level))
+            with mock.patch.object(module.urllib.request, "urlopen", side_effect=[http_error, response]), \
+                    mock.patch.object(module.time, "sleep") as sleep:
+                result, error = module.APIPool()._try_endpoint(
+                    ep, {"model": "m", "messages": []}, 60, log_usage=False,
+                )
+            self.assertIsNotNone(result)
+            self.assertEqual(error, "")
+            sleep.assert_called_once_with(3)
+            self.assertTrue(any("3 秒后进行第 1/1 次原端点重试（HTTP 502）" in msg for msg, _ in logs))
+
+    def test_timeout_recent_success_skips_internal_replay(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            ep = module.Endpoint(
+                id="retry", name="retry", base_url="http://127.0.0.1:1", api_key="x",
+                model="m", max_retries=1, use_proxy=True, in_pool=True,
+            )
+            ep._last_success_ts = module.time.time()
+            with mock.patch.object(module.urllib.request, "urlopen", side_effect=TimeoutError("read timed out")) as call, \
+                    mock.patch.object(module.time, "sleep") as sleep:
+                result, error = module.APIPool()._try_endpoint(
+                    ep, {"model": "m", "messages": []}, 60, log_usage=False,
+                )
+            self.assertIsNone(result)
+            self.assertIn("recent endpoint success", error)
+            self.assertEqual(call.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_retry_skipped_when_request_budget_is_exhausted(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            ep = module.Endpoint(
+                id="retry", name="retry", base_url="http://127.0.0.1:1", api_key="x",
+                model="m", max_retries=1, use_proxy=True, in_pool=True,
+            )
+            http_error = module.urllib.error.HTTPError(
+                "http://example/v1/chat/completions", 503, "unavailable", {}, None,
+            )
+            with mock.patch.object(module.urllib.request, "urlopen", side_effect=http_error) as call, \
+                    mock.patch.object(module.time, "sleep") as sleep:
+                result, error = module.APIPool()._try_endpoint(
+                    ep, {"model": "m", "messages": []}, 60, log_usage=False,
+                    request_deadline=module.time.time() + 1,
+                )
+            self.assertIsNone(result)
+            self.assertIn("request budget exhausted", error)
+            self.assertEqual(call.call_count, 1)
+            sleep.assert_not_called()
+
     def test_debug_disabled_does_not_build_trace_or_debug_log(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)

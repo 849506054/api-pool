@@ -911,7 +911,7 @@ class Endpoint:
     tool_call_id_prefix: str = ""
     stream_first_packet_timeout: int = 120
     stream_stall_timeout: int = 60
-    stream_max_duration: int = 120  # 流总时长上限（秒），0=禁用；防 keep-alive 型无限挂起（2026-08-14 缩短至120s）
+    stream_max_duration: int = 0  # 流总时长上限（秒），0=禁用；正常持续输出默认不截断
     deferrable: bool = True  # 是否保护本端点缓存（true=本端点工作时延迟切走）
     max_context_k: int = 0  # 最大上下文长度（K=1000 tokens），0=不限
     pool_groups: list = field(default_factory=list)  # 未入池端点默认无池组；入池时再绑定组
@@ -965,6 +965,9 @@ class APIPool:
         # 每组独立的粘性指针/手动覆盖/持久化指针/兜底锁。旧扁平状态在 _migrate_legacy_state 兼容。
         self._current_endpoint_by_group: dict[str, str | None] = {}
         self._manual_override_by_group: dict[str, str | None] = {}
+        # 每组路由决策版本：请求开始后若发生手动切换、恢复回迁或其他轮转，
+        # 迟到的旧请求只更新自身健康状态，不得覆盖更新的路由决策。
+        self._route_epoch_by_group: dict[str, int] = {}
         self._persisted_endpoint_by_group: dict[str, str | None] = {}
         self._fallback_lock_until_by_group: dict[str, float] = {}
         # 端点在途归属：ep.id → {组名: 在途请求数}。main 可抢占子组共享端点，
@@ -1630,19 +1633,28 @@ class APIPool:
         return self._current_endpoint_by_group.get(group)
 
     def _set_current(self, group, ep_id):
+        previous = self._current_endpoint_by_group.get(group)
         if ep_id is None:
             self._current_endpoint_by_group.pop(group, None)
         else:
             self._current_endpoint_by_group[group] = ep_id
+        if previous != ep_id:
+            self._route_epoch_by_group[group] = self._route_epoch_by_group.get(group, 0) + 1
 
     def _get_manual(self, group):
         return self._manual_override_by_group.get(group)
 
     def _set_manual(self, group, ep_id):
+        previous = self._manual_override_by_group.get(group)
         if ep_id is None:
             self._manual_override_by_group.pop(group, None)
         else:
             self._manual_override_by_group[group] = ep_id
+        if previous != ep_id:
+            self._route_epoch_by_group[group] = self._route_epoch_by_group.get(group, 0) + 1
+
+    def _get_route_epoch(self, group):
+        return self._route_epoch_by_group.get(group, 0)
 
     def _get_persisted(self, group):
         return self._persisted_endpoint_by_group.get(group)
@@ -2250,6 +2262,14 @@ class APIPool:
             ep._cooldown_until = time.time() + seconds
             ep._cooldown_reason = kind
             return kind, seconds
+        # 纯限流同样尊重 Retry-After；没有明确恢复时间时才交给普通冷却。
+        if "HTTP 429" in str(error_msg or ""):
+            seconds = self._parse_quota_cooldown_seconds(error_msg)
+            if seconds is not None:
+                ep._manual_unlock_required = False
+                ep._cooldown_until = time.time() + seconds
+                ep._cooldown_reason = "rate_limited"
+                return "rate_limited", seconds
         return "", None
 
     def _set_cooldown(self, ep):
@@ -2366,14 +2386,18 @@ class APIPool:
                         current_label = self._endpoint_log_label(current_ep, grp) if current_ep else f"[{grp}]无"
                         sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 冷却过期探活通过；当前端点 '{current_label}' 已开启缓存保护，延迟回切 5 分钟", "INFO")
                     else:
+                        switched = False
                         with self._lock:
                             ep._defer_until = 0
                             # 手动指定端点不被后台恢复覆盖；自动路由则立即回切
                             # 到刚恢复的端点，兑现"关闭缓存保护=立即回切"。
                             if not self._get_manual(grp):
                                 self._set_current(grp, ep.id)
-                        if current_ep is not None and current_ep is not ep and not current_ep.deferrable:
+                                switched = True
+                        if switched and current_ep is not None and current_ep is not ep and not current_ep.deferrable:
                             sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 冷却过期探活通过；当前端点 '{self._endpoint_log_label(current_ep, grp)}' 未开启缓存保护，立即回切", "INFO")
+                        elif self._get_manual(grp):
+                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 冷却过期探活通过；保留手动端点 '{self._endpoint_log_label(current_ep, grp)}'", "INFO")
                         else:
                             sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 冷却过期探活通过，已恢复", "INFO")
                     # 仅在该组当前端点不存在或已不可用时更新指针；恢复一个端点不应
@@ -2566,14 +2590,19 @@ class APIPool:
         )
         return not any(marker in lower for marker in transient_markers)
 
-    def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False, health_impact=True, group=None):
+    def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False, health_impact=True, group=None,
+                expected_route_epoch=None, request_id=None):
         grp = group or self.MAIN_GROUP
+        request_tag = f"[req={request_id}] " if request_id else ""
         if health_impact:
             failed_ep._fail_count += 1
             failed_ep._total_failures += 1
             failed_ep._last_error = error_msg
             failed_ep._last_error_ts = time.time()
-            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 请求失败: {error_msg}", "ERROR")
+            # chat() 已带同一 request_id 记录过本次失败；直接调用 _rotate
+            # （探活/测试等）才在这里补日志，避免同一错误重复两行。
+            if request_id is None:
+                sys_log(f"{request_tag}端点 '{self._endpoint_log_label(failed_ep, grp)}' 请求失败: {error_msg}", "ERROR")
         else:
             # 客户端类错误：请求形状问题，非端点故障。不冻结、fail_count 不增、
             # 不探活（探活小请求必然通过，无信息量），仅记录最后错误便于排查。
@@ -2582,13 +2611,15 @@ class APIPool:
             failed_ep._last_error = error_msg
             failed_ep._last_error_ts = time.time()
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 客户端类错误(不冻结/不记账)，同请求继续轮转: {error_msg}", "WARN")
-            return
+            return self._get_route_epoch(grp)
         capacity_kind, capacity_seconds = self._set_capacity_cooldown(failed_ep, error_msg)
         if capacity_kind == "balance_insufficient":
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 余额不足，已冻结，仅支持手动解冻", "WARN")
         elif capacity_kind == "quota_exceeded":
             detail = f"{capacity_seconds} 秒" if capacity_seconds is not None else "默认 5 小时"
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 配额不足，冻结 {detail}", "WARN")
+        elif capacity_kind == "rate_limited":
+            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 上游限流，按 Retry-After 冷却 {capacity_seconds} 秒", "WARN")
         elif probe_failed:
             # 探活失败：只设短冷却（30秒），避免误杀冷启动端点
             failed_ep._cooldown_until = time.time() + 30
@@ -2597,7 +2628,7 @@ class APIPool:
             # 端点级活跃判定：超时类失败但端点在 timeout 窗口内有成功响应
             # → 单请求饿死，非端点故障；不冻结、不切换当前端点。
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 活跃(窗口内有成功)，判定单请求饿死，不冻结不切换", "WARN")
-            return
+            return self._get_route_epoch(grp)
         else:
             self._set_cooldown(failed_ep)
             # 抖动后实际窗口为 cooldown_minutes×[80%,120%]，日志展示真实值
@@ -2606,13 +2637,19 @@ class APIPool:
         # 分组池：轮转切换限定在失败请求所属组内（含 bg 组 fallback 逻辑见 chat()）。
         active = [e for e in self._failover_endpoints() if grp in self._ep_groups(e)]
         candidates = self._ordered_failover_candidates(failed_ep, active, group=grp)
-        if candidates:
-            self._set_current(grp, candidates[0].id)
-        else:
-            self._set_current(grp, None)
-        self._set_manual(grp, None)  # 健康检测自动切换时清除手动覆盖
+        with self._lock:
+            # 请求启动后若已有更新的路由决策，保留该决策；本请求仍可在局部
+            # active 列表中继续重试，但不得让迟到失败覆盖 current/manual。
+            if expected_route_epoch is not None and self._get_route_epoch(grp) != expected_route_epoch:
+                return expected_route_epoch
+            if candidates:
+                self._set_current(grp, candidates[0].id)
+            else:
+                self._set_current(grp, None)
+            self._set_manual(grp, None)  # 当前路由决策内的失败才清除手动覆盖
+            return self._get_route_epoch(grp)
 
-    def _on_success(self, ep, result=None, clear_defer=True, group=None):
+    def _on_success(self, ep, result=None, clear_defer=True, group=None, expected_route_epoch=None):
         grp = group or self.MAIN_GROUP
         now = time.time()
         self._last_pool_activity = now  # 记录池活跃时间（用于 defer 判断）
@@ -2634,16 +2671,22 @@ class APIPool:
             self._clear_cooldown(ep)
         # 分组池：请求成功只更新该组粘性指针；runtime_state 按组持久化。
         # 测试临时池（_state_persistence_disabled）只更新内存指针，永不写盘。
-        self._set_current(grp, ep.id)
-        if not self._state_persistence_disabled and self._get_persisted(grp) != ep.id:
+        with self._lock:
+            route_is_current = (
+                expected_route_epoch is None
+                or self._get_route_epoch(grp) == expected_route_epoch
+            )
+            if route_is_current:
+                self._set_current(grp, ep.id)
+                if self._get_manual(grp) and self._get_manual(grp) != ep.id:
+                    self._set_manual(grp, None)
+        if route_is_current and not self._state_persistence_disabled and self._get_persisted(grp) != ep.id:
             state = load_runtime_state() or {}
             groups_state = state.get("groups") if isinstance(state, dict) else None
             groups_state = dict(groups_state) if isinstance(groups_state, dict) else {}
             groups_state[grp] = ep.id
             if save_runtime_state_groups(groups_state):
                 self._set_persisted(grp, ep.id)
-        if self._get_manual(grp) and self._get_manual(grp) != ep.id:
-            self._set_manual(grp, None)  # 手动覆盖端点失败后落到其他端点，清除覆盖
         # 缓存 reasoning_content/reasoning_text 用于多轮对话
         if result and isinstance(result, dict):
             try:
@@ -2749,13 +2792,19 @@ class APIPool:
             ep._health_error = "" if success else (str(err)[:100] if err else "未知错误")
         return success, err
 
-    def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False):
+    def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False, request_id=None):
         self._cleanup_expired_cooldowns()
+        if request_id is None:
+            import uuid
+            request_id = uuid.uuid4().hex[:8]
+        request_tag = f"[req={request_id}] "
         _chat_start = time.time()  # 530s 轮转预算计时起点（与 Hermes 600s 超时窗口对齐）
+        request_deadline = _chat_start + self._FALLBACK_DEADLINE_SECONDS
         debug_trace = [] if _DEBUG_LOGGING else None
         # ── 分组池路由（2026-08-29 spec）：model 字段 → 组选择器 ──
         # "api-pool"→main 别名（存量流量零感知）；精确匹配组名；无匹配→main。
         group = self._resolve_request_group(model)
+        request_route_epoch = self._get_route_epoch(group)
         group_fallback_used = False  # bg 组入口/耗尽 fallback 到 main 的标记
         # 终极兜底锁定：锁定期间该组请求直连 prio99（per-group 滑动窗口，prio99 仅 main 组语义生效）
         if self._is_fallback_locked_group(group):
@@ -2780,6 +2829,7 @@ class APIPool:
                 sys_log(f"组 '{group}' 无可用端点，入口 fallback 到 main 组（组内 fallback 计数+1）", "WARN")
                 self._group_fallback_count[group] = self._group_fallback_count.get(group, 0) + 1
                 group = self.MAIN_GROUP
+                request_route_epoch = self._get_route_epoch(group)
         if not active:
             raise ValueError("没有可用的 API 端点")
         errors = []
@@ -2899,7 +2949,10 @@ class APIPool:
                                 # 实际请求成功后标记端点成功
                                 # clear_defer：仅当请求开始时端点已在 defer（兜底使用）才清除
                                 with self._lock:
-                                    self._on_success(tgt_ep, clear_defer=defer_at_request > 0, group=group)
+                                    self._on_success(
+                                        tgt_ep, clear_defer=defer_at_request > 0, group=group,
+                                        expected_route_epoch=request_route_epoch,
+                                    )
                                 yield from gen
                                 with self._lock:
                                     self._release_inflight(tgt_ep.id, group)
@@ -2908,9 +2961,9 @@ class APIPool:
                         payload["messages"] = self._translate_images_sync(payload["messages"], active, group)
             
             if tried == 0:
-                sys_log(f"收到 API 请求，尝试请求端点 '{self._endpoint_log_label(ep, group, ep_model)}'", "INFO")
+                sys_log(f"{request_tag}收到 API 请求，尝试请求端点 '{self._endpoint_log_label(ep, group, ep_model)}'", "INFO")
             else:
-                sys_log(f"重试请求，尝试请求端点 '{self._endpoint_log_label(ep, group, ep_model)}'", "INFO")
+                sys_log(f"{request_tag}重试请求，尝试请求端点 '{self._endpoint_log_label(ep, group, ep_model)}'", "INFO")
             # 上下文长度检查：超过限制时跳过该端点（不冻结、不记失败），轮转到下一个
             if ep.max_context_k > 0:
                 estimated = self._estimate_context_tokens(loop_messages)
@@ -2931,6 +2984,7 @@ class APIPool:
                 result, error = self._try_endpoint(
                     ep, payload, ep_timeout, force_no_retry=force_no_retry,
                     pool_group=group, reset_cached_stats=reset_cached_stats,
+                    request_id=request_id, request_deadline=request_deadline,
                 )
             else:
                 result, error = self._try_endpoint(
@@ -2941,6 +2995,7 @@ class APIPool:
                     debug_trace=debug_trace,
                     pool_group=group,
                     reset_cached_stats=reset_cached_stats,
+                    request_id=request_id, request_deadline=request_deadline,
                 )
             previous_attempt_site_id = ep.site_id
             if debug_trace is not None:
@@ -2966,7 +3021,10 @@ class APIPool:
                     debug_trace.append({"endpoint": ep.name, "result": "error", "kind": error_kind})
             if result is not None:
                 with self._lock:
-                    self._on_success(ep, result, clear_defer=defer_at_request > 0, group=group)
+                    self._on_success(
+                        ep, result, clear_defer=defer_at_request > 0, group=group,
+                        expected_route_epoch=request_route_epoch,
+                    )
                     # 终极兜底成功 → 滑动刷新锁定窗口（5 分钟无新请求视为任务结束）
                     if getattr(ep, "priority", 0) == 99 and group == self.MAIN_GROUP:
                         self._fallback_lock_until_by_group[group] = time.time() + self._FALLBACK_LOCK_SECONDS
@@ -2974,7 +3032,7 @@ class APIPool:
                         # 非流式（或流已由 _try_endpoint 内部消费完）→ 立即释放在途占用；
                         # 流式 generator 的占用由消费方迭代结束时释放（见 stream close 路径）。
                         self._release_inflight(ep.id, group)
-                sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 请求成功", "INFO")
+                sys_log(f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 请求成功", "INFO")
                 # 请求耗时 DEBUG（API_POOL_DEBUG / /api/debug 开关控制）
                 if _DEBUG_LOGGING:
                     try:
@@ -2999,7 +3057,7 @@ class APIPool:
                     return self._wrap_stream_release(result, ep.id, group)
                 return result
             errors.append(f"[{ep.name}] {error}")
-            sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 请求失败: {error}", "ERROR")
+            sys_log(f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 请求失败: {error}", "ERROR")
             # 敏感词诊断只在 DEBUG 且确实出现相关拦截错误时执行；使用当前失败尝试的 payload，避免共享状态串扰。
             if _DEBUG_LOGGING and "sensitive" in str(error).lower():
                 d = self._build_cf_diag(payload)
@@ -3030,7 +3088,12 @@ class APIPool:
                 # 客户端类错误（改动二 A′）：不冻结、fail_count 不增、不探活，
                 # 同请求内继续轮转其余候选；全部候选同类失败时按现状把错误返回给客户端。
                 client_error = self._classify_client_error(error)
-                self._rotate(ep, error, skip_cooldown=skip_cooldown, health_impact=not client_error, group=group)
+                request_route_epoch = self._rotate(
+                    ep, error, skip_cooldown=skip_cooldown,
+                    health_impact=not client_error, group=group,
+                    expected_route_epoch=request_route_epoch,
+                    request_id=request_id,
+                )
                 with self._lock:
                     self._release_inflight(ep.id, group)
                 if client_error:
@@ -3162,7 +3225,8 @@ class APIPool:
             sys_log(f"组 '{group}' 轮转耗尽仍失败，fallback 到 main 组追加一轮（组内 fallback 计数+1）", "WARN")
             try:
                 return self.chat(messages, model=None, extra_payload=extra_payload,
-                                 timeout=timeout, return_endpoint=return_endpoint)
+                                 timeout=timeout, return_endpoint=return_endpoint,
+                                 request_id=request_id)
             except (AllEndpointsFailed, ValueError):
                 # main 组也失败：合并两组错误原样上报（errors 已含本组失败详情）
                 pass
@@ -3237,10 +3301,11 @@ class APIPool:
     def _try_endpoint(
         self, ep, payload, timeout, log_usage=True, force_no_retry=False,
         is_probe=False, stream_stall_retry_used=False, debug_trace=None,
-        pool_group=None, reset_cached_stats=False,
+        pool_group=None, reset_cached_stats=False, request_id=None, request_deadline=None,
     ):
         req_t0 = time.time()
         endpoint_log_label = self._endpoint_log_label(ep, pool_group)
+        request_tag = f"[req={request_id}] " if request_id else ""
         prompt_text_to_log = extract_prompt_text(payload) if log_usage and not ep.name.startswith("test_") else ""
         
         # 协议层处理：Anthropic 端点做完整格式转换以保证 Kcne 缓存 key 一致性
@@ -3398,11 +3463,10 @@ class APIPool:
                     # Stream first-packet pre-read: timeout retries, not freeze
                     first_line = b""
                     _first_pkt_timeout = getattr(ep, "stream_first_packet_timeout", 0)
-                    # 2026-08-15: 首包超时不应超过 ep.timeout——原逻辑直接 settimeout(120s)
-                    # 会把 socket 阻塞窗口放大到 120s（ep.timeout 只有 60s），半开连接时
-                    # 让 Hermes 侧多等一倍时间才收到断开信号。取 min 保证不超过请求超时。
+                    # 响应头已经到达后，首条 SSE 数据使用独立超时；不再被连接/响应头
+                    # timeout 暗中截短。0 表示不额外设置，仍受整体请求预算约束。
                     if _first_pkt_timeout > 0:
-                        _effective_pkt_timeout = min(_first_pkt_timeout, timeout or ep.timeout)
+                        _effective_pkt_timeout = _first_pkt_timeout
                         _sock1 = _get_resp_socket(resp)
                         if _sock1 is not None:
                             try:
@@ -3417,7 +3481,11 @@ class APIPool:
                                 if attempt < retries:
                                     if debug_trace is not None:
                                         debug_trace.append({"endpoint": ep.name, "result": "retry", "attempt": attempt + 1, "kind": "stream_first_packet_timeout"})
-                                    time.sleep(1.5 * (attempt + 1))
+                                    retry_delay = 3 * (2 ** attempt)
+                                    if request_deadline is not None and time.time() + retry_delay >= request_deadline:
+                                        return None, f"stream first packet timeout ({_effective_pkt_timeout}s; retry skipped: request budget exhausted)"
+                                    sys_log(f"{request_tag}端点 '{endpoint_log_label}' {retry_delay} 秒后进行第 {attempt+1}/{retries} 次原端点重试（流式首条数据超时）", "INFO")
+                                    time.sleep(retry_delay)
                                     continue
                                 return None, f"stream first packet timeout ({_effective_pkt_timeout}s)"
                             except Exception as e:
@@ -3472,7 +3540,8 @@ class APIPool:
                                     ep, payload, timeout, log_usage=log_usage,
                                     force_no_retry=True, is_probe=is_probe,
                                     stream_stall_retry_used=True,
-                                    pool_group=pool_group,
+                                    pool_group=pool_group, request_id=request_id,
+                                    request_deadline=request_deadline,
                                 )
                                 if retry_result is not None:
                                     yield from retry_result
@@ -3484,8 +3553,12 @@ class APIPool:
                             if has_output:
                                 # The partial response is already visible to Hermes;
                                 # do not replay it and create duplicated text.
+                                visible_reason = reason if reason.startswith("流式总时长超限") else ""
                                 yield b'data: ' + json.dumps({
-                                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                                    "choices": [{
+                                        "delta": {"content": f"\n\n[API Pool Error: {visible_reason}，输出已截断]"} if visible_reason else {},
+                                        "finish_reason": "error" if visible_reason else "stop",
+                                    }],
                                 }, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
                             else:
                                 yield b'data: ' + json.dumps({
@@ -3754,6 +3827,12 @@ class APIPool:
                             _content_text = (content or reasoning or "").strip()
                             if _content_text and any(p in _content_text for p in FAKE_SUCCESS_PATTERNS):
                                 sys_log(f"端点 '{endpoint_log_label}' 假成功（内容匹配拒绝模式）", "WARNING")
+                                if attempt < retries:
+                                    retry_delay = 3 * (2 ** attempt)
+                                    if request_deadline is None or time.time() + retry_delay < request_deadline:
+                                        sys_log(f"{request_tag}端点 '{endpoint_log_label}' {retry_delay} 秒后进行第 {attempt+1}/{retries} 次原端点重试（假成功）", "INFO")
+                                        time.sleep(retry_delay)
+                                        continue
                                 return None, "fake-success: 内容匹配拒绝模式"
                         return body, ""
                     
@@ -3787,7 +3866,11 @@ class APIPool:
                     if attempt < retries:
                         if debug_trace is not None:
                             debug_trace.append({"endpoint": ep.name, "result": "retry", "attempt": attempt + 1, "kind": f"http_{e.code}"})
-                        time.sleep(1.5 * (attempt + 1))
+                        retry_delay = 3 * (2 ** attempt)
+                        if request_deadline is not None and time.time() + retry_delay >= request_deadline:
+                            return None, msg + "; retry skipped: request budget exhausted"
+                        sys_log(f"{request_tag}端点 '{endpoint_log_label}' {retry_delay} 秒后进行第 {attempt+1}/{retries} 次原端点重试（HTTP {e.code}）", "INFO")
+                        time.sleep(retry_delay)
                         continue
                     return None, msg
                 return None, msg
@@ -3796,7 +3879,18 @@ class APIPool:
                 if attempt < retries:
                     if debug_trace is not None:
                         debug_trace.append({"endpoint": ep.name, "result": "retry", "attempt": attempt + 1, "kind": "timeout"})
-                    time.sleep(1.5 * (attempt + 1))
+                    # 端点在本次 timeout 窗口内仍有其他成功请求，说明是单请求
+                    # 饿死；在重放前止损，避免健康端点重复计算/计费。
+                    if ep._last_success_ts > 0 and time.time() - ep._last_success_ts < ep.timeout:
+                        return None, msg + "; recent endpoint success, retry skipped"
+                    retry_delay = 3 * (2 ** attempt)
+                    if request_deadline is not None and time.time() + retry_delay >= request_deadline:
+                        return None, msg + "; retry skipped: request budget exhausted"
+                    risk = "，请求可能已提交，存在重复计算风险" if any(
+                        marker in str(e).lower() for marker in ("write operation timed out", "read timed out", "timed out")
+                    ) else ""
+                    sys_log(f"{request_tag}端点 '{endpoint_log_label}' {retry_delay} 秒后进行第 {attempt+1}/{retries} 次原端点重试（连接/超时{risk}）", "INFO")
+                    time.sleep(retry_delay)
                     continue
                 return None, msg
             except Exception as e:
@@ -4308,11 +4402,14 @@ def api_handler(method, path, body):
                 "protocol": item.get("protocol", base.get("protocol", "openai")),
                 "default_headers": item.get("default_headers", base.get("default_headers", {"User-Agent": item.get("user_agent", base.get("user_agent", ""))} if item.get("user_agent", base.get("user_agent", "")) else {})),
                 "health_mode": item.get("health_mode", base.get("health_mode", "chat")),
-                  "billing_mode": item.get("billing_mode", base.get("billing_mode", "subscription")),
-                  "is_vision": item.get("is_vision", base.get("is_vision", True)),
-                  "in_pool": item.get("in_pool", base.get("in_pool", False)),
-                  "enabled": item.get("enabled", True),
-                  "pool_groups": item.get("pool_groups", base.get("pool_groups", ["main"])),
+                "billing_mode": item.get("billing_mode", base.get("billing_mode", "subscription")),
+                "is_vision": item.get("is_vision", base.get("is_vision", True)),
+                "stream_first_packet_timeout": item.get("stream_first_packet_timeout", base.get("stream_first_packet_timeout", 120)),
+                "stream_stall_timeout": item.get("stream_stall_timeout", base.get("stream_stall_timeout", 60)),
+                "stream_max_duration": item.get("stream_max_duration", base.get("stream_max_duration", 0)),
+                "in_pool": item.get("in_pool", base.get("in_pool", False)),
+                "enabled": item.get("enabled", True),
+                "pool_groups": item.get("pool_groups", base.get("pool_groups", ["main"])),
             }
             if ep["model"]: pool.add_endpoint(ep); added += 1
         _sync_to_config(); return 201, {"ok": True, "added": added}, False
