@@ -758,13 +758,17 @@ token_tracker = TokenTracker()
 
 class ChatLogger:
     RETENTION_DAYS = 30  # 对话日志滚动保留天数（2026-08-15 新增：超过该天数的记录定时删除）
+    BATCH_SIZE = 50  # 批量写攒批上限（条）
 
     def __init__(self, db_path="chat_logs.db"):
         self.db_path = db_path
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # 仅串行化写路径（SQLite 单写者）；读路径无锁，WAL 下多读并发
+        self._log_queue = queue.Queue(maxsize=512)
         self._init_db()
         # 后台守护线程：每小时滚动清理一次过期日志（daemon 线程，失败不影响主服务）
         threading.Thread(target=self._retention_loop, daemon=True).start()
+        # 后台守护线程：批量写对话日志（攒批单事务提交，减少锁竞争与 fsync）
+        threading.Thread(target=self._batch_writer, daemon=True).start()
 
     def _connect(self, timeout=5):
         """建立连接并应用 WAL 配套 pragma（synchronous 是 per-connection 属性，每次连接都要设置）。"""
@@ -835,109 +839,126 @@ class ChatLogger:
             conn.close()
 
     def add_log(self, endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group=None, prompt_tokens=None, cached_tokens=None):
-        def _write():
-            with self._lock:
-                try:
-                    conn = self._connect()
-                    c = conn.cursor()
-                    c.execute(
-                        "INSERT INTO chat_logs (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens)
-                    )
-                    conn.commit()
-                    conn.close()
-                except Exception as e:
-                    sys_log(f"记录对话日志失败: {e}", "ERROR")
-        threading.Thread(target=_write, daemon=True).start()
+        row = (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens)
+        try:
+            self._log_queue.put_nowait(row)
+        except queue.Full:
+            # 队列满（极端突发）：降级为独立线程直写，不丢日志
+            threading.Thread(target=self._write_batch, args=([row],), daemon=True).start()
 
-    def get_logs(self, limit=50, offset=0, detail=True):
+    def _batch_writer(self):
+        while True:
+            row = self._log_queue.get()
+            batch = [row]
+            try:
+                while len(batch) < self.BATCH_SIZE:
+                    batch.append(self._log_queue.get_nowait())
+            except queue.Empty:
+                pass
+            self._write_batch(batch)
+
+    def _write_batch(self, batch):
         with self._lock:
             try:
                 conn = self._connect()
                 c = conn.cursor()
-                # detail=False：SQL 层不取 prompt/completion（避免从磁盘读 32MB 正文再丢弃）
-                if detail:
-                    c.execute(
-                        "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
-                        (limit, offset)
-                    )
-                else:
-                    c.execute(
-                        "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
-                        (limit, offset)
-                    )
-                    rows = [r[:4] + (None, None) + r[4:] for r in c.fetchall()]
-                    c.execute("SELECT COUNT(*) FROM chat_logs")
-                    total = c.fetchone()[0]
-                    conn.close()
-                    return {
-                        "total": total,
-                        "logs": [
-                            {
-                                "id": r[0], "timestamp": r[1], "endpoint_name": r[2], "model": r[3],
-                                "prompt": None, "completion": None,
-                                "total_tokens": r[6], "latency_ms": r[7], "pool_group": r[8],
-                                "prompt_tokens": r[9], "cached_tokens": r[10]
-                            } for r in rows
-                        ]
-                    }
-                rows = c.fetchall()
-                
+                c.executemany(
+                    "INSERT INTO chat_logs (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    batch,
+                )
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                sys_log(f"记录对话日志失败: {e}", "ERROR")
+
+    def get_logs(self, limit=50, offset=0, detail=True):
+        # 读路径无锁：WAL 下多读者并发安全，不被日志写入/滚动清理阻塞
+        try:
+            conn = self._connect()
+            c = conn.cursor()
+            # detail=False：SQL 层不取 prompt/completion（避免从磁盘读 32MB 正文再丢弃）
+            if detail:
+                c.execute(
+                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (limit, offset)
+                )
+            else:
+                c.execute(
+                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (limit, offset)
+                )
+                rows = [r[:4] + (None, None) + r[4:] for r in c.fetchall()]
                 c.execute("SELECT COUNT(*) FROM chat_logs")
                 total = c.fetchone()[0]
                 conn.close()
-                
                 return {
                     "total": total,
                     "logs": [
                         {
-                            "id": r[0],
-                            "timestamp": r[1],
-                            "endpoint_name": r[2],
-                            "model": r[3],
-                            # 列表页不需要正文：detail=False 时不返回 prompt/completion（33MB→KB 级）
-                            "prompt": r[4] if detail else None,
-                            "completion": r[5] if detail else None,
-                            "total_tokens": r[6],
-                            "latency_ms": r[7],
-                            "pool_group": r[8],
-                            "prompt_tokens": r[9],
-                            "cached_tokens": r[10]
+                            "id": r[0], "timestamp": r[1], "endpoint_name": r[2], "model": r[3],
+                            "prompt": None, "completion": None,
+                            "total_tokens": r[6], "latency_ms": r[7], "pool_group": r[8],
+                            "prompt_tokens": r[9], "cached_tokens": r[10]
                         } for r in rows
                     ]
                 }
-            except Exception as e:
-                return {"total": 0, "logs": [], "error": str(e)}
+            rows = c.fetchall()
+            
+            c.execute("SELECT COUNT(*) FROM chat_logs")
+            total = c.fetchone()[0]
+            conn.close()
+            
+            return {
+                "total": total,
+                "logs": [
+                    {
+                        "id": r[0],
+                        "timestamp": r[1],
+                        "endpoint_name": r[2],
+                        "model": r[3],
+                        # 列表页不需要正文：detail=False 时不返回 prompt/completion（33MB→KB 级）
+                        "prompt": r[4] if detail else None,
+                        "completion": r[5] if detail else None,
+                        "total_tokens": r[6],
+                        "latency_ms": r[7],
+                        "pool_group": r[8],
+                        "prompt_tokens": r[9],
+                        "cached_tokens": r[10]
+                    } for r in rows
+                ]
+            }
+        except Exception as e:
+            return {"total": 0, "logs": [], "error": str(e)}
 
     def get_log_by_id(self, log_id):
         """单条详情（含正文）：列表页 detail=false 不拉正文，点击行时按 id 取全文。"""
-        with self._lock:
-            try:
-                conn = self._connect()
-                c = conn.cursor()
-                c.execute(
-                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens FROM chat_logs WHERE id = ?",
-                    (int(log_id),)
-                )
-                r = c.fetchone()
-                conn.close()
-                if r is None:
-                    return None
-                return {
-                    "id": r[0],
-                    "timestamp": r[1],
-                    "endpoint_name": r[2],
-                    "model": r[3],
-                    "prompt": r[4],
-                    "completion": r[5],
-                    "total_tokens": r[6],
-                    "latency_ms": r[7],
-                    "pool_group": r[8],
-                    "prompt_tokens": r[9],
-                    "cached_tokens": r[10]
-                }
-            except Exception as e:
+        # 读路径无锁：WAL 下多读者并发安全
+        try:
+            conn = self._connect()
+            c = conn.cursor()
+            c.execute(
+                "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens FROM chat_logs WHERE id = ?",
+                (int(log_id),)
+            )
+            r = c.fetchone()
+            conn.close()
+            if r is None:
                 return None
+            return {
+                "id": r[0],
+                "timestamp": r[1],
+                "endpoint_name": r[2],
+                "model": r[3],
+                "prompt": r[4],
+                "completion": r[5],
+                "total_tokens": r[6],
+                "latency_ms": r[7],
+                "pool_group": r[8],
+                "prompt_tokens": r[9],
+                "cached_tokens": r[10]
+            }
+        except Exception as e:
+            return None
 
     def clear_logs(self):
         with self._lock:
