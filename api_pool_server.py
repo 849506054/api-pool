@@ -1001,6 +1001,7 @@ class APIPool:
         if isinstance(ep, dict):
             raw_ep = ep
             ep_dict = {k: v for k, v in raw_ep.items() if k in Endpoint.__dataclass_fields__}
+            ep_dict["max_retries"] = self._normalize_max_retries(ep_dict.get("max_retries", 1))
             if raw_ep.get("user_agent") and "default_headers" not in ep_dict:
                 ep_dict["default_headers"] = {"User-Agent": raw_ep["user_agent"]}
             # pool_groups 归一化：未入池默认无组；旧的已入池配置缺字段时兼容 main。
@@ -1023,8 +1024,10 @@ class APIPool:
                 ep_dict["site_id"] = self._resolve_site_id(ep_dict.get("base_url", ""), ep_dict.get("api_key", ""))
             ep = Endpoint(**ep_dict)
             ep._manual_unlock_required = bool(raw_ep.get("manual_unlock_required", False))
-        elif not ep.health_mode:
-            ep.health_mode = "models" if ep.billing_mode == "pay_per_use" else ("chat" if ep.in_pool else "models")
+        else:
+            ep.max_retries = self._normalize_max_retries(ep.max_retries)
+            if not ep.health_mode:
+                ep.health_mode = "models" if ep.billing_mode == "pay_per_use" else ("chat" if ep.in_pool else "models")
         if not ep.id:
             import uuid
             ep.id = str(uuid.uuid4())
@@ -1160,6 +1163,8 @@ class APIPool:
                             dropped = [g for g in groups_now if g not in keep]
                             ep.pool_groups = keep
                             sys_log(f"端点 '{ep.name}' 模型改为 {ep.model}，自动移出专用组 {', '.join(dropped)}", "WARN")
+                    if updates.get("max_retries") is not None:
+                        ep.max_retries = self._normalize_max_retries(updates["max_retries"])
                     # cooldown_minutes 最低 1，防止跳过冷却恢复流程
                     if updates.get("cooldown_minutes") is not None and updates["cooldown_minutes"] < 1:
                         ep.cooldown_minutes = 1
@@ -1992,7 +1997,16 @@ class APIPool:
                     if c.get("type") == "image_url": return True
         return False
 
-    def _translate_images_sync(self, messages, active_eps, pool_group=None):
+    @staticmethod
+    def _normalize_max_retries(value):
+        try:
+            return min(3, max(0, int(value)))
+        except (TypeError, ValueError):
+            return 1
+
+    def _translate_images_sync(
+        self, messages, active_eps, pool_group=None, request_id=None, request_deadline=None,
+    ):
         vision_eps = [e for e in active_eps if getattr(e, "is_vision", True)]
         if not vision_eps:
             return messages
@@ -2019,7 +2033,11 @@ class APIPool:
             v_label = self._endpoint_log_label(v_ep, pool_group, v_ep.model)
             sys_log(f"启动图片解析 -> 尝试请求端点 '{v_label}'", "INFO")
             payload = {"model": v_ep.model, "messages": translation_msgs, "stream": False, "max_tokens": 4096}
-            result, error = self._try_endpoint(v_ep, payload, timeout=60, log_usage=True, force_no_retry=True, pool_group=pool_group)
+            result, error = self._try_endpoint(
+                v_ep, payload, timeout=60, log_usage=True, force_no_retry=True,
+                pool_group=pool_group, request_id=request_id,
+                request_deadline=request_deadline,
+            )
             if error:
                 sys_log(f"图片解析端点 '{v_label}' 请求失败: {error}", "WARNING")
                 continue
@@ -3017,10 +3035,16 @@ class APIPool:
                         def vision_wrapper(tgt_ep, pld, t_out, a_eps, _grp=group):
                             import json
                             yield f"data: {{'choices':[{{'delta':{{'content':'[API Pool: 检测到图片，当前目标不支持视觉，正在调用视觉模型进行解析...]\\n\\n'}}}}]}}\n\n".replace("'", '"')
-                            translated_msgs = self._translate_images_sync(pld["messages"], a_eps, _grp)
+                            translated_msgs = self._translate_images_sync(
+                                pld["messages"], a_eps, _grp,
+                                request_id=request_id, request_deadline=request_deadline,
+                            )
                             yield f"data: {{'choices':[{{'delta':{{'content':'[图片解析完成，交由目标模型继续处理...]\\n\\n'}}}}]}}\n\n".replace("'", '"')
                             pld["messages"] = translated_msgs
-                            gen, err = self._try_endpoint(tgt_ep, pld, t_out, pool_group=group)
+                            gen, err = self._try_endpoint(
+                                tgt_ep, pld, t_out, pool_group=group,
+                                request_id=request_id, request_deadline=request_deadline,
+                            )
                             if err:
                                 yield f"data: {{'choices':[{{'delta':{{'content':'\\n\\n[API Pool Error: 请求最终目标失败: {err}]'}}}}]}}\n\n".replace("'", '"')
                             else:
@@ -3036,7 +3060,10 @@ class APIPool:
                                     self._release_inflight(tgt_ep.id, group)
                         return vision_wrapper(ep, payload, ep_timeout, active)
                     else:
-                        payload["messages"] = self._translate_images_sync(payload["messages"], active, group)
+                        payload["messages"] = self._translate_images_sync(
+                            payload["messages"], active, group,
+                            request_id=request_id, request_deadline=request_deadline,
+                        )
             
             if tried == 0:
                 sys_log(f"{request_tag}收到 API 请求，尝试请求端点 '{self._endpoint_log_label(ep, group, ep_model)}'", "INFO")
@@ -3538,6 +3565,11 @@ class APIPool:
                 _open_timeout = timeout or ep.timeout
                 if not is_stream and not is_probe:
                     _open_timeout = max(_open_timeout, 600)
+                if request_deadline is not None:
+                    remaining_budget = request_deadline - time.time()
+                    if remaining_budget <= 0:
+                        return None, "request budget exhausted before upstream call"
+                    _open_timeout = min(_open_timeout, max(0.1, remaining_budget))
                 if getattr(ep, "use_proxy", True) is False:
                     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
                     resp = opener.open(req, timeout=_open_timeout)
@@ -3986,6 +4018,8 @@ class APIPool:
                         debug_trace=debug_trace,
                         pool_group=pool_group,
                         reset_cached_stats=reset_cached_stats,
+                        request_id=request_id,
+                        request_deadline=request_deadline,
                     )
                 if e.code == 429: return None, msg + " (429 rate-limited)"
                 if e.code in (401, 403): return None, msg + " (auth error)"
