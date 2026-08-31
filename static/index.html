@@ -124,6 +124,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
   .chatlog-grid>*{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .cl-ep{display:block}
   .cl-model{display:block}
+  /* 数据面板：图表/排行卡窄屏单列堆叠（PC 两列不变） */
+  .analytics-grid{grid-template-columns:1fr!important;gap:12px}
 }
 @media(max-width:480px){
   body{padding:8px 6px;font-size:12px}
@@ -166,6 +168,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 }
 
 .card{background:var(--card);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow)}
+.analytics-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
 .card-title{font-size:13px;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:7px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px}
 .card-title .icon{font-size:15px}
 
@@ -461,7 +464,7 @@ select option { background: var(--bg); color: var(--text); }
 <div id="viewAnalytics" style="display:none; padding-bottom:40px;">
     <div class="dash-stats" id="tokenStatsOverview"></div>
     
-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+    <div class="analytics-grid">
         <div class="card">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0px;">
                 <div class="card-title" style="margin-bottom:0; font-size:11px;">今日各时段消耗趋势</div>
@@ -488,7 +491,7 @@ select option { background: var(--bg); color: var(--text); }
         </div>
     </div>
     
-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top:20px;">
+    <div class="analytics-grid" style="margin-top:20px;">
         <div class="card">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
                 <div class="card-title" style="margin-bottom:0; font-size:11px;">今日模型端点排行榜</div>
