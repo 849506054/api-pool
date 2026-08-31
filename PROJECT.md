@@ -137,6 +137,8 @@
 - [x] **P0 当前生产增量收口** — 原生模型下拉预取与切换诊断已固化，153 测试通过，commit `163265f`。
 - [x] **P1 聚合池分组操作验收** — REST CRUD/落盘、追加式跨组入池、组感知移出、联合重启恢复和前端交互契约已覆盖，157 测试通过，commit `07b7fc1`。
 - [x] **P1 分组路由 REST 验收** — 按组手动切换和组内优先级联合场景已覆盖，完整测试 159 项通过，commit `e443cc2`。
+- [x] **developer 角色不兼容 400 同请求降级（2026-08-31 已部署）** — Hermes 对 gpt-5*/codex 会话把首条 system 换成 developer 角色；端点级探测证实「不认 developer」是端点/上游级差异（DS 的 AgentRouter-ds4f、qnaigc 拒绝，GLM 家族分裂：Tokenrhythm 接受 / Opencode-glm5.3f 拒绝，siliconflow-vision 拒绝，Kcne/Stepfun 接受）。客户端类错误轮转路径识别角色拒绝签名（unknown variant `developer` / Input tag 'developer' / Incorrect role information / role错误）后，同请求内把 developer 降级为 system 重试后续候选，内容不变。8 项新增测试 + 全量 178 项通过；生产 md5 `1a45f00a5a09aa384f1e66c7925d66c8`。commit `75c70c2`。
+- [ ] **[P1] 子组→main 组级延迟回切** — 子组入口/耗尽 fallback 落 main 后每个新请求重复解析死组（生产 15:20–15:32 同一 WARN 刷 22 次）。要求：组级锁定，无请求 5 分钟（滑动空闲窗口）后才回组重试；与 prio99 兜底锁语义对齐但作用于组级别。设计要点见 api-pool-management `references/next-phase-progress-2026-08-31.md` A0 节。
 - [ ] **P0 生产真实流量对账** — 只读核对 request ID、3 秒原端点重试、Retry-After、单请求饿死、route epoch 与长流式完整性；不主动探测生产模型。
 - [ ] **P1 有效业务增量停滞检测** — OpenAI/Anthropic 仅 content、reasoning、tool 增量或结束事件刷新活动时间；空行、注释心跳、空 delta 不刷新。无输出时原端点重试一次，已有输出不重放，不冻结、不改全局指针。
 - [ ] **P1 Hermes 流式错误结束 E2E** — 本地 mock 验证显式总时长触发后的 `finish_reason:error`、可见截断原因、不重复输出与不冻结端点。
