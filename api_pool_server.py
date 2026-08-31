@@ -3558,7 +3558,7 @@ class APIPool:
                                 _sock1.settimeout(_effective_pkt_timeout)
                                 first_line = resp.readline()
                             except socket.timeout:
-                                sys_log(f"端点 '{endpoint_log_label}' 流式首包超时（{_effective_pkt_timeout}s，第 {attempt+1} 次）", "WARN")
+                                sys_log(f"{request_tag}端点 '{endpoint_log_label}' 流式首包超时（{_effective_pkt_timeout}s，第 {attempt+1} 次）", "WARN")
                                 try:
                                     resp.close()
                                 except Exception:
@@ -3574,11 +3574,11 @@ class APIPool:
                                     continue
                                 return None, f"stream first packet timeout ({_effective_pkt_timeout}s)"
                             except Exception as e:
-                                sys_log(f"端点 '{endpoint_log_label}' 首包预读 socket 不可用({e})，依赖请求超时/总时长兜底", "WARN")
+                                sys_log(f"{request_tag}端点 '{endpoint_log_label}' 首包预读 socket 不可用({e})，依赖请求超时/总时长兜底", "WARN")
                         else:
                             # 2026-08-15: _get_resp_socket 失败时无法设 socket 超时，
                             # 只能依赖 urllib 的 timeout 参数（=ep.timeout），显式记录避免排障盲区
-                            sys_log(f"端点 '{endpoint_log_label}' 首包预读未取得 socket，依赖 urllib timeout({timeout or ep.timeout}s) 兜底", "WARN")
+                            sys_log(f"{request_tag}端点 '{endpoint_log_label}' 首包预读未取得 socket，依赖 urllib timeout({timeout or ep.timeout}s) 兜底", "WARN")
                     def stream_generator():
                         stream_id = f"chatcmpl-{int(time.time()*1000)}"
                         final_prompt_tokens = 0
@@ -3607,12 +3607,12 @@ class APIPool:
                             try:
                                 _sock2.settimeout(stall_timeout)
                             except Exception as e:
-                                sys_log(f"端点 '{endpoint_log_label}' 设置 stream_stall_timeout 失败({e})，依赖 stream_max_duration 兜底", "WARN")
+                                sys_log(f"{request_tag}端点 '{endpoint_log_label}' 设置 stream_stall_timeout 失败({e})，依赖 stream_max_duration 兜底", "WARN")
 
                         def _timeout_abort(reason):
                             """Handle an upstream stream stall without treating it as endpoint failure."""
                             has_output = bool(final_completion_text.strip() or final_reasoning_text.strip())
-                            sys_log(f"端点 '{endpoint_log_label}' {reason}（流式事务失败，不冻结端点）", "ERROR")
+                            sys_log(f"{request_tag}端点 '{endpoint_log_label}' {reason}（流式事务失败，不冻结端点）", "ERROR")
                             if not has_output and not stream_stall_retry_used:
                                 # Before any downstream bytes were emitted, retry the
                                 # same upstream endpoint inside API Pool. Hermes must
@@ -3632,7 +3632,7 @@ class APIPool:
                                     yield from retry_result
                                     return
                                 sys_log(
-                                    f"端点 '{ep.name}' 流式停滞后原端点内部重试失败: {retry_error}",
+                                    f"{request_tag}端点 '{endpoint_log_label}' 流式停滞后原端点内部重试失败: {retry_error}",
                                     "WARN",
                                 )
                             if has_output:
@@ -3850,9 +3850,9 @@ class APIPool:
                             # 2026-08-15: 原逻辑静默吞掉流内所有异常——23:58:26 假死请求
                             # "收到后无任何日志"的直接原因。区分客户端断开(常见噪音)与上游异常(需记录)。
                             if isinstance(e, (ConnectionResetError, BrokenPipeError)):
-                                sys_log(f"端点 '{endpoint_log_label}' 流式响应客户端断开: {type(e).__name__}", "WARN")
+                                sys_log(f"{request_tag}端点 '{endpoint_log_label}' 流式响应客户端断开: {type(e).__name__}", "WARN")
                             else:
-                                sys_log(f"端点 '{endpoint_log_label}' 流式响应异常: {type(e).__name__}: {e}", "ERROR")
+                                sys_log(f"{request_tag}端点 '{endpoint_log_label}' 流式响应异常: {type(e).__name__}: {e}", "ERROR")
                         finally:
                             if has_usage and log_usage and not ep.name.startswith("test_"):
                                 stats_cached_tokens = 0 if reset_cached_stats else final_cached_tokens

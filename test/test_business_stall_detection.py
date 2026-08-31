@@ -189,6 +189,26 @@ class BusinessStallDetectionTests(unittest.TestCase):
             # 5 组心跳 × 3 行 = 15 行全部透传（迭代器走完，无中止）
             self.assertGreaterEqual(len(chunks), 15)
 
+    def test_business_stall_lifecycle_log_includes_request_id(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            response = KeepaliveStallResponse(group_sleep=0.35, max_groups=30)
+            payload = {"model": "m", "messages": [], "stream": True}
+            logs = []
+            with mock.patch.object(module.urllib.request, "urlopen", return_value=response), \
+                    mock.patch.object(module, "_get_resp_socket", return_value=response.socket), \
+                    mock.patch.object(module, "sys_log", side_effect=lambda msg, level="INFO": logs.append((msg, level))):
+                result, error = module.APIPool()._try_endpoint(
+                    self.make_endpoint(module, stall=1), payload, 60, log_usage=False,
+                    request_id="b2req01",
+                )
+                self.assertEqual(error, "")
+                list(result)
+            lifecycle_errors = [msg for msg, level in logs if level == "ERROR" and "流式事务失败" in msg]
+            self.assertEqual(len(lifecycle_errors), 1)
+            self.assertTrue(lifecycle_errors[0].startswith("[req=b2req01] "))
+            self.assertIn("流式无有效业务增量停滞", lifecycle_errors[0])
+
 
 if __name__ == "__main__":
     unittest.main()
