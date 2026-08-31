@@ -1123,9 +1123,6 @@ class APIPool:
     def __init__(self, endpoints=None):
         self._lock = threading.RLock()
         self._endpoints: list[Endpoint] = []
-        # 状态持久化开关（True=禁用）：测试抽屉的临时池不写 api_runtime_state.json，
-        # 其端点 id 是运行时 uuid4，写入会污染重启恢复指针（2026-08-30 修复）。
-        self._state_persistence_disabled: bool = False
         self._restored_endpoint_id: str | None = None  # 兼容旧状态字段；恢复后转为持续手动覆盖
         self._last_reasoning_content = None  # 缓存上一轮返回的 reasoning_content，用于多轮对话补全
         self._last_reasoning_text = None  # 缓存上一轮返回的 reasoning_text（DeepSeek V4 request 字段名），用于多轮对话补全
@@ -4820,7 +4817,6 @@ def api_handler(method, path, body):
             if ep["id"] == ep_id: target_ep = ep; break
         if not target_ep: return 404, {"error": "端点不存在"}, False
         test_pool = APIPool()
-        test_pool._state_persistence_disabled = True  # 测试池不污染 api_runtime_state.json
         test_pool.add_endpoint({"name": target_ep["name"], "base_url": target_ep["base_url"], "api_key": target_ep["api_key_full"], "model": target_ep["model"], "priority": 1, "timeout": target_ep["timeout"], "max_retries": target_ep["max_retries"], "enabled": True, "in_pool": True, "use_proxy": target_ep.get("use_proxy", True), "protocol": target_ep.get("protocol", "openai"), "default_headers": target_ep.get("default_headers", {}), "is_vision": target_ep.get("is_vision", True)})
         
         img = body.get("image")
