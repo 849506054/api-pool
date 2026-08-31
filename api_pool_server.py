@@ -2590,6 +2590,50 @@ class APIPool:
         )
         return not any(marker in lower for marker in transient_markers)
 
+    # 角色不兼容签名（2026-08-31 端点级探测确认，均为生产/探测真实文案）：
+    # - Anthropic 风格反序列化：unknown variant `developer`
+    # - SiliconFlow：Input tag 'developer' found using 'role'
+    # - Opencode(Console Go)：Incorrect role information
+    # - qnaigc：role错误，支持类型：user、system、assistant、function、tool
+    _ROLE_REJECT_MARKERS = (
+        "unknown variant `developer`",
+        "input tag 'developer' found using 'role'",
+        "incorrect role information",
+        "role错误",
+    )
+
+    @classmethod
+    def _is_role_reject_error(cls, error_msg):
+        """客户端类 400 中的「上游不认 developer 角色」签名识别。
+
+        仅在请求携带 developer 角色消息时由调用方使用；命中后同请求内
+        把 developer 降级为 system 再轮转后续候选（OpenAI 官方语义中
+        developer 即 system 的 GPT-5 形态，降级不改变提示内容）。
+        """
+        lower = str(error_msg or "").lower()
+        if not lower.startswith("http 4"):
+            return False
+        if any(marker in lower for marker in cls._ROLE_REJECT_MARKERS):
+            return True
+        return "developer" in lower and "role" in lower
+
+    @staticmethod
+    def _downgrade_developer_role(messages):
+        """把消息列表中的 developer 角色降级为 system（新列表，不原地修改）。"""
+        downgraded = []
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") == "developer":
+                item = dict(m)
+                item["role"] = "system"
+                downgraded.append(item)
+            else:
+                downgraded.append(m)
+        return downgraded
+
+    @staticmethod
+    def _has_developer_role(messages):
+        return any(isinstance(m, dict) and m.get("role") == "developer" for m in messages)
+
     def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False, health_impact=True, group=None,
                 expected_route_epoch=None, request_id=None):
         grp = group or self.MAIN_GROUP
@@ -2834,6 +2878,7 @@ class APIPool:
             raise ValueError("没有可用的 API 端点")
         errors = []
         client_error_tried = set()  # 本请求内已因客户端类错误轮转过的端点（防不冻结路径死循环）
+        role_downgraded = False  # 已因角色不兼容 400 触发 developer→system 降级（每请求一次）
         tried = 0
         total = len(active)
         # 按优先级排序：每次从最高优先级端点开始尝试，故障自动降级，恢复后自动回迁
@@ -2914,7 +2959,14 @@ class APIPool:
             
             # 按目标端点隔离 DeepSeek 专属 reasoning 字段；每次轮转都
             # 从同一份 Hermes 历史构造独立消息，避免污染后续端点。
-            loop_messages = self._messages_for_endpoint(messages, ep)
+            # 角色降级（2026-08-31）：同请求内已有端点因「不认 developer 角色」
+            # 400 轮转时，后续候选统一把 developer 降级为 system，避免逐个
+            # 撞同类 400（端点级差异：GLM/DS/Qwen 部分端点不收 developer）。
+            if role_downgraded:
+                base_messages = self._downgrade_developer_role(messages)
+            else:
+                base_messages = messages
+            loop_messages = self._messages_for_endpoint(base_messages, ep)
             is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
             # tool_call id 前缀重写：端点配置 tool_call_id_prefix 非空时，把消息里所有 tool_call id
             # 重写为该前缀格式（如 DeepSeek 官方 call_00_ET_）。跨端点切换后历史里混入其他端点
@@ -3088,6 +3140,10 @@ class APIPool:
                 # 客户端类错误（改动二 A′）：不冻结、fail_count 不增、不探活，
                 # 同请求内继续轮转其余候选；全部候选同类失败时按现状把错误返回给客户端。
                 client_error = self._classify_client_error(error)
+                if client_error and not role_downgraded and self._has_developer_role(messages):
+                    if self._is_role_reject_error(error):
+                        role_downgraded = True
+                        sys_log(f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 拒绝 developer 角色，后续候选降级为 system 重试", "WARN")
                 request_route_epoch = self._rotate(
                     ep, error, skip_cooldown=skip_cooldown,
                     health_impact=not client_error, group=group,
