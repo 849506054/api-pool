@@ -3648,7 +3648,7 @@ class APIPool:
                             else:
                                 yield b'data: ' + json.dumps({
                                     "choices": [{
-                                        "delta": {"content": f"\\n\\n[API Pool Error: {reason}]"},
+                                        "delta": {"content": f"\n\n[API Pool Error: {reason}]"},
                                         "finish_reason": "error",
                                     }],
                                 }, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
@@ -3660,11 +3660,49 @@ class APIPool:
                         # 方案，但 http.client 的 readline 是 C 层循环（持 GIL），watchdog 被
                         # 饿死不可靠，已废弃。完全无数据场景由 stall 超时（socket）兜底。
                         stream_deadline = time.time() + ep.stream_max_duration if ep.stream_max_duration > 0 else None
+                        # 业务增量停滞检测（2026-08-31 B1）：socket 停滞超时只能拦「无网络数据」；
+                        # SSE keep-alive 注释行/空行/空 delta 持续有字节到达，会给坏死的流续命。
+                        # 仅 content / reasoning / tool 增量或结束事件刷新活动时间；心跳类字节
+                        # 不刷新。超过 stream_stall_timeout 无有效业务增量 → 按停滞处置（复用
+                        # _timeout_abort：无输出原端点内部重试一次，已有输出不重放、不冻结）。
+                        # 0 = 禁用（与 socket stall 超时语义一致）。
+                        business_stall_deadline = (time.time() + stall_timeout) if stall_timeout > 0 else None
+
+                        def _business_activity(chunk, is_anthropic_chunk):
+                            """该 chunk 是否携带有效业务增量（刷新停滞时钟）。"""
+                            try:
+                                if not is_anthropic_chunk:
+                                    choices = chunk.get("choices") or []
+                                    if choices:
+                                        delta = choices[0].get("delta") or {}
+                                        if delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls"):
+                                            return True
+                                        if choices[0].get("finish_reason"):
+                                            return True
+                                    return bool(chunk.get("usage"))
+                                ctype = chunk.get("type")
+                                if ctype in ("content_block_delta", "content_block_start", "content_block_stop",
+                                             "message_stop", "message_delta"):
+                                    delta = chunk.get("delta") or {}
+                                    if ctype == "content_block_delta" and delta.get("type") == "text_delta":
+                                        return bool(delta.get("text"))
+                                    if ctype == "message_delta":
+                                        # stop_reason/usage 收尾事件 = 结束信号，刷新
+                                        return True
+                                    return True
+                                if ctype == "message_start":
+                                    return bool((chunk.get("message") or {}).get("usage"))
+                                return False
+                            except Exception:
+                                return False
                         try:
                             lines = itertools.chain([first_line], resp) if first_line else resp
                             for line in lines:
                                 if stream_deadline is not None and time.time() > stream_deadline:
                                     yield from _timeout_abort(f"流式总时长超限（非停滞，{ep.stream_max_duration}s）")
+                                    return
+                                if business_stall_deadline is not None and time.time() > business_stall_deadline:
+                                    yield from _timeout_abort(f"流式无有效业务增量停滞（连续 {stall_timeout}s，心跳/空行不计）")
                                     return
                                 if is_anthropic:
                                     if not line.strip() or not line.startswith(b"data: "):
@@ -3673,6 +3711,8 @@ class APIPool:
                                         continue
                                     try:
                                         chunk = json.loads(line[6:].decode("utf-8"))
+                                        if stall_timeout > 0 and _business_activity(chunk, True):
+                                            business_stall_deadline = time.time() + stall_timeout
                                         ctype = chunk.get("type")
                                         if ctype == "content_block_start":
                                             block = chunk.get("content_block", {})
@@ -3784,6 +3824,8 @@ class APIPool:
                                     if line.strip() and line.startswith(b"data: ") and not line.startswith(b"data: [DONE]"):
                                         try:
                                             chunk = json.loads(line[6:].decode("utf-8"))
+                                            if stall_timeout > 0 and _business_activity(chunk, False):
+                                                business_stall_deadline = time.time() + stall_timeout
                                             if "choices" in chunk and len(chunk["choices"]) > 0:
                                                 delta = chunk["choices"][0].get("delta", {})
                                                 if "content" in delta:
