@@ -501,3 +501,60 @@ class PerGroupPriorityTests(unittest.TestCase):
             pool._try_endpoint = fake_try
             pool.chat([{"role": "user", "content": "x"}], model="bg")
             self.assertEqual(calls[0], "b2")
+
+    def test_switch_endpoint_rest_updates_only_target_group_and_runtime_state(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            main_ep = self.endpoint(module, "main-1", 1, "glm", groups=["main"])
+            shared = self.endpoint(module, "shared", 2, "glm", groups=["main", "bg"])
+            bg_ep = self.endpoint(module, "bg-1", 3, "glm", groups=["bg"])
+            for endpoint in (main_ep, shared, bg_ep):
+                module.pool.add_endpoint(endpoint)
+            module.pool._set_current("main", "main-1")
+            module.pool._set_manual("main", "main-1")
+            self.assertTrue(module.save_runtime_state_groups({"main": "main-1"}))
+
+            status, response, _ = module.api_handler(
+                "POST", "/api/switch-endpoint/shared?group=bg", None,
+            )
+
+            self.assertEqual((status, response["ok"]), (200, True))
+            self.assertEqual(module.pool._get_current("main"), "main-1")
+            self.assertEqual(module.pool._get_manual("main"), "main-1")
+            self.assertEqual(module.pool._get_current("bg"), "shared")
+            self.assertEqual(module.pool._get_manual("bg"), "shared")
+            with open(module.RUNTIME_STATE_FILE, encoding="utf-8") as handle:
+                groups = json.load(handle)["groups"]
+            self.assertEqual(groups, {"main": "main-1", "bg": "shared"})
+
+    def test_priority_rest_isolated_persisted_and_used_by_next_group_request(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            main_ep = self.endpoint(module, "main-1", 1, "glm", groups=["main"])
+            first = self.endpoint(module, "bg-1", 2, "glm", groups=["bg"])
+            promoted = self.endpoint(module, "shared", 3, "glm", groups=["main", "bg"])
+            for endpoint in (main_ep, first, promoted):
+                module.pool.add_endpoint(endpoint)
+            module.pool._renumber_pool_priorities()
+            main_priority_before = module.pool._ep_priority(promoted, "main")
+
+            status, response, _ = module.api_handler(
+                "POST", "/api/priority/shared?group=bg&priority=1", None,
+            )
+
+            self.assertEqual((status, response["ok"]), (200, True))
+            self.assertEqual(module.pool._ep_priority(promoted, "bg"), 1)
+            self.assertEqual(module.pool._ep_priority(promoted, "main"), main_priority_before)
+            with open(module.CONFIG_FILE, encoding="utf-8") as handle:
+                saved = json.load(handle)["api_endpoints"]
+            saved_promoted = next(ep for ep in saved if ep["id"] == "shared")
+            self.assertEqual(saved_promoted["priority_by_group"]["bg"], 1)
+            self.assertEqual(saved_promoted["priority_by_group"]["main"], main_priority_before)
+
+            calls = []
+            def fake_try(ep, payload, timeout, **kwargs):
+                calls.append(ep.id)
+                return {"choices": [{"message": {"content": "ok"}}]}, ""
+            module.pool._try_endpoint = fake_try
+            module.pool.chat([{"role": "user", "content": "x"}], model="bg")
+            self.assertEqual(calls[0], "shared")
