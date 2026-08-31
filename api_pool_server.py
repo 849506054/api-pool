@@ -975,6 +975,12 @@ class APIPool:
         self._inflight_owner: dict[str, dict[str, int]] = {}
         # per-group fallback 到 main 的累计次数（bg 组扩容信号，/api/endpoints 暴露）
         self._group_fallback_count: dict[str, int] = {}
+        # 子组→main 组级延迟回切锁（2026-08-31 A0）：子组 fallback 落 main 后锁定
+        # _GROUP_FALLBACK_RETURN_SECONDS 秒；期间该子组请求直走 main 不重复解析死组。
+        # 锁定窗口为滑动空闲：锁定期内又有该子组请求 → 请求仍走 main，并把窗口
+        # 顺延到最后一次请求后 N 秒（无请求 N 秒后才回组重试）。期满后第一个请求
+        # 回组试探，成功即回组粘性，失败重新锁定（与 prio99 兜底锁语义对齐）。
+        self._group_fallback_lock_until: dict[str, float] = {}
         # 每组最近一次成功写入 usage 的站点账户 ID；用于识别手动切换、恢复回切
         # 和故障轮转形成的缓存账户边界。仅保存不敏感的 site_id。
         self._cache_stats_site_id_by_group: dict[str, str] = {}
@@ -1520,6 +1526,8 @@ class APIPool:
                         state[new_name] = state.pop(name)
                 if name in self._fallback_lock_until_by_group:
                     self._fallback_lock_until_by_group[new_name] = self._fallback_lock_until_by_group.pop(name)
+                if name in self._group_fallback_lock_until:
+                    self._group_fallback_lock_until[new_name] = self._group_fallback_lock_until.pop(name)
                 if name in self._group_fallback_count:
                     self._group_fallback_count[new_name] = self._group_fallback_count.pop(name)
                 del self._group_defs[name]
@@ -1545,6 +1553,7 @@ class APIPool:
             for state in (self._current_endpoint_by_group, self._manual_override_by_group,
                           self._persisted_endpoint_by_group, self._fallback_lock_until_by_group):
                 state.pop(name, None)
+            self._group_fallback_lock_until.pop(name, None)
             self._group_fallback_count.pop(name, None)
             sys_log(f"删除分组 '{name}'（成员已移出）", "INFO")
             return True, "deleted"
@@ -2147,6 +2156,9 @@ class APIPool:
     _FALLBACK_DEADLINE_SECONDS = 530
     _FALLBACK_TIMEOUT_SECONDS = 60
     _FALLBACK_LOCK_SECONDS = 300
+    # 子组→main 组级延迟回切的空闲窗口（2026-08-31 A0）：fallback 锁定后，
+    # 无该子组请求满 N 秒才允许回组重试；窗口随每次该子组请求滑动顺延。
+    _GROUP_FALLBACK_RETURN_SECONDS = 300
 
     def _get_fallback_endpoint(self):
         """返回优先级 99 的终极兜底端点（启用、在池、未冷却）。"""
@@ -2848,6 +2860,17 @@ class APIPool:
         # ── 分组池路由（2026-08-29 spec）：model 字段 → 组选择器 ──
         # "api-pool"→main 别名（存量流量零感知）；精确匹配组名；无匹配→main。
         group = self._resolve_request_group(model)
+        # 子组→main 组级延迟回切锁（2026-08-31 A0 触发点 3=锁检查）：
+        # fallback 锁定期间该子组请求直走 main，不重复解析死组；每次请求把
+        # 空闲窗口顺延（无请求 N 秒后才回组）。期满后本请求回组试探。
+        orig_group = group
+        if group != self.MAIN_GROUP:
+            with self._lock:
+                lock_until = self._group_fallback_lock_until.get(group, 0)
+                if lock_until > time.time():
+                    self._group_fallback_lock_until[group] = time.time() + self._GROUP_FALLBACK_RETURN_SECONDS
+                    group = self.MAIN_GROUP
+                    sys_log(f"组 '{orig_group}' fallback 锁定中（剩余 {int(lock_until - time.time())}s），本请求走 main 组", "INFO")
         request_route_epoch = self._get_route_epoch(group)
         group_fallback_used = False  # bg 组入口/耗尽 fallback 到 main 的标记
         # 终极兜底锁定：锁定期间该组请求直连 prio99（per-group 滑动窗口，prio99 仅 main 组语义生效）
@@ -2872,6 +2895,9 @@ class APIPool:
                 group_fallback_used = True
                 sys_log(f"组 '{group}' 无可用端点，入口 fallback 到 main 组（组内 fallback 计数+1）", "WARN")
                 self._group_fallback_count[group] = self._group_fallback_count.get(group, 0) + 1
+                # A0：建立组级延迟回切锁（滑动空闲窗口，无请求 N 秒后回组）
+                with self._lock:
+                    self._group_fallback_lock_until[group] = time.time() + self._GROUP_FALLBACK_RETURN_SECONDS
                 group = self.MAIN_GROUP
                 request_route_epoch = self._get_route_epoch(group)
         if not active:
@@ -3279,6 +3305,9 @@ class APIPool:
             with self._lock:
                 self._group_fallback_count[group] = self._group_fallback_count.get(group, 0) + 1
             sys_log(f"组 '{group}' 轮转耗尽仍失败，fallback 到 main 组追加一轮（组内 fallback 计数+1）", "WARN")
+            # A0：耗尽 fallback 同样建立组级延迟回切锁
+            with self._lock:
+                self._group_fallback_lock_until[group] = time.time() + self._GROUP_FALLBACK_RETURN_SECONDS
             try:
                 return self.chat(messages, model=None, extra_payload=extra_payload,
                                  timeout=timeout, return_endpoint=return_endpoint,
