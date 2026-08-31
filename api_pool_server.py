@@ -15,6 +15,7 @@ API Pool — 聚合 API 自动切换模块（GUI 版）
 import os
 import json
 import time
+import signal
 import threading
 import sqlite3
 import socket
@@ -2911,8 +2912,11 @@ class APIPool:
         # 仅在非冷却中清除冷却，防止并发请求穿透冷却保护（429→冷却→并发成功→清冷却→再429）
         if not self._is_in_cooldown(ep):
             self._clear_cooldown(ep)
-        # 分组池：请求成功只更新该组粘性指针；runtime_state 按组持久化。
-        # 测试临时池（_state_persistence_disabled）只更新内存指针，永不写盘。
+        # 分组池：请求成功只更新该组粘性指针（内存态）。
+        # runtime_state 落盘改为事件驱动（2026-09-01 方案 A）：
+        # - 手动切换/模型切换等显式操作即时写盘（低频，用户意图）
+        # - 正常停止前 SIGTERM 快照全量落盘（main() 注册 snapshot_runtime_state）
+        # - 自动路由成功不再热路径读写文件（零 IO）；崩溃重启由启动恢复 + 残留自愈兜底
         with self._lock:
             route_is_current = (
                 expected_route_epoch is None
@@ -2922,13 +2926,6 @@ class APIPool:
                 self._set_current(grp, ep.id)
                 if self._get_manual(grp) and self._get_manual(grp) != ep.id:
                     self._set_manual(grp, None)
-        if route_is_current and not self._state_persistence_disabled and self._get_persisted(grp) != ep.id:
-            state = load_runtime_state() or {}
-            groups_state = state.get("groups") if isinstance(state, dict) else None
-            groups_state = dict(groups_state) if isinstance(groups_state, dict) else {}
-            groups_state[grp] = ep.id
-            if save_runtime_state_groups(groups_state):
-                self._set_persisted(grp, ep.id)
         # 缓存 reasoning_content/reasoning_text 用于多轮对话
         if result and isinstance(result, dict):
             try:
@@ -4350,6 +4347,27 @@ def save_runtime_state_groups(groups_state):
         sys_log(f"保存运行态失败，不影响当前请求: {exc}", "WARN")
         return False
 
+
+def snapshot_runtime_state():
+    """停止前快照：dump 内存指针态全量写盘（2026-09-01 方案 A）。
+
+    热路径零写盘：自动路由成功不再实时落盘；仅手动切换/模型切换等显式操作
+    即时写盘，正常停止/重启前由 SIGTERM handler 调用本函数全量覆盖。
+    崩溃场景由启动恢复 + 残留自愈兜底（文件为上次停止/手动操作时的状态）。
+    """
+    try:
+        groups_state: dict = {}
+        for grp in pool._all_group_names():
+            ep_id = pool._get_manual(grp) or pool._get_current(grp)
+            if isinstance(ep_id, str) and ep_id:
+                groups_state[grp] = ep_id
+        if save_runtime_state_groups(groups_state):
+            sys_log(f"停止前运行态快照已保存（{len(groups_state)} 个组）", "INFO")
+            return True
+    except Exception as exc:
+        sys_log(f"停止前运行态快照失败: {exc}", "WARN")
+    return False
+
 def load_config():
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f: return json.load(f).get("api_endpoints", [])
@@ -4406,6 +4424,7 @@ pool._migrate_legacy_state()
 # 按组恢复重启前的粘性指针（runtime_state 新格式 {"groups": {...}}，兼容旧扁平格式→main）。
 restored_state = load_runtime_state()
 restored_groups = restored_state.get("groups") if isinstance(restored_state, dict) else {}
+stale_state_keys: list[str] = []
 if isinstance(restored_groups, dict):
     for grp, ep_id in restored_groups.items():
         if not isinstance(ep_id, str) or not ep_id:
@@ -4427,6 +4446,21 @@ if isinstance(restored_groups, dict):
             pool._set_persisted(grp, restored_endpoint.id)
         else:
             sys_log(f"组 '{grp}' 的恢复端点 {ep_id} 不存在或不可用，忽略", "WARN")
+            # 残留自愈（2026-09-01 方案 A）：组改名/删除、端点删除遗留的键
+            # （组名已不在当前配置 或 端点 id 已不存在）从 runtime_state 删除，
+            # 避免每次重启重复 WARN。端点存在但暂不属于该组则保留（防误删合法指针）。
+            group_unknown = (
+                grp not in pool._group_defs
+                and not any(grp in pool._ep_groups(ep) for ep in pool._endpoints)
+            )
+            endpoint_missing = not any(ep.id == ep_id for ep in pool._endpoints)
+            if group_unknown or endpoint_missing:
+                stale_state_keys.append(grp)
+if stale_state_keys and isinstance(restored_groups, dict):
+    for grp in stale_state_keys:
+        restored_groups.pop(grp, None)
+    if save_runtime_state_groups(restored_groups):
+        sys_log(f"已清理运行态残留组键: {', '.join(sorted(stale_state_keys))}", "INFO")
 
 
 def api_handler(method, path, body):
@@ -4984,6 +5018,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(res[0], res[1])
 
 
+def _handle_sigterm(signum, frame):
+    # 方案 A（2026-09-01）：正常停止/重启前全量快照当前端点指针态，
+    # 保证下次启动无缝恢复；随后立即退出（不等待非 daemon 工作线程）。
+    snapshot_runtime_state()
+    os._exit(0)
+
+
 def main():
     import sys
     if sys.stdout.encoding.lower() != 'utf-8':
@@ -4996,6 +5037,7 @@ def main():
         raise SystemExit("API_POOL_PORT must be an integer")
     if not 1 <= port <= 65535:
         raise SystemExit("API_POOL_PORT must be between 1 and 65535")
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     # 注：滚动清理由 ChatLogger.__init__ 的守护线程负责（启动即执行首次清理），
     #     不在 main() 同步执行——大表 DELETE 会阻塞 server 启动（2026-08-15 实测 63s）
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)

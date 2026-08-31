@@ -242,6 +242,13 @@ class PoolGroupRoutingTests(unittest.TestCase):
             pool.chat([{"role": "user", "content": "a"}], model="api-pool")
             pool.chat([{"role": "user", "content": "b"}], model="bg")
 
+            # 方案 A（2026-09-01）：自动路由成功只更新内存态，不再热路径写盘
+            self.assertEqual(pool._get_current("main"), "m1")
+            self.assertEqual(pool._get_current("bg"), "b1")
+            self.assertFalse(os.path.exists(os.path.join(tmp_path, module.RUNTIME_STATE_FILE)))
+
+            # 事件驱动落盘（手动切换 / 停止前快照路径）后 roundtrip
+            self.assertTrue(module.save_runtime_state_groups({"main": "m1", "bg": "b1"}))
             state = module.load_runtime_state()
             groups = state.get("groups", {})
             self.assertEqual(groups.get("main"), "m1")
