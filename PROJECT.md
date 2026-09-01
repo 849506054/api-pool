@@ -57,7 +57,7 @@
 - [x] **[P0] 2.0 非 DeepSeek Endpoint fallback 兼容** — 已部署至 5200；按目标 Endpoint 隔离 DeepSeek reasoning 字段，真实端点矩阵和 Hermes 5200 链路均已验收。
 - [x] **[P3] 提交未 commit 的本地改动** — 已随 9303572/4626f16 提交（含探活竞态去重补丁）
 - [x] **[P3] systemd 代理环境收口** — `api-pool2.service` 已内置 HTTPS_PROXY / HTTP_PROXY / NO_PROXY，不再依赖已删除的 1.0 drop-in。
-- [x] **[P2] 缓存保护与切换策略整合评审（2026-09-01）** — 10:30–21:43 生产窗口 193 请求、194 成功、0 ERROR/WARN、0 多端点轮转、0 429/5xx；两次 90s 连接超时均由现有同端点 1 次重试成功吸收。当前无误切换证据，不新增连续 N 次失败、降权状态或 30–45s 首包阈值；保留现有原端点重试、单请求饿死保护、sticky、阶梯冷却与 Retry-After 语义，后续仅由真实误切换样本重开。
+- [x] **[P2] 缓存保护与切换策略整合评审（2026-09-01）** — 窗口 8-31 14:00→9-1 22:14（journal 完整段 8-31 18:03→9-1 22:14）：1753 请求 ID、15 次原端点重试全成功、6 个跨端点请求全部由真实故障触发（3× 读写超时 90s×2、2× 503 billing、1× 402 quota 冻结 5h）、0 次非必要切换；chat_logs 2025 成功请求缓存命中 92.5%（journal 段 93.0%），无骤降证据。不新增连续 N 次失败、降权状态或 30–45s 首包阈值；后续仅由真实误切换样本重开。8-31 14:00–18:02 journal 明细因宿主机 18:02:56 重启丢失（journald 仅保留当前 boot），该段成功侧 308 请求/命中 89.6% 由 chat_logs 补齐，故障事件仅存于项目记录（developer 400 轮转、gpt 组冷却 fallback）。
 - [x] **[P3] save_config 原子写（2026-08-27 已部署）** — 改为同目录临时文件 + `flush`/`fsync`/`os.replace`，增加进程内写锁与失败清理；写入失败向上抛出，旧配置文件保持不变。3 项回归测试覆盖完整写入、替换失败保护和并发写入；部署后源码 hash 一致，服务重启正常并加载 27 个端点。设计见 docs/upstream-borrow-design-v1.md 改动三。
 - [x] **[P2] 确定性抖动冷却**（2026-08-28 已部署）— `_set_cooldown()` 固定时长乘 80–120% 系数（种子 sha256(ep.id+fail_count)，跨重启可复现）；配额/余额/探活短冷却通道不参与；冷却日志展示抖动后真实时长。8 项单测 + mock 上游 E2E。commit 6561ced，宿主机 hash=`637027c83b3fbbc20d546ce478ce8189`
 - [x] **[P2] 客户端类错误分类**（2026-08-28 已部署）— HTTP 400/404/413/422 且无瞬态字样：不冻结、fail_count 不增、不探活、不改路由指针（A′ 轮转不记账）；`chat()` 请求级 `client_error_tried` 集合防不冻结路径死循环；客户端错误跳过候选探活；DEBUG trace 增加 `kind=client_error`。temperature/top_p 与 tool_call_id_prefix 特例不动。12 项单测（含真实 HTTP auto-strip 集成）+ mock 上游 E2E 16/16。commit 6550d88
