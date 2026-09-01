@@ -57,7 +57,7 @@
 - [x] **[P0] 2.0 非 DeepSeek Endpoint fallback 兼容** — 已部署至 5200；按目标 Endpoint 隔离 DeepSeek reasoning 字段，真实端点矩阵和 Hermes 5200 链路均已验收。
 - [x] **[P3] 提交未 commit 的本地改动** — 已随 9303572/4626f16 提交（含探活竞态去重补丁）
 - [x] **[P3] systemd 代理环境收口** — `api-pool2.service` 已内置 HTTPS_PROXY / HTTP_PROXY / NO_PROXY，不再依赖已删除的 1.0 drop-in。
-- [ ] **[P2] 待评估：频繁切换端点导致 cache 命中率骤降、增加成本** — 短暂故障应优先原地重试而不是立刻切换，避免丢缓存。可能方案：降权不冻结、首包超时 120s→30~45s、连续 N 次失败才切换 — `proxy.conf` 不在版本控制中，建议文档化或提交模板。（已并入下方 P2 路由与恢复整合评审，见 docs/upstream-borrow-design-v1.md §6）
+- [x] **[P2] 缓存保护与切换策略整合评审（2026-09-01）** — 10:30–21:43 生产窗口 193 请求、194 成功、0 ERROR/WARN、0 多端点轮转、0 429/5xx；两次 90s 连接超时均由现有同端点 1 次重试成功吸收。当前无误切换证据，不新增连续 N 次失败、降权状态或 30–45s 首包阈值；保留现有原端点重试、单请求饿死保护、sticky、阶梯冷却与 Retry-After 语义，后续仅由真实误切换样本重开。
 - [x] **[P3] save_config 原子写（2026-08-27 已部署）** — 改为同目录临时文件 + `flush`/`fsync`/`os.replace`，增加进程内写锁与失败清理；写入失败向上抛出，旧配置文件保持不变。3 项回归测试覆盖完整写入、替换失败保护和并发写入；部署后源码 hash 一致，服务重启正常并加载 27 个端点。设计见 docs/upstream-borrow-design-v1.md 改动三。
 - [x] **[P2] 确定性抖动冷却**（2026-08-28 已部署）— `_set_cooldown()` 固定时长乘 80–120% 系数（种子 sha256(ep.id+fail_count)，跨重启可复现）；配额/余额/探活短冷却通道不参与；冷却日志展示抖动后真实时长。8 项单测 + mock 上游 E2E。commit 6561ced，宿主机 hash=`637027c83b3fbbc20d546ce478ce8189`
 - [x] **[P2] 客户端类错误分类**（2026-08-28 已部署）— HTTP 400/404/413/422 且无瞬态字样：不冻结、fail_count 不增、不探活、不改路由指针（A′ 轮转不记账）；`chat()` 请求级 `client_error_tried` 集合防不冻结路径死循环；客户端错误跳过候选探活；DEBUG trace 增加 `kind=client_error`。temperature/top_p 与 tool_call_id_prefix 特例不动。12 项单测（含真实 HTTP auto-strip 集成）+ mock 上游 E2E 16/16。commit 6550d88
@@ -140,7 +140,7 @@
 - [x] **P1 分组路由 REST 验收** — 按组手动切换和组内优先级联合场景已覆盖，完整测试 159 项通过，commit `e443cc2`。
 - [x] **聚合池管理卡片按组呈现切换控制** — 已移除卡片内端点延迟显示；⚡ 手动切换按钮仅在端点是当前查看组的当前端点时隐藏，按组渲染隔离测试通过。
 - [x] **对话日志表格列宽定稿** — 桌面端时间/延迟/缓存命中/Tokens 统一固定 80px，其余三列均分；移动端七列均为 60px，超长数据单行省略。
-- [ ] **P1 分组 UI 一致性验收** — PC 1440px 保持 7:3 双列、移动端 390px 单列且无横向溢出已由生产 CDP 验证；待 9222 浏览器恢复后刷新页面，复核聚合池 main 计数 7 与 `/api/groups`/`/api/chain` 计数 6、当前端点显示差异。结案前不修改生产代码，不人为制造 deferred 样本。详细证据与下一步见 api-pool-management `references/next-phase-progress-2026-08-31.md`。
+- [x] **P1 分组 UI 一致性验收（2026-09-01）** — 生产页面执行既有 `refresh()` 后，DOM、`window._poolGroups`、`/api/groups` 与 `/api/chain` 一致：main=5/AgentRouter、pool-bg=5/Opencode、pool-gpt=3/无本组当前；聚合链各组分别渲染 5/5/3，跨组当前 badge 语义正确，页面无横向溢出。此前 main 7 vs 6 为陈旧页面状态，未发现统计口径缺陷；无代码改动、无生产探测。
 
 ### 工作区归属
 
