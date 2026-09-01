@@ -2468,19 +2468,41 @@ class APIPool:
                 return "rate_limited", seconds
         return "", None
 
+    @staticmethod
+    def _jitter_pct(ep):
+        """确定性抖动系数 80%–120%：种子 sha256(ep.id:fail_count)。
+
+        不同端点同批冻结时解冻时间错开（防惊群）；同一端点同一档位跨重启可复现。
+        """
+        import hashlib
+        seed = f"{ep.id}:{int(ep._fail_count)}"
+        return 80 + int(hashlib.sha256(seed.encode()).hexdigest(), 16) % 41  # 80..120
+
     def _set_cooldown(self, ep):
         # 幂等：已在冷却中不刷新冻结时间（并发请求的失败是同一故障的重复观测，
         # 不延长冷却窗口；fail_count 仍由调用方累加）。窗口过期后的新失败自然触发新冻结。
         if ep._cooldown_until > time.time():
             return
-        # 确定性抖动：80%–120% 系数，种子 sha256(ep.id:fail_count)。
-        # 不同端点同批冻结时解冻时间错开（防惊群）；同一端点同一档位跨重启可复现，
-        # 便于排查与测试。仅作用于普通故障冷却；配额/余额/探活短冷却通道不参与。
-        import hashlib
-        seed = f"{ep.id}:{int(ep._fail_count)}"
-        jitter_pct = 80 + int(hashlib.sha256(seed.encode()).hexdigest(), 16) % 41  # 80..120
-        cd_seconds = max(ep.cooldown_minutes, 1) * 60 * jitter_pct / 100
+        # 普通故障冷却：cooldown_minutes × [80%,120%] 抖动 × 连续失败次数，封顶 1 小时。
+        # 阶梯（2026-09-01）：持续故障端点冷却线性拉长（5m→10m→15m→…→60m），
+        # 成功/探活通过时 _fail_count 清零自动复位；配额/余额通道由 _set_capacity_cooldown 独立处理。
+        n = max(int(ep._fail_count), 1)
+        cd_seconds = min(max(ep.cooldown_minutes, 1) * 60 * self._jitter_pct(ep) / 100 * n, 3600)
         ep._cooldown_until = time.time() + cd_seconds
+
+    def _set_probe_cooldown(self, ep, base_seconds, cap_seconds):
+        """探活失败阶梯冷却：连续失败线性递增，封顶后稳定（2026-09-01）。
+
+        需求：短时间内探活失败多次重试探活的端点需阶梯式延长冻结时间。
+        n = 本次失败后的连续失败次数（_fail_count 由调用方累加；探活通过/请求成功清零），
+        时长 = min(base_seconds × n, cap_seconds)。幂等：已在冷却中不刷新窗口。
+        """
+        if ep._cooldown_until > time.time():
+            return
+        n = max(int(ep._fail_count), 1)
+        seconds = min(base_seconds * n, cap_seconds)
+        ep._cooldown_until = time.time() + seconds
+        ep._cooldown_reason = "probe_failed"
 
     def _clear_cooldown(self, ep):
         ep._cooldown_until = 0
@@ -2622,6 +2644,7 @@ class APIPool:
                                 self._set_current(grp, best.id)
             else:
                 with self._lock:
+                    ep._fail_count += 1  # 探活失败计入连续失败，驱动阶梯冷却
                     capacity_kind, capacity_seconds = self._set_capacity_cooldown(ep, probe_error or "探活失败")
                 if capacity_kind == "balance_insufficient":
                     sys_log(f"端点 '{self._endpoint_log_label(ep, self._ep_groups(ep)[0])}' 后台探活发现余额不足，已冻结，仅支持手动解冻", "WARN")
@@ -2630,8 +2653,11 @@ class APIPool:
                     sys_log(f"端点 '{self._endpoint_log_label(ep, self._ep_groups(ep)[0])}' 后台探活发现配额不足，冻结 {detail}", "WARN")
                 else:
                     with self._lock:
-                        self._set_cooldown(ep)
-                sys_log(f"端点 '{self._endpoint_log_label(ep, self._ep_groups(ep)[0])}' 冷却过期探活未通过，继续冷却", "WARN")
+                        # 阶梯冷却：cooldown_minutes × 抖动 × 连续失败次数，封顶 1 小时
+                        base = max(ep.cooldown_minutes, 1) * 60 * self._jitter_pct(ep) / 100
+                        self._set_probe_cooldown(ep, base_seconds=base, cap_seconds=3600)
+                    actual = max(0, (ep._cooldown_until - time.time()) / 60)
+                    sys_log(f"端点 '{self._endpoint_log_label(ep, self._ep_groups(ep)[0])}' 冷却过期探活未通过，阶梯冷却 {actual:.1f} 分钟（连续第 {int(ep._fail_count)} 次）", "WARN")
         except Exception as e:
             sys_log(f"端点 '{self._endpoint_log_label(ep, self._ep_groups(ep)[0])}' 后台探活异常: {e}", "ERROR")
         finally:
@@ -2861,9 +2887,11 @@ class APIPool:
         elif capacity_kind == "rate_limited":
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 上游限流，按 Retry-After 冷却 {capacity_seconds} 秒", "WARN")
         elif probe_failed:
-            # 探活失败：只设短冷却（30秒），避免误杀冷启动端点
-            failed_ep._cooldown_until = time.time() + 30
-            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 探活失败，短冷却 30 秒", "WARN")
+            # 探活失败：阶梯短冷却（30 秒 × 连续失败次数，封顶 30 分钟），
+            # 首次不误杀冷启动端点，连续失败逐步拉长冻结时间。
+            self._set_probe_cooldown(failed_ep, base_seconds=30, cap_seconds=1800)
+            actual = max(0, (failed_ep._cooldown_until - time.time()) / 60)
+            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 探活失败，阶梯冷却 {actual:.1f} 分钟（连续第 {int(failed_ep._fail_count)} 次）", "WARN")
         elif skip_cooldown:
             # 端点级活跃判定：超时类失败但端点在 timeout 窗口内有成功响应
             # → 单请求饿死，非端点故障；不冻结、不切换当前端点。
@@ -2871,9 +2899,9 @@ class APIPool:
             return self._get_route_epoch(grp)
         else:
             self._set_cooldown(failed_ep)
-            # 抖动后实际窗口为 cooldown_minutes×[80%,120%]，日志展示真实值
+            # 抖动+阶梯后实际窗口为 cooldown_minutes×[80%,120%]×连续失败次数，日志展示真实值
             actual = max(0, (failed_ep._cooldown_until - time.time()) / 60)
-            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 触发冷却机制，下次可用时间在 {actual:.1f} 分钟后", "WARN")
+            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 触发冷却机制，下次可用时间在 {actual:.1f} 分钟后（连续第 {int(failed_ep._fail_count)} 次）", "WARN")
         # 分组池：轮转切换限定在失败请求所属组内（含 bg 组 fallback 逻辑见 chat()）。
         active = [e for e in self._failover_endpoints() if grp in self._ep_groups(e)]
         candidates = self._ordered_failover_candidates(failed_ep, active, group=grp)
