@@ -4329,17 +4329,24 @@ _runtime_state_lock = threading.Lock()
 
 
 def load_runtime_state():
-    """读取运行态：新格式 {"groups": {grp: ep_id}}；兼容旧扁平 {"last_success_endpoint_id"}。"""
+    """读取运行态：新格式 {"groups": {grp: ep_id}, "cooldowns": {ep_id: {...}}}；
+    兼容旧扁平 {"last_success_endpoint_id"}（迁移为 main 组）。
+    返回完整 dict（可能含 cooldowns）；旧调用方只取 .get("groups")，语义不变。"""
     try:
         with open(RUNTIME_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+        out: dict = {}
         groups = data.get("groups")
         if isinstance(groups, dict) and groups:
-            return {"groups": {str(k): v for k, v in groups.items() if isinstance(v, str) and v}}
-        endpoint_id = data.get("last_success_endpoint_id")
-        if isinstance(endpoint_id, str) and endpoint_id:
-            return {"groups": {APIPool.MAIN_GROUP: endpoint_id}}
-        return {}
+            out["groups"] = {str(k): v for k, v in groups.items() if isinstance(v, str) and v}
+        else:
+            endpoint_id = data.get("last_success_endpoint_id")
+            if isinstance(endpoint_id, str) and endpoint_id:
+                out["groups"] = {APIPool.MAIN_GROUP: endpoint_id}
+        cooldowns = data.get("cooldowns")
+        if isinstance(cooldowns, dict) and cooldowns:
+            out["cooldowns"] = cooldowns
+        return out
     except (OSError, ValueError, TypeError):
         return {}
 
@@ -4353,13 +4360,30 @@ def save_runtime_state(endpoint_id):
     return save_runtime_state_groups(groups_state)
 
 
-def save_runtime_state_groups(groups_state):
-    state = {"groups": groups_state}
+def save_runtime_state_groups(groups_state, cooldowns=None, replace_groups=False):
+    """保存运行态（2026-09-01 冷却持久化）：
+    - 默认合并模式：更新 groups 指针并保留文件既有 cooldowns（手动切换等显式操作语义，
+      传完整 groups 时与旧精确覆盖等价，且不会抹掉冷却态）；
+    - replace_groups=True：groups 精确覆盖（SIGTERM 快照全量覆盖、启动残留清理语义），
+      避免把将要删除的残留键合并回去。cooldowns 显式传入时同样精确覆盖。"""
+    state = load_runtime_state() or {}
+    if not isinstance(state, dict):
+        state = {}
+    prev_groups = state.get("groups") if isinstance(state.get("groups"), dict) else {}
+    prev_cooldowns = state.get("cooldowns") if isinstance(state.get("cooldowns"), dict) else {}
+    if replace_groups:
+        payload: dict = {"groups": groups_state}
+    else:
+        payload = {"groups": {**prev_groups, **groups_state}}
+    if cooldowns is not None:
+        payload["cooldowns"] = cooldowns
+    elif prev_cooldowns:
+        payload["cooldowns"] = prev_cooldowns
     tmp_file = f"{RUNTIME_STATE_FILE}.tmp"
     try:
         with _runtime_state_lock:
             with open(tmp_file, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
+                json.dump(payload, f, ensure_ascii=False, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_file, RUNTIME_STATE_FILE)
@@ -4373,10 +4397,35 @@ def save_runtime_state_groups(groups_state):
         return False
 
 
-def snapshot_runtime_state():
-    """停止前快照：dump 内存指针态全量写盘（2026-09-01 方案 A）。
+def _collect_cooldown_state():
+    """收集端点冷却/冻结状态用于快照（2026-09-01 冷却持久化）。
 
-    热路径零写盘：自动路由成功不再实时落盘；仅手动切换/模型切换等显式操作
+    仅记录有状态价值的端点：冷却中（cooldown_until>now）、余额手动解冻、
+    连续失败计数>0（阶梯冷却基数）、探活 bad。defer/展示性字段不持久化。"""
+    now = time.time()
+    out: dict = {}
+    for ep in pool._endpoints:
+        rec: dict = {}
+        if ep._cooldown_until > now:
+            rec["cooldown_until"] = ep._cooldown_until
+            rec["cooldown_reason"] = ep._cooldown_reason or ""
+        if ep._manual_unlock_required:
+            rec["manual_unlock_required"] = True
+        if ep._fail_count > 0:
+            rec["fail_count"] = ep._fail_count
+        if ep._health == "bad":
+            rec["health"] = "bad"
+            if ep._health_error:
+                rec["health_error"] = ep._health_error
+        if rec:
+            out[ep.id] = rec
+    return out
+
+
+def snapshot_runtime_state():
+    """停止前快照：dump 内存指针态 + 冷却/冻结状态全量写盘（2026-09-01 方案 A + 冷却持久化）。
+
+    热路径零写盘：自动路由成功/冷却设置不再实时落盘；仅手动切换/模型切换等显式操作
     即时写盘，正常停止/重启前由 SIGTERM handler 调用本函数全量覆盖。
     崩溃场景由启动恢复 + 残留自愈兜底（文件为上次停止/手动操作时的状态）。
     """
@@ -4386,8 +4435,12 @@ def snapshot_runtime_state():
             ep_id = pool._get_manual(grp) or pool._get_current(grp)
             if isinstance(ep_id, str) and ep_id:
                 groups_state[grp] = ep_id
-        if save_runtime_state_groups(groups_state):
-            sys_log(f"停止前运行态快照已保存（{len(groups_state)} 个组）", "INFO")
+        cooldowns = _collect_cooldown_state()
+        if save_runtime_state_groups(groups_state, cooldowns=cooldowns, replace_groups=True):
+            sys_log(
+                f"停止前运行态快照已保存（{len(groups_state)} 个组，{len(cooldowns)} 个端点冷却态）",
+                "INFO",
+            )
             return True
     except Exception as exc:
         sys_log(f"停止前运行态快照失败: {exc}", "WARN")
@@ -4449,6 +4502,7 @@ pool._migrate_legacy_state()
 # 按组恢复重启前的粘性指针（runtime_state 新格式 {"groups": {...}}，兼容旧扁平格式→main）。
 restored_state = load_runtime_state()
 restored_groups = restored_state.get("groups") if isinstance(restored_state, dict) else {}
+restored_cooldowns = restored_state.get("cooldowns") if isinstance(restored_state, dict) else {}
 stale_state_keys: list[str] = []
 if isinstance(restored_groups, dict):
     for grp, ep_id in restored_groups.items():
@@ -4484,8 +4538,43 @@ if isinstance(restored_groups, dict):
 if stale_state_keys and isinstance(restored_groups, dict):
     for grp in stale_state_keys:
         restored_groups.pop(grp, None)
-    if save_runtime_state_groups(restored_groups):
+    if save_runtime_state_groups(restored_groups, replace_groups=True):
         sys_log(f"已清理运行态残留组键: {', '.join(sorted(stale_state_keys))}", "INFO")
+
+# 冷却/冻结状态恢复（2026-09-01 冷却持久化）：SIGTERM 快照写入的 cooldowns 键。
+# 恢复 cooldown_until/reason、manual_unlock_required、fail_count（阶梯基数）与
+# 探活 bad 状态；过期冷却不恢复；端点已不存在的键清理（防每次重启重复 WARN）。
+stale_cooldown_keys: list[str] = []
+if isinstance(restored_cooldowns, dict):
+    _now = time.time()
+    for ep_id, rec in restored_cooldowns.items():
+        ep = next((e for e in pool._endpoints if e.id == ep_id), None)
+        if ep is None or not isinstance(rec, dict):
+            stale_cooldown_keys.append(ep_id)
+            continue
+        try:
+            until = float(rec.get("cooldown_until", 0))
+        except (TypeError, ValueError):
+            until = 0
+        if until > _now:
+            ep._cooldown_until = until
+            ep._cooldown_reason = str(rec.get("cooldown_reason") or "")
+        if rec.get("manual_unlock_required"):
+            ep._manual_unlock_required = True
+        try:
+            ep._fail_count = max(0, int(rec.get("fail_count", 0)))
+        except (TypeError, ValueError):
+            pass
+        if rec.get("health") == "bad":
+            ep._health = "bad"
+            ep._health_error = str(rec.get("health_error") or "")
+    if stale_cooldown_keys:
+        for k in stale_cooldown_keys:
+            restored_cooldowns.pop(k, None)
+        if save_runtime_state_groups(restored_groups, cooldowns=restored_cooldowns, replace_groups=True):
+            sys_log(f"已清理运行态残留冷却键: {', '.join(sorted(stale_cooldown_keys))}", "INFO")
+    if restored_cooldowns:
+        sys_log(f"已恢复 {len(restored_cooldowns)} 个端点的冷却/冻结状态", "INFO")
 
 
 def api_handler(method, path, body):

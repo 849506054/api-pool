@@ -59,7 +59,8 @@ class JitterCooldownTests(unittest.TestCase):
             (frozen_at,) = results
             seed = "ep-a:2"
             jitter_pct = 80 + int(hashlib.sha256(seed.encode()).hexdigest(), 16) % 41
-            expected = fixed_now + 5 * 60 * jitter_pct / 100
+            # 阶梯冷却（2026-09-01）：时长 = base × 抖动 × 连续失败次数 n，封顶 1 小时
+            expected = min(fixed_now + 5 * 60 * jitter_pct / 100 * 2, fixed_now + 3600)
             self.assertEqual(frozen_at, expected)
             self.assertGreaterEqual(jitter_pct, 80)
             self.assertLessEqual(jitter_pct, 120)
@@ -73,9 +74,13 @@ class JitterCooldownTests(unittest.TestCase):
                 before = time.time()
                 module.APIPool()._set_cooldown(ep)
                 duration = ep._cooldown_until - before
+                n = max(i, 1)
                 base = 5 * 60
-                self.assertGreaterEqual(duration, base * 0.80 - self.TOL)
-                self.assertLessEqual(duration, base * 1.20 + self.TOL)
+                # 阶梯冷却：base × 抖动(80%–120%) × n，封顶 1 小时
+                lo = min(base * 0.80 * n, 3600)
+                hi = min(base * 1.20 * n, 3600)
+                self.assertGreaterEqual(duration, lo - self.TOL)
+                self.assertLessEqual(duration, hi + self.TOL)
 
     def test_same_batch_endpoints_freeze_apart(self):
         with tempfile.TemporaryDirectory() as tmp_path:
