@@ -148,9 +148,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .modal h2{font-size:16px;margin-bottom:18px;font-weight:700}
 .form-group{margin-bottom:12px}
 .form-group label{display:block;font-size:11px;font-weight:600;color:var(--text-dim);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px}
-.form-group input,.form-group select{width:100%;padding:9px 11px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;outline:none;transition:border-color .12s;box-shadow:inset 0 1px 2px rgba(0,0,0,0.1)}
+.form-group input,.form-group select{box-sizing:border-box;width:100%;height:38px;padding:9px 11px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;outline:none;transition:border-color .12s;box-shadow:inset 0 1px 2px rgba(0,0,0,0.1)}
 .form-group input:focus,.form-group select:focus{border-color:var(--accent)}
 .form-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.form-row.form-row-routing,.form-row.form-row-limit,.form-row.form-row-capability{grid-template-columns:repeat(3,1fr)}
+.form-row.form-row-request{grid-template-columns:1fr 1fr}
+.form-row.form-row-stream{grid-template-columns:repeat(3,1fr)}
 .form-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
 
 .model-row{display:flex;gap:8px;align-items:center}
@@ -261,6 +264,14 @@ select option { background: var(--bg); color: var(--text); }
   .filter-bar{flex-wrap:wrap;gap:4px}
   .filter-bar .filter-btn{font-size:11px;padding:3px 8px}
   .form-row{grid-template-columns:1fr!important;gap:8px}
+  .modal>.form-row{margin-bottom:10px}
+  .modal>.form-group{margin-bottom:10px}
+  .form-row.form-row-routing,.form-row.form-row-limit,.form-row.form-row-capability{grid-template-columns:repeat(3,1fr)!important;gap:5px}
+  .form-row.form-row-request{grid-template-columns:repeat(2,1fr)!important;gap:5px}
+  .form-row.form-row-request{grid-template-columns:1fr 1fr}
+  .form-row.form-row-stream{grid-template-columns:repeat(3,1fr)!important;gap:5px}
+  .form-row.form-row-stream .form-group label{font-size:10px;letter-spacing:0}
+  .form-row.form-row-stream .form-group input{padding-left:5px;padding-right:5px}
   .form-group{margin-bottom:0}
   .form-group label{font-size:11px;margin-bottom:2px}
   .form-group input,.form-group select{font-size:13px;padding:6px 8px}
@@ -553,51 +564,36 @@ select option { background: var(--bg); color: var(--text); }
       <div id="modelBrowser" style="display:none"></div>
       <div id="batchBar" style="display:none"></div>
     </div>
-    <div class="form-row">
+    <div class="form-row form-row-routing">
       <div class="form-group"><label>优先级</label><input type="number" id="fPriority" value="1" min="1"></div>
-      <div class="form-group"><label title="流式请求的连接、上传请求体及等待响应头超时；非流式正常请求仍受整体请求预算控制">连接/响应头超时 (秒)</label><input type="number" id="fTimeout" value="60" min="1"></div>
-    </div>
-    <div class="form-row">
-      <div class="form-group"><label title="可恢复错误发生后，在同一客户端请求内重新向原端点发送完整请求的额外次数；建议 0-1 次">原端点额外重试次数</label><input type="number" id="fRetries" value="1" min="0" max="3"></div>
+      <div class="form-group"><label title="可恢复错误发生后，在同一客户端请求内重新向原端点发送完整请求的额外次数；建议 0-1 次">额外重试次数</label><input type="number" id="fRetries" value="1" min="0" max="3"></div>
       <div class="form-group"><label>冷却 (分钟)</label><input type="number" id="fCooldown" value="5" min="0"></div>
     </div>
-      <div class="form-group">
-        <label title="标识该模型是否原生支持读图。若选“不支持”，收到图片时会自动触发图片解析。">多模态 (视觉) 能力</label>
-        <select id="fVision"><option value="true">👁️ 原生支持</option><option value="false">🚫 不支持 (触发自动转译)</option></select>
-      </div>
-    <div class="form-row">
+    <div class="form-row form-row-request">
+      <div class="form-group"><label title="流式请求的连接、上传请求体及等待响应头超时；非流式正常请求仍受整体请求预算控制">连接/响应头超时 (秒)</label><input type="number" id="fTimeout" value="60" min="1"></div>
+      <div class="form-group"><label title="最大上下文长度（K=1000 tokens），0=不限。超过此长度时自动跳过该端点，避免账号被限制">上下文限制</label><input type="number" id="fMaxContext" value="0" min="0" placeholder="0=不限, 如 128"></div>
+    </div>
+    <div class="form-group"><label title="非空时启用：请求消息里的 tool_call id 重写为该前缀（如 call_00_ET_），解决跨端点切换后 DeepSeek 官方端点 reasoning_text 400">ToolCall ID 前缀</label><input type="text" id="fToolCallPrefix" placeholder="留空=不重写，如 call_00_ET_" value=""></div>
+    <div class="form-row form-row-limit">
+      <div class="form-group"><label title="达到额度后挂起，0为不限制">每日额度 (0不限)</label><input type="number" id="fDailyLimit" value="0" min="0"></div>
+      <div class="form-group"><label title="每分钟最高请求次数，超限自动切换，0为不限制">请求频率 (RPM)</label><input type="number" id="fRpmLimit" value="0" min="0"></div>
+      <div class="form-group"><label title="按次计费的端点健康检查将自动使用零成本 Models 探针，避免产生费用">计费方式</label><select id="fBillingMode"><option value="subscription">按量计费</option><option value="pay_per_use">按次计费</option></select></div>
+    </div>
+    <div class="form-row form-row-capability">
+      <div class="form-group"><label title="底层协议类型">协议类型</label><select id="fProtocol"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic</option></select></div>
+      <div class="form-group"><label title="标识该模型是否原生支持读图。若选“不支持”，收到图片时会自动触发图片解析。">多模态能力</label><select id="fVision"><option value="true">👁️ 原生支持</option><option value="false">🚫 不支持 (触发自动转译)</option></select></div>
+      <div class="form-group"><label title="是否使用系统代理 (如v2ray)。本地或直连接口请选择否。">代理设置</label><select id="fProxy"><option value="false">强制直连</option><option value="true">随系统</option></select></div>
+    </div>
+    <div class="form-row form-row-routing">
       <div class="form-group"><label title="检测上游返回内容是否含拒绝信息，从而触发自动轮转">假成功检测</label><select id="fFakeCheck"><option value="false">关闭</option><option value="true">开启</option></select></div>
       <div class="form-group"><label title="开启后，本端点工作时会保护其缓存：其他端点恢复后暂不切走；关闭后允许立即回切到恢复端点">缓存保护</label><select id="fDeferrable"><option value="true">开启（延迟切走）</option><option value="false">关闭（允许立即回切）</option></select></div>
-      <div class="form-group"><label title="最大上下文长度（K=1000 tokens），0=不限。超过此长度时自动跳过该端点，避免账号被限制">上下文限制</label><input type="number" id="fMaxContext" value="0" min="0" placeholder="0=不限, 如 128"></div>
-      <div class="form-group"><label title="非空时启用：请求消息里的 tool_call id 重写为该前缀（如 call_00_ET_），解决跨端点切换后 DeepSeek 官方端点 reasoning_text 400">ToolCall ID 前缀</label><input type="text" id="fToolCallPrefix" placeholder="留空=不重写，如 call_00_ET_" value=""></div>
-      <div class="form-group"><label title="达到额度后挂起，0为不限制">每日额度 (0不限)</label><input type="number" id="fDailyLimit" value="0" min="0"></div>
-      <div class="form-group">
-        <label title="按次计费的端点健康检查将自动使用零成本 Models 探针，避免产生费用">计费方式</label>
-        <select id="fBillingMode">
-          <option value="subscription">按量计费</option>
-          <option value="pay_per_use">按次计费</option>
-        </select>
-      </div>
+      <div class="form-group"><label>后台探针</label><select id="fHealthMode"><option value="chat">Ping (/chat/completions)</option><option value="models">Models (/v1/models) 零成本</option><option value="none">关闭检测</option></select></div>
     </div>
-    <div class="form-row" style="grid-template-columns: 1fr 1fr 1fr;">
-      <div class="form-group"><label title="每分钟最高请求次数，超限自动切换，0为不限制">并发 (0不限)</label><input type="number" id="fRpmLimit" value="0" min="0"></div>
-      <div class="form-group"><label title="是否使用系统代理 (如v2ray)。本地或直连接口请选择否。">代理设置</label><select id="fProxy"><option value="false">强制直连</option><option value="true">随系统</option></select></div>
-      <div class="form-group"><label title="底层协议类型">协议类型</label><select id="fProtocol"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic</option></select></div>
-
-    </div>
-    <div class="form-row" style="grid-template-columns: 1fr 1fr 1fr;">
-      <div class="form-group"><label title="收到响应头后等待第一条 SSE 数据的独立超时，0=不额外设置；仍受整体请求预算约束">流式首条数据超时 (秒)</label><input type="number" id="fStreamFirstPacket" value="120" min="0" placeholder="0=不额外设置, 默认120"></div>
+    <div class="form-row form-row-stream">
+      <div class="form-group"><label title="收到响应头后等待第一条 SSE 数据的独立超时，0=不额外设置；仍受整体请求预算约束">首条数据 (秒)</label><input type="number" id="fStreamFirstPacket" value="120" min="0" placeholder="默认120"></div>
       <div class="form-group"><label title="流式无新数据停滞判定（秒），0=禁用停滞检测。停滞不冻结端点，仅事务失败">停滞判定 (秒)</label><input type="number" id="fStreamStall" value="60" min="0" placeholder="0=禁用, 默认60"></div>
-      <div class="form-group"><label title="流式总时长上限（秒），0=不限。正常持续输出默认不截断，仅对确需限制的端点单独设置">总时长上限 (秒)</label><input type="number" id="fStreamMaxDuration" value="0" min="0" placeholder="0=不限（默认）"></div>
+      <div class="form-group"><label title="流式总时长上限（秒），0=不限。正常持续输出默认不截断，仅对确需限制的端点单独设置">总时长上限 (秒)</label><input type="number" id="fStreamMaxDuration" value="0" min="0" placeholder="0=不限"></div>
 
-    </div>
-    <div class="form-group">
-      <label>后台探针</label>
-      <select id="fHealthMode">
-        <option value="chat">Ping (/chat/completions)</option>
-        <option value="models">Models (/v1/models) 零成本</option>
-        <option value="none">关闭检测</option>
-      </select>
     </div>
 
     <div class="form-actions">
@@ -1332,7 +1328,7 @@ async function testSelectedVision(){
 function openAddModal(){
     document.getElementById('editName').value='';document.getElementById('modalTitle').textContent='添加端点';
     ['fName','fSiteName','fUrl','fKey','fModel','fUserAgent'].forEach(id=>document.getElementById(id).value='');
-    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fDeferrable').value='true';document.getElementById('fMaxContext').value=0;document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';document.getElementById('fFakeCheck').value='false';document.getElementById('fToolCallPrefix').value='';document.getElementById('fStreamFirstPacket').value=120;document.getElementById('fStreamStall').value=60;document.getElementById('fStreamMaxDuration').value=120;
+    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fDeferrable').value='true';document.getElementById('fMaxContext').value=0;document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';document.getElementById('fFakeCheck').value='false';document.getElementById('fToolCallPrefix').value='';document.getElementById('fStreamFirstPacket').value=120;document.getElementById('fStreamStall').value=60;document.getElementById('fStreamMaxDuration').value=0;
     document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';
     document.getElementById('fetchModelsBtn').disabled=true;document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
     allModels=[];selectedModels=new Set();latencyResults={};visionResults={};
