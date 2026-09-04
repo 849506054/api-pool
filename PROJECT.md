@@ -131,6 +131,7 @@
 | 2026-09-01 | 探活失败阶梯冷却（线性递增） | 短时间内探活失败多次重试探活的端点需阶梯式延长冻结时间：请求路径探活失败 30s×连续失败次数（封顶 30 分钟），后台探活失败 cooldown_minutes×抖动×连续失败次数（封顶 1 小时）；`_fail_count` 驱动、探活通过/请求成功清零复位；配额/余额/429 Retry-After 通道不受影响。生产 hash `1cc570e3`。 |
 | 2026-09-01 | 普通故障阶梯冷却（线性递增） | 普通故障（5xx 重试耗尽、连接错误、假成功等）冻结时长在原有抖动机制上叠加阶梯：cooldown_minutes×抖动×连续失败次数（封顶 1 小时），仅乘系数 n、原抖动（80–120%、sha256 种子、防惊群）完全保留；成功复位。探活阶梯先行部署（1cc570e3），本轮合并为完整阶梯体系。生产 hash `de58a08c`。 |
 | 2026-09-01 | 冷却/冻结状态快照持久化 | 冷却状态重启丢失（402 冻结 18000s 被重启清空→端点被重新使用）。与端点指针同机制：SIGTERM 快照写入 `api_runtime_state.json` 的 `cooldowns` 键（cooldown_until/reason、manual_unlock_required、fail_count、探活 bad），启动恢复、过期不恢复、端点缺失键自愈；`save_runtime_state_groups` 改合并保存（手动切换不抹冷却态）+ `replace_groups` 精确覆盖（快照/清理语义）；defer/展示字段不持久化。222 测试全绿。生产 hash `324eb7be`。 |
+| 2026-09-04 | 前端 UI 修复批次：保存反馈 + 端点表单布局重构 | 保存反馈：`api()` fetch 封装从不检查 response.ok → 4xx/5xx 被当成功解析、保存无条件弹成功并关窗；修复=api() 统一返回 `{ok:false,error,status}` + 调用方 toast 错误并保留弹窗（commit 0ac5681，生产 hash b3c0adae）。表单重构：新增端点默认流式总时长 120→0（默认不限）；移动端流式超时三参数同行；端点表单按配置语义分组（路由优先级/请求约束/ToolCall 兼容/额度与频率/协议与能力，ToolCall ID 前缀独占一行）；控件高度统一 38px（`box-sizing:border-box`，桌面/移动端共用）（commit 3bdacdc，22:21 热更新生产 hash cb819950）。纯前端 static/ 直推热更新，无需重启 api-pool2.service。 |
 
 ## 📌 活跃事项
 
