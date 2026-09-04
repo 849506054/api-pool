@@ -616,7 +616,22 @@ select option { background: var(--bg); color: var(--text); }
 document.getElementById('displayUrl').textContent = window.location.protocol + '//' + window.location.host + '/v1';
 
 const API='';
-async function api(method,path,body){const opts={method,headers:{'Content-Type':'application/json'}};if(body)opts.body=JSON.stringify(body);return(await fetch(API+path,opts)).json();}
+async function api(method,path,body){
+  const opts={method,headers:{'Content-Type':'application/json'}};
+  if(body)opts.body=JSON.stringify(body);
+  try{
+    const response=await fetch(API+path,opts);
+    const text=await response.text();
+    let data;
+    try{data=text?JSON.parse(text):{};}catch(_){data={};}
+    if(!response.ok){
+      return {ok:false,error:data.error||data.message||`请求失败（HTTP ${response.status}）`,status:response.status};
+    }
+    return data;
+  }catch(err){
+    return {ok:false,error:err?.message||'网络请求失败'};
+  }
+}
 
 let allModels=[],selectedModels=new Set(),latencyResults={},visionResults={};
 let epFilter='all',modelPage=1,PP=50;
@@ -1340,9 +1355,12 @@ async function saveEndpoint(){
     const d={name:document.getElementById('fName').value.trim(),site_name:document.getElementById('fSiteName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),deferrable:document.getElementById('fDeferrable').value==='true',max_context_k:parseInt(document.getElementById('fMaxContext').value)||0,daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',default_headers:ua?{'User-Agent':ua}:{},health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true',tool_call_id_prefix:document.getElementById('fToolCallPrefix').value.trim(),stream_first_packet_timeout:parseInt(document.getElementById('fStreamFirstPacket').value)||0,stream_stall_timeout:parseInt(document.getElementById('fStreamStall').value)||0,stream_max_duration:parseInt(document.getElementById('fStreamMaxDuration').value)||0};
     if(!d.name||!d.base_url||!d.api_key){toast('填写名称/URL/Key','error');return;}
     if(!d.model){toast('选择模型','error');return;}
-    if(ep_id){await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d);toast('已更新','success');}
-    else{d.enabled=true;d.in_pool=false;d.pool_groups=[];await api('POST','/api/endpoints',d);toast('已添加','success');}
-    closeModal();refresh();
+    try{
+      const r=ep_id?await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d):await api('POST','/api/endpoints',Object.assign(d,{enabled:true,in_pool:false,pool_groups:[]}));
+      if(!r.ok){toast(`❌ ${r.error||'保存失败'}`,'error');return;}
+      toast(ep_id?'已更新':'已添加','success');
+      closeModal();refresh();
+    }catch(err){toast(`❌ ${err?.message||'保存失败'}`,'error');}
 }
 
 async function batchAddEndpoints(){
