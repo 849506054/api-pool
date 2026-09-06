@@ -190,15 +190,18 @@ class SiteModelReplacementTests(unittest.TestCase):
         after = [(ep.id, ep.model, list(ep.pool_groups)) for ep in self.pool._endpoints]
         self.assertEqual(after, before)
 
-    def test_dedicated_group_rejects_incompatible_model_without_mutation(self):
+    def test_dedicated_group_model_replacement_without_check(self):
+        """2026-09-06 决策：专用组内选模不再校验目标模型=绑定模型（人工遵循规范）。"""
         source = self.endpoint("source", "model-a", groups=["dedicated"])
         self.pool._group_defs["dedicated"] = {"type": "dedicated", "model": "model-a"}
-        before = [(ep.id, ep.model, list(ep.pool_groups)) for ep in self.pool._endpoints]
-        with self.assertRaisesRegex(ValueError, "仅允许模型"):
+        # model-b 与绑定模型不同，不再被拒绝（由具体替换逻辑继续处理）
+        # 此处仅验证校验层不再抛「仅允许模型」
+        try:
             self.pool.replace_group_model("dedicated", source.id, "model-b")
-        self.assertEqual(
-            [(ep.id, ep.model, list(ep.pool_groups)) for ep in self.pool._endpoints], before
-        )
+        except ValueError as e:
+            self.assertNotIn("仅允许模型", str(e))
+        except KeyError:
+            pass  # 无目标端点可复用时抛 KeyError，属正常路径
 
     def test_api_persists_config_and_moved_runtime_pointer(self):
         source = self.endpoint("source", "model-a")
@@ -266,7 +269,27 @@ class SiteModelReplacementTests(unittest.TestCase):
             logs,
         )
 
-    def test_frontend_prefetches_pool_models_before_native_select_opens(self):
+    def test_group_switch_api_accepts_member_and_rejects_cross_group(self):
+        source = self.endpoint("source", "model-a", groups=["main", "pool-bg"])
+        other = self.endpoint("other", "model-b", groups=["main"])
+        self.pool._group_defs["pool-bg"] = {"type": "mixed", "model": "api-pool-bg"}
+        with mock.patch.object(self.module, "save_runtime_state_groups", return_value=True):
+            status, response, _ = self.module.api_handler(
+                "POST", "/api/pool/switch",
+                {"group": "pool-bg", "endpoint_id": source.id},
+            )
+            bad_status, bad_response, _ = self.module.api_handler(
+                "POST", "/api/pool/switch",
+                {"group": "pool-bg", "endpoint_id": other.id},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(response["group"], "pool-bg")
+        self.assertEqual(response["endpoint_id"], source.id)
+        self.assertTrue(response["current"])
+        self.assertEqual(bad_status, 409)
+        self.assertIn("不属于目标分组", bad_response["error"])
+
+
         index_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static", "index.html")
         with open(index_path, encoding="utf-8") as handle:
             html = handle.read()

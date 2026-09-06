@@ -96,6 +96,17 @@ class PoolGroupRoutingTests(unittest.TestCase):
             # bg 组粘性不污染 main 组指针
             self.assertEqual(pool._get_current("main"), "m1")
 
+    def test_dedicated_group_can_use_main_current_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            shared = self.endpoint(module, "shared", 1, "deepseek-v4-flash", groups=["main", "dedicated"])
+            pool = self.make_pool(module, [shared])
+            pool._group_defs["dedicated"] = {"type": "dedicated", "model": "deepseek-v4-flash"}
+            pool._set_current("main", "shared")
+            pool._try_endpoint = self.ok_try
+            result = pool.chat([{"role": "user", "content": "x"}], model="dedicated")
+            self.assertEqual(result["choices"][0]["message"]["content"], "from-shared")
+
     def test_legacy_config_defaults_to_main(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)

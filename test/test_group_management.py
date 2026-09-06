@@ -1,12 +1,15 @@
-"""组管理（2026-08-30）E2E 测试：组实体 CRUD、selector 路由、dedicated 校验、持久化。
+"""组管理（2026-08-30）E2E 测试：组实体 CRUD、selector 路由、dedicated 持久化。
+
+2026-09-06 决策更新：dedicated 组不再做成员模型校验（入池/改模型/类型转换均不校验，
+规范由人工遵循）。
 
 覆盖：
 - create_group：合法/重名/保留名/dedicated 缺模型/选择器冲突
-- update_group：改名（端点/指针同步）、mixed→dedicated 成员模型校验、main 锁定
+- update_group：改名（端点/指针同步）、mixed→dedicated（不校验成员）、main 锁定
 - delete_group：成员移出、指针清理、main 拒删
 - _resolve_request_group：selector 优先解析（mixed=Hermes 配置名 / dedicated=真实模型名）
-- set_pool 入组校验：dedicated 模型不匹配被过滤
-- update_endpoint 改模型：所属 dedicated 组自动移出
+- set_pool 入组：dedicated 组不过滤模型（人工规范）
+- update_endpoint 改模型：所属 dedicated 组保留
 - 持久化：pool_group_defs 落盘与加载往返
 """
 
@@ -139,19 +142,18 @@ class GroupManagementTests(unittest.TestCase):
             self.assertEqual(pool._resolve_request_group("bg"), "bg")
             self.assertEqual(pool._resolve_request_group("api-pool-bg"), "bg")
 
-    def test_mixed_to_dedicated_rejects_mismatched_members(self):
+    def test_mixed_to_dedicated_allows_mismatched_members(self):
+        """2026-09-06 决策：dedicated 组不做成员模型校验（渠道命名差异无法用字符串判定，
+        入池规范由人工遵循）。mixed→dedicated 即使成员模型与绑定模型不一致也允许。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             ep = self.endpoint(module, "b1", 1, "glm-5.3", groups=["bg", "main"])
             pool = self.make_pool(module, [ep])
             ok, msg = pool.update_group("bg", {"type": "dedicated", "model": "deepseek-v4-flash"})
-            self.assertFalse(ok)
-            self.assertIn("不匹配", msg)
-            # 全员匹配则通过
-            ep.model = "deepseek-v4-flash"
-            ok, msg = pool.update_group("bg", {"type": "dedicated", "model": "deepseek-v4-flash"})
             self.assertTrue(ok, msg)
             self.assertEqual(pool._group_defs["bg"]["type"], "dedicated")
+            # 成员模型不匹配也保留在组内
+            self.assertIn("bg", ep.pool_groups)
 
     def test_main_group_locked(self):
         with tempfile.TemporaryDirectory() as tmp_path:
@@ -205,16 +207,18 @@ class GroupManagementTests(unittest.TestCase):
 
     # ── 入组校验 ──
 
-    def test_set_pool_filters_dedicated_mismatch(self):
+    def test_set_pool_keeps_dedicated_mismatch(self):
+        """2026-09-06 决策：入池不做 dedicated 模型过滤，由人工遵循规范。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             ep = self.endpoint(module, "b1", 1, "glm-5.3", groups=["main"])
             pool = self.make_pool(module, [ep])
             pool.create_group("ds", "dedicated", "deepseek-v4-flash")
-            pool.set_pool("b1", True, groups=["ds", "main"])  # ds 模型不匹配
-            self.assertEqual(ep.pool_groups, ["main"])
+            pool.set_pool("b1", True, groups=["ds", "main"])  # ds 模型不匹配，仍保留
+            self.assertEqual(ep.pool_groups, ["ds", "main"])
 
-    def test_endpoint_model_change_evicts_dedicated_group(self):
+    def test_endpoint_model_change_keeps_dedicated_group(self):
+        """2026-09-06 决策：端点改模型不再自动移出 dedicated 组。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             ep = self.endpoint(module, "b1", 1, "deepseek-v4-flash", groups=["ds", "main"])
@@ -223,7 +227,7 @@ class GroupManagementTests(unittest.TestCase):
                 {"name": "ds", "type": "dedicated", "model": "deepseek-v4-flash"},
             ])
             pool.update_endpoint("b1", {"model": "glm-5.3"})
-            self.assertEqual(ep.pool_groups, ["main"])  # ds 自动移出，main 保留
+            self.assertEqual(ep.pool_groups, ["ds", "main"])  # 不再自动移出
 
     # ── 持久化往返 ──
 

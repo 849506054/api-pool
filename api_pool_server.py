@@ -1278,10 +1278,8 @@ class APIPool:
                     ep.in_pool = in_pool
                     # 入池同时指定组（2026-08-29 分组池）：?groups=main,bg 形式
                     if in_pool and groups is not None:
-                        # 组管理（2026-08-30）：dedicated 组模型不匹配 → 过滤掉不匹配组
                         sanitized = self._sanitize_groups(groups)
-                        enforced = self._enforce_dedicated_membership(ep, sanitized)
-                        ep.pool_groups = enforced or [self.MAIN_GROUP]
+                        ep.pool_groups = sanitized or [self.MAIN_GROUP]
                     elif in_pool and not ep.pool_groups:
                         ep.pool_groups = [self.MAIN_GROUP]
                     # 出池清组绑定，避免残留（全量出池路径；单组移除走 remove_from_group）
@@ -1348,19 +1346,7 @@ class APIPool:
                     # pool_groups 归一化（分组池 2026-08-29）：去重/去空/空列表回退 main
                     if updates.get("pool_groups") is not None:
                         sanitized = self._sanitize_groups(ep.pool_groups)
-                        # 组管理（2026-08-30）：dedicated 组模型不匹配 → 过滤
-                        ep.pool_groups = self._enforce_dedicated_membership(ep, sanitized) or [self.MAIN_GROUP]
-                    # 端点改模型 → 所属 dedicated 组重校验（2026-08-30）：
-                    # 模型不再匹配的 dedicated 组自动移出（避免编辑被拒留下脏绑定）
-                    if updates.get("model") is not None and ep.in_pool:
-                        groups_now = self._ep_groups(ep)
-                        keep = [g for g in groups_now
-                                if g == self.MAIN_GROUP or not self._dedicated_model(g)
-                                or ep.model == self._dedicated_model(g)]
-                        if len(keep) != len(groups_now):
-                            dropped = [g for g in groups_now if g not in keep]
-                            ep.pool_groups = keep
-                            sys_log(f"端点 '{ep.name}' 模型改为 {ep.model}，自动移出专用组 {', '.join(dropped)}", "WARN")
+                        ep.pool_groups = sanitized or [self.MAIN_GROUP]
                     if updates.get("max_retries") is not None:
                         ep.max_retries = self._normalize_max_retries(updates["max_retries"])
                     # cooldown_minutes 最低 1，防止跳过冷却恢复流程
@@ -1422,9 +1408,6 @@ class APIPool:
         with self._lock:
             if group not in self._all_group_names():
                 raise KeyError("分组不存在")
-            dedicated_model = self._dedicated_model(group)
-            if dedicated_model and model != dedicated_model:
-                raise ValueError(f"专用组 '{group}' 仅允许模型 '{dedicated_model}'")
 
             source = next((ep for ep in self._endpoints if ep.id == source_ep_id), None)
             if source is None:
@@ -1661,8 +1644,7 @@ class APIPool:
     def update_group(self, name, updates):
         """编辑分组（名称/类型/绑定模型）。返回 (ok, message)。
         - main：仅允许改选择器 model（名称/类型锁定）
-        - 改类型 mixed→dedicated：校验现有成员模型全部匹配，否则拒绝
-        - 改类型 dedicated→mixed：原绑定模型解除
+        - 改类型 mixed→dedicated / dedicated→mixed：不校验成员模型（入池规范由人工遵循）
         - 改名：同步端点 pool_groups / 指针态 / defs 键
         """
         with self._lock:
@@ -1710,14 +1692,6 @@ class APIPool:
                 if g != name and gd.get("model") == eff_model:
                     return False, f"选择器 '{eff_model}' 已被组 '{g}' 使用"
 
-            # mixed→dedicated：成员模型必须全部匹配绑定模型
-            if new_type == "dedicated":
-                mismatched = [ep.name for ep in self._endpoints
-                              if ep.in_pool and name in self._ep_groups(ep)
-                              and ep.model != eff_model]
-                if mismatched:
-                    return False, f"成员模型不匹配专用绑定（{', '.join(mismatched[:5])}）"
-
             # 应用改名：端点 pool_groups / 指针态 / fallback 计数 / defs
             if new_name != name:
                 for ep in self._endpoints:
@@ -1760,16 +1734,6 @@ class APIPool:
             self._group_fallback_count.pop(name, None)
             sys_log(f"删除分组 '{name}'（成员已移出）", "INFO")
             return True, "deleted"
-
-    def _enforce_dedicated_membership(self, ep, groups):
-        """入组列表过滤：剔除模型不匹配的 dedicated 组（入组校验前置）。"""
-        result = []
-        for g in groups:
-            dm = self._dedicated_model(g)
-            if dm and ep.model != dm:
-                continue
-            result.append(g)
-        return result
 
     # ── per-group 优先级访问器（2026-08-29 分组隔离）──
     def _ep_priority(self, ep, group):
@@ -1958,7 +1922,10 @@ class APIPool:
         with self._lock:
             for ep in self._endpoints:
                 if ep.id == ep_id:
+                    grp = str(group or self.MAIN_GROUP).strip() or self.MAIN_GROUP
                     if not ep.enabled or not ep.in_pool:
+                        return False
+                    if group is not None and grp not in self._ep_groups(ep):
                         return False
                     # 手动切换是用户的显式断言（「这个端点现在可用」，例如刚续费、
                     # 上游已恢复），优先于 API Pool 上一次观测推导出的不健康状态。
@@ -2866,12 +2833,14 @@ class APIPool:
         fb = self._get_fallback_endpoint()
         return [fb] if fb else []
 
-    def _ordered_failover_candidates(self, failed_ep, active, prefer_model=None, exclude=None, group=None):
-        """Return available endpoints in ring order, preferring the failed model.
+    def _ordered_failover_candidates(self, failed_ep, active, exclude=None, group=None):
+        """Return available endpoints in ring order.
 
         Ring order is calculated from the complete in-pool priority order instead
         of the filtered active list, because the failed endpoint is already in
         cooldown when this function is called. 分组隔离：按该组优先级排 ring。
+        模型优先分桶已移除（2026-09-06）：渠道命名差异下字符串相等既漏判又误判，
+        同模型/同类型互备由人工把相关端点排成相邻优先级实现。
         """
         grp = group or self.MAIN_GROUP
         excluded_ids = {ep.id for ep in (exclude or ())}
@@ -2891,19 +2860,13 @@ class APIPool:
         else:
             ring = pool
 
-        candidates = [
+        return [
             ep for ep in ring
             if ep.id in active_ids
             and ep is not failed_ep
             and ep.id not in excluded_ids
             and not self._is_in_cooldown(ep)
             and not self._is_manually_locked(ep)
-        ]
-        model = prefer_model if prefer_model is not None else getattr(failed_ep, "model", None)
-        if model is None:
-            return candidates
-        return [ep for ep in candidates if ep.model == model] + [
-            ep for ep in candidates if ep.model != model
         ]
 
     @staticmethod
@@ -3536,7 +3499,7 @@ class APIPool:
                 if total == 0:
                     break
                 tried = 0  # 轮转后重置尝试计数，用刷新后的 total 重新计算
-                # 从失败端点之后的环形顺序选择候选，同模型优先。
+                # 从失败端点之后的环形顺序选择候选（同模型优先分桶已移除，纯优先级顺延）。
                 candidates = self._ordered_failover_candidates(ep, active, group=group)
                 if client_error:
                     # 客户端类错误不冻结端点，冷却机制不会收缩 total；
@@ -5162,6 +5125,36 @@ def api_handler(method, path, body):
     # ================= 聚合池管理 =================
     if method == "GET" and cp == "/api/pool":
         return 200, [ep for ep in pool.list_endpoints() if ep.get("in_pool")], False
+    if method == "POST" and cp == "/api/pool/switch":
+        # 组感知切换接口必须先于通用 /api/pool/ 路由匹配。
+        # 插件只提交结构化参数，组归属与状态持久化由 API Pool 统一负责。
+        group = str(body.get("group", "") or "").strip()
+        ep_id = str(body.get("endpoint_id", "") or "").strip()
+        if not group or not ep_id:
+            return 400, {"ok": False, "error": "需要 group 和 endpoint_id"}, False
+        ep = pool.get_endpoint(ep_id)
+        if ep is None:
+            return 404, {"ok": False, "error": "端点不存在"}, False
+        if group not in pool._all_group_names():
+            return 404, {"ok": False, "error": "分组不存在"}, False
+        if group not in pool._ep_groups(ep):
+            return 409, {"ok": False, "error": "端点不属于目标分组"}, False
+        if not pool.switch_to_endpoint(ep_id, group=group):
+            return 409, {"ok": False, "error": "端点未启用、未入池或不可切换"}, False
+        state = load_runtime_state() or {}
+        loaded = state.get("groups") if isinstance(state.get("groups"), dict) else None
+        groups_state: dict = dict(loaded) if loaded is not None else {}
+        groups_state[group] = ep_id
+        if save_runtime_state_groups(groups_state, cooldowns=_collect_cooldown_state()):
+            pool._set_persisted(group, ep_id)
+        return 200, {
+            "ok": True,
+            "group": group,
+            "endpoint_id": ep_id,
+            "endpoint_name": ep.name,
+            "model": ep.model,
+            "current": True,
+        }, False
     if method == "POST" and cp.startswith("/api/pool/") and cp.endswith("/select-model"):
         source_ep_id = unquote(cp[len("/api/pool/"):-len("/select-model")]).strip("/")
         group = str(body.get("group", "") or "").strip()

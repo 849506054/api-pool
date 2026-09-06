@@ -634,16 +634,25 @@ let epFilter='all',modelPage=1,PP=50;
 const endpointModelsCache=new Map();
 const ENDPOINT_MODELS_CACHE_MS=5*60*1000;
 let loadingPoolModelSelect=null;
+let refreshGeneration=0;
+let poolSnapshot={endpoints:[],chain:[],groups:{},groupDefs:[]};
 
 async function refresh(){
+  const generation=++refreshGeneration;
   const[eps,chainRes,groupsRes]=await Promise.all([api('GET','/api/endpoints'),api('GET','/api/chain'),api('GET','/api/groups')]);
+  // 丢弃较早的并发刷新结果，避免慢响应覆盖较新的页面状态。
+  if(generation!==refreshGeneration)return;
   // 分组池：/api/chain 返回 {chain, groups}（groups = 各组指针与 fallback 统计）
   const chain = Array.isArray(chainRes) ? chainRes : (chainRes.chain || []);
-  window._poolGroups = (chainRes && chainRes.groups) ? chainRes.groups : {};
-  window._groupDefs = (groupsRes && groupsRes.groups) ? groupsRes.groups : []; // 组实体（2026-08-30 组管理弹窗）
+  const groups = (chainRes && chainRes.groups) ? chainRes.groups : {};
+  const groupDefs = (groupsRes && groupsRes.groups) ? groupsRes.groups : [];
+  poolSnapshot={endpoints:eps,chain,groups,groupDefs};
+  window._poolGroups = groups;
+  window._groupDefs = groupDefs; // 组实体（2026-08-30 组管理弹窗）
   window._allEps = eps; // 入池弹层读取端点当前组（回显勾选）
   renderStats(eps);renderFilterBar(eps);renderEndpoints(eps);
-  // 优先级下拉框或模型选择器展开期间，避免自动刷新重建 DOM 导致控件收回
+  // 分组切换是本地视图操作；这里仅负责后台快照到达后的状态更新。
+  // 优先级下拉框或模型选择器展开期间，避免自动刷新重建 DOM 导致控件收回。
   const active = document.activeElement;
   if (!loadingPoolModelSelect && !(active && active.tagName === 'SELECT' && active.closest('#poolList'))) {
     renderPoolList(eps);
@@ -773,7 +782,11 @@ function renderEndpoints(eps){
 
 // 分组池（2026-08-29）：聚合池内组筛选标签——默认显示 main，点击切换子组，一次只看一组
 let poolGroupFilter='main';
-function setPoolGroupFilter(g){poolGroupFilter=g;refresh();}
+function setPoolGroupFilter(g){
+  poolGroupFilter=g;
+  // 分组切换只改变当前视图，复用最近一次后台快照，不重新请求三个状态接口。
+  if(Array.isArray(poolSnapshot.endpoints))renderPoolList(poolSnapshot.endpoints);
+}
 
 function renderPoolList(eps){
   const poolEps=eps.filter(e=>e.in_pool).sort((a,b)=>a.priority-b.priority);
@@ -927,7 +940,7 @@ function openGroupModal(editName){
     <h2>${editing?'✏️':'➕'} ${title}</h2>
     <div style="display:flex;flex-direction:column;gap:12px">
       <div class="form-group"><label>分组名称</label><input type="text" id="gName" value="${esc(g.name)}" placeholder="如 bg、deepseek-v4-flash" ${nameDisabled}></div>
-      <div class="form-group"><label title="mixed=任意模型端点可入组；dedicated=仅允许绑定模型的端点入组">分组类型</label>
+      <div class="form-group"><label title="mixed=任意模型端点可入组；dedicated=专用模型池（绑定模型名对外暴露，成员入组由人工按规范判断）">分组类型</label>
         <select id="gType" ${typeDisabled} onchange="document.getElementById('gModelLabel').textContent=this.value==='dedicated'?'绑定模型（真实模型名，兼作选择器）':'选择器（Hermes 侧配置的 model 名）'">
           <option value="mixed" ${g.type!=='dedicated'?'selected':''}>混合型（mixed）</option>
           <option value="dedicated" ${g.type==='dedicated'?'selected':''}>专用型（dedicated）</option>
