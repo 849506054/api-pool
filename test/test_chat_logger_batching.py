@@ -50,6 +50,7 @@ class ChatLoggerBatchingTests(unittest.TestCase):
         self.assertEqual(logs[0]["total_tokens"], 10)
         self.assertEqual(logs[0]["latency_ms"], 123)
         self.assertEqual(logs[0]["pool_group"], "main")
+        self.assertIsNone(logs[0]["reasoning_tokens"])
 
     def test_batch_write_persists_more_than_batch_size(self):
         lg = self._make_logger()
@@ -126,6 +127,13 @@ class ChatLoggerBatchingTests(unittest.TestCase):
         self.assertIsNotNone(got)
         self.assertEqual(got["prompt"], "prompt-abc")
         self.assertEqual(got["completion"], "completion-xyz")
+
+    def test_reasoning_tokens_roundtrip(self):
+        lg = self._make_logger()
+        lg.add_log("ep", "m", "p", "c", 10, 1, "main", 4, 0, 7)
+        self.assertTrue(self._wait_until(lambda: lg.get_logs(limit=10, detail=False)["total"] >= 1))
+        row = lg.get_logs(limit=1, detail=False)["logs"][0]
+        self.assertEqual(row["reasoning_tokens"], 7)
 
     def test_queue_full_fallback_persists(self):
         lg = self._make_logger()

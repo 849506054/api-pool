@@ -24,10 +24,10 @@
 | 7 | **单请求饿死**（超时但端点 timeout 窗口内有成功响应） | `chat()` L2119-2128 判定 | ✗ | ✗ **不冻结** | ✗ **不切换**（交回 Hermes 重试） | ✗ | （08-22 修正后无新样本；边界已明确） |
 | 8 | 假成功（200 但内容匹配拒绝模式） | 仅端点开启 `check_fake_success`；尚未向下游输出时按端点重试配置原地重试 | ✓ `max_retries` | ✓ 重试用尽后常规冷却 | ✓ | 候选探活 | 默认关闭 |
 | 9 | 流式首条数据超时 | 响应头到达后独立等待首条 SSE 数据，不受连接/响应头 timeout 截短 | ✓ 3s 起始退避，受整体预算约束 | ✗ 超时重试不冻结 | 重试用尽才轮转 | — | 默认 120s，0=不额外设置 |
-| 10 | 流式无新数据停滞（`stream_stall_timeout`，默认 60s） | `_timeout_abort` L2526 | 无输出且未用过 → **同端点内部重试一次**；已有输出 → 不重放 | ✗ **不冻结** | ✗（重试失败后由 Hermes 侧善后） | ✗ | ✓ 08-26 15:14:02 Opencode 停滞 60s → 不冻结；08-25 18:02 AgentRouter 停滞同路径 |
+| 10 | 流式无新数据停滞（`stream_stall_timeout`，默认 60s） | `_timeout_abort` | 无输出且未用过 → **同端点内部重试一次**；已有输出 → 不重放，显式发送 error finish 与可见截断原因 | ✗ **不冻结** | ✗（Hermes 收到 error finish 后走续写） | ✗ | ✓ 09-05 19:51/19:59/20:12/23:39 Justwoker 业务增量停滞均在已有输出后 → 不冻结 |
 | 11 | 流式总时长超限（`stream_max_duration`，默认 0=不限，**端点可配**） | `stream_deadline` | 同上：无输出重试一次；已有输出不重放，显式发送 error 与可见截断原因 | ✗ **不冻结** | ✗ | ✗ | 正常持续输出默认不再被 120s 截断 |
 | 12 | Anthropic 流提前结束（message_stop 前 EOF） | L2710 `_timeout_abort` | 同 #10 | ✗ | ✗ | ✗ | （协议层既有路径） |
-| 13 | 余额不足 | `_classify_capacity_error` → `balance_insufficient` | ✗ | ✓ **冻结至手动解冻**（`_manual_unlock_required`） | ✓ | ✗ 仅手动 | （历史样本：进入 manual_unlock 状态） |
+| 13 | 余额不足 | `_classify_capacity_error` → `balance_insufficient` | ✗ | ✓ **冻结至手动解除**（`_manual_unlock_required`；⏰ `clear_error` 或 ⚡ 手动切换均可解除） | ✓ | ✗ 仅手动 | （历史样本：进入 manual_unlock 状态） |
 | 14 | 配额/额度耗尽（quota_exceeded / daily_limit） | `_set_capacity_cooldown` 解析 Retry-After/reset 时间；`_is_quota_exceeded` 每日额度 | ✗ | ✓ 冻结至重置时间（默认 5h）；每日额度到期自然解除 | ✓ | 到期后台探活 | （999554 RPM 限流路径同构验证） |
 | 15 | 上下文超限（`max_context_k`） | `chat()` L2030-2036 | ✗ | ✗ **不记失败** | ✓ **跳过**该端点轮转下一个 | ✗ | （防护性跳过，不计入错误） |
 | 16 | RPM 限流（`rpm_limit` 本地计数） | `_is_rpm_limited`，`_active_endpoints` 排除 | ✗ | ✗ 非冷却状态 | ✓ 池内排除，自然切换 | — | ✓ 999554 rpm=5 路径（本地限流，非上游 429） |

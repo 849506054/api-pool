@@ -125,7 +125,8 @@ class CacheAccountBoundaryTests(unittest.TestCase):
                 self.assertEqual(error, "")
                 self.assertEqual(result["usage"]["prompt_tokens_details"]["cached_tokens"], 99)
                 self.assertEqual(usage_calls[0][-1], 0)
-                self.assertEqual(log_calls[0][-1], 0)
+                self.assertEqual(log_calls[0][-2], 0)
+                self.assertIsNone(log_calls[0][-1])
             finally:
                 server.shutdown()
                 server.server_close()

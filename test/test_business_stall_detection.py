@@ -111,7 +111,7 @@ class BusinessStallDetectionTests(unittest.TestCase):
         )
 
     def test_keepalive_stream_aborted_by_business_stall(self):
-        """有输出的心跳续命流：透传已见内容、提前中止（finish=stop）、不重放。"""
+        """有输出的心跳续命流：透传已见内容、提前中止、不重放，截断信号可见（finish=error）。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             response = KeepaliveStallResponse(first_content=True)  # 首行业务增量
@@ -127,9 +127,14 @@ class BusinessStallDetectionTests(unittest.TestCase):
             self.assertIn(b"partial", text)
             self.assertIn(b"[DONE]", text)
             self.assertLessEqual(out.count(b'"delta":{}') , 5, "应在数个心跳组内中止，不应跑完 30 组")
-            # 有输出 → 不重放、finish=stop（与 socket 停滞语义一致），无可见错误文本
+            # 有输出 → 不重放原文（partial 只出现一次），但截断必须对下游可见：
+            # finish=error + 原因文本，Hermes 才会把它当成可续写的截断而非完整回答。
+            decoded = text.decode("utf-8", "replace")
+            self.assertEqual(decoded.count("partial"), 1)
+            self.assertIn("业务增量停滞", decoded)
+            self.assertIn("输出已截断", decoded)
             tail = [c for c in out if b"finish_reason" in c]
-            self.assertTrue(tail and b'"stop"' in tail[-1])
+            self.assertTrue(tail and b'"error"' in tail[-1])
 
     def test_no_output_keepalive_retries_once_then_visible_error(self):
         """无输出的心跳流：原端点内部重试一次，仍停滞 → 可见 error 原因。"""
