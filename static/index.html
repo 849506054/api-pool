@@ -858,13 +858,13 @@ function renderPoolList(eps){
     const gDef=(window._groupDefs||[]).find(x=>x.name===gr)||{};
     const selTip=gDef.model&&gDef.model!==gr?` · 选择器：${esc(gDef.model)}`:'';
     const typeTip=gDef.type==='dedicated'?' · 专用型（绑定 '+esc(gDef.model)+'）':'';
-    const tip=`当前端点：${gi.current_endpoint?esc(gi.current_endpoint):'无'}${gi.fallback_count>0?' · 已 fallback '+gi.fallback_count+' 次':''}${selTip}${typeTip}`;
+    const tip=`当前端点：${gi.current_endpoint?esc(gi.current_endpoint):'无'}${gi.fallback_lock_remaining>0?' · 整组 fallback 借道 main':''}${selTip}${typeTip}`;
     return `<button class="filter-btn ${gr===poolGroupFilter?'active':''}" onclick="setPoolGroupFilter('${esc(gr)}')" title="${tip}">${icon}${esc(gr)} ${memN}</button>`;
   }).join('');
   const statusHtml=`<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;margin:2px 0 10px">
     <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
       <span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="该组当前端点">● ${info.current_endpoint?esc(info.current_endpoint):'无'}</span>
-      ${info.fallback_count>0?`<span class="badge badge-cooldown" style="font-size:9px;padding:1px 5px" title="fallback 到 main 累计次数（扩容信号）">↩${info.fallback_count}</span>`:''}
+      ${info.fallback_lock_remaining>0?`<span class="badge badge-cooldown" style="font-size:9px;padding:1px 5px" title="整组 fallback，请求借道 main（剩余 ${fmtTime(info.fallback_lock_remaining)}）">↩main</span>`:''}
     </div>
     <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin-left:auto">
     <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:10px" title="新建分组（暂未开放）" onclick="createPoolGroup()">新建分组</button>
@@ -1014,12 +1014,12 @@ function renderChain(chain){
         const info=gs[g]||{};
         const memN=chain.filter(it=>chainGroupsOf(it).includes(g)).length;
         const icon=g==='main'?'🏊':'';
-        const tip=`当前端点：${info.current_endpoint?esc(info.current_endpoint):'无'}${info.fallback_count>0?' · 已 fallback '+info.fallback_count+' 次':''}`;
+        const tip=`当前端点：${info.current_endpoint?esc(info.current_endpoint):'无'}${info.fallback_lock_remaining>0?' · 整组 fallback 借道 main':''}`;
         return `<button class="filter-btn ${g===chainGroupFilter?'active':''}" onclick="setChainGroupFilter('${esc(g)}')" title="${tip}">${icon}${esc(g)} ${memN}</button>`;
       }).join('')+`</div>`+
       `<div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin:2px 0 10px">
         <span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="该组当前端点">● ${gs[chainGroupFilter]&&gs[chainGroupFilter].current_endpoint?esc(gs[chainGroupFilter].current_endpoint):'无'}</span>
-        ${(gs[chainGroupFilter]&&gs[chainGroupFilter].fallback_count>0)?`<span class="badge badge-cooldown" style="font-size:9px;padding:1px 5px" title="fallback 到 main 累计次数（扩容信号）">↩${gs[chainGroupFilter].fallback_count}</span>`:''}
+        ${(gs[chainGroupFilter]&&gs[chainGroupFilter].fallback_lock_remaining>0)?`<span class="badge badge-cooldown" style="font-size:9px;padding:1px 5px" title="整组 fallback，请求借道 main（剩余 ${fmtTime(gs[chainGroupFilter].fallback_lock_remaining)}）">↩main</span>`:''}
       </div>`;
     } else { gEl.innerHTML=''; }
   }

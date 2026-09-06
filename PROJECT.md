@@ -52,6 +52,8 @@
 - [x] **删除 reasoning_text 注入逻辑** — 8/6+8/7 注入修复经 H/K 测试矩阵证伪（Kcne 校验 tool_call id 与 reasoning 字段无关），注入禁用后 Kcne 46万token 请求正常，正式删除 (commit 4626f16)
 - [x] **端点级流式参数配置入口（2026-08-26）** — 编辑/新增端点表单新增「首包超时 / 停滞判定 / 总时长上限」三字段（0=禁用，默认 120/60/120），后端 `_sync_to_config` 白名单与 `_ep_to_dict` 输出补齐，PUT/POST 全链路持久化。触发样本：glm-5.3 长流式请求反复触发 `stream_max_duration` 120s 默认上限被静默截断（近24h 12 次超限）。
 - [x] **出站 User-Agent 透传（2026-09-05）** — 代理主链路出站 UA 由写死改为透传客户端原请求 UA，端点自定义 UA 仍最高优先，客户端缺 UA 回退默认库标识；管理页与探活保持默认标识。11 单测 + 7 项 mock E2E，生产 hash `3f1babad`。
+- [x] **组 fallback 徽标改实时锁定语义（2026-09-07）** — ↩N 历史累计计数整体移除（UI 徽标 + 后端 `_group_fallback_count` 字段/两处 +1/快照 counts 键）；UI 改为锁定期实时徽标 `↩main`。`/api/chain` groups 暴露 `fallback_lock_remaining`（>0 = 该组正整组 fallback 借道 main，即组级延迟回切锁锁定期）；旧快照 counts 残留启动恢复时剔除回写。全套 258 测试通过 + mock E2E，生产 hash 后端 `97d3db7c` / 前端 `b5120044`。
+- [x] **启动批量加载保持 config 组内优先级（2026-09-07）** — `add_endpoint()` 每次加入端点即调用 `_renumber_pool_priorities()`，启动加载 26 个端点逐个 add 时以加载顺序为并列 tiebreak 增量重编号，覆盖 config 已保存的组内优先级（Tokenrhythm config bg/cron=2 因 add 序靠前被提为 #1，真正的 #1 ARZ-ds4f/ARP 被挤成 #2）。修复：批量加载路径 `renumber=False`，端点与组实体全部就绪后单次全量重排（config pbg 完整时幂等）；运行期单端点增删保持原增量语义。全套 259 测试通过（含新增回归 + 无 pbg 场景断言更新为按全局序分配），生产 hash 后端 `eb6d43e7`。
 
 ### 待办
 
@@ -142,6 +144,8 @@
 | 2026-09-06 | 移除同模型优先 fallback 分桶 + dedicated 组模型校验 | 两项配套决策，源于渠道模型命名差异事实（deepseek-v4-flash 与 -0731/大小写变体在不同渠道指向同一正式版，字符串相等既漏判又误判；apipool 无法联网查证）。①`_ordered_failover_candidates()` 删除 `prefer_model` 参数与 `ep.model==model` 分桶：失败轮转纯按组内优先级 ring 顺延，同模型/同类型互备由人工把相关端点排成相邻优先级实现（priority 是唯一排序依据，不再被分桶覆盖）。②dedicated 组彻底去掉成员模型校验：删 `_enforce_dedicated_membership()`（入池过滤）、端点改模型自动移出、mixed→dedicated 成员全匹配拒绝、`replace_group_model()` 专用组「仅允许绑定模型」四段；绑定模型保留为 selector/对外暴露名（dedicated 组两点意义：客户端按真实模型名获得专有配置、按能力划分会话工作负载），入池规范由人工遵循，不按规范产生的兼容性问题用户自担。前端组弹窗 tooltip 更新。测试反转 4 项（mismatched_members/set_pool_mismatch/evicts/replace_rejects→allows/keeps/without_check），全套 257 测试通过。 |
 
 | 2026-09-06 | 聚合池分组切换改为本地快照视图 | 原实现点击组标签调用 `refresh()`，并发请求 `/api/endpoints`、`/api/chain`、`/api/groups` 后整页重绘；快速切换时慢响应可覆盖新选择，且与池内 select 焦点渲染守卫叠加造成卡住。聚合链原本直接本地 `renderChain()`，因此不存在同样延迟。修复：`refresh()` 保存 `poolSnapshot`，点击聚合池组只更新 `poolGroupFilter` 并本地 `renderPoolList(poolSnapshot.endpoints)`，不发网络请求、不重绘其他区域；增加 `refreshGeneration` 丢弃过期并发刷新结果。移除此前无效的 blur workaround。浏览器验证连续 7 次切换最终准确停在目标组，切换时 resource 数量保持不变（无新增请求），控制台无异常；前端 hash `427fb4a5`。 |
+| 2026-09-07 | 移除组 fallback 累计计数徽标与后端计数；UI 改为锁定期实时徽标 `↩main` | ↩N 是「fallback 累计次数」，无时间维度、无法指引当下处理，对用户无意义（同端点累计故障次数）；用户真正需要的是实时状态「该组当前正整组 fallback 借道 main」= 组级延迟回切锁锁定期。后端删除 `_group_fallback_count`（字段/两处 +1/重命名与删组迁移/快照 counts 键），恢复逻辑对旧快照 counts 残留剔除回写；`/api/chain` groups 暴露 `fallback_lock_remaining`（锁剩余秒，>0 锁定中）。前端徽标条件由 `fallback_count>0` 改 `fallback_lock_remaining>0`，文案 `↩main`（title 含剩余时间），组标签 title 同步改实时提示。全套 258 测试通过 + mock E2E（5299 锁定态验证），生产 hash 后端 `97d3db7c` / 前端 `b5120044`。 |
+| 2026-09-07 | 启动批量加载保持 config 组内优先级 | 重启后 bg/cron 组 #1 端点在 UI 上变化（用户报告「重启前这两个分别是分组的优先级1」）。根因：`add_endpoint()`（:1237）每次加入端点即 `_renumber_pool_priorities()`，启动加载逐个 add 26 个端点时，重排以「当时已加入成员 + _endpoints 加载顺序」为并列 tiebreak——config 中 bg/cron=2 的 Tokenrhythm 因 add 序第 2 先入组被重排为 #1，真正 #1（bg=AgentRouterZ-ds4f、cron=AgentRouterP，add 序 #20/#22）被挤成 #2；当前端点指针不受影响，故「使用端点正常、优先级不对」。非快照 bug、与 fallback 徽标改动无关（2026-08-29 分组池引入 renumber 即存在），重启暴露。修复：`add_endpoint(ep, renumber=True)` 增加开关，批量加载路径（模块级 4741 + `__init__`）传 `renumber=False`，端点与组实体全部就绪后单次全量重排（config pbg 完整时幂等）；运行期 UI 单端点增删保持增量语义。无 pbg 端点分配语义相应变为按全局 priority 序（原为 add 序），相关测试断言同步更新。全套 259 测试通过，生产 hash 后端 `eb6d43e7`。 |
 
 ### 下一阶段进度（2026-08-31）
 

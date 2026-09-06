@@ -1171,8 +1171,6 @@ class APIPool:
         # 端点在途归属：ep.id → {组名: 在途请求数}。main 可抢占子组共享端点，
         # 因此必须按组计数，避免并发请求覆盖 owner 或提前释放仍在途的占用。
         self._inflight_owner: dict[str, dict[str, int]] = {}
-        # per-group fallback 到 main 的累计次数（bg 组扩容信号，/api/endpoints 暴露）
-        self._group_fallback_count: dict[str, int] = {}
         # 子组→main 组级延迟回切锁（2026-08-31 A0）：子组 fallback 落 main 后锁定
         # _GROUP_FALLBACK_RETURN_SECONDS 秒；期间该子组请求直走 main 不重复解析死组。
         # 锁定窗口为滑动空闲：锁定期内又有该子组请求 → 请求仍走 main，并把窗口
@@ -1193,9 +1191,12 @@ class APIPool:
         self._health_probe_max_workers = 2  # chat/models 探针会消耗上游并发与额度
         if endpoints:
             for ep in endpoints:
-                self.add_endpoint(ep)
+                # 批量加载：逐次 add 不做组内重排（增量重排以加载顺序为 tiebreak，
+                # 会覆盖 config 已保存的组内优先级——2026-09-07 修复），循环后统一一次。
+                self.add_endpoint(ep, renumber=False)
+            self._renumber_pool_priorities()
 
-    def add_endpoint(self, ep):
+    def add_endpoint(self, ep, renumber=True):
         if isinstance(ep, dict):
             raw_ep = ep
             ep_dict = {k: v for k, v in raw_ep.items() if k in Endpoint.__dataclass_fields__}
@@ -1236,7 +1237,8 @@ class APIPool:
         with self._lock:
             self._endpoints.append(ep)
             self._endpoints.sort(key=lambda e: e.priority)
-            self._renumber_pool_priorities()
+            if renumber:
+                self._renumber_pool_priorities()
 
     def remove_endpoint(self, ep_id):
         with self._lock:
@@ -1692,7 +1694,7 @@ class APIPool:
                 if g != name and gd.get("model") == eff_model:
                     return False, f"选择器 '{eff_model}' 已被组 '{g}' 使用"
 
-            # 应用改名：端点 pool_groups / 指针态 / fallback 计数 / defs
+            # 应用改名：端点 pool_groups / 指针态 / fallback 锁 / defs
             if new_name != name:
                 for ep in self._endpoints:
                     if name in self._ep_groups(ep):
@@ -1705,8 +1707,6 @@ class APIPool:
                     self._fallback_lock_until_by_group[new_name] = self._fallback_lock_until_by_group.pop(name)
                 if name in self._group_fallback_lock_until:
                     self._group_fallback_lock_until[new_name] = self._group_fallback_lock_until.pop(name)
-                if name in self._group_fallback_count:
-                    self._group_fallback_count[new_name] = self._group_fallback_count.pop(name)
                 del self._group_defs[name]
 
             self._group_defs[new_name] = {"type": new_type, "model": eff_model}
@@ -1731,7 +1731,6 @@ class APIPool:
                           self._persisted_endpoint_by_group, self._fallback_lock_until_by_group):
                 state.pop(name, None)
             self._group_fallback_lock_until.pop(name, None)
-            self._group_fallback_count.pop(name, None)
             sys_log(f"删除分组 '{name}'（成员已移出）", "INFO")
             return True, "deleted"
 
@@ -3193,8 +3192,7 @@ class APIPool:
             active, starved2 = self._group_sticky_candidates(self.MAIN_GROUP)
             if active:
                 group_fallback_used = True
-                sys_log(f"组 '{group}' 无可用端点，入口 fallback 到 main 组（组内 fallback 计数+1）", "WARN")
-                self._group_fallback_count[group] = self._group_fallback_count.get(group, 0) + 1
+                sys_log(f"组 '{group}' 无可用端点，入口 fallback 到 main 组", "WARN")
                 # A0：建立组级延迟回切锁（滑动空闲窗口，无请求 N 秒后回组）
                 with self._lock:
                     self._group_fallback_lock_until[group] = time.time() + self._GROUP_FALLBACK_RETURN_SECONDS
@@ -3611,9 +3609,7 @@ class APIPool:
         # 再失败才报 AllEndpointsFailed 交 Hermes。530s 预算跨组共享不翻倍（剩余预算内执行）。
         # 仅当请求原生属于非 main 组且尚未 fallback 过（入口触发点 1 会改写 group）。
         if group != self.MAIN_GROUP and not group_fallback_used and errors:
-            with self._lock:
-                self._group_fallback_count[group] = self._group_fallback_count.get(group, 0) + 1
-            sys_log(f"组 '{group}' 轮转耗尽仍失败，fallback 到 main 组追加一轮（组内 fallback 计数+1）", "WARN")
+            sys_log(f"组 '{group}' 轮转耗尽仍失败，fallback 到 main 组追加一轮", "WARN")
             # A0：耗尽 fallback 同样建立组级延迟回切锁
             with self._lock:
                 self._group_fallback_lock_until[group] = time.time() + self._GROUP_FALLBACK_RETURN_SECONDS
@@ -4645,19 +4641,11 @@ def _collect_cooldown_state():
 def _collect_fallback_state():
     """收集组级 fallback 状态用于快照（2026-09-06 组 fallback 持久化）。
 
-    仅记录有状态价值的项：组 fallback 计数（>0，UI 扩容信号）、组 fallback
-    回切锁（未过期）、main 组 prio99 终极兜底锁（未过期）。过期锁不落盘。"""
+    仅记录有状态价值的项：组 fallback 回切锁（未过期）、main 组 prio99 终极兜底锁（未过期）。
+    过期锁不落盘。历史 fallback 计数已移除（2026-09-06，不再跨重启累计）。"""
     now = time.time()
-    counts: dict = {}
     locks: dict = {}
     fallback_locks: dict = {}
-    for grp, value in pool._group_fallback_count.items():
-        try:
-            n = int(value)
-        except (TypeError, ValueError):
-            continue
-        if n > 0:
-            counts[grp] = n
     for grp, until in pool._group_fallback_lock_until.items():
         try:
             ts = float(until)
@@ -4673,8 +4661,6 @@ def _collect_fallback_state():
         if ts > now:
             fallback_locks[grp] = ts
     out: dict = {}
-    if counts:
-        out["counts"] = counts
     if locks:
         out["locks"] = locks
     if fallback_locks:
@@ -4702,7 +4688,6 @@ def snapshot_runtime_state():
         ):
             sys_log(
                 f"停止前运行态快照已保存（{len(groups_state)} 个组，{len(cooldowns)} 个端点冷却态，"
-                f"{len(fallback_state.get('counts', {}))} 个组 fallback 计数，"
                 f"{len(fallback_state.get('locks', {})) + len(fallback_state.get('fallback_locks', {}))} 把 fallback 锁）",
                 "INFO",
             )
@@ -4755,7 +4740,9 @@ ensure_config()
 pool = APIPool()
 for ep_data in load_config():
     if "in_pool" not in ep_data: ep_data["in_pool"] = True
-    pool.add_endpoint(ep_data)
+    # 批量加载不逐次重排：增量 renumber 以加载顺序为 tiebreak，会覆盖 config 中
+    # 已保存的组内优先级（2026-09-07 修复，见 _load_group_defs 后的统一收尾）。
+    pool.add_endpoint(ep_data, renumber=False)
 # 组管理（2026-08-30）：加载组实体定义；旧配置无 defs → 从端点声明派生（selector=组名，mixed；
 # 仅内存态，首次组编辑时 _sync_to_config 才把 pool_group_defs 落盘）
 _defs_raw = load_group_defs_config()
@@ -4764,6 +4751,9 @@ if isinstance(_defs_raw, list):
 pool._derive_group_defs()
 # 分组池：旧扁平路由状态（若有）迁移为 main 组状态
 pool._migrate_legacy_state()
+# 统一收尾：端点与组实体全部就绪后按 config 已保存的组内优先级重排一次。
+# 单次全量重排按现有 pbg 排序编号，无并列时幂等，不会破坏持久化优先级。
+pool._renumber_pool_priorities()
 # 按组恢复重启前的粘性指针（runtime_state 新格式 {"groups": {...}}，兼容旧扁平格式→main）。
 restored_state = load_runtime_state()
 restored_groups = restored_state.get("groups") if isinstance(restored_state, dict) else {}
@@ -4849,22 +4839,20 @@ if isinstance(restored_cooldowns, dict):
         sys_log(f"已恢复 {len(restored_cooldowns)} 个端点的冷却/冻结状态", "INFO")
 
 # 组级 fallback 状态恢复（2026-09-06 组 fallback 持久化）：SIGTERM 快照写入的
-# group_fallback 键。恢复组 fallback 计数（UI 扩容信号，跨重启累计）与未过期的
-# fallback 回切锁 / main 组 prio99 兜底锁（锁按绝对时间戳恢复剩余窗口）；过期锁
-# 剔除；组已不存在（组名不在 defs 且无端点归属）的键清理（与 groups 残留自愈一致）。
+# group_fallback 键。恢复未过期的 fallback 回切锁 / main 组 prio99 兜底锁
+# （锁按绝对时间戳恢复剩余窗口）；过期锁剔除；组已不存在（组名不在 defs 且无端点归属）
+# 的键清理（与 groups 残留自愈一致）。历史 fallback 计数已移除（2026-09-06）：
+# 旧快照中的 counts 键不再恢复，回写时剔除，避免跨重启残留累计数。
 if isinstance(restored_fallback, dict) and restored_fallback:
     _now = time.time()
-    _fb_counts = restored_fallback.get("counts") if isinstance(restored_fallback.get("counts"), dict) else {}
+    _legacy_counts = restored_fallback.pop("counts", None)
+    if isinstance(_legacy_counts, dict) and _legacy_counts:
+        sys_log("旧快照含组 fallback 累计计数（已弃用移除，不恢复）", "INFO")
     _fb_locks = restored_fallback.get("locks") if isinstance(restored_fallback.get("locks"), dict) else {}
     _fb_fallback_locks = (
         restored_fallback.get("fallback_locks")
         if isinstance(restored_fallback.get("fallback_locks"), dict) else {}
     )
-    for _grp, _n in _fb_counts.items():
-        try:
-            pool._group_fallback_count[_grp] = max(0, int(_n))
-        except (TypeError, ValueError):
-            pass
     for _grp, _until in _fb_locks.items():
         try:
             _ts = float(_until)
@@ -4882,31 +4870,26 @@ if isinstance(restored_fallback, dict) and restored_fallback:
     # 残留组清理：锁键指向不存在的组时剔除并回写，防每次重启重复残留。
     # 回写无条件执行（进入本块即发生过状态读取），清空时显式写 {} 覆盖残留键。
     _stale_fb_groups = {
-        grp for grp in {*_fb_counts, *_fb_locks, *_fb_fallback_locks}
+        grp for grp in {*_fb_locks, *_fb_fallback_locks}
         if grp not in pool._group_defs
         and not any(grp in pool._ep_groups(ep) for ep in pool._endpoints)
     }
     if _stale_fb_groups:
         for _grp in _stale_fb_groups:
-            pool._group_fallback_count.pop(_grp, None)
             pool._group_fallback_lock_until.pop(_grp, None)
             pool._fallback_lock_until_by_group.pop(_grp, None)
-        _fb_counts = {g: n for g, n in _fb_counts.items() if g not in _stale_fb_groups}
         _fb_locks = {g: t for g, t in _fb_locks.items() if g not in _stale_fb_groups}
         _fb_fallback_locks = {g: t for g, t in _fb_fallback_locks.items() if g not in _stale_fb_groups}
         restored_fallback = {}
-        if _fb_counts:
-            restored_fallback["counts"] = _fb_counts
         if _fb_locks:
             restored_fallback["locks"] = _fb_locks
         if _fb_fallback_locks:
             restored_fallback["fallback_locks"] = _fb_fallback_locks
     if _stale_fb_groups:
         sys_log(f"已清理运行态残留组 fallback 键: {', '.join(sorted(_stale_fb_groups))}", "INFO")
-    if _fb_counts or _fb_locks or _fb_fallback_locks:
+    if _fb_locks or _fb_fallback_locks:
         sys_log(
-            f"已恢复组 fallback 状态：{len(_fb_counts)} 个组计数，"
-            f"{len(_fb_locks) + len(_fb_fallback_locks)} 把锁",
+            f"已恢复组 fallback 锁：{len(_fb_locks) + len(_fb_fallback_locks)} 把",
             "INFO",
         )
     save_runtime_state_groups(
@@ -5045,15 +5028,17 @@ def api_handler(method, path, body):
             return 200, {"ok": False, "error": str(exc)}, False
     if method == "GET" and cp == "/api/chain":
         chain = pool.get_active_chain()
-        # 分组池：附加 per-group 汇总（各组当前指针 + fallback 计数），驱动 UI 组视图
+        # 分组池：附加 per-group 汇总（各组当前指针 + fallback 锁实时状态），驱动 UI 组视图
         group_summary = {}
         for grp in pool._all_group_names():
             cur = pool._get_manual(grp) or pool._get_current(grp)
             cur_ep = next((e for e in pool._endpoints if e.id == cur), None)
+            _fb_until = pool._group_fallback_lock_until.get(grp, 0)
             group_summary[grp] = {
                 "current_endpoint": cur_ep.name if cur_ep else None,
                 "current_endpoint_id": cur,
-                "fallback_count": pool._group_fallback_count.get(grp, 0),
+                # 整组 fallback 锁剩余秒数（>0 = 该组正借道 main，UI 显示 ↩main）
+                "fallback_lock_remaining": max(0, int(_fb_until - time.time())) if _fb_until else 0,
                 "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)),
             }
         return 200, {"chain": chain, "groups": group_summary}, False

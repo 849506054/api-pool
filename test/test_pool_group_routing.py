@@ -57,6 +57,29 @@ class PoolGroupRoutingTests(unittest.TestCase):
     def make_pool(self, module, endpoints):
         return module.APIPool(endpoints)
 
+    def test_batch_load_preserves_config_pbg_order(self):
+        """启动批量加载保持 config 已保存的组内优先级，不被加载顺序覆盖（2026-09-07 修复）。
+
+        回归场景：组 bg 的 #1 端点在配置列表中排在 #2 端点之后。旧实现 add_endpoint 逐次
+        增量 renumber（以加载顺序为并列 tiebreak），先加载的 #2 端点会先占 1、把真正的 #1
+        挤成 2。修复后批量加载不逐次重排，config 优先级原样保留。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            second_in_cfg = module.Endpoint(
+                id="first", name="first", base_url="http://127.0.0.1:1", api_key="k",
+                model="mdl", priority=1, in_pool=True, use_proxy=False,
+                pool_groups=["bg"], priority_by_group={"bg": 2},
+            )
+            top_in_cfg = module.Endpoint(
+                id="top", name="top", base_url="http://127.0.0.1:1", api_key="k",
+                model="mdl", priority=5, in_pool=True, use_proxy=False,
+                pool_groups=["bg"], priority_by_group={"bg": 1},
+            )
+            pool = self.make_pool(module, [second_in_cfg, top_in_cfg])
+            # config 里的组内 #1/#2 保持，而非被加载顺序颠倒
+            self.assertEqual(pool._ep_priority(top_in_cfg, "bg"), 1)
+            self.assertEqual(pool._ep_priority(second_in_cfg, "bg"), 2)
+
     @staticmethod
     def ok_try(ep, payload, timeout, **kwargs):
         return {"choices": [{"message": {"content": f"from-{ep.name}"}}]}, ""
@@ -201,7 +224,8 @@ class PoolGroupRoutingTests(unittest.TestCase):
             result = pool.chat([{"role": "user", "content": "x"}], model="bg")
             self.assertIsNotNone(result)
             self.assertEqual(calls, ["m1"])
-            self.assertEqual(pool._group_fallback_count.get("bg"), 1)
+            # fallback 已建立组级延迟回切锁（徽标 ↩main 依据）
+            self.assertGreater(pool._group_fallback_lock_until.get("bg", 0), module.time.time())
 
     def test_exhaustion_fallback_to_main(self):
         """触发点 2：bg 组轮转完仍失败 → fallback 到 main 组一轮成功。"""
@@ -223,7 +247,8 @@ class PoolGroupRoutingTests(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertEqual(calls[0], "b1")
             self.assertIn("m1", calls)
-            self.assertGreaterEqual(pool._group_fallback_count.get("bg"), 1)
+            # 轮转耗尽 fallback 同样建立组级延迟回切锁
+            self.assertGreater(pool._group_fallback_lock_until.get("bg", 0), module.time.time())
 
     def test_bg_all_failed_reports_error(self):
         """bg + main 都失败 → AllEndpointsFailed（不无限递归）。"""
@@ -477,13 +502,16 @@ class PerGroupPriorityTests(unittest.TestCase):
             pool = module.APIPool([m1, m2, b1, b2, shared])
             pool._renumber_pool_priorities()
 
-            # main: m1,m2,sh → 1,2,3；bg: b1,b2,sh → 1,2,3（按初始全局序）
+            # main: m1,m2,sh → 1,2,3（全局序）
             self.assertEqual(pool._ep_priority(m1, "main"), 1)
             self.assertEqual(pool._ep_priority(m2, "main"), 2)
             self.assertEqual(pool._ep_priority(shared, "main"), 3)
-            self.assertEqual(pool._ep_priority(b1, "bg"), 1)
-            self.assertEqual(pool._ep_priority(b2, "bg"), 2)
-            self.assertEqual(pool._ep_priority(shared, "bg"), 3)
+            # bg：无 pbg 时按全局序（main 镜像后 sh=3 < b1/b2=999）→ sh,b1,b2 → 1,2,3。
+            # （2026-09-07 修复：组内编号按排序键而非端点 add 顺序——旧增量 renumber
+            #  会让先加载的 b1/b2 占 #1/#2、全局序更前的 shared 排 #3。）
+            self.assertEqual(pool._ep_priority(shared, "bg"), 1)
+            self.assertEqual(pool._ep_priority(b1, "bg"), 2)
+            self.assertEqual(pool._ep_priority(b2, "bg"), 3)
             # main 组值镜像全局 priority
             self.assertEqual(shared.priority, 3)
 
