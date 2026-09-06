@@ -272,6 +272,8 @@ select option { background: var(--bg); color: var(--text); }
   .form-row.form-row-stream{grid-template-columns:repeat(3,1fr)!important;gap:5px}
   .form-row.form-row-stream .form-group label{font-size:10px;letter-spacing:0}
   .form-row.form-row-stream .form-group input{padding-left:5px;padding-right:5px}
+  /* 站点名称/端点名称：移动端保持同行两列（字段短，无需随 .form-row 堆叠为单列） */
+  .form-row.form-row-names{grid-template-columns:1fr 1fr!important;gap:6px}
   .form-group{margin-bottom:0}
   .form-group label{font-size:11px;margin-bottom:2px}
   .form-group input,.form-group select{font-size:13px;padding:6px 8px}
@@ -315,7 +317,8 @@ select option { background: var(--bg); color: var(--text); }
   #chatLogsList{overflow-x:hidden!important}
   #chatLogsX{overflow-x:auto!important;-webkit-overflow-scrolling:touch!important;scrollbar-width:none!important}
   #chatLogsX::-webkit-scrollbar{display:none!important}
-  .chatlog-grid{grid-template-columns:60px repeat(7,minmax(96px,1fr))!important;min-width:780px!important;box-sizing:border-box}
+  /* 移动端整表收窄：时间/池组/耗时/缓存命中/推理强度/Tokens 固定 60px 等宽；端点/模型弹性列；min-width 620px 减少横向拖动 */
+  .chatlog-grid{grid-template-columns:60px 60px minmax(80px,1fr) minmax(80px,1fr) repeat(4,60px)!important;min-width:620px!important;gap:6px!important;box-sizing:border-box}
   .chatlog-grid>*{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .cl-ep{display:block}
   .cl-model{display:block}
@@ -548,9 +551,9 @@ select option { background: var(--bg); color: var(--text); }
   <div class="modal">
     <h2 id="modalTitle">添加端点</h2>
     <input type="hidden" id="editName">
-    <div class="form-row">
-      <div class="form-group"><label>名称</label><input type="text" id="fName" placeholder="如 OpenAI 或 DeepSeek" oninput="this.dataset.autofilled='false'"></div>
-      <div class="form-group"><label title="用于端点列表按站点筛选；同一站点的多个端点填写相同名称">站点名称</label><input type="text" id="fSiteName" placeholder="如 OpenAI"></div>
+    <div class="form-row form-row-names">
+      <div class="form-group"><label title="用于端点列表按站点筛选；同一站点的多个端点填写相同名称">站点名称</label><input type="text" id="fSiteName" placeholder="如 OpenAI" oninput="this.dataset.autofilled='false'"></div>
+      <div class="form-group"><label title="端点显示名称；留空时随 Base URL 输入自动识别补全">端点名称</label><input type="text" id="fName" placeholder="如 OpenAI 或 DeepSeek" oninput="this.dataset.autofilled='false'"></div>
     </div>
     <div class="form-group"><label>Base URL</label><input type="text" id="fUrl" placeholder="https://api.openai.com/v1" oninput="checkFetchBtn()"></div>
     <div class="form-group"><label>API Key</label><input type="text" id="fKey" placeholder="sk-..." oninput="checkFetchBtn()"></div>
@@ -1194,16 +1197,20 @@ async function resetPool(){await api('POST','/api/reset');toast('已重置','suc
 function checkFetchBtn(){
     const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
     document.getElementById('fetchModelsBtn').disabled=!(u&&k);
-    
-    const nameEl = document.getElementById('fName');
-    if (!nameEl.value || nameEl.dataset.autofilled === 'true') {
-        const provider = detectProvider(u);
+    const provider = detectProvider(u);
+    // 端点名称与站点名称共用同一自动补全机制：字段为空（或此前为自动填入）时随 URL 识别结果填充
+    autoFillFromProvider(document.getElementById('fName'), provider);
+    autoFillFromProvider(document.getElementById('fSiteName'), provider);
+}
+function autoFillFromProvider(el, provider){
+    if (!el) return;
+    if (!el.value || el.dataset.autofilled === 'true') {
         if (provider) {
-            nameEl.value = provider;
-            nameEl.dataset.autofilled = 'true';
-        } else if (nameEl.dataset.autofilled === 'true') {
-            nameEl.value = '';
-            nameEl.dataset.autofilled = 'false';
+            el.value = provider;
+            el.dataset.autofilled = 'true';
+        } else if (el.dataset.autofilled === 'true') {
+            el.value = '';
+            el.dataset.autofilled = 'false';
         }
     }
 }
