@@ -42,6 +42,34 @@ LATENCY_SLOW_MAX = 5000
 # 假成功检测：上游返回 200 OK 但内容含拒绝/错误信息
 FAKE_SUCCESS_PATTERNS = ["无法给到相关内容"]
 
+# 流事务中止原因中「答案被截断」的那一类：已向下游输出内容后再中止，回答一定不完整。
+# 这些原因要保留可见的 error finish，让 Hermes 走续写路径（`_timeout_abort`）。
+_TRUNCATED_STREAM_REASONS = ("流式总时长超限", "流式无有效业务增量停滞", "流式无新数据停滞")
+
+# ── 出站 User-Agent 透传（2026-09-05）──
+# 客户端原始 UA 经线程局部存储送到出站请求构造点。ThreadingHTTPServer 每请求独占
+# 线程，流式生成器与图片翻译都在同一线程内消费，因此该作用域覆盖整个请求生命周期
+# （含流式内部重试与 temperature/top_p 清洗重试）。
+# 只有代理路径写入：后台探活线程与管理页测试/拉模型接口保持默认库标识，避免把浏览器
+# UA 透到上游。端点自定义 UA（default_headers/extra_headers）在此之后 add_header 覆盖，
+# 优先级为 端点自定义 > 客户端原始 > 默认库标识。
+_DEFAULT_OUTBOUND_UA = "OpenAI/Python 2.33.0"
+_client_ctx = threading.local()
+
+
+def set_client_user_agent(ua):
+    _client_ctx.user_agent = (ua or "").strip()
+
+
+def clear_client_user_agent():
+    _client_ctx.user_agent = ""
+
+
+def resolve_outbound_user_agent():
+    """出站 UA：客户端原始 UA 优先，缺失时回退默认库标识（避免 Python-urllib 被 WAF 拦）。"""
+    return getattr(_client_ctx, "user_agent", "") or _DEFAULT_OUTBOUND_UA
+
+
 
 class LogManager:
     def __init__(self, max_history=300):
@@ -824,7 +852,8 @@ class ChatLogger:
                 latency_ms INTEGER,
                 pool_group TEXT,
                 prompt_tokens INTEGER,
-                cached_tokens INTEGER
+                cached_tokens INTEGER,
+                reasoning_tokens INTEGER
             )''')
             # 存量库迁移：老表缺列时补齐（pool_group 2026-08-30 分组调用区分；prompt/cached tokens 同日命中统计）
             c.execute("PRAGMA table_info(chat_logs)")
@@ -833,14 +862,15 @@ class ChatLogger:
                 ("pool_group", "TEXT"),
                 ("prompt_tokens", "INTEGER"),
                 ("cached_tokens", "INTEGER"),
+                ("reasoning_tokens", "INTEGER"),
             ):
                 if _col not in _cols:
                     c.execute(f"ALTER TABLE chat_logs ADD COLUMN {_col} {_ddl}")
             conn.commit()
             conn.close()
 
-    def add_log(self, endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group=None, prompt_tokens=None, cached_tokens=None):
-        row = (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens)
+    def add_log(self, endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group=None, prompt_tokens=None, cached_tokens=None, reasoning_tokens=None):
+        row = (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens)
         try:
             self._log_queue.put_nowait(row)
         except queue.Full:
@@ -864,7 +894,7 @@ class ChatLogger:
                 conn = self._connect()
                 c = conn.cursor()
                 c.executemany(
-                    "INSERT INTO chat_logs (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO chat_logs (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     batch,
                 )
                 conn.commit()
@@ -880,12 +910,12 @@ class ChatLogger:
             # detail=False：SQL 层不取 prompt/completion（避免从磁盘读 32MB 正文再丢弃）
             if detail:
                 c.execute(
-                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
+                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
                     (limit, offset)
                 )
             else:
                 c.execute(
-                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
+                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
                     (limit, offset)
                 )
                 rows = [r[:4] + (None, None) + r[4:] for r in c.fetchall()]
@@ -899,7 +929,7 @@ class ChatLogger:
                             "id": r[0], "timestamp": r[1], "endpoint_name": r[2], "model": r[3],
                             "prompt": None, "completion": None,
                             "total_tokens": r[6], "latency_ms": r[7], "pool_group": r[8],
-                            "prompt_tokens": r[9], "cached_tokens": r[10]
+                            "prompt_tokens": r[9], "cached_tokens": r[10], "reasoning_tokens": r[11]
                         } for r in rows
                     ]
                 }
@@ -924,7 +954,8 @@ class ChatLogger:
                         "latency_ms": r[7],
                         "pool_group": r[8],
                         "prompt_tokens": r[9],
-                        "cached_tokens": r[10]
+                        "cached_tokens": r[10],
+                        "reasoning_tokens": r[11]
                     } for r in rows
                 ]
             }
@@ -938,7 +969,7 @@ class ChatLogger:
             conn = self._connect()
             c = conn.cursor()
             c.execute(
-                "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens FROM chat_logs WHERE id = ?",
+                "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens FROM chat_logs WHERE id = ?",
                 (int(log_id),)
             )
             r = c.fetchone()
@@ -956,7 +987,8 @@ class ChatLogger:
                 "latency_ms": r[7],
                 "pool_group": r[8],
                 "prompt_tokens": r[9],
-                "cached_tokens": r[10]
+                "cached_tokens": r[10],
+                "reasoning_tokens": r[11]
             }
         except Exception as e:
             return None
@@ -1860,7 +1892,7 @@ class APIPool:
 
     def _is_ep_inflight_elsewhere(self, ep, group):
         """子组仅受 main 在途占用约束；main 不受任何子组约束。"""
-        if group == self.MAIN_GROUP:
+        if group == self.MAIN_GROUP or self._group_defs.get(group, {}).get("type") == "dedicated":
             return False
         owners = self._inflight_owner.get(ep.id) or {}
         return owners.get(self.MAIN_GROUP, 0) > 0
@@ -1896,7 +1928,7 @@ class APIPool:
 
     def _is_ep_sticky_elsewhere(self, ep, group):
         """子组仅避让 main 粘性/手动端点；main 不受子组指针约束。"""
-        if group == self.MAIN_GROUP:
+        if group == self.MAIN_GROUP or self._group_defs.get(group, {}).get("type") == "dedicated":
             return False
         return ep.id in {
             self._get_current(self.MAIN_GROUP),
@@ -1926,17 +1958,38 @@ class APIPool:
         with self._lock:
             for ep in self._endpoints:
                 if ep.id == ep_id:
-                    if not ep.enabled or not ep.in_pool or ep._manual_unlock_required:
+                    if not ep.enabled or not ep.in_pool:
                         return False
-                    # 手动选择明确表示用户希望立即使用该端点；只绕过 defer，
-                    # 不清除 cooldown、配额或余额保护。
+                    # 手动切换是用户的显式断言（「这个端点现在可用」，例如刚续费、
+                    # 上游已恢复），优先于 API Pool 上一次观测推导出的不健康状态。
+                    # 因此先把该端点视为恢复健康并真的发请求，再由真实结果重新分类：
+                    # 请求失败会走既有故障路径重新冷却，代价是一次请求；反过来
+                    # 让观测推论压掉用户指令，会让切换变成静默空操作
+                    # （候选集 _group_sticky_candidates 先过滤，指针根本读不到）。
+                    # enabled/in_pool 是配置声明而非健康推论，仍然是硬性守卫。
+                    # 用户配置的预算上限同样不动：daily_limit/_today_used 与
+                    # rpm_limit/_req_timestamps 是既发用量事实，不是可推翻的观测。
                     ep._defer_until = 0
+                    ep._cooldown_until = 0
+                    ep._cooldown_reason = ""
+                    ep._fail_count = 0
+                    ep._last_error = ""
+                    ep._last_error_ts = 0
+                    ep._manual_unlock_required = False
+                    ep._health_error = ""
+                    # 未经真实请求验证 → unknown；首次成功由 _on_success 置 ok。
+                    ep._health = "unknown"
                     grp = group or self.MAIN_GROUP
                     self._set_manual(grp, ep_id)
                     self._set_current(grp, ep_id)
-                    sys_log(f"手动切换端点: '{self._endpoint_log_label(ep, grp)}'（清除其 defer，保留冷却/配额/余额状态）", "INFO")
+                    sys_log(f"手动切换端点: '{self._endpoint_log_label(ep, grp)}'（按用户断言重置为待验证：清除冷却/上游配额/余额冻结与失败计数）", "INFO")
                     return True
         return False
+
+    def get_endpoint(self, ep_id):
+        """按 ID 返回主池中的真实端点对象，用于定向管理操作。"""
+        with self._lock:
+            return next((ep for ep in self._endpoints if ep.id == ep_id), None)
 
     def list_endpoints(self):
         self._cleanup_expired_cooldowns()
@@ -2523,6 +2576,82 @@ class APIPool:
                     sys_log(f"端点 '{ep.name}' 手动解冻，错误状态已清除", "INFO")
                     return True
         return False
+
+    def _apply_test_result(self, ep, error=None, latency_ms=-1, group=None):
+        """将端点卡片的定向测试结果写回主池端点，并复用正式故障分类。"""
+        error_text = str(error or "")
+        with self._lock:
+            ep._health_latency_ms = int(latency_ms) if latency_ms is not None else -1
+            ep._health_last_check = time.time()
+            if not error_text:
+                ep._health = "ok" if ep._health_latency_ms < 0 or ep._health_latency_ms <= LATENCY_OK_MAX else "slow"
+                ep._health_error = ""
+                ep._fail_count = 0
+                ep._last_error = ""
+                ep._last_error_ts = 0
+                ep._cooldown_until = 0
+                ep._cooldown_reason = ""
+                ep._manual_unlock_required = False
+                return
+
+            if self._classify_client_error(error_text):
+                ep._last_error = error_text
+                ep._last_error_ts = time.time()
+                sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 测试返回客户端类错误，不冻结端点: {error_text}", "WARN")
+                return
+
+            ep._health = "bad"
+            ep._health_error = error_text[:100]
+            ep._fail_count += 1
+            ep._total_failures += 1
+            ep._last_error = error_text
+            ep._last_error_ts = time.time()
+            capacity_kind, capacity_seconds = self._set_capacity_cooldown(ep, error_text)
+            if capacity_kind == "balance_insufficient":
+                sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 测试失败，余额不足，已冻结，仅支持手动解冻", "WARN")
+            elif capacity_kind == "quota_exceeded":
+                detail = f"{capacity_seconds} 秒" if capacity_seconds is not None else "默认 5 小时"
+                sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 测试失败，配额不足，冻结 {detail}", "WARN")
+            elif capacity_kind == "rate_limited":
+                sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 测试失败，上游限流，按 Retry-After 冷却 {capacity_seconds} 秒", "WARN")
+            else:
+                self._set_cooldown(ep)
+                actual = max(0, (ep._cooldown_until - time.time()) / 60)
+                ep._cooldown_reason = ep._cooldown_reason or "test_failed"
+                sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 测试失败，已写回主端点并触发冷却 {actual:.1f} 分钟", "WARN")
+
+    def test_endpoint(self, ep, message="你好", image=None, group=None):
+        """在不启用候选轮转的前提下测试主池中的指定端点。"""
+        import uuid
+        started = time.time()
+        request_id = f"test-{uuid.uuid4().hex[:8]}"
+        test_group = group or (self._ep_groups(ep)[0] if self._ep_groups(ep) else self.MAIN_GROUP)
+        payload_message = message
+        if image:
+            payload_message = [
+                {"type": "text", "text": message},
+                {"type": "image_url", "image_url": {"url": image}},
+            ]
+        payload = {
+            "model": ep.model,
+            "messages": [{"role": "user", "content": payload_message}],
+        }
+        sys_log(f"[req={request_id}] 测试端点 '{self._endpoint_log_label(ep, test_group, ep.model)}'", "INFO")
+        result, error = self._try_endpoint(
+            ep, payload, timeout=ep.timeout, pool_group=test_group,
+            force_no_retry=False, request_id=request_id,
+        )
+        latency_ms = int((time.time() - started) * 1000)
+        if error:
+            sys_log(f"[req={request_id}] 端点 '{self._endpoint_log_label(ep, test_group)}' 测试请求失败: {error}", "ERROR")
+            self._apply_test_result(ep, error=error, latency_ms=latency_ms, group=test_group)
+            return None, error
+        with self._lock:
+            ep._total_calls += 1
+            ep._last_success_ts = time.time()
+        self._apply_test_result(ep, latency_ms=latency_ms, group=test_group)
+        sys_log(f"[req={request_id}] 端点 '{self._endpoint_log_label(ep, test_group)}' 测试请求成功", "INFO")
+        return result, ""
 
     def _cleanup_expired_cooldowns(self):
         """冷却过期端点：收集后丢给后台线程探活，不阻塞请求路径（2026-08-13 后台化改造）。
@@ -3739,7 +3868,7 @@ class APIPool:
                 req.add_header("x-api-key", safe_api_key)
                 req.add_header("anthropic-version", "2023-06-01")
             req.add_header("Authorization", f"Bearer {safe_api_key}")
-            req.add_header("User-Agent", "OpenAI/Python 2.33.0")
+            req.add_header("User-Agent", resolve_outbound_user_agent())
             for k, v in ep.default_headers.items():
                 req.add_header(k, v)
 
@@ -3767,46 +3896,140 @@ class APIPool:
                     resp = urllib.request.urlopen(req, timeout=_open_timeout)
                 
                 if is_stream:
-                    # Stream first-packet pre-read: timeout retries, not freeze
-                    first_line = b""
+                    # 在 generator 返回给 chat() 前预读到首个有效业务 chunk。
+                    # 这样首包前的 SSE 业务错误仍处于 chat() 的重试/轮转上下文内。
+                    prefetched_lines = []
+                    pending_error_event = False
                     _first_pkt_timeout = getattr(ep, "stream_first_packet_timeout", 0)
-                    # 响应头已经到达后，首条 SSE 数据使用独立超时；不再被连接/响应头
-                    # timeout 暗中截短。0 表示不额外设置，仍受整体请求预算约束。
+                    _sock1 = _get_resp_socket(resp)
                     if _first_pkt_timeout > 0:
-                        _effective_pkt_timeout = _first_pkt_timeout
-                        _sock1 = _get_resp_socket(resp)
                         if _sock1 is not None:
                             try:
-                                _sock1.settimeout(_effective_pkt_timeout)
-                                first_line = resp.readline()
-                            except socket.timeout:
-                                sys_log(f"{request_tag}端点 '{endpoint_log_label}' 流式首包超时（{_effective_pkt_timeout}s，第 {attempt+1} 次）", "WARN")
-                                try:
-                                    resp.close()
-                                except Exception:
-                                    pass
-                                if attempt < retries:
-                                    if debug_trace is not None:
-                                        debug_trace.append({"endpoint": ep.name, "result": "retry", "attempt": attempt + 1, "kind": "stream_first_packet_timeout"})
-                                    retry_delay = 3 * (2 ** attempt)
-                                    if request_deadline is not None and time.time() + retry_delay >= request_deadline:
-                                        return None, f"stream first packet timeout ({_effective_pkt_timeout}s; retry skipped: request budget exhausted)"
-                                    sys_log(f"{request_tag}端点 '{endpoint_log_label}' {retry_delay} 秒后进行第 {attempt+1}/{retries} 次原端点重试（流式首条数据超时）", "INFO")
-                                    time.sleep(retry_delay)
-                                    continue
-                                return None, f"stream first packet timeout ({_effective_pkt_timeout}s)"
+                                _sock1.settimeout(_first_pkt_timeout)
                             except Exception as e:
                                 sys_log(f"{request_tag}端点 '{endpoint_log_label}' 首包预读 socket 不可用({e})，依赖请求超时/总时长兜底", "WARN")
                         else:
                             # 2026-08-15: _get_resp_socket 失败时无法设 socket 超时，
                             # 只能依赖 urllib 的 timeout 参数（=ep.timeout），显式记录避免排障盲区
                             sys_log(f"{request_tag}端点 '{endpoint_log_label}' 首包预读未取得 socket，依赖 urllib timeout({timeout or ep.timeout}s) 兜底", "WARN")
+
+                    def _stream_error(chunk, event_error=False):
+                        if not isinstance(chunk, dict):
+                            return "invalid stream error event" if event_error else ""
+                        error = chunk.get("error")
+                        error_type = ""
+                        message = ""
+                        if isinstance(error, dict):
+                            error_type = str(error.get("type") or "")
+                            message = str(error.get("message") or error.get("detail") or "")
+                        elif error is not None:
+                            message = str(error)
+                        chunk_type = str(chunk.get("type") or "")
+                        if event_error or chunk_type == "error" or error is not None or error_type == "upstream_error":
+                            detail = ": ".join(part for part in (error_type or chunk_type, message) if part)
+                            return detail or "upstream stream error"
+                        return ""
+
+                    def _is_business_chunk(chunk):
+                        if not isinstance(chunk, dict):
+                            return False
+                        if is_anthropic:
+                            ctype = chunk.get("type")
+                            delta = chunk.get("delta") or {}
+                            if ctype == "content_block_delta":
+                                return bool(delta.get("text") or delta.get("thinking") or delta.get("partial_json"))
+                            if ctype == "content_block_start":
+                                return (chunk.get("content_block") or {}).get("type") == "tool_use"
+                            return False
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            return False
+                        delta = choices[0].get("delta") or {}
+                        return bool(delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls"))
+
+                    try:
+                        # 只读上游、逐行前进。bounded give-up：长时间只有心跳/空 delta
+                        # 而无业务首包时，不在此无限等待，把控制交还 generator 的既有
+                        # 停滞机制（_timeout_abort 内部重试/可见错误），保持 2026-08-22
+                        # 起冻结解耦语义；预读行会原样重放，不丢帧。
+                        _stall_budget = getattr(ep, "stream_stall_timeout", 0)
+                        _max_budget = getattr(ep, "stream_max_duration", 0)
+                        _gate_elapsed_stall = False
+                        _gate_elapsed_maxdur = False
+                        _gate_stall_deadline = time.time() + _stall_budget if _stall_budget > 0 else None
+                        _gate_max_deadline = time.time() + _max_budget if _max_budget > 0 else None
+                        _gate_max_lines = 200
+                        while True:
+                            if _gate_stall_deadline is not None and time.time() > _gate_stall_deadline:
+                                _gate_elapsed_stall = True
+                                break
+                            if _gate_max_deadline is not None and time.time() > _gate_max_deadline:
+                                _gate_elapsed_maxdur = True
+                                break
+                            if len(prefetched_lines) >= _gate_max_lines:
+                                break
+                            line = resp.readline()
+                            if not line:
+                                resp.close()
+                                return None, "HTTP 502: upstream stream ended before first business chunk"
+                            prefetched_lines.append(line)
+                            stripped = line.strip()
+                            if not stripped or stripped.startswith(b":"):
+                                continue
+                            if stripped.lower().startswith(b"event:"):
+                                pending_error_event = stripped[6:].strip().lower() == b"error"
+                                continue
+                            if not stripped.startswith(b"data:"):
+                                continue
+                            raw_data = stripped[5:].strip()
+                            if not raw_data:
+                                continue
+                            if raw_data == b"[DONE]":
+                                resp.close()
+                                return None, "HTTP 502: upstream stream ended before first business chunk"
+                            try:
+                                chunk = json.loads(raw_data.decode("utf-8"))
+                            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                                resp.close()
+                                return None, f"HTTP 502: invalid upstream SSE before first business chunk: {e}"
+                            stream_error = _stream_error(chunk, pending_error_event)
+                            pending_error_event = False
+                            if stream_error:
+                                resp.close()
+                                return None, f"HTTP 502: upstream stream error: {stream_error}"
+                            if _is_business_chunk(chunk):
+                                break
+                    except socket.timeout:
+                        _timeout_label = f"{_first_pkt_timeout}s" if _first_pkt_timeout > 0 else f"{timeout or ep.timeout}s(urllib)"
+                        sys_log(f"{request_tag}端点 '{endpoint_log_label}' 流式首包超时（{_timeout_label}，第 {attempt+1} 次）", "WARN")
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                        if attempt < retries:
+                            if debug_trace is not None:
+                                debug_trace.append({"endpoint": ep.name, "result": "retry", "attempt": attempt + 1, "kind": "stream_first_packet_timeout"})
+                            retry_delay = 3 * (2 ** attempt)
+                            if request_deadline is not None and time.time() + retry_delay >= request_deadline:
+                                return None, f"stream first packet timeout ({_first_pkt_timeout}s; retry skipped: request budget exhausted)"
+                            sys_log(f"{request_tag}端点 '{endpoint_log_label}' {retry_delay} 秒后进行第 {attempt+1}/{retries} 次原端点重试（流式首条数据超时）", "INFO")
+                            time.sleep(retry_delay)
+                            continue
+                        return None, f"stream first packet timeout ({_first_pkt_timeout}s)"
+                    except Exception as e:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                        return None, f"HTTP 502: upstream stream pre-read failed: {type(e).__name__}: {e}"
+
                     def stream_generator():
                         stream_id = f"chatcmpl-{int(time.time()*1000)}"
                         final_prompt_tokens = 0
                         final_completion_tokens = 0
                         final_total_tokens = 0
                         final_cached_tokens = 0
+                        final_reasoning_tokens = None
                         has_usage = False
                         final_completion_text = ""
                         final_reasoning_text = ""
@@ -3859,8 +4082,13 @@ class APIPool:
                                 )
                             if has_output:
                                 # The partial response is already visible to Hermes;
-                                # do not replay it and create duplicated text.
-                                visible_reason = reason if reason.startswith("流式总时长超限") else ""
+                                # do not replay it and create duplicated text. Stall and
+                                # duration-budget aborts both leave a truncated answer, so
+                                # the finish must stay an error: Hermes converts an error
+                                # finish after partial delivery into a length-truncated
+                                # stub and runs its continuation path. A silent "stop"
+                                # would end the turn as if the answer were complete.
+                                visible_reason = reason if reason.startswith(_TRUNCATED_STREAM_REASONS) else ""
                                 yield b'data: ' + json.dumps({
                                     "choices": [{
                                         "delta": {"content": f"\n\n[API Pool Error: {visible_reason}，输出已截断]"} if visible_reason else {},
@@ -3881,14 +4109,22 @@ class APIPool:
                         # readline 每行返回、循环体能执行 → 此检查生效；曾试过 watchdog 线程
                         # 方案，但 http.client 的 readline 是 C 层循环（持 GIL），watchdog 被
                         # 饿死不可靠，已废弃。完全无数据场景由 stall 超时（socket）兜底。
-                        stream_deadline = time.time() + ep.stream_max_duration if ep.stream_max_duration > 0 else None
+                        stream_deadline = (
+                            time.time() - 1
+                            if _gate_elapsed_maxdur
+                            else (time.time() + ep.stream_max_duration if ep.stream_max_duration > 0 else None)
+                        )
                         # 业务增量停滞检测（2026-08-31 B1）：socket 停滞超时只能拦「无网络数据」；
                         # SSE keep-alive 注释行/空行/空 delta 持续有字节到达，会给坏死的流续命。
                         # 仅 content / reasoning / tool 增量或结束事件刷新活动时间；心跳类字节
                         # 不刷新。超过 stream_stall_timeout 无有效业务增量 → 按停滞处置（复用
                         # _timeout_abort：无输出原端点内部重试一次，已有输出不重放、不冻结）。
                         # 0 = 禁用（与 socket stall 超时语义一致）。
-                        business_stall_deadline = (time.time() + stall_timeout) if stall_timeout > 0 else None
+                        business_stall_deadline = (
+                            time.time() - 1
+                            if (_gate_elapsed_stall and stall_timeout > 0)
+                            else ((time.time() + stall_timeout) if stall_timeout > 0 else None)
+                        )
 
                         def _business_activity(chunk, is_anthropic_chunk):
                             """该 chunk 是否携带有效业务增量（刷新停滞时钟）。"""
@@ -3918,7 +4154,9 @@ class APIPool:
                             except Exception:
                                 return False
                         try:
-                            lines = itertools.chain([first_line], resp) if first_line else resp
+                            # 预读阶段已同步消费首个业务 chunk 前的所有行；把它们
+                            # 原样重放给下游，再继续消费上游剩余流，避免首包丢失。
+                            lines = itertools.chain(prefetched_lines, resp)
                             for line in lines:
                                 if stream_deadline is not None and time.time() > stream_deadline:
                                     yield from _timeout_abort(f"流式总时长超限（非停滞，{ep.stream_max_duration}s）")
@@ -4048,6 +4286,11 @@ class APIPool:
                                             chunk = json.loads(line[6:].decode("utf-8"))
                                             if stall_timeout > 0 and _business_activity(chunk, False):
                                                 business_stall_deadline = time.time() + stall_timeout
+                                            if isinstance(chunk, dict) and (chunk.get("type") == "error" or chunk.get("error") is not None):
+                                                # 首包后的中流错误：错误帧原样透传给下游，此处只记录中断。
+                                                _err = chunk.get("error") or {}
+                                                _msg = _err.get("message") if isinstance(_err, dict) else (str(_err) if _err else "")
+                                                sys_log(f"{request_tag}端点 '{endpoint_log_label}' 流式传输中断/异常: upstream stream error: {_msg}", "ERROR")
                                             if "choices" in chunk and len(chunk["choices"]) > 0:
                                                 delta = chunk["choices"][0].get("delta", {})
                                                 if "content" in delta:
@@ -4059,6 +4302,9 @@ class APIPool:
                                                 final_total_tokens = u.get("total_tokens", 0)
                                                 if "prompt_tokens_details" in u and isinstance(u["prompt_tokens_details"], dict):
                                                     final_cached_tokens = u["prompt_tokens_details"].get("cached_tokens", 0)
+                                                details = u.get("completion_tokens_details") or {}
+                                                if isinstance(details, dict) and "reasoning_tokens" in details:
+                                                    final_reasoning_tokens = details.get("reasoning_tokens")
                                                 has_usage = True
                                         except Exception:
                                             pass
@@ -4079,7 +4325,7 @@ class APIPool:
                             if has_usage and log_usage and not ep.name.startswith("test_"):
                                 stats_cached_tokens = 0 if reset_cached_stats else final_cached_tokens
                                 token_tracker.add_usage(ep.name, ep.model, final_prompt_tokens, final_completion_tokens, final_total_tokens, stats_cached_tokens)
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, final_completion_text.strip() or final_reasoning_text.strip(), final_total_tokens, int((time.time() - req_t0) * 1000), pool_group, final_prompt_tokens, stats_cached_tokens)
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, final_completion_text.strip() or final_reasoning_text.strip(), final_total_tokens, int((time.time() - req_t0) * 1000), pool_group, final_prompt_tokens, stats_cached_tokens, final_reasoning_tokens)
                                 self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
                                 ep._today_used += final_total_tokens
                             resp.close()
@@ -4164,11 +4410,13 @@ class APIPool:
                             cached = 0
                             if "prompt_tokens_details" in u and isinstance(u["prompt_tokens_details"], dict):
                                 cached = u["prompt_tokens_details"].get("cached_tokens", 0)
+                            completion_details = u.get("completion_tokens_details") or {}
+                            reasoning_tokens = completion_details.get("reasoning_tokens") if isinstance(completion_details, dict) else None
                             if log_usage and not ep.name.startswith("test_"):
                                 stats_cached = 0 if reset_cached_stats else cached
                                 token_tracker.add_usage(ep.name, ep.model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), tot, stats_cached)
                                 log_text = content.strip() or reasoning.strip()
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000), pool_group, u.get("prompt_tokens", 0), stats_cached)
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000), pool_group, u.get("prompt_tokens", 0), stats_cached, reasoning_tokens)
                                 self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
                                 ep._today_used += tot
                         # 假成功检测（仅端点启用时）
@@ -4329,9 +4577,10 @@ _runtime_state_lock = threading.Lock()
 
 
 def load_runtime_state():
-    """读取运行态：新格式 {"groups": {grp: ep_id}, "cooldowns": {ep_id: {...}}}；
-    兼容旧扁平 {"last_success_endpoint_id"}（迁移为 main 组）。
-    返回完整 dict（可能含 cooldowns）；旧调用方只取 .get("groups")，语义不变。"""
+    """读取运行态：新格式 {"groups": {grp: ep_id}, "cooldowns": {ep_id: {...}},
+    "group_fallback": {counts/locks/fallback_locks}}；兼容旧扁平 {"last_success_endpoint_id"}
+    （迁移为 main 组）。返回完整 dict（可能含 cooldowns/group_fallback）；
+    旧调用方只取 .get("groups")，语义不变。"""
     try:
         with open(RUNTIME_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -4346,6 +4595,9 @@ def load_runtime_state():
         cooldowns = data.get("cooldowns")
         if isinstance(cooldowns, dict) and cooldowns:
             out["cooldowns"] = cooldowns
+        fallback = data.get("group_fallback")
+        if isinstance(fallback, dict) and fallback:
+            out["group_fallback"] = fallback
         return out
     except (OSError, ValueError, TypeError):
         return {}
@@ -4360,17 +4612,18 @@ def save_runtime_state(endpoint_id):
     return save_runtime_state_groups(groups_state)
 
 
-def save_runtime_state_groups(groups_state, cooldowns=None, replace_groups=False):
-    """保存运行态（2026-09-01 冷却持久化）：
-    - 默认合并模式：更新 groups 指针并保留文件既有 cooldowns（手动切换等显式操作语义，
-      传完整 groups 时与旧精确覆盖等价，且不会抹掉冷却态）；
+def save_runtime_state_groups(groups_state, cooldowns=None, replace_groups=False, fallback=None):
+    """保存运行态（2026-09-01 冷却持久化；2026-09-06 组 fallback 状态持久化）：
+    - 默认合并模式：更新 groups 指针并保留文件既有 cooldowns / group_fallback
+      （手动切换等显式操作语义，传完整 groups 时与旧精确覆盖等价，且不会抹掉冷却态）；
     - replace_groups=True：groups 精确覆盖（SIGTERM 快照全量覆盖、启动残留清理语义），
-      避免把将要删除的残留键合并回去。cooldowns 显式传入时同样精确覆盖。"""
+      避免把将要删除的残留键合并回去。cooldowns / fallback 显式传入时同样精确覆盖。"""
     state = load_runtime_state() or {}
     if not isinstance(state, dict):
         state = {}
     prev_groups = state.get("groups") if isinstance(state.get("groups"), dict) else {}
     prev_cooldowns = state.get("cooldowns") if isinstance(state.get("cooldowns"), dict) else {}
+    prev_fallback = state.get("group_fallback") if isinstance(state.get("group_fallback"), dict) else {}
     if replace_groups:
         payload: dict = {"groups": groups_state}
     else:
@@ -4379,6 +4632,10 @@ def save_runtime_state_groups(groups_state, cooldowns=None, replace_groups=False
         payload["cooldowns"] = cooldowns
     elif prev_cooldowns:
         payload["cooldowns"] = prev_cooldowns
+    if fallback is not None:
+        payload["group_fallback"] = fallback
+    elif prev_fallback:
+        payload["group_fallback"] = prev_fallback
     tmp_file = f"{RUNTIME_STATE_FILE}.tmp"
     try:
         with _runtime_state_lock:
@@ -4422,6 +4679,46 @@ def _collect_cooldown_state():
     return out
 
 
+def _collect_fallback_state():
+    """收集组级 fallback 状态用于快照（2026-09-06 组 fallback 持久化）。
+
+    仅记录有状态价值的项：组 fallback 计数（>0，UI 扩容信号）、组 fallback
+    回切锁（未过期）、main 组 prio99 终极兜底锁（未过期）。过期锁不落盘。"""
+    now = time.time()
+    counts: dict = {}
+    locks: dict = {}
+    fallback_locks: dict = {}
+    for grp, value in pool._group_fallback_count.items():
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            counts[grp] = n
+    for grp, until in pool._group_fallback_lock_until.items():
+        try:
+            ts = float(until)
+        except (TypeError, ValueError):
+            continue
+        if ts > now:
+            locks[grp] = ts
+    for grp, until in pool._fallback_lock_until_by_group.items():
+        try:
+            ts = float(until)
+        except (TypeError, ValueError):
+            continue
+        if ts > now:
+            fallback_locks[grp] = ts
+    out: dict = {}
+    if counts:
+        out["counts"] = counts
+    if locks:
+        out["locks"] = locks
+    if fallback_locks:
+        out["fallback_locks"] = fallback_locks
+    return out
+
+
 def snapshot_runtime_state():
     """停止前快照：dump 内存指针态 + 冷却/冻结状态全量写盘（2026-09-01 方案 A + 冷却持久化）。
 
@@ -4436,9 +4733,14 @@ def snapshot_runtime_state():
             if isinstance(ep_id, str) and ep_id:
                 groups_state[grp] = ep_id
         cooldowns = _collect_cooldown_state()
-        if save_runtime_state_groups(groups_state, cooldowns=cooldowns, replace_groups=True):
+        fallback_state = _collect_fallback_state()
+        if save_runtime_state_groups(
+            groups_state, cooldowns=cooldowns, replace_groups=True, fallback=fallback_state,
+        ):
             sys_log(
-                f"停止前运行态快照已保存（{len(groups_state)} 个组，{len(cooldowns)} 个端点冷却态）",
+                f"停止前运行态快照已保存（{len(groups_state)} 个组，{len(cooldowns)} 个端点冷却态，"
+                f"{len(fallback_state.get('counts', {}))} 个组 fallback 计数，"
+                f"{len(fallback_state.get('locks', {})) + len(fallback_state.get('fallback_locks', {}))} 把 fallback 锁）",
                 "INFO",
             )
             return True
@@ -4503,6 +4805,11 @@ pool._migrate_legacy_state()
 restored_state = load_runtime_state()
 restored_groups = restored_state.get("groups") if isinstance(restored_state, dict) else {}
 restored_cooldowns = restored_state.get("cooldowns") if isinstance(restored_state, dict) else {}
+restored_fallback = (
+    restored_state.get("group_fallback")
+    if isinstance(restored_state, dict) and isinstance(restored_state.get("group_fallback"), dict)
+    else {}
+)
 stale_state_keys: list[str] = []
 if isinstance(restored_groups, dict):
     for grp, ep_id in restored_groups.items():
@@ -4538,7 +4845,9 @@ if isinstance(restored_groups, dict):
 if stale_state_keys and isinstance(restored_groups, dict):
     for grp in stale_state_keys:
         restored_groups.pop(grp, None)
-    if save_runtime_state_groups(restored_groups, replace_groups=True):
+    if save_runtime_state_groups(
+        restored_groups, cooldowns=restored_cooldowns, replace_groups=True, fallback=restored_fallback,
+    ):
         sys_log(f"已清理运行态残留组键: {', '.join(sorted(stale_state_keys))}", "INFO")
 
 # 冷却/冻结状态恢复（2026-09-01 冷却持久化）：SIGTERM 快照写入的 cooldowns 键。
@@ -4575,6 +4884,71 @@ if isinstance(restored_cooldowns, dict):
             sys_log(f"已清理运行态残留冷却键: {', '.join(sorted(stale_cooldown_keys))}", "INFO")
     if restored_cooldowns:
         sys_log(f"已恢复 {len(restored_cooldowns)} 个端点的冷却/冻结状态", "INFO")
+
+# 组级 fallback 状态恢复（2026-09-06 组 fallback 持久化）：SIGTERM 快照写入的
+# group_fallback 键。恢复组 fallback 计数（UI 扩容信号，跨重启累计）与未过期的
+# fallback 回切锁 / main 组 prio99 兜底锁（锁按绝对时间戳恢复剩余窗口）；过期锁
+# 剔除；组已不存在（组名不在 defs 且无端点归属）的键清理（与 groups 残留自愈一致）。
+if isinstance(restored_fallback, dict) and restored_fallback:
+    _now = time.time()
+    _fb_counts = restored_fallback.get("counts") if isinstance(restored_fallback.get("counts"), dict) else {}
+    _fb_locks = restored_fallback.get("locks") if isinstance(restored_fallback.get("locks"), dict) else {}
+    _fb_fallback_locks = (
+        restored_fallback.get("fallback_locks")
+        if isinstance(restored_fallback.get("fallback_locks"), dict) else {}
+    )
+    for _grp, _n in _fb_counts.items():
+        try:
+            pool._group_fallback_count[_grp] = max(0, int(_n))
+        except (TypeError, ValueError):
+            pass
+    for _grp, _until in _fb_locks.items():
+        try:
+            _ts = float(_until)
+        except (TypeError, ValueError):
+            continue
+        if _ts > _now:
+            pool._group_fallback_lock_until[_grp] = _ts
+    for _grp, _until in _fb_fallback_locks.items():
+        try:
+            _ts = float(_until)
+        except (TypeError, ValueError):
+            continue
+        if _ts > _now:
+            pool._fallback_lock_until_by_group[_grp] = _ts
+    # 残留组清理：锁键指向不存在的组时剔除并回写，防每次重启重复残留。
+    # 回写无条件执行（进入本块即发生过状态读取），清空时显式写 {} 覆盖残留键。
+    _stale_fb_groups = {
+        grp for grp in {*_fb_counts, *_fb_locks, *_fb_fallback_locks}
+        if grp not in pool._group_defs
+        and not any(grp in pool._ep_groups(ep) for ep in pool._endpoints)
+    }
+    if _stale_fb_groups:
+        for _grp in _stale_fb_groups:
+            pool._group_fallback_count.pop(_grp, None)
+            pool._group_fallback_lock_until.pop(_grp, None)
+            pool._fallback_lock_until_by_group.pop(_grp, None)
+        _fb_counts = {g: n for g, n in _fb_counts.items() if g not in _stale_fb_groups}
+        _fb_locks = {g: t for g, t in _fb_locks.items() if g not in _stale_fb_groups}
+        _fb_fallback_locks = {g: t for g, t in _fb_fallback_locks.items() if g not in _stale_fb_groups}
+        restored_fallback = {}
+        if _fb_counts:
+            restored_fallback["counts"] = _fb_counts
+        if _fb_locks:
+            restored_fallback["locks"] = _fb_locks
+        if _fb_fallback_locks:
+            restored_fallback["fallback_locks"] = _fb_fallback_locks
+    if _stale_fb_groups:
+        sys_log(f"已清理运行态残留组 fallback 键: {', '.join(sorted(_stale_fb_groups))}", "INFO")
+    if _fb_counts or _fb_locks or _fb_fallback_locks:
+        sys_log(
+            f"已恢复组 fallback 状态：{len(_fb_counts)} 个组计数，"
+            f"{len(_fb_locks) + len(_fb_fallback_locks)} 把锁",
+            "INFO",
+        )
+    save_runtime_state_groups(
+        restored_groups, cooldowns=restored_cooldowns, replace_groups=True, fallback=restored_fallback,
+    )
 
 
 def api_handler(method, path, body):
@@ -4860,7 +5234,10 @@ def api_handler(method, path, body):
             loaded = state.get("groups") if isinstance(state.get("groups"), dict) else None
             groups_state: dict = dict(loaded) if loaded is not None else {}
             groups_state[grp] = ep_id
-            if save_runtime_state_groups(groups_state):
+            # 手动切换清除了该端点的冷却/冻结内存态，冷却快照必须同步落盘。
+            # 合并模式会保留文件里的旧 cooldowns，非 SIGTERM 崩溃重启会把已解除的
+            # 冻结从磁盘复活（启动恢复读 cooldowns 键）。
+            if save_runtime_state_groups(groups_state, cooldowns=_collect_cooldown_state()):
                 pool._set_persisted(grp, ep_id)
         return 200, {"ok": ok}, False
     if method == "POST" and cp == "/api/endpoints":
@@ -4929,22 +5306,25 @@ def api_handler(method, path, body):
     if method == "POST" and cp == "/api/test-model": return 200, pool.test_model_latency(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai"), user_agent=body.get("user_agent", "")), False
     if method == "POST" and cp == "/api/test-vision": return 200, pool.test_vision(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai"), user_agent=body.get("user_agent", "")), False
     if method == "POST" and cp == "/api/test":
-        ep_id = body.get("id", ""); test_msg = body.get("message", "你好"); target_ep = None
-        for ep in pool.list_endpoints():
-            if ep["id"] == ep_id: target_ep = ep; break
-        if not target_ep: return 404, {"error": "端点不存在"}, False
-        test_pool = APIPool()
-        test_pool.add_endpoint({"name": target_ep["name"], "base_url": target_ep["base_url"], "api_key": target_ep["api_key_full"], "model": target_ep["model"], "priority": 1, "timeout": target_ep["timeout"], "max_retries": target_ep["max_retries"], "enabled": True, "in_pool": True, "use_proxy": target_ep.get("use_proxy", True), "protocol": target_ep.get("protocol", "openai"), "default_headers": target_ep.get("default_headers", {}), "is_vision": target_ep.get("is_vision", True)})
-        
-        img = body.get("image")
-        if img:
-            test_msg = [{"type": "text", "text": test_msg}, {"type": "image_url", "image_url": {"url": img}}]
-            
+        ep_id = body.get("id", "")
+        test_msg = body.get("message", "你好")
+        target_ep = pool.get_endpoint(ep_id)
+        if target_ep is None:
+            return 404, {"error": "端点不存在"}, False
+        group = body.get("group") or None
         try:
-            res_dict, served_ep = test_pool.chat([{"role": "user", "content": test_msg}], return_endpoint=True)
+            res_dict, error = pool.test_endpoint(
+                target_ep, message=test_msg, image=body.get("image"), group=group,
+            )
+            cooldowns = _collect_cooldown_state()
+            if save_runtime_state_groups({}, cooldowns=cooldowns):
+                pass
+            if error:
+                return 200, {"ok": False, "error": error}, False
             res_str = res_dict.get("choices", [{}])[0].get("message", {}).get("content", "") if isinstance(res_dict, dict) else res_dict
-            return 200, {"ok": True, "result": res_str, "served_by": f"{served_ep.name} ({served_ep.model})"}, False
-        except Exception as e: return 200, {"ok": False, "error": str(e)}, False
+            return 200, {"ok": True, "result": res_str, "served_by": f"{target_ep.name} ({target_ep.model})"}, False
+        except Exception as e:
+            return 200, {"ok": False, "error": str(e)}, False
     if method == "POST" and cp == "/api/test-pool":
         test_msg = body.get("message", "你好")
         img = body.get("image")
@@ -5099,27 +5479,41 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": "Not found"})
 
+    _PROXY_PATHS = ("/v1/chat/completions", "/chat/completions")
+
+    def _is_proxy_path(self):
+        return urlparse(self.path).path in self._PROXY_PATHS
+
     def do_POST(self):
         body = self._read_body()
-        res = api_handler("POST", self.path, body)
-        
-        if len(res) == 3 and res[2] is True:
-            code, stream_gen = res[0], res[1]
-            try:
-                self.send_response(code)
-                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                
-                for chunk in stream_gen:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                self.close_connection = True
-            except ConnectionError:
-                pass
-        else:
-            self._send_json(res[0], res[1])
+        # 出站 UA 透传：仅代理路径把客户端原始 UA 带入本请求线程；管理页与探活保持默认标识。
+        # 流式生成器在本方法内同线程消费，故清理放在 finally，覆盖整个请求生命周期。
+        proxy_request = self._is_proxy_path()
+        if proxy_request:
+            set_client_user_agent(self.headers.get("User-Agent"))
+        try:
+            res = api_handler("POST", self.path, body)
+
+            if len(res) == 3 and res[2] is True:
+                code, stream_gen = res[0], res[1]
+                try:
+                    self.send_response(code)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+
+                    for chunk in stream_gen:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    self.close_connection = True
+                except ConnectionError:
+                    pass
+            else:
+                self._send_json(res[0], res[1])
+        finally:
+            if proxy_request:
+                clear_client_user_agent()
 
     def do_PUT(self):
         body = self._read_body()

@@ -302,7 +302,7 @@ select option { background: var(--bg); color: var(--text); }
   .modal-overlay .modal .form-actions .btn{width:100%}
 }
 @media(max-width:768px){
-  /* 对话日志：列表/详情纵向堆叠。行布局保持 PC 端 7 列不变，窄屏横向滚动查看 */
+  /* 对话日志：列表/详情纵向堆叠。行布局保持 PC 端 8 列不变，窄屏横向滚动查看 */
   .chatlog-layout{flex-direction:column!important;height:auto!important;min-height:0!important}
   .chatlog-listwrap{min-height:0}
   /* 表头已搬入滚动容器，listwrap 首个子元素即滚动区；flex:1(inline) basis:0 会架空高度 */
@@ -315,7 +315,7 @@ select option { background: var(--bg); color: var(--text); }
   #chatLogsList{overflow-x:hidden!important}
   #chatLogsX{overflow-x:auto!important;-webkit-overflow-scrolling:touch!important;scrollbar-width:none!important}
   #chatLogsX::-webkit-scrollbar{display:none!important}
-  .chatlog-grid{grid-template-columns:repeat(7,60px)!important;min-width:492px!important;box-sizing:border-box}
+  .chatlog-grid{grid-template-columns:60px repeat(7,minmax(96px,1fr))!important;min-width:780px!important;box-sizing:border-box}
   .chatlog-grid>*{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .cl-ep{display:block}
   .cl-model{display:block}
@@ -441,8 +441,8 @@ select option { background: var(--bg); color: var(--text); }
     <div class="chatlog-layout" style="display:flex; gap:15px; height:450px; min-height:300px;">
       <!-- List View -->
       <div class="chatlog-listwrap" style="flex:1; display:flex; flex-direction:column; border:1px solid var(--border); border-radius:8px; overflow:hidden;">
-        <div class="chatlog-grid chatlog-header" style="background:rgba(255,255,255,0.05); padding:8px 12px; font-weight:bold; border-bottom:1px solid var(--border); display:grid; grid-template-columns:80px repeat(3,minmax(0,1fr)) repeat(3,80px); gap:8px; font-size:12px;">
-          <span>时间</span><span>池组</span><span>端点</span><span>模型</span><span>延迟</span><span>缓存命中</span><span>Tokens</span>
+        <div class="chatlog-grid chatlog-header" style="background:rgba(255,255,255,0.05); padding:8px 12px; font-weight:bold; border-bottom:1px solid var(--border); display:grid; grid-template-columns:80px repeat(3,minmax(0,1fr)) repeat(4,80px); gap:8px; font-size:12px;">
+          <span>时间</span><span>池组</span><span>端点</span><span>模型</span><span>耗时</span><span>缓存命中</span><span>推理强度</span><span>Tokens</span>
         </div>
         <div style="flex:1; position:relative; overflow:hidden;">
           <div id="chatLogsList" style="position:absolute; top:0; left:0; right:0; bottom:0; overflow-y:auto; scrollbar-width:none; -ms-overflow-style:none;">
@@ -554,7 +554,7 @@ select option { background: var(--bg); color: var(--text); }
     </div>
     <div class="form-group"><label>Base URL</label><input type="text" id="fUrl" placeholder="https://api.openai.com/v1" oninput="checkFetchBtn()"></div>
     <div class="form-group"><label>API Key</label><input type="text" id="fKey" placeholder="sk-..." oninput="checkFetchBtn()"></div>
-    <div class="form-group"><label title="发送给该端点的自定义 User-Agent；留空使用默认值">User-Agent（可选）</label><input type="text" id="fUserAgent" placeholder="如 hermes-agent/0.20.1"></div>
+    <div class="form-group"><label title="发送给该端点的自定义 User-Agent；留空则透传客户端原请求的 User-Agent">User-Agent（可选）</label><input type="text" id="fUserAgent" placeholder="留空透传客户端 UA"></div>
     <div class="form-group">
       <label>模型</label>
       <div class="model-row">
@@ -821,9 +821,10 @@ function renderPoolList(eps){
         <select class="btn btn-ghost btn-sm pool-model-select" data-loaded="false" data-current-model="${escAttr(ep.model||'')}" onmousedown="event.stopPropagation();loadPoolModelOptions(this,'${escAttr(ep.id)}')" onclick="event.stopPropagation()" onfocus="loadPoolModelOptions(this,'${escAttr(ep.id)}')" onchange="changePoolModel(this,'${escAttr(ep.id)}','${escAttr(displayGroup)}')" title="修改当前组使用的模型"><option value="${escAttr(ep.model||'')}">${esc(ep.model||'未设置模型')}</option></select>
         <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
           <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority('${ep.id}', this.value, '${esc(displayGroup)}');this.blur()" title="修改组内优先级">${options}</select>
+          <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="测试端点" onclick="openTestDrawer('${ep.id}', '${esc(ep.name)} (${esc(ep.model)})', '${esc(displayGroup)}')">🧪</button>
           <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="${ep.enabled?'暂停端点':'恢复端点'}" onclick="toggleEndpoint('${ep.id}')">${ep.enabled?'⏸':'▶'}</button>
           <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="编辑端点" onclick="editEndpoint('${ep.id}')">✏️</button>
-          ${!((ep.current_groups||[]).includes(displayGroup)&&ep.is_current)?`<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="切换为当前端点（组 ${esc(displayGroup)}）" onclick="switchEndpoint('${ep.id}','${esc(displayGroup)}')">⚡</button>`:''}
+          ${!((ep.current_groups||[]).includes(displayGroup)&&ep.is_current)?`<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="${(ep.in_cooldown||ep.manual_unlock_required)?`切换为当前端点（组 ${esc(displayGroup)}）并解除其冻结，按真实请求结果重新判定`:`切换为当前端点（组 ${esc(displayGroup)}）`}" onclick="switchEndpoint('${ep.id}','${esc(displayGroup)}')">⚡</button>`:''}
           <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="从当前组移除（其他组不受影响；最后一组移除时整体出池）" onclick="removeFromPool('${ep.id}','${esc(displayGroup)}')">📤</button>
         </div>
       </div>
@@ -1140,8 +1141,9 @@ function clearTestImage() {
   if (btn) { btn.style.background = 'transparent'; btn.title = '上传图片测试'; }
 }
 
-function openTestDrawer(targetId, targetName) {
+function openTestDrawer(targetId, targetName, targetGroup) {
   document.getElementById('testTargetId').value = targetId;
+  document.getElementById('testTargetGroup').value = targetGroup || '';
   if(targetId === 'pool') {
     document.getElementById('testDrawerTitle').innerHTML = '🧪 测试端点池 (Pool)';
   } else {
@@ -1161,7 +1163,7 @@ async function sendTest() {
   if(targetId === 'pool'){
     r = await api('POST','/api/test-pool',{message:m,image:testImageBase64});
   } else {
-    r = await api('POST','/api/test',{id:targetId,message:m,image:testImageBase64});
+    r = await api('POST','/api/test',{id:targetId,group:document.getElementById('testTargetGroup').value||undefined,message:m,image:testImageBase64});
   }
   const el = document.getElementById('testResult');
   el.style.display = 'block';
@@ -1857,13 +1859,14 @@ async function loadChatLogs(page, opts = {}) {
   }
   
   listEl.innerHTML = currentChatLogs.map((log, i) => `
-    <div class="chatlog-grid chatlog-row hover-bg" style="padding:8px 12px; border-bottom:1px solid var(--border); display:grid; grid-template-columns:80px repeat(3,minmax(0,1fr)) repeat(3,80px); gap:8px; font-size:12px; cursor:pointer; transition:background 0.2s;" onclick="viewChatLog(${i})">
+    <div class="chatlog-grid chatlog-row hover-bg" style="padding:8px 12px; border-bottom:1px solid var(--border); display:grid; grid-template-columns:80px repeat(3,minmax(0,1fr)) repeat(4,80px); gap:8px; font-size:12px; cursor:pointer; transition:background 0.2s;" onclick="viewChatLog(${i})">
       <div class="cl-cell cl-time" style="color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${log.timestamp.split(' ')[1]}</div>
       <div class="cl-cell cl-group" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--accent-light);" title="${log.pool_group || ''}">${log.pool_group || ''}</div>
       <div class="cl-cell cl-ep" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${log.endpoint_name}">${log.endpoint_name}</div>
       <div class="cl-cell cl-model" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text-dim);" title="${log.model}">${log.model}</div>
       <div class="cl-cell cl-lat" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text-dim);">${log.latency_ms ? (log.latency_ms/1000).toFixed(1)+'s' : '—'}</div>
       <div class="cl-cell cl-cache" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--yellow);" title="${log.cached_tokens>0&&log.prompt_tokens>0 ? 'cached '+log.cached_tokens+' / prompt '+log.prompt_tokens : ''}">${(log.cached_tokens>0 && log.prompt_tokens>0) ? (log.cached_tokens/log.prompt_tokens*100).toFixed(1)+'%' : '—'}</div>
+      <div class="cl-cell cl-reasoning" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--accent-light);" title="上游 usage.completion_tokens_details.reasoning_tokens">${log.reasoning_tokens != null ? log.reasoning_tokens : '—'}</div>
       <div class="cl-cell cl-tok" style="color:var(--green);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${log.total_tokens}</div>
     </div>
   `).join('');
@@ -1884,7 +1887,7 @@ async function viewChatLog(idx) {
   const full = (res && res.id) ? res : log;
   document.getElementById('clPrompt').textContent = full.prompt || '';
   document.getElementById('clCompletion').textContent = full.completion || '';
-  document.getElementById('clMeta').innerHTML = `<span style="color:var(--green)">${full.total_tokens} Tokens</span> <span style="margin-left:10px;color:var(--yellow)">${full.latency_ms}ms</span>${full.pool_group ? ` <span style="margin-left:10px;color:var(--accent-light)">组: ${esc(full.pool_group)}</span>` : ''}`;
+  document.getElementById('clMeta').innerHTML = `<span style="color:var(--green)">${full.total_tokens} Tokens</span> <span style="margin-left:10px;color:var(--yellow)">${full.latency_ms}ms</span>${full.pool_group ? ` <span style="margin-left:10px;color:var(--accent-light)">组: ${esc(full.pool_group)}</span>` : ''}${full.reasoning_tokens != null ? ` <span style="margin-left:10px;color:var(--accent-light)">推理: ${full.reasoning_tokens}</span>` : ''}`;
 }
 async function clearChatLogs() {
   if (!confirm('确定要清空所有对话日志记录吗？此操作不可逆。')) return;
@@ -1929,6 +1932,7 @@ initChatLogs();
   </div>
   <div class="drawer-body">
     <input type="hidden" id="testTargetId" value="">
+    <input type="hidden" id="testTargetGroup" value="">
     <div id="testResult" class="test-result" style="margin-top:0; max-height:200px; display:none;"></div>
     <div class="test-input-row" style="display:flex; gap:8px;">
       <input type="text" id="testMsg" placeholder="测试消息..." value="用一句话介绍自己" style="flex:1">
