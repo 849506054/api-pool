@@ -744,7 +744,7 @@ function renderEndpoints(eps){
     if(ep.in_pool)b+='<span class="badge" style="background:rgba(16,163,127,0.2);color:#2ecc71;border:1px solid rgba(16,163,127,0.3)" title="已加入聚合池">🏊</span>';
     if(ep.protocol==='anthropic')b+=`<span class="badge" style="background:rgba(217,119,87,0.2);color:#ff9e7a;border:1px solid rgba(217,119,87,0.3)" title="Anthropic 原生协议翻译">🧠Anthropic</span>`;
     else b+=`<span class="badge badge-priority" style="background:rgba(16,163,127,0.2);color:#2ecc71" title="OpenAI 兼容协议">🟢OpenAI</span>`;
-    if(ep.is_current)b+='<span class="badge badge-current">● 当前</span>';
+    if(ep.is_current){const cg=ep.current_groups||[];const sub=cg.filter(g=>g!=='main');b+=sub.length?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35)" title="当前服务组：${esc(cg.join(', '))}">● ${esc(cg.join('·'))}</span>`:`<span class="badge badge-current" title="当前服务组：main">● MAIN</span>`;}
     if(!ep.enabled)b+='<span class="badge badge-disabled">禁用</span>';
 
       if(ep.is_vision!==false)b+=`<span class=\"badge\" style=\"background:rgba(0,122,255,.15);color:#0a84ff\" title=\"原生支持视觉能力\">👁️视觉</span>`;
