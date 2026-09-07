@@ -300,8 +300,8 @@ select option { background: var(--bg); color: var(--text); }
   .chat-log-item{font-size:11px;padding:6px 8px}
   .chat-log-meta{font-size:10px;flex-wrap:wrap}
   .toast{font-size:12px;padding:8px 16px;bottom:16px;left:10px;right:10px;width:auto}
-  .modal-overlay .modal .form-actions{flex-direction:column;gap:6px}
-  .modal-overlay .modal .form-actions .btn{width:100%}
+  .modal-overlay .modal .form-actions{flex-direction:row;gap:8px}
+  .modal-overlay .modal .form-actions .btn{flex:1;height:38px;box-sizing:border-box;justify-content:center}
 }
 @media(max-width:768px){
   /* 对话日志：列表/详情纵向堆叠。行布局保持 PC 端 8 列不变，窄屏横向滚动查看 */
