@@ -170,22 +170,6 @@ class ManualSwitchClearsHealthTests(unittest.TestCase):
             self.assertFalse(pool.switch_to_endpoint("out"))
             self.assertIsNone(pool._get_manual(pool.MAIN_GROUP))
 
-    def test_switch_does_not_reset_configured_usage_budgets(self):
-        """daily_limit/rpm_limit 是用户配置的预算，切换不重置既发用量。"""
-        with tempfile.TemporaryDirectory() as tmp_path:
-            module = load_module(tmp_path)
-            capped = self.endpoint(module, "capped", 1, daily_limit=1000, rpm_limit=5)
-            pool = module.APIPool([capped])
-            capped._today_date = module.datetime.now().strftime("%Y-%m-%d")
-            capped._today_used = 1200
-            for _ in range(5):
-                capped._req_timestamps.append(time.time())
-
-            self.assertTrue(pool.switch_to_endpoint(capped.id))
-            self.assertEqual(capped._today_used, 1200)
-            self.assertEqual(len(capped._req_timestamps), 5)
-            self.assertTrue(pool._is_quota_exceeded(capped))
-            self.assertTrue(pool._is_rpm_limited(capped))
 
     def test_switch_rest_persists_cleared_cooldown_snapshot(self):
         """REST 切换必须同步落盘冷却快照，避免崩溃重启复活已解除的冻结。"""

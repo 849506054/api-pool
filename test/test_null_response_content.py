@@ -126,7 +126,6 @@ class NullContentTests(unittest.TestCase):
                 self.assertEqual(len(usage_calls), 1)
                 self.assertEqual(len(log_calls), 1)
                 self.assertEqual(log_calls[0][3], "reasoning only")
-                self.assertEqual(ep._today_used, 12)
             finally:
                 server.shutdown()
                 server.server_close()

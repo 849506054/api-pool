@@ -207,22 +207,16 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             self.assertEqual(calls, ["current", "deferred"])
             self.assertEqual(deferred._defer_until, 0)
 
-    def test_failover_still_excludes_cooldown_quota_rpm_and_manual_lock(self):
+    def test_failover_still_excludes_cooldown_and_manual_lock(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             failed = self.endpoint(module, "failed", 1, "gpt-5.6-sol")
             deferred = self.endpoint(module, "deferred", 2, "gpt-5.6-sol")
             cooldown = self.endpoint(module, "cooldown", 3, "gpt-5.6-sol")
-            quota = self.endpoint(module, "quota", 4, "gpt-5.6-sol")
-            rpm = self.endpoint(module, "rpm", 5, "gpt-5.6-sol")
             locked = self.endpoint(module, "locked", 6, "gpt-5.6-sol")
-            pool = module.APIPool([failed, deferred, cooldown, quota, rpm, locked])
+            pool = module.APIPool([failed, deferred, cooldown, locked])
             deferred._defer_until = module.time.time() + 300
             cooldown._cooldown_until = module.time.time() + 300
-            quota.daily_limit = 1
-            quota._today_used = 1
-            rpm.rpm_limit = 1
-            rpm._req_timestamps.append(module.time.time())
             locked._manual_unlock_required = True
 
             candidates = pool._failover_endpoints()

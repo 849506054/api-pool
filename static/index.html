@@ -142,22 +142,24 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .chain-err{font-size:10px;color:var(--red);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chain-connector{height:12px;border-left:2px dashed var(--border);margin-left:0}
 
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.65);backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;z-index:1000;opacity:0;pointer-events:none;transition:opacity .15s}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.65);backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;z-index:1000;opacity:0;pointer-events:none;transition:opacity .15s;overflow:hidden}
 .modal-overlay.show{opacity:1;pointer-events:all}
-.modal{background:var(--card);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border:1px solid var(--border);border-radius:16px;padding:24px;width:560px;max-width:94vw;max-height:88vh;overflow-y:auto;box-shadow:0 16px 48px rgba(0,0,0,.5)}
+.modal{background:var(--card);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border:1px solid var(--border);border-radius:16px;padding:24px;width:560px;max-width:94vw;max-height:88vh;overflow-y:auto;overflow-x:hidden;scrollbar-width:none;box-shadow:0 16px 48px rgba(0,0,0,.5);box-sizing:border-box}
+.modal::-webkit-scrollbar{display:none}
 .modal h2{font-size:16px;margin-bottom:18px;font-weight:700}
-.form-group{margin-bottom:12px}
+.form-group{margin-bottom:12px;min-width:0}
 .form-group label{display:block;font-size:11px;font-weight:600;color:var(--text-dim);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px}
-.form-group input,.form-group select{box-sizing:border-box;width:100%;height:38px;padding:9px 11px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;outline:none;transition:border-color .12s;box-shadow:inset 0 1px 2px rgba(0,0,0,0.1)}
+.form-group input,.form-group select{box-sizing:border-box;width:100%;min-width:0;height:34px;padding:0 11px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;outline:none;transition:border-color .12s;box-shadow:inset 0 1px 2px rgba(0,0,0,0.1)}
 .form-group input:focus,.form-group select:focus{border-color:var(--accent)}
 .form-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.form-row.form-row-routing,.form-row.form-row-limit,.form-row.form-row-capability{grid-template-columns:repeat(3,1fr)}
+.form-row.form-row-routing,.form-row.form-row-capability{grid-template-columns:repeat(3,1fr)}
 .form-row.form-row-request{grid-template-columns:1fr 1fr}
 .form-row.form-row-stream{grid-template-columns:repeat(3,1fr)}
 .form-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
+.modal .btn{height:34px;box-sizing:border-box}
 
 .model-row{display:flex;gap:8px;align-items:center}
-.model-row input{flex:1}
+.model-row input{flex:1;min-width:0}
 .model-browser{margin-top:8px;border:1px solid var(--border);border-radius:8px;overflow:hidden}
 .mb-toolbar{display:flex;gap:6px;padding:8px 10px;background:rgba(255,255,255,.02);border-bottom:1px solid var(--border);align-items:center;flex-wrap:wrap}
 .mb-toolbar input[type=text]{flex:1;min-width:100px;padding:6px 9px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:11px;outline:none}
@@ -266,7 +268,7 @@ select option { background: var(--bg); color: var(--text); }
   .form-row{grid-template-columns:1fr!important;gap:8px}
   .modal>.form-row{margin-bottom:10px}
   .modal>.form-group{margin-bottom:10px}
-  .form-row.form-row-routing,.form-row.form-row-limit,.form-row.form-row-capability{grid-template-columns:repeat(3,1fr)!important;gap:5px}
+  .form-row.form-row-routing,.form-row.form-row-capability{grid-template-columns:repeat(3,1fr)!important;gap:5px}
   .form-row.form-row-request{grid-template-columns:repeat(2,1fr)!important;gap:5px}
   .form-row.form-row-request{grid-template-columns:1fr 1fr}
   .form-row.form-row-stream{grid-template-columns:repeat(3,1fr)!important;gap:5px}
@@ -277,9 +279,7 @@ select option { background: var(--bg); color: var(--text); }
   .form-group{margin-bottom:0}
   .form-group label{font-size:11px;margin-bottom:2px}
   .form-group input,.form-group select{font-size:13px;padding:6px 8px}
-  .modal{width:95%;padding:16px;max-height:90vh;overflow-y:auto}
-  .model-row{flex-direction:column;align-items:stretch;gap:6px}
-  .model-row .btn{width:100%}
+  .modal{width:calc(100vw - 16px);padding:16px;max-height:90vh;overflow-y:auto}
   .api-info-card{padding:10px 12px;font-size:12px}
   .api-info-card code{font-size:11px}
   .test-drawer{width:95%;right:2.5%}
@@ -301,7 +301,7 @@ select option { background: var(--bg); color: var(--text); }
   .chat-log-meta{font-size:10px;flex-wrap:wrap}
   .toast{font-size:12px;padding:8px 16px;bottom:16px;left:10px;right:10px;width:auto}
   .modal-overlay .modal .form-actions{flex-direction:row;gap:8px}
-  .modal-overlay .modal .form-actions .btn{flex:1;height:38px;box-sizing:border-box;justify-content:center}
+  .modal-overlay .modal .form-actions .btn{flex:1;height:34px;box-sizing:border-box;justify-content:center}
 }
 @media(max-width:768px){
   /* 对话日志：列表/详情纵向堆叠。行布局保持 PC 端 8 列不变，窄屏横向滚动查看 */
@@ -335,7 +335,7 @@ select option { background: var(--bg); color: var(--text); }
   .header-actions{gap:4px}
   .header-actions .btn{font-size:10px;padding:4px 8px}
   .ep-actions .btn{font-size:9px;padding:2px 5px;min-width:22px}
-  .modal{width:100%;padding:12px;border-radius:12px}
+  .modal{width:calc(100vw - 12px);padding:12px;border-radius:12px}
   .card{padding:10px 12px;border-radius:12px}
   .ep-meta span{max-width:100%}
   .filter-bar{gap:3px}
@@ -557,7 +557,6 @@ select option { background: var(--bg); color: var(--text); }
     </div>
     <div class="form-group"><label>Base URL</label><input type="text" id="fUrl" placeholder="https://api.openai.com/v1" oninput="checkFetchBtn()"></div>
     <div class="form-group"><label>API Key</label><input type="text" id="fKey" placeholder="sk-..." oninput="checkFetchBtn()"></div>
-    <div class="form-group"><label title="发送给该端点的自定义 User-Agent；留空则透传客户端原请求的 User-Agent">User-Agent（可选）</label><input type="text" id="fUserAgent" placeholder="留空透传客户端 UA"></div>
     <div class="form-group">
       <label>模型</label>
       <div class="model-row">
@@ -567,24 +566,26 @@ select option { background: var(--bg); color: var(--text); }
       <div id="modelBrowser" style="display:none"></div>
       <div id="batchBar" style="display:none"></div>
     </div>
+    <div class="form-row form-row-request">
+      <div class="form-group"><label title="发送给该端点的自定义 User-Agent；留空则透传客户端原请求的 User-Agent">User-Agent（可选）</label><input type="text" id="fUserAgent" placeholder="留空透传客户端 UA"></div>
+      <div class="form-group"><label title="非空时启用：请求消息里的 tool_call id 重写为该前缀（如 call_00_ET_），解决跨端点切换后 DeepSeek 官方端点 reasoning_text 400">ToolCall ID 前缀</label><input type="text" id="fToolCallPrefix" placeholder="留空=不重写，如 call_00_ET_" value=""></div>
+    </div>
     <div class="form-row form-row-routing">
-      <div class="form-group"><label>优先级</label><input type="number" id="fPriority" value="1" min="1"></div>
+      <div class="form-group"><label title="流式请求的连接、上传请求体及等待响应头超时；非流式正常请求仍受整体请求预算控制">连接/响应头超时 (秒)</label><input type="number" id="fTimeout" value="60" min="1"></div>
       <div class="form-group"><label title="可恢复错误发生后，在同一客户端请求内重新向原端点发送完整请求的额外次数；建议 0-1 次">额外重试次数</label><input type="number" id="fRetries" value="1" min="0" max="3"></div>
       <div class="form-group"><label>冷却 (分钟)</label><input type="number" id="fCooldown" value="5" min="0"></div>
     </div>
     <div class="form-row form-row-request">
-      <div class="form-group"><label title="流式请求的连接、上传请求体及等待响应头超时；非流式正常请求仍受整体请求预算控制">连接/响应头超时 (秒)</label><input type="number" id="fTimeout" value="60" min="1"></div>
-      <div class="form-group"><label title="最大上下文长度（K=1000 tokens），0=不限。超过此长度时自动跳过该端点，避免账号被限制">上下文限制</label><input type="number" id="fMaxContext" value="0" min="0" placeholder="0=不限, 如 128"></div>
-    </div>
-    <div class="form-group"><label title="非空时启用：请求消息里的 tool_call id 重写为该前缀（如 call_00_ET_），解决跨端点切换后 DeepSeek 官方端点 reasoning_text 400">ToolCall ID 前缀</label><input type="text" id="fToolCallPrefix" placeholder="留空=不重写，如 call_00_ET_" value=""></div>
-    <div class="form-row form-row-limit">
-      <div class="form-group"><label title="达到额度后挂起，0为不限制">每日额度 (0不限)</label><input type="number" id="fDailyLimit" value="0" min="0"></div>
-      <div class="form-group"><label title="每分钟最高请求次数，超限自动切换，0为不限制">请求频率 (RPM)</label><input type="number" id="fRpmLimit" value="0" min="0"></div>
+      <div class="form-group"><label title="模型上下文长度（K=1000 tokens），0=不限。对话请求超出该长度时自动 fallback 到下一个端点">模型上下文长度 (K)</label><input type="number" id="fMaxContext" value="0" min="0" placeholder="0=不限, 如 128"></div>
       <div class="form-group"><label title="按次计费的端点健康检查将自动使用零成本 Models 探针，避免产生费用">计费方式</label><select id="fBillingMode"><option value="subscription">按量计费</option><option value="pay_per_use">按次计费</option></select></div>
     </div>
     <div class="form-row form-row-capability">
+      <div class="form-group"><label title="reasoning_content 回传策略：auto=DeepSeek/GLM 自动保留，其余剥离；keep=强制保留（上游要求回传的中转）；strip=强制剥离（上游拒绝该字段）">推理回传策略</label><select id="fReasoningPolicy"><option value="auto">自动（DeepSeek/GLM 保留）</option><option value="keep">强制保留</option><option value="strip">强制剥离</option></select></div>
+      <div class="form-group"><label title="GLM 保留式思考：请求注入 thinking.clear_thinking=false，要求历史 reasoning_content 完整回传（需上游支持，默认关）">保留式思考</label><select id="fPreservedThinking"><option value="false">关闭</option><option value="true">开启（GLM）</option></select></div>
+    </div>
+    <div class="form-row form-row-capability">
       <div class="form-group"><label title="底层协议类型">协议类型</label><select id="fProtocol"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic</option></select></div>
-      <div class="form-group"><label title="标识该模型是否原生支持读图。若选“不支持”，收到图片时会自动触发图片解析。">多模态能力</label><select id="fVision"><option value="true">👁️ 原生支持</option><option value="false">🚫 不支持 (触发自动转译)</option></select></div>
+      <div class="form-group"><label title="标识该模型是否原生支持读图。若选“不支持”，收到图片时会自动触发图片解析。">多模态能力</label><select id="fVision"><option value="false" selected>🚫 不支持 (触发自动转译)</option><option value="true">👁️ 原生支持</option></select></div>
       <div class="form-group"><label title="是否使用系统代理 (如v2ray)。本地或直连接口请选择否。">代理设置</label><select id="fProxy"><option value="false">强制直连</option><option value="true">随系统</option></select></div>
     </div>
     <div class="form-row form-row-routing">
@@ -738,8 +739,6 @@ function renderEndpoints(eps){
     if(ep.manual_unlock_required)cls+=' has-error';
     if(ep.in_pool)cls+=' in-pool';
     if(ep.last_error&&!ep.in_cooldown)cls+=' has-error';
-    if(ep.daily_limit>0&&ep.today_used>=ep.daily_limit)cls+=' in-cooldown';
-    if(ep.is_rpm_limited)cls+=' in-cooldown';
     let b=`<span class="badge badge-priority">#${ep.priority}</span>${hBadge(ep.health,ep.health_latency_ms)}`;
     if(ep.in_pool)b+='<span class="badge" style="background:rgba(16,163,127,0.2);color:#2ecc71;border:1px solid rgba(16,163,127,0.3)" title="已加入聚合池">🏊</span>';
     if(ep.protocol==='anthropic')b+=`<span class="badge" style="background:rgba(217,119,87,0.2);color:#ff9e7a;border:1px solid rgba(217,119,87,0.3)" title="Anthropic 原生协议翻译">🧠Anthropic</span>`;
@@ -749,21 +748,18 @@ function renderEndpoints(eps){
 
       if(ep.is_vision!==false)b+=`<span class=\"badge\" style=\"background:rgba(0,122,255,.15);color:#0a84ff\" title=\"原生支持视觉能力\">👁️视觉</span>`;
     if(ep.manual_unlock_required)b+=`<span class="badge badge-h-bad" title="余额不足：不会自动探活或恢复，需手动解冻">💳余额不足·手动解冻</span>`;
-    else if(ep.is_rpm_limited)b+=`<span class="badge badge-cooldown" title="每分钟并发已满，限流降级中">🚧限流中</span>`;
-    else if(ep.daily_limit>0&&ep.today_used>=ep.daily_limit)b+=`<span class="badge badge-cooldown" title="今日额度已满，挂起至明日">🛑额度耗尽</span>`;
     else if(ep.in_cooldown)b+=`<span class="badge badge-cooldown">⏳${fmtTime(ep.cooldown_remaining)}</span>`;
     if(ep.is_deferred)b+=`<span class="badge badge-deferred" title="当前工作端点已开启缓存保护，恢复端点延迟回切，剩余 ${fmtTime(ep.defer_remaining)}">⏸延迟回切 ${fmtTime(ep.defer_remaining)}</span>`;
-    if(!ep.use_proxy)b+=`<span class="badge badge-priority" title="绕过系统全局代理，强制直连">🌐直连</span>`;
+    if(ep.use_proxy)b+=`<span class="badge badge-priority" title="随系统代理转发请求">🌐代理</span>`;
     if(ep.health_mode==='none')b+=`<span class="badge" style="background:rgba(255,255,255,.05);color:var(--text-dim)" title="已关闭后台健康监测">🔕免扰</span>`;
     else if(ep.health_mode==='models')b+=`<span class="badge" style="background:rgba(50,215,75,.1);color:var(--green)" title="零成本 Models 探针">☘️无感测</span>`;
     if(ep.billing_mode==='pay_per_use')b+=`<span class="badge" style="background:rgba(255,159,10,.15);color:#ff9f0a" title="按次计费，健康检查使用零成本探针">💰按次</span>`;
-    if(ep.daily_limit>0)b+=`<span class="badge" style="background:rgba(255,255,255,.05);color:var(--text-dim)" title="每日消耗进度">📊${fmtNum(ep.today_used)} / ${fmtNum(ep.daily_limit)}</span>`;
-    if(ep.rpm_limit>0)b+=`<span class="badge" style="background:rgba(255,255,255,.05);color:var(--text-dim)" title="每分钟最高并发请求限制">🚀${ep.rpm_limit} RPM</span>`;
     const last=ep.last_success?timeAgo(ep.last_success):'—';
     return`<div class="${cls}">
       <div class="ep-header">
         <div class="ep-name"><span style="word-break: break-all;">${esc(ep.name)}</span> ${b}</div>
         <div class="ep-actions">
+          <button class="btn btn-ghost btn-sm" title="直达站点：${esc(siteUrl(ep.base_url))}" onclick="window.open(siteUrl('${esc(ep.base_url)}'), '_blank', 'noopener')">🌐</button>
           <button class="btn btn-ghost btn-sm" title="连通性测试" onclick="openTestDrawer('${ep.id}', '${esc(ep.name)} (${esc(ep.model)})')">🧪</button>
           ${(ep.in_cooldown||ep.manual_unlock_required)?`<button class="btn btn-yellow btn-sm" title="${ep.manual_unlock_required?'手动解冻余额不足端点':'立刻解除冷却'}" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
           <button class="btn btn-ghost btn-sm" title="${ep.enabled?'禁用端点':'启用端点'}" onclick="toggleEndpoint('${ep.id}')">${ep.enabled?'⏸':'▶'}</button>
@@ -816,7 +812,8 @@ function renderPoolList(eps){
     if(ep.manual_unlock_required)cls+=' has-error';
     if(ep.in_pool)cls+=' in-pool';
     const prioOf=(e)=>((e.priority_by_group&&e.priority_by_group[displayGroup]!==undefined)?e.priority_by_group[displayGroup]:e.priority);
-    const maxP=Math.max(poolEps.length, Math.max(...poolEps.map(e=>prioOf(e))));
+    const groupEps=poolEps.filter(e=>groupsOf(e).includes(displayGroup));
+    const maxP=Math.max(groupEps.length, Math.max(...groupEps.map(e=>prioOf(e))));
     let options='';
     for(let p=1;p<=maxP;p++) options+=`<option value="${p}" ${p===prioOf(ep)?'selected':''}>#${p}</option>`;
     return `<div class="${cls}" style="display:flex;flex-direction:column;gap:6px;padding:10px 12px">
@@ -1352,7 +1349,7 @@ async function testSelectedVision(){
 function openAddModal(){
     document.getElementById('editName').value='';document.getElementById('modalTitle').textContent='添加端点';
     ['fName','fSiteName','fUrl','fKey','fModel','fUserAgent'].forEach(id=>document.getElementById(id).value='');
-    document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fDeferrable').value='true';document.getElementById('fMaxContext').value=0;document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';document.getElementById('fFakeCheck').value='false';document.getElementById('fToolCallPrefix').value='';document.getElementById('fStreamFirstPacket').value=120;document.getElementById('fStreamStall').value=60;document.getElementById('fStreamMaxDuration').value=0;
+    document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fDeferrable').value='true';document.getElementById('fMaxContext').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='false';document.getElementById('fFakeCheck').value='false';document.getElementById('fToolCallPrefix').value='';document.getElementById('fReasoningPolicy').value='auto';document.getElementById('fPreservedThinking').value='false';document.getElementById('fStreamFirstPacket').value=120;document.getElementById('fStreamStall').value=60;document.getElementById('fStreamMaxDuration').value=0;
     document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';
     document.getElementById('fetchModelsBtn').disabled=true;document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
     allModels=[];selectedModels=new Set();latencyResults={};visionResults={};_origDraft=null;
@@ -1362,7 +1359,7 @@ function editEndpoint(id){
     api('GET','/api/endpoints').then(eps=>{const ep=eps.find(e=>e.id===id);if(!ep)return;
         document.getElementById('editName').value=id;document.getElementById('modalTitle').textContent='编辑端点';
         document.getElementById('fName').value=ep.name;document.getElementById('fSiteName').value=ep.site_name||'';document.getElementById('fUrl').value=ep.base_url;document.getElementById('fKey').value=ep.api_key_full||'';document.getElementById('fModel').value=ep.model;document.getElementById('fUserAgent').value=ep.default_headers?.['User-Agent']||'';
-        document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fDeferrable').value=String(ep.deferrable!==false);document.getElementById('fMaxContext').value=ep.max_context_k||0;document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);document.getElementById('fToolCallPrefix').value=ep.tool_call_id_prefix||'';document.getElementById('fStreamFirstPacket').value=ep.stream_first_packet_timeout??120;document.getElementById('fStreamStall').value=ep.stream_stall_timeout??60;document.getElementById('fStreamMaxDuration').value=ep.stream_max_duration??0;
+        document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fDeferrable').value=String(ep.deferrable!==false);document.getElementById('fMaxContext').value=ep.max_context_k||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision===true);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);document.getElementById('fToolCallPrefix').value=ep.tool_call_id_prefix||'';document.getElementById('fReasoningPolicy').value=ep.reasoning_policy||'auto';document.getElementById('fPreservedThinking').value=String(ep.preserved_thinking===true);document.getElementById('fStreamFirstPacket').value=ep.stream_first_packet_timeout??120;document.getElementById('fStreamStall').value=ep.stream_stall_timeout??60;document.getElementById('fStreamMaxDuration').value=ep.stream_max_duration??0;
         document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
         allModels=[];selectedModels=new Set();latencyResults={};visionResults={};_origDraft=readFormDraft();checkFetchBtn();document.getElementById('modal').classList.add('show');
     });
@@ -1372,7 +1369,7 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 let _origDraft=null; // 编辑模式打开时的表单快照；仅提交与之不同的字段，未改字段不更新
 function readFormDraft(){
     const ua=document.getElementById('fUserAgent').value.trim();
-    return {name:document.getElementById('fName').value.trim(),site_name:document.getElementById('fSiteName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),deferrable:document.getElementById('fDeferrable').value==='true',max_context_k:parseInt(document.getElementById('fMaxContext').value)||0,daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',default_headers:ua?{'User-Agent':ua}:{},health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true',tool_call_id_prefix:document.getElementById('fToolCallPrefix').value.trim(),stream_first_packet_timeout:parseInt(document.getElementById('fStreamFirstPacket').value)||0,stream_stall_timeout:parseInt(document.getElementById('fStreamStall').value)||0,stream_max_duration:parseInt(document.getElementById('fStreamMaxDuration').value)||0};
+    return {name:document.getElementById('fName').value.trim(),site_name:document.getElementById('fSiteName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),deferrable:document.getElementById('fDeferrable').value==='true',max_context_k:parseInt(document.getElementById('fMaxContext').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',default_headers:ua?{'User-Agent':ua}:{},health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true',tool_call_id_prefix:document.getElementById('fToolCallPrefix').value.trim(),reasoning_policy:document.getElementById('fReasoningPolicy').value||'auto',preserved_thinking:document.getElementById('fPreservedThinking').value==='true',stream_first_packet_timeout:parseInt(document.getElementById('fStreamFirstPacket').value)||0,stream_stall_timeout:parseInt(document.getElementById('fStreamStall').value)||0,stream_max_duration:parseInt(document.getElementById('fStreamMaxDuration').value)||0};
 }
 function sameVal(a,b){return JSON.stringify(a)===JSON.stringify(b);}
 async function saveEndpoint(){
@@ -1404,15 +1401,16 @@ async function batchAddEndpoints(){
     const fn=document.getElementById('fName').value.trim();
     const siteName=document.getElementById('fSiteName').value.trim();
     const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
-    const sp=parseInt(document.getElementById('fPriority').value)||1,to=parseInt(document.getElementById('fTimeout').value)||60,re=parseInt(document.getElementById('fRetries').value)||0,cd=Math.max(1,parseInt(document.getElementById('fCooldown').value)||5),dl=parseInt(document.getElementById('fDailyLimit').value)||0,rl=parseInt(document.getElementById('fRpmLimit').value)||0,up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',ua=document.getElementById('fUserAgent').value.trim(),hm=document.getElementById('fHealthMode').value||'chat',bm=document.getElementById('fBillingMode').value||'subscription',sf=parseInt(document.getElementById('fStreamFirstPacket').value)||0,ss=parseInt(document.getElementById('fStreamStall').value)||0,sm=parseInt(document.getElementById('fStreamMaxDuration').value)||0;
+    const sp=1,to=parseInt(document.getElementById('fTimeout').value)||60,re=parseInt(document.getElementById('fRetries').value)||0,cd=Math.max(1,parseInt(document.getElementById('fCooldown').value)||5),up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',ua=document.getElementById('fUserAgent').value.trim(),hm=document.getElementById('fHealthMode').value||'chat',bm=document.getElementById('fBillingMode').value||'subscription',sf=parseInt(document.getElementById('fStreamFirstPacket').value)||0,ss=parseInt(document.getElementById('fStreamStall').value)||0,sm=parseInt(document.getElementById('fStreamMaxDuration').value)||0;
     if(!u||!k){toast('填写 URL 和 Key','error');return;}
     if(!selectedModels.size){toast('选择模型','error');return;}
     const ms=[...selectedModels];toast(`添加 ${ms.length} 个...`,'info');
-    const r=await api('POST','/api/endpoints/batch',{endpoints:ms.map((m,i)=>({name:fn?fn:m,model:m,priority:sp+i,is_vision:visionResults[m]?visionResults[m].supports_vision:true})),base:{site_name:siteName,base_url:u,api_key:k,default_headers:ua?{'User-Agent':ua}:{},timeout:to,max_retries:re,cooldown_minutes:cd,daily_limit:dl,rpm_limit:rl,use_proxy:up,protocol:pt,start_priority:sp,health_mode:hm,billing_mode:bm,stream_first_packet_timeout:sf,stream_stall_timeout:ss,stream_max_duration:sm,enabled:true,in_pool:false,pool_groups:[]}});
+    const r=await api('POST','/api/endpoints/batch',{endpoints:ms.map((m,i)=>({name:fn?fn:m,model:m,priority:sp+i,is_vision:visionResults[m]?visionResults[m].supports_vision:false})),base:{site_name:siteName,base_url:u,api_key:k,default_headers:ua?{'User-Agent':ua}:{},timeout:to,max_retries:re,cooldown_minutes:cd,use_proxy:up,protocol:pt,start_priority:sp,health_mode:hm,billing_mode:bm,stream_first_packet_timeout:sf,stream_stall_timeout:ss,stream_max_duration:sm,enabled:true,in_pool:false,pool_groups:[]}});
     if(r.ok){toast(`✅ ${r.added} 个`,'success');closeModal();refresh();}else toast('失败','error');
 }
 
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+function siteUrl(base){try{const u=new URL(base);u.pathname=u.pathname.replace(/\/v1\/?$/,'')||'/';u.search='';u.hash='';return u.origin==='null'?base:u.href;}catch(e){return base;}}
 function escAttr(s){return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function timeAgo(ts){if(!ts)return'—';const s=Math.floor(Date.now()/1000-ts);if(s<60)return s+'s前';if(s<3600)return Math.floor(s/60)+'m前';if(s<86400)return Math.floor(s/3600)+'h前';return Math.floor(s/86400)+'d前';}
 function fmtTime(s){if(s<=0)return'';if(s<60)return s+'s';const m=Math.floor(s/60);return(s%60)?`${m}m${s%60}s`:`${m}m`;}

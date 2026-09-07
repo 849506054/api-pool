@@ -653,15 +653,6 @@ class TokenTracker:
                 sys_log(f"记录 token 消耗失败: {e}", "WARN")
         threading.Thread(target=_do_insert, daemon=True).start()
 
-    def get_today_usage_by_endpoint(self, endpoint_name):
-        try:
-            with self._connect() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT SUM(total_tokens) FROM token_usage WHERE endpoint_name = ? AND timestamp >= datetime(date('now', 'localtime'), 'utc')", (endpoint_name,))
-                return cursor.fetchone()[0] or 0
-        except Exception:
-            return 0
-
     def rename_endpoint(self, old_name: str, new_name: str):
         try:
             with self._connect() as conn:
@@ -1100,8 +1091,6 @@ class Endpoint:
     max_retries: int = 1
     enabled: bool = True
     cooldown_minutes: int = 5
-    daily_limit: int = 0
-    rpm_limit: int = 0
     use_proxy: bool = False
     protocol: str = "openai"
     extra_headers: dict = field(default_factory=dict)
@@ -1110,16 +1099,16 @@ class Endpoint:
     in_pool: bool = False  # 是否加入聚合池（默认不加入）
     check_fake_success: bool = False  # 是否检测假成功（200 OK 但内容含拒绝信息）
     tool_call_id_prefix: str = ""
+    reasoning_policy: str = "auto"  # auto=DeepSeek保留+GLM保留+其余剥离 | keep=强制保留回传 | strip=强制剥离
+    preserved_thinking: bool = False  # GLM 保留式思考：注入 thinking.clear_thinking=False
     stream_first_packet_timeout: int = 120
     stream_stall_timeout: int = 60
     stream_max_duration: int = 0  # 流总时长上限（秒），0=禁用；正常持续输出默认不截断
     deferrable: bool = True  # 是否保护本端点缓存（true=本端点工作时延迟切走）
-    max_context_k: int = 0  # 最大上下文长度（K=1000 tokens），0=不限
+    max_context_k: int = 0  # 模型上下文长度（K=1000 tokens），0=不限；请求超限自动 fallback 下一端点
     pool_groups: list = field(default_factory=list)  # 未入池端点默认无池组；入池时再绑定组
 
     _fail_count: int = field(default=0, repr=False)
-    _req_timestamps: deque = field(default_factory=deque, repr=False)
-    _rpm_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _last_error: str = field(default="", repr=False)
     _last_error_ts: float = field(default=0, repr=False)
     _last_success_ts: float = field(default=0, repr=False)
@@ -1130,8 +1119,6 @@ class Endpoint:
     _manual_unlock_required: bool = field(default=False, repr=False)
     _defer_until: float = field(default=0, repr=False)  # 延迟回迁到期时间，在此期间不主动回迁到此端点
     
-    _today_used: int = field(default=0, repr=False)
-    _today_date: str = field(default="", repr=False)
     health_mode: str = field(default="models")
     billing_mode: str = field(default="subscription")
 
@@ -1232,8 +1219,6 @@ class APIPool:
             ep.id = str(uuid.uuid4())
         if not ep.site_id:
             ep.site_id = self._resolve_site_id(ep.base_url, ep.api_key)
-        ep._today_date = datetime.now().strftime("%Y-%m-%d")
-        ep._today_used = token_tracker.get_today_usage_by_endpoint(ep.name)
         with self._lock:
             self._endpoints.append(ep)
             self._endpoints.sort(key=lambda e: e.priority)
@@ -1904,8 +1889,7 @@ class APIPool:
                 and group in self._ep_groups(ep)
                 and not ep._manual_unlock_required
                 and not self._is_in_cooldown(ep)
-                and not self._is_quota_exceeded(ep)
-                and not self._is_rpm_limited(ep)]
+]
         if not base:
             return [], False
         if group == self.MAIN_GROUP:
@@ -1933,8 +1917,6 @@ class APIPool:
                     # 让观测推论压掉用户指令，会让切换变成静默空操作
                     # （候选集 _group_sticky_candidates 先过滤，指针根本读不到）。
                     # enabled/in_pool 是配置声明而非健康推论，仍然是硬性守卫。
-                    # 用户配置的预算上限同样不动：daily_limit/_today_used 与
-                    # rpm_limit/_req_timestamps 是既发用量事实，不是可推翻的观测。
                     ep._defer_until = 0
                     ep._cooldown_until = 0
                     ep._cooldown_reason = ""
@@ -2012,9 +1994,6 @@ class APIPool:
             "max_retries": ep.max_retries,
             "enabled": ep.enabled,
             "cooldown_minutes": ep.cooldown_minutes,
-            "daily_limit": ep.daily_limit,
-            "today_used": ep._today_used,
-            "rpm_limit": ep.rpm_limit,
             "use_proxy": ep.use_proxy,
             "protocol": ep.protocol,
             "extra_headers": ep.extra_headers,
@@ -2025,12 +2004,13 @@ class APIPool:
             "in_pool": ep.in_pool,
             "check_fake_success": ep.check_fake_success,
             "tool_call_id_prefix": ep.tool_call_id_prefix,
+            "reasoning_policy": getattr(ep, "reasoning_policy", "auto"),
+            "preserved_thinking": getattr(ep, "preserved_thinking", False),
             "stream_first_packet_timeout": ep.stream_first_packet_timeout,
             "stream_stall_timeout": ep.stream_stall_timeout,
             "stream_max_duration": ep.stream_max_duration,
             "pool_groups": list(self._ep_groups(ep)),
             "current_groups": self._groups_pointing_at(ep.id),
-            "is_rpm_limited": self._is_rpm_limited(ep),
             "fail_count": ep._fail_count,
             "last_error": ep._last_error,
             "last_success": ep._last_success_ts,
@@ -2085,11 +2065,7 @@ class APIPool:
                     "is_deferred": ep._defer_until > now,
                     "defer_remaining": max(0, int(ep._defer_until - now)),
             "max_context_k": ep.max_context_k,
-                    "daily_limit": ep.daily_limit,
-                    "today_used": ep._today_used,
-                    "rpm_limit": ep.rpm_limit,
                     "use_proxy": ep.use_proxy,
-                    "is_rpm_limited": self._is_rpm_limited(ep),
                     "is_vision": ep.is_vision,
             "in_pool": ep.in_pool,
                     "health": ep._health,
@@ -2109,8 +2085,6 @@ class APIPool:
                 ep._cooldown_reason = ""
                 ep._manual_unlock_required = False
                 ep._defer_until = 0
-                with ep._rpm_lock:
-                    ep._req_timestamps.clear()
             self._current_endpoint_by_group.clear()
             self._manual_override_by_group.clear()
 
@@ -2367,28 +2341,12 @@ class APIPool:
         """返回优先级 99 的终极兜底端点（启用、在池、未冷却）。"""
         for ep in self._endpoints:
             if (ep.enabled and ep.in_pool and not ep._manual_unlock_required and ep.priority == 99
-                    and not self._is_in_cooldown(ep) and not self._is_quota_exceeded(ep)):
+                    and not self._is_in_cooldown(ep)):
                 return ep
         return None
 
     def _is_fallback_locked(self):
         return self._is_fallback_locked_group(self.MAIN_GROUP)
-
-    def _is_quota_exceeded(self, ep):
-        if ep.daily_limit <= 0: return False
-        now_date = datetime.now().strftime("%Y-%m-%d")
-        if ep._today_date != now_date:
-            ep._today_date = now_date
-            ep._today_used = 0
-        return ep._today_used >= ep.daily_limit
-
-    def _is_rpm_limited(self, ep):
-        if ep.rpm_limit <= 0: return False
-        now = time.time()
-        with ep._rpm_lock:
-            while ep._req_timestamps and ep._req_timestamps[0] < now - 60:
-                ep._req_timestamps.popleft()
-            return len(ep._req_timestamps) >= ep.rpm_limit
 
     def _is_deferred(self, ep):
         return ep._defer_until > time.time()
@@ -2725,15 +2683,12 @@ class APIPool:
                             or not current_ep.enabled
                             or not current_ep.in_pool
                             or self._is_in_cooldown(current_ep)
-                            or self._is_quota_exceeded(current_ep)
-                            or self._is_rpm_limited(current_ep)
                         )
                         if not self._get_manual(grp) and current_unavailable:
                             group_eps = [e for e in self._endpoints if e.enabled and e.in_pool
                                          and grp in self._ep_groups(e)
                                          and not self._is_in_cooldown(e)
-                                         and not self._is_quota_exceeded(e)
-                                         and not self._is_rpm_limited(e)]
+]
                             if group_eps:
                                 best = min(group_eps, key=lambda e: self._ep_priority(e, grp))
                                 self._set_current(grp, best.id)
@@ -2815,15 +2770,12 @@ class APIPool:
         return [ep for ep in self._endpoints if ep.enabled and ep.in_pool
                 and not ep._manual_unlock_required
                 and not self._is_in_cooldown(ep)
-                and not self._is_quota_exceeded(ep)
-                and not self._is_rpm_limited(ep)]
+]
 
     def _active_endpoints(self):
         available = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
                      and not ep._manual_unlock_required
                      and not self._is_in_cooldown(ep)
-                     and not self._is_quota_exceeded(ep)
-                     and not self._is_rpm_limited(ep)
                      and not self._is_deferred(ep)]
         if available:
             return available
@@ -3087,10 +3039,92 @@ class APIPool:
         prefix = str(getattr(ep, "tool_call_id_prefix", "") or "").lower()
         return "deepseek" in model or "deepseek" in base_url or bool(prefix)
 
+    @staticmethod
+    def _is_glm_endpoint(ep):
+        """GLM 系列端点：交错/保留式思考要求回传 reasoning_content。"""
+        return "glm" in str(getattr(ep, "model", "") or "").lower()
+
+    @classmethod
+    def _keep_reasoning_fields(cls, ep):
+        """端点 reasoning_content 回传策略（端点级 reasoning_policy 覆盖启发式）。
+
+        keep/strip 显式覆盖；auto 家族对齐 Hermes _REASONING_ECHO_RULES（docs:
+        DeepSeek/Kimi/Moonshot/MiMo 回传校验）+ GLM（交错/保留式思考），其余剥离。
+        """
+        policy = str(getattr(ep, "reasoning_policy", "") or "").strip().lower()
+        if policy == "keep":
+            return True
+        if policy == "strip":
+            return False
+        model = str(getattr(ep, "model", "") or "").lower()
+        base_url = str(getattr(ep, "base_url", "") or "").lower()
+        if cls._is_deepseek_endpoint(ep) or cls._is_glm_endpoint(ep):
+            return True
+        # Kimi/Moonshot、Xiaomi MiMo：与 Hermes 相同的回传校验家族
+        return any(k in model or k in base_url for k in ("kimi", "moonshot", "mimo"))
+
+    # GLM 官方 reasoning_effort 映射（docs.bigmodel.cn 深度思考页，2026-09-08）：
+    # GLM-5.3/5.3-FLASH 标准 API 仅接受 max/high/low，其余报错；GLM-5.2 服务端自动
+    # 映射 medium→high、xhigh→max，透传即可。Coding Plan 语义：low→low，
+    # medium/high→high，xhigh/max→max。
+    _GLM_EFFORT_MAP = {
+        "none": "low", "minimal": "low", "low": "low",
+        "medium": "high", "high": "high",
+        "xhigh": "max", "max": "max",
+    }
+    _KIMI_K3_EFFORT_MAP = {
+        "none": "low", "minimal": "low", "low": "low",
+        "medium": "high", "high": "high",
+        "xhigh": "max", "max": "max",
+    }
+    _KIMI_K2_EFFORT_MAP = {
+        "none": "low", "minimal": "low", "low": "low",
+        "medium": "medium", "high": "high",
+        "xhigh": "high", "max": "high",
+    }
+    _DEEPSEEK_V4_EFFORT_MAP = {
+        "none": "low", "minimal": "low", "low": "low",
+        "medium": "medium", "high": "high",
+        "xhigh": "max", "max": "max",
+    }
+
+    @staticmethod
+    def _is_kimi_endpoint(ep):
+        model = str(getattr(ep, "model", "") or "").lower()
+        base_url = str(getattr(ep, "base_url", "") or "").lower()
+        return any(k in model or k in base_url for k in ("kimi", "moonshot"))
+
+    @staticmethod
+    def _is_kimi_k3_model(model):
+        """匹配 k3、k3-*、kimi-k3*，但不误判 kimi-k2.6。"""
+        return re.search(r"(?:^|[^a-z0-9])k3(?:[^a-z0-9]|$)", model) is not None
+
+    @classmethod
+    def _map_reasoning_effort(cls, payload, ep):
+        """按端点模型/家族改写或剔除顶层 reasoning_effort。仅处理显式值。"""
+        if "reasoning_effort" not in payload:
+            return
+        effort = str(payload.get("reasoning_effort") or "").strip().lower()
+        model = str(getattr(ep, "model", "") or "").lower()
+        if "glm-5.3" in model:
+            payload["reasoning_effort"] = cls._GLM_EFFORT_MAP.get(effort, "high")
+        elif "glm" in model and "glm-5.2" not in model:
+            # glm-4.x 等不支持该参数的 GLM 模型：剔除，交服务端默认
+            payload.pop("reasoning_effort", None)
+        elif cls._is_kimi_endpoint(ep):
+            mapping = cls._KIMI_K3_EFFORT_MAP if cls._is_kimi_k3_model(model) else cls._KIMI_K2_EFFORT_MAP
+            payload["reasoning_effort"] = mapping.get(effort, "high")
+        elif cls._is_deepseek_endpoint(ep) and "deepseek-v3" not in model:
+            payload["reasoning_effort"] = cls._DEEPSEEK_V4_EFFORT_MAP.get(effort, "high")
+
     @classmethod
     def _messages_for_endpoint(cls, messages, ep):
-        """Remove DeepSeek-only reasoning fields for non-DeepSeek targets."""
-        if cls._is_deepseek_endpoint(ep):
+        """Strip reasoning_content/reasoning_text for endpoints that don't accept them.
+
+        GLM（交错/保留式思考）与 DeepSeek 一样要求回传 reasoning_content，一并保留；
+        端点级 reasoning_policy=keep/strip 可强制覆盖启发式。
+        """
+        if cls._keep_reasoning_fields(ep):
             return messages
 
         cleaned = []
@@ -3306,6 +3340,16 @@ class APIPool:
                 "model": ep_model, "messages": loop_messages,
                 **(extra_payload or {}),
             }
+            # GLM 系列推理强度适配：reasoning_effort 按官方映射改写/剔除；
+            # preserved_thinking 开关：注入 clear_thinking=False 开启保留式思考
+            if not is_anthropic:
+                self._map_reasoning_effort(payload, ep)
+                if getattr(ep, "preserved_thinking", False):
+                    t = payload.get("thinking")
+                    if isinstance(t, dict):
+                        t["clear_thinking"] = False
+                    else:
+                        payload["thinking"] = {"type": "enabled", "clear_thinking": False}
             
             # [VISION TRANSLATION INTERCEPT]
             if self._has_images(payload["messages"]) and getattr(ep, "is_vision", True) is False:
@@ -3816,10 +3860,6 @@ class APIPool:
         is_stream = payload.get("stream", False)
         retries = 0 if force_no_retry else ep.max_retries
         for attempt in range(retries + 1):
-            if ep.rpm_limit > 0:
-                with ep._rpm_lock:
-                    ep._req_timestamps.append(time.time())
-                    
             req = urllib.request.Request(url, data=data, method="POST")
             req.add_header("Content-Type", "application/json")
             safe_api_key = ep.api_key.encode('ascii', 'ignore').decode('ascii').strip()
@@ -4286,7 +4326,6 @@ class APIPool:
                                 token_tracker.add_usage(ep.name, ep.model, final_prompt_tokens, final_completion_tokens, final_total_tokens, stats_cached_tokens)
                                 chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, final_completion_text.strip() or final_reasoning_text.strip(), final_total_tokens, int((time.time() - req_t0) * 1000), pool_group, final_prompt_tokens, stats_cached_tokens, final_reasoning_tokens)
                                 self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
-                                ep._today_used += final_total_tokens
                             resp.close()
                     return stream_generator(), ""
                 else:
@@ -4320,7 +4359,6 @@ class APIPool:
                                 token_tracker.add_usage(ep.name, ep.model, prompt_t, u.get("output_tokens", 0), tot, stats_cached)
                                 chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, reply.strip() or reasoning.strip(), tot, int((time.time() - req_t0) * 1000), pool_group, prompt_t, stats_cached)
                                 self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
-                                ep._today_used += tot
                         stop_reason = body.get("stop_reason")
                         finish_reason = {
                             "tool_use": "tool_calls",
@@ -4377,7 +4415,6 @@ class APIPool:
                                 log_text = content.strip() or reasoning.strip()
                                 chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000), pool_group, u.get("prompt_tokens", 0), stats_cached, reasoning_tokens)
                                 self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
-                                ep._today_used += tot
                         # 假成功检测（仅端点启用时）
                         if ep.check_fake_success:
                             _content_text = (content or reasoning or "").strip()
@@ -5229,8 +5266,7 @@ def api_handler(method, path, body):
                 "api_key": item.get("api_key", base.get("api_key", "")), "model": item.get("model", ""),
                 "priority": item.get("priority", start_priority + i), "timeout": item.get("timeout", base.get("timeout", 60)),
                 "max_retries": item.get("max_retries", base.get("max_retries", 1)), "cooldown_minutes": item.get("cooldown_minutes", base.get("cooldown_minutes", 5)),
-                "daily_limit": item.get("daily_limit", base.get("daily_limit", 0)), "rpm_limit": item.get("rpm_limit", base.get("rpm_limit", 0)),
-                "use_proxy": item.get("use_proxy", base.get("use_proxy", False)),
+                               "use_proxy": item.get("use_proxy", base.get("use_proxy", False)),
                 "protocol": item.get("protocol", base.get("protocol", "openai")),
                 "default_headers": item.get("default_headers", base.get("default_headers", {"User-Agent": item.get("user_agent", base.get("user_agent", ""))} if item.get("user_agent", base.get("user_agent", "")) else {})),
                 "health_mode": item.get("health_mode", base.get("health_mode", "chat")),
@@ -5342,8 +5378,8 @@ def _sync_to_config():
     for gname, gd in pool._group_defs.items():
         if gname != pool.MAIN_GROUP:
             defs_list.append({"name": gname, "type": gd.get("type", "mixed"), "model": gd.get("model", gname)})
-    save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "daily_limit": ep.get("daily_limit", 0), "rpm_limit": ep.get("rpm_limit", 0), "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
-            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list)
+    save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
+            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list)
 
 
 GUI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
