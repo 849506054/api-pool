@@ -1197,6 +1197,8 @@ async function resetPool(){await api('POST','/api/reset');toast('已重置','suc
 function checkFetchBtn(){
     const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
     document.getElementById('fetchModelsBtn').disabled=!(u&&k);
+    // 自动补全仅用于添加模式：编辑已有端点时绝不改写名称/站点名称（防误保存覆盖原值）
+    if(document.getElementById('editName').value) return;
     const provider = detectProvider(u);
     // 端点名称与站点名称共用同一自动补全机制：字段为空（或此前为自动填入）时随 URL 识别结果填充
     autoFillFromProvider(document.getElementById('fName'), provider);
@@ -1353,7 +1355,7 @@ function openAddModal(){
     document.getElementById('fPriority').value=1;document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fDeferrable').value='true';document.getElementById('fMaxContext').value=0;document.getElementById('fDailyLimit').value=0;document.getElementById('fRpmLimit').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='true';document.getElementById('fFakeCheck').value='false';document.getElementById('fToolCallPrefix').value='';document.getElementById('fStreamFirstPacket').value=120;document.getElementById('fStreamStall').value=60;document.getElementById('fStreamMaxDuration').value=0;
     document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';
     document.getElementById('fetchModelsBtn').disabled=true;document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
-    allModels=[];selectedModels=new Set();latencyResults={};visionResults={};
+    allModels=[];selectedModels=new Set();latencyResults={};visionResults={};_origDraft=null;
     document.getElementById('modal').classList.add('show');
 }
 function editEndpoint(id){
@@ -1362,17 +1364,34 @@ function editEndpoint(id){
         document.getElementById('fName').value=ep.name;document.getElementById('fSiteName').value=ep.site_name||'';document.getElementById('fUrl').value=ep.base_url;document.getElementById('fKey').value=ep.api_key_full||'';document.getElementById('fModel').value=ep.model;document.getElementById('fUserAgent').value=ep.default_headers?.['User-Agent']||'';
         document.getElementById('fPriority').value=ep.priority;document.getElementById('fTimeout').value=ep.timeout;document.getElementById('fRetries').value=ep.max_retries;document.getElementById('fCooldown').value=ep.cooldown_minutes;document.getElementById('fDeferrable').value=String(ep.deferrable!==false);document.getElementById('fMaxContext').value=ep.max_context_k||0;document.getElementById('fDailyLimit').value=ep.daily_limit||0;document.getElementById('fRpmLimit').value=ep.rpm_limit||0;document.getElementById('fProxy').value=String(ep.use_proxy!==false);document.getElementById('fProtocol').value=ep.protocol||'openai';document.getElementById('fHealthMode').value=ep.health_mode||'chat';document.getElementById('fBillingMode').value=ep.billing_mode||'subscription';document.getElementById('fVision').value=String(ep.is_vision!==false);document.getElementById('fFakeCheck').value=String(ep.check_fake_success===true);document.getElementById('fToolCallPrefix').value=ep.tool_call_id_prefix||'';document.getElementById('fStreamFirstPacket').value=ep.stream_first_packet_timeout??120;document.getElementById('fStreamStall').value=ep.stream_stall_timeout??60;document.getElementById('fStreamMaxDuration').value=ep.stream_max_duration??0;
         document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
-        allModels=[];selectedModels=new Set();latencyResults={};visionResults={};checkFetchBtn();document.getElementById('modal').classList.add('show');
+        allModels=[];selectedModels=new Set();latencyResults={};visionResults={};_origDraft=readFormDraft();checkFetchBtn();document.getElementById('modal').classList.add('show');
     });
 }
 function closeModal(){document.getElementById('modal').classList.remove('show');}
 
+let _origDraft=null; // 编辑模式打开时的表单快照；仅提交与之不同的字段，未改字段不更新
+function readFormDraft(){
+    const ua=document.getElementById('fUserAgent').value.trim();
+    return {name:document.getElementById('fName').value.trim(),site_name:document.getElementById('fSiteName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),deferrable:document.getElementById('fDeferrable').value==='true',max_context_k:parseInt(document.getElementById('fMaxContext').value)||0,daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',default_headers:ua?{'User-Agent':ua}:{},health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true',tool_call_id_prefix:document.getElementById('fToolCallPrefix').value.trim(),stream_first_packet_timeout:parseInt(document.getElementById('fStreamFirstPacket').value)||0,stream_stall_timeout:parseInt(document.getElementById('fStreamStall').value)||0,stream_max_duration:parseInt(document.getElementById('fStreamMaxDuration').value)||0};
+}
+function sameVal(a,b){return JSON.stringify(a)===JSON.stringify(b);}
 async function saveEndpoint(){
     const ep_id=document.getElementById('editName').value;
-    const ua=document.getElementById('fUserAgent').value.trim();
-    const d={name:document.getElementById('fName').value.trim(),site_name:document.getElementById('fSiteName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),priority:parseInt(document.getElementById('fPriority').value)||1,timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),deferrable:document.getElementById('fDeferrable').value==='true',max_context_k:parseInt(document.getElementById('fMaxContext').value)||0,daily_limit:parseInt(document.getElementById('fDailyLimit').value)||0,rpm_limit:parseInt(document.getElementById('fRpmLimit').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',default_headers:ua?{'User-Agent':ua}:{},health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true',tool_call_id_prefix:document.getElementById('fToolCallPrefix').value.trim(),stream_first_packet_timeout:parseInt(document.getElementById('fStreamFirstPacket').value)||0,stream_stall_timeout:parseInt(document.getElementById('fStreamStall').value)||0,stream_max_duration:parseInt(document.getElementById('fStreamMaxDuration').value)||0};
-    if(!d.name||!d.base_url||!d.api_key){toast('填写名称/URL/Key','error');return;}
-    if(!d.model){toast('选择模型','error');return;}
+    const draft=readFormDraft();
+    let d;
+    if(ep_id){ // 编辑模式：只提交用户实际改动的字段，未改字段（含名称/站点名称）不进 PUT
+        d={};
+        for(const k of Object.keys(draft)){
+            if(!sameVal(draft[k],_origDraft&&_origDraft[k])) d[k]=draft[k];
+        }
+        if(Object.keys(d).length===0){toast('没有改动','info');return;}
+    }else{ // 添加模式：整单提交
+        d=draft;
+    }
+    if(d.name!==undefined&&!d.name){toast('填写名称','error');return;}
+    if(d.base_url!==undefined&&!d.base_url){toast('填写 URL','error');return;}
+    if(d.api_key!==undefined&&!d.api_key){toast('填写 Key','error');return;}
+    if(d.model!==undefined&&!d.model){toast('选择模型','error');return;}
     try{
       const r=ep_id?await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d):await api('POST','/api/endpoints',Object.assign(d,{enabled:true,in_pool:false,pool_groups:[]}));
       if(!r.ok){toast(`❌ ${r.error||'保存失败'}`,'error');return;}
