@@ -4680,7 +4680,7 @@ class APIPool:
         # 协议层处理：Anthropic 端点做完整格式转换以保证 Kcne 缓存 key 一致性
         is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
         is_responses = (getattr(ep, "protocol", "openai") == "responses")
-        if is_responses or getattr(ep, "protocol", "openai") == "responses":
+        if is_responses:
             url = ep.base_url.rstrip("/") + "/responses"
             responses_payload = _responses_body_from_chat(payload)
             responses_payload.setdefault("model", ep.model)
@@ -5320,7 +5320,7 @@ class APIPool:
                     return stream_generator(), ""
                 else:
                     body = json.loads(resp.read().decode("utf-8"))
-                    if is_responses or getattr(ep, "protocol", "openai") == "responses":
+                    if is_responses:
                         response_text, response_tools = _responses_output_to_chat_message(body.get("output", []))
                         response_message = {"role": "assistant", "content": response_text}
                         if response_tools:
