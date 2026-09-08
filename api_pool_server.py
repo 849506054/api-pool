@@ -2030,7 +2030,7 @@ class Endpoint:
     protocol: str = "openai"
     extra_headers: dict = field(default_factory=dict)
     default_headers: dict = field(default_factory=dict)
-    is_vision: bool = True
+    is_vision: bool = False
     in_pool: bool = False  # 是否加入聚合池（默认不加入）
     check_fake_success: bool = False  # 是否检测假成功（200 OK 但内容含拒绝信息）
     tool_call_id_prefix: str = ""
@@ -6293,7 +6293,7 @@ def api_handler(method, path, body):
                 "default_headers": item.get("default_headers", base.get("default_headers", {"User-Agent": item.get("user_agent", base.get("user_agent", ""))} if item.get("user_agent", base.get("user_agent", "")) else {})),
                 "health_mode": item.get("health_mode", base.get("health_mode", "chat")),
                 "billing_mode": item.get("billing_mode", base.get("billing_mode", "subscription")),
-                "is_vision": item.get("is_vision", base.get("is_vision", True)),
+                "is_vision": item.get("is_vision", base.get("is_vision", False)),
                 "stream_first_packet_timeout": item.get("stream_first_packet_timeout", base.get("stream_first_packet_timeout", 120)),
                 "stream_stall_timeout": item.get("stream_stall_timeout", base.get("stream_stall_timeout", 60)),
                 "stream_max_duration": item.get("stream_max_duration", base.get("stream_max_duration", 0)),
