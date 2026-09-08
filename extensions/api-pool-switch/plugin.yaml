@@ -1,0 +1,8 @@
+name: api-pool-switch
+version: "1.3.0"
+description: "Switch API Pool endpoints via /endpoint slash command (pool-group aware)"
+author: Hermes Agent
+commands:
+  - name: endpoint
+    description: "Pick API Pool pool group then endpoint"
+    args_hint: "[switch <name> | check | health]"
