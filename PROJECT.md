@@ -202,6 +202,7 @@
 - [x] **请求控制路径可解释性** — DEBUG 请求级诊断已完成。DEBUG 关闭时不增加额外 payload 遍历、网络请求、探针、重试、线程或路由动作；DEBUG 开启时记录端点尝试、内部重试、端点切换和最终状态，不记录完整敏感请求内容，也不逐 chunk 记录流式响应。
 - [x] **探活失败阶梯冷却（2026-09-01）** — 探活失败按连续失败次数线性递增冻结时长：请求路径 30s 起步封顶 30 分钟，后台探活 cooldown_minutes×抖动起步封顶 1 小时；成功/探活通过即复位。生产 hash `1cc570e3`。
 - [x] **普通故障阶梯冷却（2026-09-01）** — 普通故障（5xx/连接错误/假成功）在原有抖动机制上叠加线性阶梯：cooldown_minutes×抖动×连续失败次数，封顶 1 小时；抖动机制原样保留。生产 hash `de58a08c`。
+
 - [x] **DeepSeek 严格校验 400 防御（2026-09-10，V4.1-Flash 发布日）** — 观测到三类上游校验 400（`reasoning_content must be passed back` / `must be followed by tool messages` / `content-blocked`），同端点相邻请求时通时不通。修复：① 预检修复悬空 tool_calls（`_repair_dangling_tool_calls` 补合成 tool 结果）；② 命中严格校验签名时同端点重试（上限 2 次，第 2 次显式 `thinking: disabled` 绕开回传校验），不直接轮转换模型；inflight 计数在重试前释放防泄漏。270 测试通过（1 个环境相关失败与 HEAD 相同）。生产 hash `5b87d65c`。根因知识 → skill `references/deepseek-reasoning-400-2026-09-10.md`。
 
 #### P1：真实问题驱动的复核
@@ -215,3 +216,21 @@
 - [x] **移出性能评测主线** — 当前阶段不开展 payload 规模基准、P50/P95/P99、Hermes 直连对照、固定开销拆分、吞吐/容量评估，也不为这些评测增加常驻计时或网络请求；未来如确有需要，另建独立性能评估阶段。
 
 **阶段边界**：当前阶段只处理 API Pool 生产请求的路由正确性、故障判断、冷却与恢复、缓存保护、fallback 和流式事务完整性。工作由真实故障样本驱动，优先最小确定性修复。DEBUG 仅用于解释已有请求控制路径，不承担性能基准。除非出现明确生产证据，本阶段不进行 payload 基准、吞吐/容量评估、日志管线重构、路由状态机扩张或多模型上游建模。
+
+## 2026-09-10 视觉池组（Vision Pool Group）已部署生产
+图片解析调度改造：组实体新增角色 `role: vision`（组 api-pool-vision，selector api-pool-vision），
+`_vision_pool_candidates()` 取代「请求组内任意 is_vision 端点」抓取；降级策略 B（池不可用 → WARNING 日志 + 原图直发）；
+翻译失败写阶梯冷却（60s→600s）；图片 hash → 描述短 TTL 缓存（300s/256 条）；UI 组弹窗用途单选 + 👁️ 徽章 + 状态行。
+生产 hash 后端 db0f5b35 / 前端 c170fb62（部署前备份 .bak-20260910-195900-vision-pool），git c6f8c58。
+池成员：Qwen/Qwen3-VL-32B-Instruct（priority 1，首选）+ Qwen3-VL-8B（priority 2，备选），in_pool=true 仅属视觉池。
+全量 288 测试通过 + 1 已知基线失败；真机验收：pool-bg 发图走视觉池转译、目标端点正确回答、同图重发缓存命中（1.1s）。
+详见 skill api-pool-management references/vision-pool-group-implemented-2026-09-10.md。
+
+## 2026-09-10 客户端伪装（Client Profile）已部署生产
+端点级出站客户端伪装：`client_profile` 三态（`""` 透传默认 / `auto` 按入站 UA 动态识别 / 静态 profile），
+内建 hermes profile（12 头完整 X-Stainless 集，`Accept-Encoding: gzip, deflate` + 响应解压链 `_DecodedResponse`），
+管理 API 4 路由（GET/POST/PUT/DELETE /api/client-profiles）+ 前端「客户端伪装」下拉 / ⚙️ 管理弹层 / 🎭 徽章。
+41 端点零迁移（默认全透传，出站头与部署前逐字节一致）。
+生产 hash 后端 0dc01558 / 前端 a0726603（部署前备份 .bak-20260910-233015）。
+验证：新单测 30 例全过 + 全量回归无新增；ps.air 实测上游 UA 校验（裸请求 401 / 带 hermes UA 200）；经服务真实请求 200。
+详见 skill api-pool-management references/client-impersonation-implemented-2026-09-10.md。
