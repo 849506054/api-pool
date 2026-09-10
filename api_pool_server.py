@@ -60,6 +60,39 @@ _TRUNCATED_STREAM_REASONS = ("流式总时长超限", "流式无有效业务增�
 _DEFAULT_OUTBOUND_UA = "OpenAI/Python 2.33.0"
 _client_ctx = threading.local()
 
+# ── 客户端伪装 Client Profile（2026-09-10）──
+# 让选中端点的出站请求在头层面与真实客户端一致。内建 profile 不落盘；
+# 配置文件 client_profiles 键存用户自定义 profile（与内建重名则忽略+WARN）。
+# 黄金样本来源：/opt/hermes/.venv openai SDK 2.24.0 实测出站头集合。
+_BUILTIN_CLIENT_PROFILES = {
+    "hermes": {
+        "builtin": True,
+        "headers": {
+            "User-Agent": "hermes-agent/0.21.0",
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+            "X-Stainless-Lang": "python",
+            "X-Stainless-Package-Version": "2.24.0",
+            "X-Stainless-OS": "Linux",
+            "X-Stainless-Arch": "x64",
+            "X-Stainless-Runtime": "CPython",
+            "X-Stainless-Runtime-Version": "3.13.5",
+            "X-Stainless-Async": "false",
+            "x-stainless-retry-count": "0",
+            "x-stainless-read-timeout": "600",
+        },
+    },
+}
+# profile 不允许覆盖的保留头（由 pool 按端点协议管理）
+_PROFILE_RESERVED_HEADERS = frozenset({
+    "host", "content-length", "authorization", "x-api-key", "anthropic-version",
+})
+# 动态识别规则表：(UA 子串小写, profile 名)，顺序匹配命中即停。
+# 只收录已存在 profile 的规则；新 profile 落地后再补规则。
+_AUTO_PROFILE_RULES = (
+    ("hermes-agent", "hermes"),
+)
+
 
 def set_client_user_agent(ua):
     _client_ctx.user_agent = (ua or "").strip()
@@ -1984,6 +2017,122 @@ def _get_resp_socket(resp):
         return None
 
 
+class _DecodedResponse:
+    """Content-Encoding 感知解压（仅 gzip/deflate）的 HTTPResponse 包装。
+
+    客户端伪装（2026-09-10）配套：出站声明 Accept-Encoding: gzip, deflate 后，
+    上游可能真实压缩响应，urllib 不会自动解压，必须在此处理。
+
+    铁律：
+    1. 无 Content-Encoding / identity / 未知编码 → 完全透传，零开销
+    2. 解压失败 → 异常向上传播（调用方按上游失败处理），绝不吐损坏字节
+    3. deflate 双模式：wbits=47（gzip/zlib 自动识别）首块失败回退 wbits=-15（裸 deflate RFC1951）
+    """
+
+    def __init__(self, resp):
+        self._resp = resp
+        try:
+            enc = (resp.headers.get("Content-Encoding") or "").strip().lower()
+        except Exception:
+            enc = ""
+        self._encoding = enc if enc in ("gzip", "deflate") else ""
+        self._decoder = None
+        self._buf = b""
+        self._eof = False
+        self._first_raw = None  # 首块原始字节，用于裸 deflate 回退重放
+
+    def _decode(self, raw):
+        if self._decoder is None:
+            self._decoder = zlib.decompressobj(47)
+        if self._first_raw is None:
+            self._first_raw = raw
+        try:
+            out = self._decoder.decompress(raw)
+            self._first_raw = None  # 成功消费，不再需要重放基线
+            return out
+        except zlib.error:
+            if self._first_raw is raw:
+                # 首块即失败：可能是裸 deflate（RFC1951 无 zlib 头），用 -15 重放首块
+                try:
+                    self._decoder = zlib.decompressobj(-15)
+                    return self._decoder.decompress(raw)
+                except zlib.error:
+                    pass
+            # 首块成功后的中途损坏，或回退也失败：按铁律 2 抛（上游失败）
+            raise
+
+    def _flush(self):
+        if self._decoder is None:
+            return b""
+        return self._decoder.flush()
+
+    def _fill(self):
+        """从底层拉一块数据解压进缓冲。返回 False 表示 EOF 且缓冲已空。"""
+        raw = self._resp.read(65536)
+        if not raw:
+            self._eof = True
+            out = self._flush()
+        else:
+            out = self._decode(raw)
+        if out:
+            self._buf += out
+        return not self._eof or bool(self._buf)
+
+    def read(self, size=-1):
+        if not self._encoding:
+            return self._resp.read() if size is None or size < 0 else self._resp.read(size)
+        if size is None or size < 0:
+            while not self._eof:
+                self._fill()
+            out, self._buf = self._buf, b""
+            return out
+        while len(self._buf) < size and not self._eof:
+            self._fill()
+        out, self._buf = self._buf[:size], self._buf[size:]
+        return out
+
+    def readline(self, limit=-1):
+        if not self._encoding:
+            return self._resp.readline() if limit is None or limit < 0 else self._resp.readline(limit)
+        while b"\n" not in self._buf and not self._eof:
+            self._fill()
+        if b"\n" in self._buf:
+            idx = self._buf.index(b"\n") + 1
+            out, self._buf = self._buf[:idx], self._buf[idx:]
+        else:
+            out, self._buf = self._buf, b""
+        return out
+
+    def __iter__(self):
+        if not self._encoding:
+            return iter(self._resp)
+
+        def _gen():
+            while True:
+                line = self.readline()
+                if not line:
+                    return
+                yield line
+
+        return _gen()
+
+    def close(self):
+        try:
+            self._resp.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def __getattr__(self, item):
+        return getattr(self._resp, item)
+
+
 def _anthropic_tools_from_chat(tools):
     """将 OpenAI 格式的 tools 转换为 Anthropic 格式。"""
     if not isinstance(tools, list):
@@ -2034,6 +2183,7 @@ class Endpoint:
     protocol: str = "openai"
     extra_headers: dict = field(default_factory=dict)
     default_headers: dict = field(default_factory=dict)
+    client_profile: str = ""  # 客户端伪装 profile 名（空=不伪装）；头合并优先级：profile < default_headers < extra_headers
     is_vision: bool = False
     in_pool: bool = False  # 是否加入聚合池（默认不加入）
     check_fake_success: bool = False  # 是否检测假成功（200 OK 但内容含拒绝信息）
@@ -2110,6 +2260,7 @@ class APIPool:
         # mixed 组 model = Hermes 侧配置的选择器名（如 api-pool-bg）；dedicated 组 model = 绑定的
         # 真实上游模型名（兼作选择器）。main 恒为 mixed，选择器固定 api-pool（历史别名）。
         self._group_defs: dict[str, dict] = {self.MAIN_GROUP: {"type": "mixed", "model": "api-pool"}}
+        self._client_profiles: dict = load_client_profiles()
         # 图片翻译短 TTL 缓存：图片集合签名 → (时间戳, 描述)，消除多轮重发历史含图的重译（2026-09-10 视觉池组）
         self._vision_cache: dict[str, tuple[float, str]] = {}
         # 后台探活基础设施：冷却过期端点在后台线程探活，不阻塞请求路径
@@ -2302,6 +2453,46 @@ class APIPool:
 
                     self._endpoints.sort(key=lambda e: e.priority)
                     break
+
+    # ── 客户端伪装 profile 管理（2026-09-10）──
+
+    def list_client_profiles(self):
+        """列表：内建（builtin=True，不可删改）+ 自定义。"""
+        out = []
+        for name, entry in _BUILTIN_CLIENT_PROFILES.items():
+            out.append({"name": name, "builtin": True, "headers": entry.get("headers", {})})
+        for name, entry in (self._client_profiles or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            out.append({"name": name, "builtin": False, "headers": entry.get("headers", {})})
+        return out
+
+    def save_client_profile(self, name, headers):
+        """新建/覆盖自定义 profile。保留头过滤；重名内建 → 拒绝。"""
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("profile 名称不能为空")
+        if name in _BUILTIN_CLIENT_PROFILES:
+            raise ValueError(f"'{name}' 为内建 profile，不可覆盖")
+        clean, dropped = _sanitize_profile_headers(headers)
+        if dropped:
+            sys_log(f"客户端伪装：profile '{name}' 提交的保留头 {dropped} 已过滤", "WARN")
+        with self._lock:
+            self._client_profiles[name] = {"headers": clean}
+        sys_log(f"客户端伪装：profile '{name}' 已保存（{len(clean)} 头）", "INFO")
+        return name
+
+    def delete_client_profile(self, name):
+        """删除自定义 profile；被引用端点在解析时自动降级为不伪装（WARN）。"""
+        name = (name or "").strip()
+        if name in _BUILTIN_CLIENT_PROFILES:
+            raise ValueError(f"'{name}' 为内建 profile，不可删除")
+        with self._lock:
+            if not self._client_profiles or name not in self._client_profiles:
+                raise ValueError(f"profile '{name}' 不存在")
+            self._client_profiles.pop(name, None)
+        sys_log(f"客户端伪装：profile '{name}' 已删除", "INFO")
+        return name
 
     def fetch_endpoint_models(self, ep_id):
         """使用指定端点自身的连接配置读取上游模型目录。"""
@@ -2990,6 +3181,7 @@ class APIPool:
             "protocol": ep.protocol,
             "extra_headers": ep.extra_headers,
             "default_headers": ep.default_headers,
+            "client_profile": ep.client_profile,
             "health_mode": ep.health_mode,
             "billing_mode": ep.billing_mode,
             "is_vision": ep.is_vision,
@@ -5029,6 +5221,9 @@ class APIPool:
                 req.add_header("anthropic-version", "2023-06-01")
             req.add_header("Authorization", f"Bearer {safe_api_key}")
             req.add_header("User-Agent", resolve_outbound_user_agent())
+            # 客户端伪装 profile（2026-09-10）：合并优先级 客户端UA < profile < default_headers < extra_headers
+            for k, v in resolve_client_profile(ep, self._client_profiles).items():
+                req.add_header(k, v)
             for k, v in ep.default_headers.items():
                 req.add_header(k, v)
 
@@ -5054,7 +5249,11 @@ class APIPool:
                     resp = opener.open(req, timeout=_open_timeout)
                 else:
                     resp = urllib.request.urlopen(req, timeout=_open_timeout)
-                
+
+                # 响应解压（2026-09-10 客户端伪装）：仅当上游声明 Content-Encoding: gzip/deflate 时解压，
+                # 其余（含未知编码）一律透传；解压失败向上抛（按上游失败处理），绝不吐损坏字节。
+                resp = _DecodedResponse(resp)
+
                 if is_stream:
                     # 在 generator 返回给 chat() 前预读到首个有效业务 chunk。
                     # 这样首包前的 SSE 业务错误仍处于 chat() 的重试/轮转上下文内。
@@ -5984,6 +6183,55 @@ def load_config():
     except Exception:
         return []
 
+def load_client_profiles():
+    """读取 client_profiles 顶层键；旧配置无此键 → {}。"""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f: return json.load(f).get("client_profiles", {})
+    except Exception:
+        return {}
+
+def _sanitize_profile_headers(headers):
+    """过滤 profile 保留头（由 pool 按端点协议管理）；返回 (清洗后 dict, 被过滤头名列表)。"""
+    clean, dropped = {}, []
+    for k, v in (headers or {}).items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        if k.strip().lower() in _PROFILE_RESERVED_HEADERS:
+            dropped.append(k)
+            continue
+        clean[k] = v
+    return clean, dropped
+
+def resolve_client_profile(ep, client_profiles=None):
+    """返回端点生效的 profile 头 dict（已过滤保留头）。内建优先；未知 profile 名 → 空 + WARN。"""
+    name = (getattr(ep, "client_profile", "") or "").strip()
+    if not name:
+        return {}
+    if name == "auto":
+        # 动态识别（2026-09-10）：按入站客户端 UA 匹配规则表；未命中 → 透传（默认哲学）
+        ua = (getattr(_client_ctx, "user_agent", "") or "").lower()
+        hit = ""
+        for marker, prof in _AUTO_PROFILE_RULES:
+            if marker in ua:
+                hit = prof
+                break
+        if not hit:
+            return {}
+        name = hit
+        sys_log(f"客户端伪装：动态识别 UA '{ua[:80]}' → profile '{hit}'", "INFO")
+    if name in _BUILTIN_CLIENT_PROFILES:
+        headers = _BUILTIN_CLIENT_PROFILES[name].get("headers", {})
+    else:
+        entry = (client_profiles or {}).get(name)
+        if not isinstance(entry, dict):
+            sys_log(f"客户端伪装：端点 '{getattr(ep, 'name', '')}' 引用了未知 profile '{name}'，降级为不伪装", "WARN")
+            return {}
+        headers = entry.get("headers", {})
+    clean, dropped = _sanitize_profile_headers(headers)
+    if dropped:
+        sys_log(f"客户端伪装：profile '{name}' 包含保留头 {sorted(dropped)}，已过滤", "WARN")
+    return clean
+
 def load_group_defs_config():
     """读取组实体定义（2026-08-30 组管理）：pool_group_defs 顶层键。旧配置无此键 → None（走派生）。"""
     try:
@@ -5991,7 +6239,7 @@ def load_group_defs_config():
     except Exception:
         return None
 
-def save_config(endpoints_data, group_defs=None):
+def save_config(endpoints_data, group_defs=None, client_profiles=None):
     tmp_file = os.path.join(
         os.path.dirname(os.path.abspath(CONFIG_FILE)),
         f".{os.path.basename(CONFIG_FILE)}.tmp",
@@ -6000,6 +6248,9 @@ def save_config(endpoints_data, group_defs=None):
     # 组管理（2026-08-30）：仅显式传入时写入（None=保持不落盘，旧配置首次编辑前零迁移）
     if group_defs is not None:
         payload["pool_group_defs"] = group_defs
+    # 客户端伪装（2026-09-10）：与组管理同模式，None=不落盘
+    if client_profiles is not None:
+        payload["client_profiles"] = client_profiles
     try:
         with _config_lock:
             with open(tmp_file, "w", encoding="utf-8") as f:
@@ -6523,6 +6774,33 @@ def api_handler(method, path, body):
             if save_runtime_state_groups(groups_state, cooldowns=_collect_cooldown_state()):
                 pool._set_persisted(grp, ep_id)
         return 200, {"ok": ok}, False
+    # ================= 客户端伪装 profile 管理（2026-09-10） =================
+    if method == "GET" and cp == "/api/client-profiles":
+        return 200, {"profiles": pool.list_client_profiles()}, False
+    if method == "POST" and cp == "/api/client-profiles":
+        try:
+            name = pool.save_client_profile(body.get("name", ""), body.get("headers", {}))
+        except ValueError as e:
+            return 400, {"error": str(e)}, False
+        _sync_to_config()
+        return 201, {"ok": True, "name": name}, False
+    if method == "PUT" and cp.startswith("/api/client-profiles/"):
+        name = unquote(cp[len("/api/client-profiles/"):]).strip("/")
+        try:
+            pool.save_client_profile(name, body.get("headers", {}))
+        except ValueError as e:
+            return 400, {"error": str(e)}, False
+        _sync_to_config()
+        return 200, {"ok": True, "name": name}, False
+    if method == "DELETE" and cp.startswith("/api/client-profiles/"):
+        name = unquote(cp[len("/api/client-profiles/"):]).strip("/")
+        try:
+            pool.delete_client_profile(name)
+        except ValueError as e:
+            return 400, {"error": str(e)}, False
+        _sync_to_config()
+        return 200, {"ok": True}, False
+
     if method == "POST" and cp == "/api/endpoints":
         pool.add_endpoint(body); _sync_to_config(); return 201, {"ok": True}, False
     if method == "POST" and cp == "/api/endpoints/batch":
@@ -6536,6 +6814,7 @@ def api_handler(method, path, body):
                 "max_retries": item.get("max_retries", base.get("max_retries", 1)), "cooldown_minutes": item.get("cooldown_minutes", base.get("cooldown_minutes", 5)),
                                "use_proxy": item.get("use_proxy", base.get("use_proxy", False)),
                 "protocol": item.get("protocol", base.get("protocol", "openai")),
+                "client_profile": item.get("client_profile", base.get("client_profile", "")),
                 "default_headers": item.get("default_headers", base.get("default_headers", {"User-Agent": item.get("user_agent", base.get("user_agent", ""))} if item.get("user_agent", base.get("user_agent", "")) else {})),
                 "health_mode": item.get("health_mode", base.get("health_mode", "chat")),
                 "billing_mode": item.get("billing_mode", base.get("billing_mode", "subscription")),
@@ -6710,8 +6989,8 @@ def _sync_to_config():
             if gd.get("role"):
                 entry["role"] = gd["role"]
             defs_list.append(entry)
-    save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
-            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list)
+    save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "client_profile": ep.get("client_profile", ""), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
+            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles)
 
 
 GUI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
