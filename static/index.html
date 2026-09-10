@@ -859,17 +859,22 @@ function renderPoolList(eps){
     const gDef=(window._groupDefs||[]).find(x=>x.name===gr)||{};
     const selTip=gDef.model&&gDef.model!==gr?` · 选择器：${esc(gDef.model)}`:'';
     const typeTip=gDef.type==='dedicated'?' · 专用型（绑定 '+esc(gDef.model)+'）':'';
-    const tip=`当前端点：${gi.current_endpoint?esc(gi.current_endpoint):'无'}${gi.fallback_lock_remaining>0?' · 整组 fallback 借道 main':''}${selTip}${typeTip}`;
-    return `<button class="filter-btn ${gr===poolGroupFilter?'active':''}" onclick="setPoolGroupFilter('${esc(gr)}')" title="${tip}">${icon}${esc(gr)} ${memN}</button>`;
+    const roleTip=gDef.role==='vision'?' · 图片解析池（图片转译来源）':'';
+    const roleBadge=gDef.role==='vision'?`<span class="badge" style="background:rgba(10,132,255,.15);color:#0a84ff;font-size:9px;padding:1px 4px;margin-left:2px" title="图片解析池：图片转译的唯一来源">👁️</span>`:'';
+    const tip=`当前端点：${gi.current_endpoint?esc(gi.current_endpoint):'无'}${gi.fallback_lock_remaining>0?' · 整组 fallback 借道 main':''}${selTip}${typeTip}${roleTip}`;
+    return `<button class="filter-btn ${gr===poolGroupFilter?'active':''}" onclick="setPoolGroupFilter('${esc(gr)}')" title="${tip}">${icon}${esc(gr)} ${memN}${roleBadge}</button>`;
   }).join('');
+  const curDef=(window._groupDefs||[]).find(x=>x.name===poolGroupFilter)||{};
+  const visionBadge=curDef.role==='vision'?`<span class="badge" style="background:rgba(10,132,255,.15);color:#0a84ff;font-size:10px;padding:1px 6px" title="图片解析池（role=vision）：图片转译的唯一候选来源，成员需 is_vision 且已入池">👁️ 图片解析池（成员 ${info.members??0}，可用 ${info.available??0}）</span>`:'';
   const statusHtml=`<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;margin:2px 0 10px">
     <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
       <span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="该组当前端点">● ${info.current_endpoint?esc(info.current_endpoint):'无'}</span>
+      ${visionBadge}
       ${info.fallback_lock_remaining>0?`<span class="badge badge-cooldown" style="font-size:9px;padding:1px 5px" title="整组 fallback，请求借道 main（剩余 ${fmtTime(info.fallback_lock_remaining)}）">↩main</span>`:''}
     </div>
     <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin-left:auto">
-    <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:10px" title="新建分组（暂未开放）" onclick="createPoolGroup()">新建分组</button>
-    <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:10px" title="编辑分组属性（类型：混合/专用，暂未开放）" onclick="editPoolGroup('${esc(poolGroupFilter)}')">编辑分组</button>
+    <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:10px" title="新建分组" onclick="createPoolGroup()">新建分组</button>
+    <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:10px" title="编辑分组属性（类型、用途）" onclick="editPoolGroup('${esc(poolGroupFilter)}')">编辑分组</button>
     </div>
   </div>`;
   el.innerHTML=`<div class="filter-bar" style="margin-bottom:8px">${barHtml}</div>`+statusHtml+members.map(cardOf).join('');
@@ -925,7 +930,7 @@ async function changePoolModel(select,endpointId,group){
 // 组实体：name=显示名；type=mixed（选择器=Hermes 配置的 model 名）/dedicated（绑定真实模型名，兼作选择器）
 function openGroupModal(editName){
   const editing=!!editName;
-  let g={name:'',type:'mixed',model:'',is_main:false};
+  let g={name:'',type:'mixed',model:'',role:'',is_main:false};
   if(editing){
     const gs=window._groupDefs||[];
     g=gs.find(x=>x.name===editName)||g;
@@ -933,6 +938,7 @@ function openGroupModal(editName){
   const title=editing?`编辑分组${g.is_main?'（main）':''}`:'新建分组';
   const nameDisabled=g.is_main?'disabled':'';
   const typeDisabled=g.is_main?'disabled':'';
+  const roleDisabled=g.is_main?'disabled':'';
   const modelLabel=g.type==='dedicated'?'绑定模型（真实模型名，兼作选择器）':'选择器（Hermes 侧配置的 model 名）';
   const overlay=document.createElement('div');
   overlay.className='modal-overlay show';
@@ -947,7 +953,12 @@ function openGroupModal(editName){
           <option value="dedicated" ${g.type==='dedicated'?'selected':''}>专用型（dedicated）</option>
         </select></div>
       <div class="form-group"><label id="gModelLabel">${modelLabel}</label><input type="text" id="gModel" value="${esc(g.model||'')}" placeholder="${g.type==='dedicated'?'如 deepseek-v4-flash':'缺省=组名'}"></div>
-      ${g.is_main?'<div style="font-size:11px;color:var(--text-dim)">main 组为保留主组：名称/类型/选择器均锁定</div>':''}
+      <div class="form-group"><label title="普通分组=仅作为选择器/路由组；图片解析池=图片转译的唯一来源（全池最多一个，调度忽略请求组内视觉端点）">用途</label>
+        <select id="gRole" ${roleDisabled}>
+          <option value="" ${g.role!=='vision'?'selected':''}>普通分组</option>
+          <option value="vision" ${g.role==='vision'?'selected':''}>图片解析池（vision，全池唯一）</option>
+        </select></div>
+      ${g.is_main?'<div style="font-size:11px;color:var(--text-dim)">main 组为保留主组：名称/类型/用途/选择器均锁定</div>':''}
       ${editing&&!g.is_main?`<button class="btn btn-ghost" style="color:var(--red);justify-content:flex-start" onclick="deletePoolGroup('${esc(g.name)}')">🗑 删除该分组（成员移出）</button>`:''}
     </div>
     <div class="form-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
@@ -965,15 +976,16 @@ async function savePoolGroup(editName){
   const name=document.getElementById('gName').value.trim();
   const type=document.getElementById('gType').value;
   const model=document.getElementById('gModel').value.trim();
+  const role=document.getElementById('gRole').value;
   if(!name){toast('填写分组名称','error');return;}
   const btn=document.getElementById('gSaveBtn');
   if(btn){btn.disabled=true;btn.textContent='保存中...';}
   try{
     let r;
     if(editName){
-      r=await api('PUT',`/api/groups/${encodeURIComponent(editName)}`,{name,type,model});
+      r=await api('PUT',`/api/groups/${encodeURIComponent(editName)}`,{name,type,model,role});
     }else{
-      r=await api('POST','/api/groups',{name,type,model});
+      r=await api('POST','/api/groups',{name,type,model,role});
     }
     if(r.ok){toast(editName?'✅ 分组已更新':'✅ 分组已创建','success');closeGroupModal();refresh();}
     else{toast(r.error||'操作失败','error');if(btn){btn.disabled=false;btn.textContent=editName?'保存':'创建';}}

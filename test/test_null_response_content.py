@@ -166,8 +166,12 @@ class NullContentTests(unittest.TestCase):
     def test_image_translation_falls_back_to_reasoning_when_content_is_null(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
-            ep = module.Endpoint(name="vision", model="vision", is_vision=True)
-            pool = module.APIPool([ep])
+            # 2026-09-10 视觉池组：候选来源 = role:vision 组，端点需入池
+            pool = module.APIPool()
+            pool.create_group("vision-pool", "mixed", "api-pool-vision", "vision")
+            ep = module.Endpoint(name="vision", model="vision", is_vision=True,
+                                 enabled=True, in_pool=True, pool_groups=["vision-pool"])
+            pool.add_endpoint(ep)
             pool._try_endpoint = lambda *args, **kwargs: (
                 {
                     "choices": [

@@ -19,6 +19,10 @@ import signal
 import threading
 import sqlite3
 import socket
+import hashlib
+import base64
+import struct
+import zlib
 import itertools
 import re
 import urllib.request
@@ -2106,6 +2110,8 @@ class APIPool:
         # mixed 组 model = Hermes 侧配置的选择器名（如 api-pool-bg）；dedicated 组 model = 绑定的
         # 真实上游模型名（兼作选择器）。main 恒为 mixed，选择器固定 api-pool（历史别名）。
         self._group_defs: dict[str, dict] = {self.MAIN_GROUP: {"type": "mixed", "model": "api-pool"}}
+        # 图片翻译短 TTL 缓存：图片集合签名 → (时间戳, 描述)，消除多轮重发历史含图的重译（2026-09-10 视觉池组）
+        self._vision_cache: dict[str, tuple[float, str]] = {}
         # 后台探活基础设施：冷却过期端点在后台线程探活，不阻塞请求路径
         self._probe_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="apipool-probe")
         self._probe_inflight = set()  # 正在探活的端点 id 集合（后台/批量探活共享，防重复请求）
@@ -2499,6 +2505,18 @@ class APIPool:
     def _valid_group_type(self, gtype):
         return gtype in ("mixed", "dedicated")
 
+    @staticmethod
+    def _valid_group_role(role):
+        """组用途角色："" = 普通组；"vision" = 图片解析池（全池唯一）。"""
+        return role in ("", "vision")
+
+    def _vision_group_name(self):
+        """当前标记为图片解析池的组名（无 → None）。"""
+        for grp, gd in self._group_defs.items():
+            if gd.get("role") == "vision":
+                return grp
+        return None
+
     def _group_selector(self, name):
         """组选择器（Hermes 侧 model 名）：有实体定义取其 model，否则回退组名。"""
         gd = self._group_defs.get(name)
@@ -2521,9 +2539,14 @@ class APIPool:
                 name = str(d.get("name", "")).strip()
                 gtype = d.get("type", "mixed")
                 model = str(d.get("model", "")).strip()
+                role = d.get("role", "")
                 if not name or name == self.MAIN_GROUP or not self._valid_group_type(gtype):
                     continue
+                if not self._valid_group_role(role):
+                    role = ""
                 self._group_defs[name] = {"type": gtype, "model": model or name}
+                if role:
+                    self._group_defs[name]["role"] = role
         return self._group_defs
 
     def _derive_group_defs(self):
@@ -2534,8 +2557,8 @@ class APIPool:
                 self._group_defs[grp] = {"type": "mixed", "model": grp}
         return self._group_defs
 
-    def create_group(self, name, gtype="mixed", model=""):
-        """新建分组。返回 (ok, message)。"""
+    def create_group(self, name, gtype="mixed", model="", role=""):
+        """新建分组。返回 (ok, message)。role="vision" = 图片解析池（全池唯一）。"""
         with self._lock:
             name = str(name or "").strip()
             if not self._valid_group_name(name):
@@ -2546,6 +2569,13 @@ class APIPool:
                 return False, f"组 '{name}' 已存在"
             if not self._valid_group_type(gtype):
                 return False, "分组类型必须为 mixed 或 dedicated"
+            role = str(role or "").strip()
+            if not self._valid_group_role(role):
+                return False, "用途取值非法（仅支持空或 vision）"
+            if role == "vision":
+                existing = self._vision_group_name()
+                if existing:
+                    return False, f"图片解析池已存在（组 '{existing}'），全池只能有一个"
             model = str(model or "").strip()
             if gtype == "dedicated":
                 if not model:
@@ -2560,6 +2590,8 @@ class APIPool:
                     if g != name and gd.get("model") == model:
                         return False, f"选择器 '{model}' 已被组 '{g}' 使用"
             self._group_defs[name] = {"type": gtype, "model": model}
+            if role:
+                self._group_defs[name]["role"] = role
             sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}）", "INFO")
             return True, name
 
@@ -2580,12 +2612,21 @@ class APIPool:
             new_name = str(updates.get("name", name)).strip() or name
             new_type = updates.get("type", old["type"])
             new_model = str(updates.get("model", old.get("model", "")) or "").strip()
+            new_role = str(updates.get("role", old.get("role", "")) or "").strip()
 
             if not self._valid_group_type(new_type):
                 return False, "分组类型必须为 mixed 或 dedicated"
+            if not self._valid_group_role(new_role):
+                return False, "用途取值非法（仅支持空或 vision）"
+            if new_role == "vision":
+                existing = self._vision_group_name()
+                if existing and existing != name:
+                    return False, f"图片解析池已存在（组 '{existing}'），全池只能有一个"
             if name == self.MAIN_GROUP:
                 if new_name != self.MAIN_GROUP or new_type != "mixed":
                     return False, "main 组名称与类型不可修改（仅可改选择器）"
+                if new_role:
+                    return False, "main 组不可设为图片解析池"
                 if new_model and new_model != "api-pool":
                     # main 选择器改名会让存量 Hermes 配置失配，禁止
                     return False, "main 组选择器固定为 api-pool（历史别名）"
@@ -2630,6 +2671,8 @@ class APIPool:
                 del self._group_defs[name]
 
             self._group_defs[new_name] = {"type": new_type, "model": eff_model}
+            if new_role:
+                self._group_defs[new_name]["role"] = new_role
             sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}）", "INFO")
             return True, new_name
 
@@ -2835,6 +2878,20 @@ class APIPool:
         if free:
             return free, False
         return [], False
+
+    def _vision_pool_candidates(self):
+        """图片解析的候选来源：role=vision 组的可用端点（2026-09-10 视觉池组）。
+
+        取代"在请求组内自动找任意 is_vision 端点"。返回 (候选列表, 视觉池组名)：
+        - 未配置视觉池 → ([], None)
+        - 视觉池无可用成员（禁用/未入池/手动锁/冷却）→ ([], 组名)
+        候选语义与普通请求一致（_group_sticky_candidates：enabled + in_pool + 非锁 + 非冷却）。
+        """
+        vision_group = self._vision_group_name()
+        if not vision_group:
+            return [], None
+        candidates, _ = self._group_sticky_candidates(vision_group)
+        return candidates, vision_group
 
     def switch_to_endpoint(self, ep_id, group=None):
         with self._lock:
@@ -3098,13 +3155,65 @@ class APIPool:
         except (TypeError, ValueError):
             return 1
 
+    _VISION_CACHE_TTL = 300  # 图片转译缓存有效期（秒）
+    _VISION_CACHE_MAX = 256  # 缓存条目上限（超出按过期优先、最旧兜底淘汰）
+
+    @staticmethod
+    def _vision_cache_key(translation_msgs):
+        """图片集合签名：全部 image_url 的有序 md5；无图 → None。"""
+        urls = []
+        for m in translation_msgs:
+            content = m.get("content") if isinstance(m, dict) else None
+            if not isinstance(content, list):
+                continue
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "image_url":
+                    u = c.get("image_url")
+                    if isinstance(u, dict):
+                        u = u.get("url", "")
+                    if u:
+                        urls.append(str(u))
+        if not urls:
+            return None
+        return hashlib.md5("|".join(urls).encode("utf-8")).hexdigest()
+
+    def _vision_cache_get(self, key):
+        if not key:
+            return None
+        item = self._vision_cache.get(key)
+        if not item:
+            return None
+        ts, desc = item
+        if time.time() - ts > self._VISION_CACHE_TTL:
+            self._vision_cache.pop(key, None)
+            return None
+        return desc
+
+    def _vision_cache_set(self, key, desc):
+        if not key or not desc:
+            return
+        if len(self._vision_cache) >= self._VISION_CACHE_MAX:
+            now = time.time()
+            for k in [k for k, (ts, _) in list(self._vision_cache.items())
+                      if now - ts > self._VISION_CACHE_TTL]:
+                self._vision_cache.pop(k, None)
+            if len(self._vision_cache) >= self._VISION_CACHE_MAX:
+                # 全部新鲜：按插入序丢最旧一条（近似 LRU，够用）
+                self._vision_cache.pop(next(iter(self._vision_cache)), None)
+        self._vision_cache[key] = (time.time(), desc)
+
     def _translate_images_sync(
         self, messages, active_eps, pool_group=None, request_id=None, request_deadline=None,
     ):
-        vision_eps = [e for e in active_eps if getattr(e, "is_vision", True)]
+        """图片转译：候选来源 = 视觉池（role: vision 组），不再从请求组内抓取任意视觉端点。
+
+        降级策略（2026-09-10 拍板 B）：视觉池无可用成员时本函数静默返回原消息，
+        图片原样交给目标端点；降级告警由调用方（chat 拦截处）记录一次。
+        """
+        vision_eps, vision_group = self._vision_pool_candidates()
         if not vision_eps:
             return messages
-            
+
         translation_msgs = []
         for m in messages:
             if isinstance(m.get("content"), list):
@@ -3116,48 +3225,64 @@ class APIPool:
                         new_content.append(c)
                 if has_image:
                     translation_msgs.append({"role": "user", "content": new_content})
-        
-        if not translation_msgs: return messages
-        
-        sys_prompt = "你是一个专业图像解析器。请将用户提供的图片内容转化为极其详细的文字描述（包括画面细节、OCR文字、代码片段等），只输出文字描述，不要有多余的客套话。"
-        translation_msgs.insert(0, {"role": "system", "content": sys_prompt})
-        
-        description = ""
-        for v_ep in vision_eps:
-            v_label = self._endpoint_log_label(v_ep, pool_group, v_ep.model)
-            sys_log(f"启动图片解析 -> 尝试请求端点 '{v_label}'", "INFO")
-            payload = {"model": v_ep.model, "messages": translation_msgs, "stream": False, "max_tokens": 4096}
-            result, error = self._try_endpoint(
-                v_ep, payload, timeout=60, log_usage=True, force_no_retry=True,
-                pool_group=pool_group, request_id=request_id,
-                request_deadline=request_deadline,
-            )
-            if error:
-                sys_log(f"图片解析端点 '{v_label}' 请求失败: {error}", "WARNING")
-                continue
-                
-            if isinstance(result, str):
-                description = result
-                result_message = {}
-            elif isinstance(result, dict):
-                result_message = (result.get("choices") or [{}])[0].get("message") or {}
-                description = result_message.get("content") or ""
-            else:
-                result_message = {}
-                description = ""
-            if not description.strip():
-                reasoning = result_message.get("reasoning_content") or ""
-                if reasoning:
-                    description = reasoning
-            if description:
-                break
-                
-        if not description:
-            sys_log("所有图片解析端点均失败", "ERROR")
+
+        if not translation_msgs:
             return messages
-        
-        import copy
-        new_msgs = copy.deepcopy(messages)
+
+        cache_key = self._vision_cache_key(translation_msgs)
+        description = self._vision_cache_get(cache_key) or ""
+
+        if description:
+            sys_log(f"图片解析命中缓存，跳过转译（视觉池 '{vision_group}'）", "INFO")
+        else:
+            sys_prompt = "你是一个专业图像解析器。请将用户提供的图片内容转化为极其详细的文字描述（包括画面细节、OCR文字、代码片段等），只输出文字描述，不要有多余的客套话。"
+            translation_msgs.insert(0, {"role": "system", "content": sys_prompt})
+
+            for v_ep in vision_eps:
+                v_label = self._endpoint_log_label(v_ep, vision_group, v_ep.model)
+                sys_log(f"启动图片解析 -> 视觉池 '{vision_group}' 端点 '{v_label}'", "INFO")
+                payload = {"model": v_ep.model, "messages": translation_msgs, "stream": False, "max_tokens": 4096}
+                result, error = self._try_endpoint(
+                    v_ep, payload, timeout=60, log_usage=True, force_no_retry=True,
+                    pool_group=vision_group, request_id=request_id,
+                    request_deadline=request_deadline,
+                )
+                if error:
+                    sys_log(f"图片解析端点 '{v_label}' 请求失败: {error}", "WARNING")
+                    # 失败写阶梯短冷却（幂等：已冷却不刷新），避免坏端点让每个图片请求重复付 60s 超时
+                    with self._lock:
+                        v_ep._fail_count = int(v_ep._fail_count or 0) + 1
+                        self._set_probe_cooldown(v_ep, 60, 600)
+                        v_ep._cooldown_reason = "vision_translate_failed"
+                    continue
+
+                if isinstance(result, str):
+                    description = result
+                    result_message = {}
+                elif isinstance(result, dict):
+                    result_message = (result.get("choices") or [{}])[0].get("message") or {}
+                    description = result_message.get("content") or ""
+                else:
+                    result_message = {}
+                    description = ""
+                if not description.strip():
+                    reasoning = result_message.get("reasoning_content") or ""
+                    if reasoning:
+                        description = reasoning
+                if description:
+                    with self._lock:
+                        v_ep._fail_count = 0
+                        v_ep._cooldown_until = 0
+                        v_ep._cooldown_reason = ""
+                    break
+
+            if not description:
+                sys_log(f"视觉池 '{vision_group}' 内所有端点图片解析均失败", "ERROR")
+                return messages
+
+            self._vision_cache_set(cache_key, description)
+
+        new_msgs = _copy.deepcopy(messages)
         for m in new_msgs:
             if isinstance(m.get("content"), list):
                 has_image = False
@@ -4357,8 +4482,13 @@ class APIPool:
             
             # [VISION TRANSLATION INTERCEPT]
             if self._has_images(payload["messages"]) and getattr(ep, "is_vision", True) is False:
-                has_vision = any(getattr(e, "is_vision", True) for e in active)
-                if has_vision:
+                vision_cands, vision_grp = self._vision_pool_candidates()
+                if not vision_cands:
+                    # 降级策略 B（2026-09-10）：视觉池无可用端点 → 图片原样直发，
+                    # 打一次 WARNING 保持可观测；不回退"组内任意 is_vision 端点"。
+                    _why = "未配置图片解析池" if not vision_grp else f"图片解析池 '{vision_grp}' 无可用端点"
+                    sys_log(f"{_why}，图片未转译，原样转发目标端点", "WARNING")
+                else:
                     if payload.get("stream"):
                         def vision_wrapper(tgt_ep, pld, t_out, a_eps, _grp=group):
                             import json
@@ -4386,10 +4516,10 @@ class APIPool:
                                 yield from gen
                                 with self._lock:
                                     self._release_inflight(tgt_ep.id, group)
-                        return vision_wrapper(ep, payload, ep_timeout, active)
+                        return vision_wrapper(ep, payload, ep_timeout, vision_cands)
                     else:
                         payload["messages"] = self._translate_images_sync(
-                            payload["messages"], active, group,
+                            payload["messages"], vision_cands, group,
                             request_id=request_id, request_deadline=request_deadline,
                         )
             
@@ -5621,9 +5751,31 @@ class APIPool:
         except Exception as e:
             raise e
 
+    @staticmethod
+    def _tiny_png_base64():
+        """合法 32x32 PNG（base64）。Qwen3-VL 系列要求图片尺寸 > 28px 且 PNG 校验严格；
+        旧 1x1 坏图（IDAT checksum 错误）会被 SiliconFlow 400 拒绝。"""
+        rows = []
+        for y in range(32):
+            row = bytearray([0])
+            for x in range(32):
+                row += bytes([(x * 8) % 256, (y * 8) % 256, 200])
+            rows.append(bytes(row))
+        raw = b"".join(rows)
+
+        def _chunk(tag, data):
+            chunk_body = tag + data
+            return struct.pack(">I", len(data)) + chunk_body + struct.pack(">I", zlib.crc32(chunk_body) & 0xffffffff)
+
+        png = (b"\x89PNG\r\n\x1a\n"
+               + _chunk(b"IHDR", struct.pack(">IIBBBBB", 32, 32, 8, 2, 0, 0, 0))
+               + _chunk(b"IDAT", zlib.compress(raw, 9))
+               + _chunk(b"IEND", b""))
+        return base64.b64encode(png).decode()
+
     def test_vision(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai", user_agent=""):
         ep = Endpoint(name="test_vision", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol, default_headers={"User-Agent": user_agent} if user_agent else {})
-        tiny_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwADhQGAWjR9awAAAABJRU5ErkJggg=="
+        tiny_png = self._tiny_png_base64()
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": [{"type": "text", "text": "describe this image in 3 words"}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{tiny_png}"}}]}],
@@ -6188,6 +6340,9 @@ def api_handler(method, path, body):
                 # 整组 fallback 锁剩余秒数（>0 = 该组正借道 main，UI 显示 ↩main）
                 "fallback_lock_remaining": max(0, int(_fb_until - time.time())) if _fb_until else 0,
                 "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)),
+                "role": pool._group_defs.get(grp, {}).get("role", ""),
+                # 图片解析池可用成员数（调度候选口径，与 _vision_pool_candidates 一致）
+                "available": len(pool._vision_pool_candidates()[0]) if pool._group_defs.get(grp, {}).get("role") == "vision" else 0,
             }
         return 200, {"chain": chain, "groups": group_summary}, False
     # ================= 组管理（2026-08-30）=================
@@ -6201,6 +6356,7 @@ def api_handler(method, path, body):
                 "name": grp,
                 "type": gd.get("type", "mixed"),
                 "model": gd.get("model", grp),
+                "role": gd.get("role", ""),
                 "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)),
                 "current_endpoint": cur_ep.name if cur_ep else None,
                 "is_main": grp == pool.MAIN_GROUP,
@@ -6210,7 +6366,8 @@ def api_handler(method, path, body):
         name = str(body.get("name", "")).strip()
         gtype = body.get("type", "mixed")
         model = str(body.get("model", "") or "").strip()
-        ok, msg = pool.create_group(name, gtype, model)
+        role = str(body.get("role", "") or "").strip()
+        ok, msg = pool.create_group(name, gtype, model, role)
         if not ok:
             return 400, {"error": msg}, False
         _sync_to_config()
@@ -6549,7 +6706,10 @@ def _sync_to_config():
     defs_list = [{"name": pool.MAIN_GROUP, **pool._group_defs[pool.MAIN_GROUP]}]
     for gname, gd in pool._group_defs.items():
         if gname != pool.MAIN_GROUP:
-            defs_list.append({"name": gname, "type": gd.get("type", "mixed"), "model": gd.get("model", gname)})
+            entry = {"name": gname, "type": gd.get("type", "mixed"), "model": gd.get("model", gname)}
+            if gd.get("role"):
+                entry["role"] = gd["role"]
+            defs_list.append(entry)
     save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
             "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list)
 

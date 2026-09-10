@@ -137,7 +137,11 @@ class RetryBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             pool = module.APIPool()
-            vision = module.Endpoint(id="vision", name="vision", model="vm", is_vision=True)
+            # 2026-09-10 视觉池组：候选来源 = role:vision 组，端点需入池
+            pool.create_group("vision-pool", "mixed", "api-pool-vision", "vision")
+            vision = module.Endpoint(id="vision", name="vision", model="vm", is_vision=True,
+                                     enabled=True, in_pool=True, pool_groups=["vision-pool"])
+            pool.add_endpoint(vision)
             calls = []
 
             def fake_try(*_args, **kwargs):
@@ -148,7 +152,7 @@ class RetryBoundaryTests(unittest.TestCase):
             deadline = time.time() + 30
             translated = pool._translate_images_sync(
                 [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:x"}}]}],
-                [vision], "main", request_id="visionreq", request_deadline=deadline,
+                [vision], "vision-pool", request_id="visionreq", request_deadline=deadline,
             )
             self.assertIn("图片解析内容", translated[0]["content"][-1]["text"])
             self.assertEqual(calls[0]["request_id"], "visionreq")
