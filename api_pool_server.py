@@ -3834,6 +3834,68 @@ class APIPool:
     def _has_developer_role(messages):
         return any(isinstance(m, dict) and m.get("role") == "developer" for m in messages)
 
+    # DeepSeek thinking 模式（带 tools 时）的严格校验 400 签名（2026-09-10）。
+    # 观测：V4.1-Flash 起，中转/上游对历史形态的校验更严格，同一 payload 在不同
+    # 上游实例上时通时不通；命中后同端点重试一次（第二次显式关闭 thinking）比直接
+    # 轮转换成换模型更省事，也不改变请求所属端点。
+    _STRICT_VALIDATION_MARKERS = (
+        "must be passed back",
+        "must be followed by tool messages",
+        "insufficient tool messages",
+    )
+
+    @classmethod
+    def _is_strict_validation_400(cls, error_msg):
+        """识别 DeepSeek thinking 模式的严格校验 400（reasoning_content / tool 配对）。"""
+        lower = str(error_msg or "").lower()
+        if not lower.startswith("http 4"):
+            return False
+        return any(marker in lower for marker in cls._STRICT_VALIDATION_MARKERS)
+
+    @staticmethod
+    def _repair_dangling_tool_calls(messages):
+        """给未被 tool 消息应答的 assistant tool_calls 补合成结果（新列表）。
+
+        DeepSeek 校验「assistant tool_calls 后必须跟齐每条 tool_call_id 的 tool 消息」，
+        中断/异常历史的悬空 tool_call 会触发 400。合成结果仅补齐结构，不伪造业务内容。
+        """
+        out = []
+        pending = []  # [(msg_index_in_out, tool_call_id)]
+        for m in messages:
+            if not isinstance(m, dict):
+                out.append(m)
+                continue
+            role = m.get("role")
+            if role == "assistant":
+                out.append(m)
+                for tc in (m.get("tool_calls") or []):
+                    tc_id = tc.get("id") or ""
+                    if tc_id:
+                        pending.append((len(out) - 1, tc_id))
+            elif role == "tool":
+                tc_id = m.get("tool_call_id") or ""
+                if tc_id:
+                    pending = [p for p in pending if p[1] != tc_id]
+                out.append(m)
+            else:
+                out.append(m)
+        if not pending:
+            return messages
+        # 把合成结果插到各自 assistant 消息之后（保持原有顺序的稳定重建）
+        by_assistant = {}
+        for _, tc_id in pending:
+            by_assistant.setdefault(_, []).append(tc_id)
+        rebuilt = []
+        for i, m in enumerate(out):
+            rebuilt.append(m)
+            for tc_id in by_assistant.get(i, []):
+                rebuilt.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": "[tool call aborted — no result was produced]",
+                })
+        return rebuilt
+
     def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False, health_impact=True, group=None,
                 expected_route_epoch=None, request_id=None):
         grp = group or self.MAIN_GROUP
@@ -4172,6 +4234,8 @@ class APIPool:
         errors = []
         client_error_tried = set()  # 本请求内已因客户端类错误轮转过的端点（防不冻结路径死循环）
         role_downgraded = False  # 已因角色不兼容 400 触发 developer→system 降级（每请求一次）
+        strict_validation_retries = 0  # DeepSeek 严格校验 400 的同端点重试次数（上限 2）
+        disable_thinking_forced = False  # 严格校验重试第 2 次起显式关闭 thinking
         tried = 0
         total = len(active)
         # 按优先级排序：每次从最高优先级端点开始尝试，故障自动降级，恢复后自动回迁
@@ -4200,9 +4264,10 @@ class APIPool:
                         seen_tc_ids.add(tc.get("id", ""))
                 fixed.append(m)
             messages = fixed
+        # 悬空 tool_calls（assistant 有 tool_calls 但缺对应 tool 结果）→ 补合成结果：
+        # DeepSeek 校验「tool_calls 后必须跟齐每条 tool_call_id」（2026-09-10 观测）。
+        messages = self._repair_dangling_tool_calls(messages)
 
-        
-        # 补全 reasoning_content：找到最后一个 assistant 消息，如果没有则注入缓存值
         # 当前端点保持粘性：无明确故障/手动切换/恢复回迁时，后续请求继续使用
         # 最近成功或故障转移选中的端点，而不是每次回到最高优先级端点。
         # 分组池：粘性指针按组读取（fallback 到 main 后读 main 组指针）。
@@ -4279,7 +4344,11 @@ class APIPool:
             # preserved_thinking 开关：注入 clear_thinking=False 开启保留式思考
             if not is_anthropic:
                 self._map_reasoning_effort(payload, ep)
-                if getattr(ep, "preserved_thinking", False):
+                if disable_thinking_forced:
+                    # 严格校验重试第 2 次：显式关闭 thinking，绕开 reasoning_content
+                    # 回传校验（历史形态不变时唯一可靠的方式，2026-09-10）
+                    payload["thinking"] = {"type": "disabled"}
+                elif getattr(ep, "preserved_thinking", False):
                     t = payload.get("thinking")
                     if isinstance(t, dict):
                         t["clear_thinking"] = False
@@ -4438,6 +4507,26 @@ class APIPool:
             # 探活(ping max_tokens=3) 无法鉴别网关故障：小请求通过≠真实请求可用，
             # 避免"探活通过→重试超时"空转。超时/连接错误仍走探活（瞬态防误杀）。
             gateway_error = any(f"HTTP {c}" in error for c in ("502", "503", "504"))
+            # DeepSeek thinking 严格校验 400（2026-09-10，V4.1-Flash 起观测）：同端点重试
+            # 一次；第二次显式关闭 thinking（历史形态不变时唯一可靠的绕开方式）。
+            # 放在冻结/轮转之前：这两类错误是客户端类（不冻结、不计账），且证据显示
+            # 相邻请求在同一端点上时通时不通 —— 先原地重试比直接换成别的模型代价小。
+            # 上限 2 次，避免与 _rotate 的轮转预算叠加成空转。
+            if self._is_strict_validation_400(error) and strict_validation_retries < 2:
+                strict_validation_retries += 1
+                if strict_validation_retries >= 2:
+                    disable_thinking_forced = True
+                sys_log(
+                    f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 命中 DeepSeek 严格校验 400，"
+                    f"同端点重试（第 {strict_validation_retries}/2 次"
+                    f"{'，本次关闭 thinking' if disable_thinking_forced else ''}）",
+                    "WARN",
+                )
+                # 释放本尝试的在途占用，循环顶部会重新 acquire（否则计数器泄漏）
+                with self._lock:
+                    self._release_inflight(ep.id, group)
+                idx = active.index(ep)
+                continue
             # _try_endpoint 内部已按 max_retries 重试完毕，直接冻结+轮转
             with self._lock:
                 # 端点级活跃判定（2026-08-14）：超时类错误但端点在 timeout 窗口内

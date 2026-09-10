@@ -202,6 +202,7 @@
 - [x] **请求控制路径可解释性** — DEBUG 请求级诊断已完成。DEBUG 关闭时不增加额外 payload 遍历、网络请求、探针、重试、线程或路由动作；DEBUG 开启时记录端点尝试、内部重试、端点切换和最终状态，不记录完整敏感请求内容，也不逐 chunk 记录流式响应。
 - [x] **探活失败阶梯冷却（2026-09-01）** — 探活失败按连续失败次数线性递增冻结时长：请求路径 30s 起步封顶 30 分钟，后台探活 cooldown_minutes×抖动起步封顶 1 小时；成功/探活通过即复位。生产 hash `1cc570e3`。
 - [x] **普通故障阶梯冷却（2026-09-01）** — 普通故障（5xx/连接错误/假成功）在原有抖动机制上叠加线性阶梯：cooldown_minutes×抖动×连续失败次数，封顶 1 小时；抖动机制原样保留。生产 hash `de58a08c`。
+- [x] **DeepSeek 严格校验 400 防御（2026-09-10，V4.1-Flash 发布日）** — 观测到三类上游校验 400（`reasoning_content must be passed back` / `must be followed by tool messages` / `content-blocked`），同端点相邻请求时通时不通。修复：① 预检修复悬空 tool_calls（`_repair_dangling_tool_calls` 补合成 tool 结果）；② 命中严格校验签名时同端点重试（上限 2 次，第 2 次显式 `thinking: disabled` 绕开回传校验），不直接轮转换模型；inflight 计数在重试前释放防泄漏。270 测试通过（1 个环境相关失败与 HEAD 相同）。生产 hash `5b87d65c`。根因知识 → skill `references/deepseek-reasoning-400-2026-09-10.md`。
 
 #### P1：真实问题驱动的复核
 
