@@ -1351,16 +1351,18 @@ def _responses_usage_from_chat_usage(usage):
     }
 
 
-def _chat_content_to_responses_content(content):
+def _chat_content_to_responses_content(content, text_type="input_text"):
+    # Responses 校验：assistant 正文只能是 output_text/refusal，user/system 才是
+    # input_text（ps.air-outer 严格校验，assistant 带 input_text 直接 400）。
     if isinstance(content, str):
-        return [{"type": "input_text", "text": content}]
+        return [{"type": text_type, "text": content}]
     parts = []
     for c in content or []:
         if not isinstance(c, dict):
             continue
         ctype = c.get("type")
         if ctype == "text":
-            parts.append({"type": "input_text", "text": c.get("text", "")})
+            parts.append({"type": text_type, "text": c.get("text", "")})
         elif ctype == "image_url":
             raw_url = c.get("image_url") or {}
             if isinstance(raw_url, dict):
@@ -1394,7 +1396,7 @@ def _chat_messages_to_responses_input(messages):
                 items.append({
                     "type": "message",
                     "role": "assistant",
-                    "content": _chat_content_to_responses_content(content)
+                    "content": _chat_content_to_responses_content(content, "output_text")
                 })
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function") or {}
@@ -1458,6 +1460,12 @@ def _responses_body_from_chat(payload):
         if text:
             body["text"] = text
         body.pop("response_format", None)
+    # Hermes 顶层 reasoning_effort → Responses 的 reasoning.effort：chat/completions
+    # 下「tools + reasoning_effort」被上游拒（建议改用 /v1/responses），转成 Responses
+    # 体时必须带上推理强度，否则客户端设置被静默丢弃。minimal 上游不收，钳到 low。
+    effort = str(payload.get("reasoning_effort") or "").strip().lower()
+    if effort and "reasoning" not in body:
+        body["reasoning"] = {"effort": "low" if effort == "minimal" else effort}
     tools = _responses_tools_from_chat(payload.get("tools"))
     if "_responses_response_format" in payload:
         text = _chat_response_format_to_responses_text(payload["_responses_response_format"])
