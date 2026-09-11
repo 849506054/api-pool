@@ -1465,7 +1465,8 @@ def _responses_body_from_chat(payload):
     # 体时必须带上推理强度，否则客户端设置被静默丢弃。minimal 上游不收，钳到 low。
     effort = str(payload.get("reasoning_effort") or "").strip().lower()
     if effort and "reasoning" not in body:
-        body["reasoning"] = {"effort": "low" if effort == "minimal" else effort}
+        # summary=auto：Responses 只在显式请求摘要时返回推理文本（否则只有 encrypted_content）。
+        body["reasoning"] = {"effort": "low" if effort == "minimal" else effort, "summary": "auto"}
     tools = _responses_tools_from_chat(payload.get("tools"))
     if "_responses_response_format" in payload:
         text = _chat_response_format_to_responses_text(payload["_responses_response_format"])
@@ -1488,6 +1489,7 @@ def _responses_body_from_chat(payload):
 def _responses_output_to_chat_message(output):
     text = ""
     tool_calls = []
+    reasoning = ""
     for item in output or []:
         if not isinstance(item, dict):
             continue
@@ -1495,6 +1497,11 @@ def _responses_output_to_chat_message(output):
             for part in item.get("content") or []:
                 if isinstance(part, dict) and part.get("type") == "output_text":
                     text += part.get("text", "")
+        elif item.get("type") == "reasoning":
+            # Responses 的推理摘要 → chat 的 reasoning_content（需请求体带 reasoning.summary）
+            for part in item.get("summary") or []:
+                if isinstance(part, dict) and part.get("type") == "summary_text":
+                    reasoning += part.get("text", "")
         elif item.get("type") == "function_call":
             tool_calls.append({
                 "id": item.get("call_id", ""),
@@ -1504,7 +1511,7 @@ def _responses_output_to_chat_message(output):
                     "arguments": item.get("arguments", "") or ""
                 }
             })
-    return text, tool_calls
+    return text, tool_calls, reasoning
 
 
 def _responses_usage_to_chat_usage(usage):
@@ -5478,6 +5485,7 @@ class APIPool:
                         anthropic_stop_reason = None
                         anthropic_message_stopped = False
                         responses_event = ""
+                        responses_reasoning_seen = False
                         responses_tool_states = {}
 
                         def finish_chunk(reason):
@@ -5621,6 +5629,24 @@ class APIPool:
                                         if ctype == "response.output_text.delta":
                                             final_completion_text += chunk.get("delta", "")
                                             yield b"data: " + json.dumps({"choices": [{"delta": {"content": chunk.get("delta", "")}, "finish_reason": None}]}).encode() + b"\n\n"
+                                        elif ctype in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+                                            # Responses 的推理文本（需请求体带 reasoning.summary）→ chat 的 reasoning_content。
+                                            rdelta = chunk.get("delta", "") or ""
+                                            if rdelta:
+                                                responses_reasoning_seen = True
+                                                final_reasoning_text += rdelta
+                                                yield b"data: " + json.dumps({"choices": [{"delta": {"reasoning_content": rdelta}, "finish_reason": None}]}).encode() + b"\n\n"
+                                        elif ctype == "response.output_item.done":
+                                            # 兜底：部分上游不逐字下发摘要，只在 item 收尾时带完整 summary。
+                                            item = chunk.get("item") or {}
+                                            if item.get("type") == "reasoning" and not responses_reasoning_seen:
+                                                summary_text = "".join(
+                                                    p.get("text", "") for p in (item.get("summary") or [])
+                                                    if isinstance(p, dict) and p.get("type") == "summary_text")
+                                                if summary_text:
+                                                    responses_reasoning_seen = True
+                                                    final_reasoning_text += summary_text
+                                                    yield b"data: " + json.dumps({"choices": [{"delta": {"reasoning_content": summary_text}, "finish_reason": None}]}).encode() + b"\n\n"
                                         elif ctype == "response.output_item.added":
                                             item = chunk.get("item") or {}
                                             if item.get("type") == "function_call":
@@ -5638,8 +5664,22 @@ class APIPool:
                                             final_prompt_tokens = usage.get("input_tokens", 0) or 0
                                             final_completion_tokens = usage.get("output_tokens", 0) or 0
                                             final_total_tokens = usage.get("total_tokens", 0) or 0
+                                            # Responses usage 的缓存与推理明细：不解析则 stats 命中率恒 0
+                                            # （ps.air-outer 实际返回 input_tokens_details.cached_tokens）。
+                                            _in_details = usage.get("input_tokens_details") or {}
+                                            if isinstance(_in_details, dict) and _in_details.get("cached_tokens"):
+                                                final_cached_tokens = _in_details.get("cached_tokens") or 0
+                                            _out_details = usage.get("output_tokens_details") or {}
+                                            if isinstance(_out_details, dict) and _out_details.get("reasoning_tokens") is not None:
+                                                final_reasoning_tokens = _out_details.get("reasoning_tokens")
                                             yield finish_chunk("stop")
-                                            yield b"data: " + json.dumps({"choices": [], "usage": {"prompt_tokens": final_prompt_tokens, "completion_tokens": final_completion_tokens, "total_tokens": final_total_tokens}}).encode() + b"\n\n"
+                                            yield b"data: " + json.dumps({"choices": [], "usage": {
+                                                "prompt_tokens": final_prompt_tokens,
+                                                "completion_tokens": final_completion_tokens,
+                                                "total_tokens": final_total_tokens,
+                                                "prompt_tokens_details": {"cached_tokens": final_cached_tokens},
+                                                "completion_tokens_details": {"reasoning_tokens": final_reasoning_tokens or 0},
+                                            }}).encode() + b"\n\n"
                                     except Exception:
                                         continue
                                     responses_event = ""
@@ -5819,11 +5859,25 @@ class APIPool:
                 else:
                     body = json.loads(resp.read().decode("utf-8"))
                     if is_responses:
-                        response_text, response_tools = _responses_output_to_chat_message(body.get("output", []))
+                        response_text, response_tools, response_reasoning = _responses_output_to_chat_message(body.get("output", []))
                         response_message = {"role": "assistant", "content": response_text}
+                        if response_reasoning:
+                            response_message["reasoning_content"] = response_reasoning
                         if response_tools:
                             response_message["tool_calls"] = response_tools
                         response_usage = _responses_usage_to_chat_usage(body.get("usage"))
+                        if log_usage and not ep.name.startswith("test_"):
+                            # 非流式 responses 分支此前直接返回、完全不记账（token_stats 无行）。
+                            _cached = (response_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+                            _reasoning = (response_usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+                            stats_cached = 0 if reset_cached_stats else _cached
+                            token_tracker.add_usage(ep.name, ep.model, response_usage.get("prompt_tokens", 0),
+                                                    response_usage.get("completion_tokens", 0),
+                                                    response_usage.get("total_tokens", 0), stats_cached)
+                            chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, (response_text or "").strip(),
+                                                response_usage.get("total_tokens", 0), int((time.time() - req_t0) * 1000),
+                                                pool_group, response_usage.get("prompt_tokens", 0), stats_cached, _reasoning)
+                            self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
                         return {
                             "id": body.get("id", f"chatcmpl-{int(time.time())}"),
                             "object": "chat.completion",
@@ -7161,7 +7215,7 @@ def _handle_responses(body):
         chat_body = result if isinstance(result, dict) else {"choices": [{"message": {"role": "assistant", "content": str(result or "")}}]}
         choices = chat_body.get("choices") or []
         message = (choices[0].get("message") or {}) if choices else {}
-        text, _ = _responses_output_to_chat_message([{
+        text, _, _ = _responses_output_to_chat_message([{
             "type": "message", "content": [{"type": "output_text", "text": message.get("content") or ""}]
         }])
         response_obj = _responses_response_object(

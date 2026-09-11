@@ -49,11 +49,11 @@ def test_assistant_content_is_output_text():
 def test_reasoning_effort_passthrough():
     body = m._responses_body_from_chat({"messages": [{"role": "user", "content": "hi"}],
                                         "reasoning_effort": "medium"})
-    assert body["reasoning"] == {"effort": "medium"}, body.get("reasoning")
+    assert body["reasoning"] == {"effort": "medium", "summary": "auto"}, body.get("reasoning")
     # Hermes 可发 minimal，上游只收 none/low/medium/high/xhigh/max → 钳到 low
     body = m._responses_body_from_chat({"messages": [{"role": "user", "content": "hi"}],
                                         "reasoning_effort": "MINIMAL"})
-    assert body["reasoning"] == {"effort": "low"}, body.get("reasoning")
+    assert body["reasoning"] == {"effort": "low", "summary": "auto"}, body.get("reasoning")
     # 没有显式值时不下发，交上游默认
     body = m._responses_body_from_chat({"messages": [{"role": "user", "content": "hi"}]})
     assert "reasoning" not in body, body.get("reasoning")

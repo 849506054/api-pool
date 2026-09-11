@@ -254,12 +254,20 @@ class ResponsesUpstreamMock(BaseHTTPRequestHandler):
                     "name": "get_weather",
                     "arguments": "{\"city\":\"Beijing\"}",
                     "output": None
+                }, {
+                    "id": "rs_up_1",
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "rsn-stream"}]
                 }],
                 "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
-                          "input_tokens_details": {"cached_tokens": 1}}
+                          "input_tokens_details": {"cached_tokens": 1},
+                          "output_tokens_details": {"reasoning_tokens": 3}}
             }
             events = [
                 ("response.created", {"type": "response.created", "response": response}),
+                ("response.reasoning_summary_text.delta", {"type": "response.reasoning_summary_text.delta",
+                                                          "item_id": "rs_up_1", "output_index": 1,
+                                                          "summary_index": 0, "delta": "rsn-stream"}),
                 ("response.output_text.delta", {"type": "response.output_text.delta",
                                                 "item_id": "msg_up_1", "output_index": 0,
                                                 "content_index": 0, "delta": "checking"}),
@@ -290,10 +298,13 @@ class ResponsesUpstreamMock(BaseHTTPRequestHandler):
                      "content": [{"type": "output_text", "text": "checking", "annotations": []}]},
                     {"id": "fc_up_1", "type": "function_call", "status": "completed",
                      "call_id": "call_up_1", "name": "get_weather",
-                     "arguments": "{\"city\":\"Beijing\"}", "output": None}
+                     "arguments": "{\"city\":\"Beijing\"}", "output": None},
+                    {"id": "rs_up_1", "type": "reasoning",
+                     "summary": [{"type": "summary_text", "text": "rsn-plain"}]}
                 ],
                 "usage": {"input_tokens": 12, "output_tokens": 7, "total_tokens": 19,
-                          "input_tokens_details": {"cached_tokens": 2}}
+                          "input_tokens_details": {"cached_tokens": 2},
+                          "output_tokens_details": {"reasoning_tokens": 4}}
             }
             data = json.dumps(resp).encode("utf-8")
             self.send_response(200)
@@ -620,6 +631,81 @@ def test_regression_chat_and_health_call_sites():
     server.server_close()
 
 
+class _UsageRecorder:
+    """替换模块级 token_tracker / chat_logger，拦截记账实参。"""
+
+    def __init__(self):
+        self.usage = []
+        self.logs = []
+
+    def add_usage(self, *args, **kwargs):
+        self.usage.append(args)
+
+    def add_log(self, *args, **kwargs):
+        self.logs.append(args)
+
+
+def test_responses_upstream_usage_accounting():
+    """responses 协议上游的 usage 明细（缓存/推理）必须进记账并透传给客户端。
+
+    2026-09-12 修：流式分支只解析 input/output/total，cached_tokens 恒 0；
+    非流式分支直接返回、完全不记账。两组数值取自 ResponsesUpstreamMock
+    （流式 cached=1/reasoning=3，非流式 cached=2/reasoning=4）。
+    """
+    server, port = start_server(ResponsesUpstreamMock)
+    set_pool(f"http://127.0.0.1:{port}", protocol="responses", name="resp_acc_up")
+    app_server = m.ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
+    threading.Thread(target=app_server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{app_server.server_address[1]}"
+
+    recorder = _UsageRecorder()
+    orig_usage, orig_logger = m.token_tracker, m.chat_logger
+    m.token_tracker, m.chat_logger = recorder, recorder
+    try:
+        def last(endpoint, rows):
+            hits = [r for r in rows if r and r[0] == endpoint]
+            assert hits, f"no accounting row for {endpoint}"
+            return hits[-1]
+
+        # 非流式：客户端 usage 带 details；记账 cached=2 / reasoning=4
+        status, _, body = request(base, "POST", "/v1/chat/completions",
+                                  {"messages": [{"role": "user", "content": "hi"}],
+                                   "reasoning_effort": "high"})
+        assert status == 200
+        payload = json.loads(body)
+        usage = payload["usage"]
+        assert usage["prompt_tokens_details"]["cached_tokens"] == 2, usage
+        assert payload["choices"][0]["message"]["reasoning_content"] == "rsn-plain"
+        assert ResponsesUpstreamMock.calls[-1]["reasoning"] == {"effort": "high", "summary": "auto"}
+        assert last("resp_acc_up", recorder.usage)[5] == 2
+        assert last("resp_acc_up", recorder.logs)[9] == 4
+
+        # 流式：末帧 usage 带 details；记账 cached=1 / reasoning=3；推理 delta 透传且不重复
+        status, _, body = request(base, "POST", "/v1/chat/completions",
+                                  {"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        assert status == 200
+        chunk_usage = None
+        reasoning_text = ""
+        for line in body.decode("utf-8").splitlines():
+            if not line.startswith("data: ") or line[6:].strip() == "[DONE]":
+                continue
+            obj = json.loads(line[6:])
+            if obj.get("usage"):
+                chunk_usage = obj["usage"]
+            for choice in obj.get("choices") or []:
+                reasoning_text += (choice.get("delta") or {}).get("reasoning_content") or ""
+        assert chunk_usage and chunk_usage["prompt_tokens_details"]["cached_tokens"] == 1, chunk_usage
+        assert reasoning_text == "rsn-stream", reasoning_text
+        assert last("resp_acc_up", recorder.usage)[5] == 1
+        assert last("resp_acc_up", recorder.logs)[9] == 3
+    finally:
+        m.token_tracker, m.chat_logger = orig_usage, orig_logger
+        app_server.shutdown()
+        app_server.server_close()
+        server.shutdown()
+        server.server_close()
+
+
 def main():
     check("inbound /v1/responses over OpenAI chat upstream (text/image/reasoning/stream)", test_inbound_openai_text)
     check("OpenAI chat upstream tool calls (non-stream + stream)", test_openai_tool_calls)
@@ -628,6 +714,7 @@ def main():
     check("store / previous_response_id / retrieve / delete chain", test_store_previous_reasoning_retrieve_delete)
     check("error cases", test_error_cases)
     check("chat completions regression + health call sites", test_regression_chat_and_health_call_sites)
+    check("responses upstream usage accounting (cached/reasoning tokens)", test_responses_upstream_usage_accounting)
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     failed = len(RESULTS) - passed
