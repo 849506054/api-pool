@@ -266,3 +266,25 @@ profile 管理弹层重做为列表/表单双视图（可编辑已有 profile、
 根因两条：① GLM-5.3 官方契约 `thinking.type` 仅支持 `enabled`（思考不可关闭），池侧只做了 `reasoning_effort` 数值映射，没有处理 `thinking` 形态——官方迁移建议是原发 `{"type":"disabled"}` 的调用方改为 `{"type":"enabled"}` + `reasoning_effort: "low"`；② 2026-09-10 严格校验防御的 `disable_thinking_forced` 是**请求级**标志，置真后轮转中的每个后续端点都被注入 `thinking={"type":"disabled"}`，轮到 GLM 即 400（跨端点污染）。
 修复：① 新增 `_normalize_glm_thinking`——GLM-5.3 系列把 `disabled`/`none`/`off` 折叠为 `{"type":"enabled"}` + `reasoning_effort: low`（显式档位不覆盖；数据式映射，与 Hermes `agent/reasoning_effort.py` 的 GLM53/OX_ALPHA 声明同型）；② 删除严格校验 400 的原第 2 次「显式关闭 thinking」重试，同端点重试维持**请求级总上限 1**——该类 400 校验的是历史消息形态（旧轮 assistant 的 `" "` 占位 reasoning_content），请求级 `thinking=disabled` 改不了已发历史，结构性无效（42h 窗口内 0 成功），且该字段会随轮转污染异构端点（本次 GLM 400 的直接触发路径）。
 验证：直连对照（未折叠原始 `disabled` 仍 400 原文一致；折叠后 `disabled`/`none`/`off` 均 200；显式 `high` 保留档位 200；preserved_thinking 注入体 200）；全量 36 个测试文件 0 失败（GLM 适配测试新增关闭思考映射与「不再注入 disabled thinking」护栏断言）；生产 hash 后端 `33636e88`；重启后无 ERROR/WARN、请求正常成功。改前备份 `backups/api_pool_server.py.20260911-231948.bak`（本轮首次部署前备份 `backups/api_pool_server.py.20260911-230616.bak`）。
+
+## 2026-09-12 chat/completions → Responses 桥接体形状修复（assistant 正文类型 + reasoning_effort 透传）已部署生产
+
+现象：5200 请求 `gpt-6-astra`（pool-gpt6 组，三端点 `protocol=responses`）连报两类 400 —— ① 默认 openai 协议下 `Function tools with reasoning_effort are not supported for gpt-6-astra in /v1/chat/completions`；② 端点切 responses 后 `Invalid value: 'input_text'. Supported values are: 'output_text' and 'refusal'`。
+
+根因：① 属上游模型能力约束（chat 下 tools 与 reasoning_effort 不可共存，正解为切 `/v1/responses`），池侧无缺陷；② 属池内桥接缺陷 —— `_chat_content_to_responses_content()` 对所有角色硬编码 `input_text`，assistant 历史消息正文（Responses 规范只收 `output_text`/`refusal`）被 ps.air-outer 严格校验拒绝，只在历史含 assistant 消息时触发，故单轮健康探针一直正常而真实流量全 400；三端点全 400 后按候选轮转由 `[main]AgentRouter-ds4f` 返回成功，表现为 200 而 `model=deepseek-v4-flash` 的静默降级。
+
+修复：① `_chat_content_to_responses_content(content, text_type="input_text")`，assistant 分支传 `output_text`（user/system 保持 `input_text`）；② `_responses_body_from_chat` 末端补顶层 `reasoning_effort` → Responses `reasoning.effort` 透传（客户端显式 `reasoning` 优先；`minimal` 上游不收，钳到 `low`），此前该键不在出站白名单、客户端推理强度被静默丢弃。
+
+验证：上游直连对照矩阵（assistant `input_text`+tools 400 与生产报错逐字一致 / `output_text`+tools 200 / 无 assistant 200 / `output_text`+tools+`reasoning.effort=high` 200；档位枚举 none/low/medium/high/xhigh/max/disabled 全 200，仅 `minimal` 400）；隔离实例对照组（未打补丁 3 条 400 ERROR + 降级 ds4f，打补丁 0 ERROR 首端点成功）；mock 上游捕获桥接后真实出站体（assistant=`output_text`、user=`input_text`、`reasoning={"effort":"medium"}`）；生产 5200 以「tools + assistant 历史 + `reasoning_effort=medium`」请求实测 `[pool-gpt6]AgentRouterP-gpt-6-astra` 首端点成功且回包 `model=gpt-6-astra`；全量 38 个测试文件 0 失败（新增 `test/test_responses_chat_bridge_shape.py`）。
+
+生产 hash 后端 `99dccd6a`（改前 `b6d8f17a`），备份 `api_pool_server.py.bak-20260912-0140-responses-bridge`，重启时间 2026-09-12 01:39。验证工具 `scripts/mock_responses_capture.py` / `scripts/fire_hermes_shape.py`；排查笔记见 skill references/responses-bridge-shape-fix-2026-09-12.md。
+
+## 2026-09-12 vision 池升为 main 同级内置组 + 组级上下文长度（纯显式）已部署生产
+
+vision 池定位修正：由「`role: vision` 标记的普通组」改为与 main 同级的系统内置池——系统内唯一、编辑分组弹窗的「用途（role）」配置项删除、前端聚合池与聚合链标签栏与 main 同位（🏊 main → 👁️ vision 恒置顶，同去专属蓝色徽章）。后端新增常量 `VISION_GROUP` / `VISION_SELECTOR`，加载时恒建 main(首位)+vision(次位)，旧 `role` 键一律忽略；内置组名称/类型/选择器/删除全锁（建同名报「保留名」）；`/api/groups`、`/api/chain` 以 `is_vision` 取代 `role`。
+
+组级上下文长度（池组声明 → Hermes 读取）：组实体新增 `context_k`（K=1000 tokens，0=不声明，边界 2K–10000K，纯显式无推导兜底）；对外经 `GET /v1/models` 的 `context_length` 暴露，新增 `GET /v1/models/{selector}`（未知 404），`GET /api/groups` 暴露 `context_k`，落盘 `pool_group_defs[].context_k` 并在加载时恢复（含 main）；main/vision 的 `context_k` 可改。前端分组弹窗新增「上下文长度 (K)」输入 + 原生 datalist 档位 256/400/512/1000K（可手填）。
+
+部署：后端 `b6d8f17a` / 前端 `c6e3d153`（01:27 重启；档位精简 01:30 热更新）。生产已填组值：main/pool-bg/pool-cron/pool-gpt6/pool-gpt5=1000K、vision=256K，`/v1/models` 已带 `context_length`。Hermes 侧 `config.yaml` 的 `model.context_length` 保持显式声明不变（该键是 Hermes 解析链第 1 级，未删除前池声明不生效；口径与判定依据见 skill references/group-context-population-2026-09-12.md）。
+
+验证：新增 `test/test_group_context_length.py` 8 项，全量 320 测试 0 失败（另 1 项预存环境错误：缺 `openai` 包）；隔离实例（5299 + HERMES_HOME 隔离）实测池值被 Hermes 真实解析器读出。工作区提交 `3bc75ee`。
