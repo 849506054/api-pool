@@ -59,6 +59,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .stat-item:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.2)}
 .stat-item .num{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
 .stat-item .label{font-size:10px;color:var(--text-dim);margin-top:2px;text-transform:uppercase;letter-spacing:.5px}
+.stat-item.clickable{cursor:pointer}
+.stat-item.active{border-color:var(--red);background:var(--red-dim)}
 
 .dash-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
 .dash-stat{position:relative;overflow:hidden;background:linear-gradient(145deg, rgba(255,255,255,0.03) 0%, rgba(255,255,255,0.01) 100%);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border:1px solid rgba(255,255,255,0.06);border-radius:16px;padding:20px;text-align:left;transition:transform .3s cubic-bezier(0.2,0.8,0.2,1),box-shadow .3s;box-shadow:0 4px 16px rgba(0,0,0,0.2)}
@@ -634,6 +636,7 @@ async function api(method,path,body){
 }
 
 let allModels=[],selectedModels=new Set(),latencyResults={},visionResults={};
+const ABN_FILTER='__abnormal__'; /* 异常筛选哨兵值：与站点筛选共用 epFilter */
 let epFilter='all',modelPage=1,PP=50;
 const endpointModelsCache=new Map();
 const ENDPOINT_MODELS_CACHE_MS=5*60*1000;
@@ -695,11 +698,14 @@ function renderStats(eps){
   const t=eps.length,en=eps.filter(e=>e.enabled).length,h=eps.filter(e=>e.health==='ok').length;
   const cl=eps.filter(e=>e.in_cooldown).length,bad=eps.filter(e=>e.health==='bad').length;
   const calls=eps.reduce((s,e)=>s+e.total_calls,0);
+  const abn=epFilter===ABN_FILTER;
+  const abnCls=bad?(abn?' clickable active':' clickable'):'';
+  const abnAttr=bad?` onclick="setFilter('${abn?'all':ABN_FILTER}')" title="${abn?'点击返回全部端点':'点击仅显示异常端点'}"`:'';
   document.getElementById('stats').innerHTML=`
     <div class="stat-item"><div class="num">${t}</div><div class="label">端点</div></div>
     <div class="stat-item"><div class="num" style="color:var(--green)">${en}</div><div class="label">启用</div></div>
     <div class="stat-item"><div class="num" style="color:var(--green)">${h}</div><div class="label">健康</div></div>
-    <div class="stat-item"><div class="num" style="color:${bad?'var(--red)':'var(--text-dim)'}">${bad}</div><div class="label">异常</div></div>
+    <div class="stat-item${abnCls}"${abnAttr}><div class="num" style="color:${bad?'var(--red)':'var(--text-dim)'}">${bad}</div><div class="label">异常</div></div>
     <div class="stat-item"><div class="num" style="color:${cl?'var(--yellow)':'var(--text-dim)'}">${cl}</div><div class="label">冷却</div></div>
     <div class="stat-item"><div class="num" style="color:var(--blue)">${calls}</div><div class="label">调用</div></div>`;
 }
@@ -710,7 +716,8 @@ function renderFilterBar(eps){
     const site=String(ep.site_name||'').trim();
     if(site)sites.set(site,(sites.get(site)||0)+1);
   }
-  if(epFilter!=='all'&&!sites.has(epFilter))epFilter='all';
+  if(epFilter===ABN_FILTER&&!eps.some(e=>e.health==='bad'))epFilter='all';
+  if(epFilter!=='all'&&epFilter!==ABN_FILTER&&!sites.has(epFilter))epFilter='all';
   document.getElementById('filterBar').innerHTML=`
     <button class="filter-btn ${epFilter==='all'?'active':''}" onclick="setFilter('all')">全部 ${eps.length}</button>
     ${[...sites.entries()].sort((a,b)=>a[0].localeCompare(b[0])).map(([site,count])=>`<button class="filter-btn ${epFilter===site?'active':''}" data-site="${escAttr(site)}">${esc(site)} ${count}</button>`).join('')}
@@ -726,7 +733,8 @@ function hBadge(h,lat){
 }
 
 function renderEndpoints(eps){
-  if(epFilter!=='all')eps=eps.filter(e=>String(e.site_name||'').trim()===epFilter);
+  if(epFilter===ABN_FILTER)eps=eps.filter(e=>e.health==='bad');
+  else if(epFilter!=='all')eps=eps.filter(e=>String(e.site_name||'').trim()===epFilter);
 
   const c=document.getElementById('filterCount');if(c)c.textContent=`${eps.length} 个`;
   const el=document.getElementById('epList');
