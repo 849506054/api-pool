@@ -4,9 +4,9 @@
 
 ![API Pool 2.0 概览](docs/api-pool2-poster-16x9.png)
 
-> **定位**：API Pool 2.0 对外提供稳定的 OpenAI-compatible Chat Completions 入口，
-> 对内按 Endpoint 配置进行模型路由、协议转换、健康管理、故障转移和统计。Endpoint
-> 可以使用不同的模型和协议，不要求整个池只服务于某一种模型。
+> **定位**：API Pool 2.0 对外提供稳定的 OpenAI-compatible 入口（Chat Completions 与
+> Responses 两种协议），对内按 Endpoint 配置进行分组路由、协议转换、健康管理、故障转移
+> 和统计。Endpoint 可以使用不同的模型和协议，不要求整个池只服务于某一种模型。
 
 ![Python](https://img.shields.io/badge/Python-3.13-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -18,16 +18,19 @@
 ## 核心功能
 
 - **Endpoint 集中管理** — UI 可视化维护多个上游 Endpoint，各自配置 URL、Key、模型、协议、代理和兼容参数
+- **池组隔离路由** — 端点可加入多个分组，每个分组独立维护选择器、优先级、当前端点与兜底锁；子组端点失效时可回落到 main 组，手动切换只影响当前组
 - **自动健康检测** — 内置周期性连通性检测和 Endpoint 状态管理，避免把请求持续发送到不可用上游
 - **优先级调度与故障转移** — 按 priority 选择 Endpoint，支持失败重试、冷却、恢复探活和自动回迁
+- **手动切换（⚡）** — 端点卡片一键把目标端点设为该组当前工作端点，并按真实请求结果重新判定其状态（含解冻）
 - **延迟回迁（Deferred Failback）** — 上游恢复后可延迟回迁，减少切换造成的 prompt cache 损失；当前端点再次故障时，延迟回迁端点仍可作为故障转移目标；支持 Endpoint 级开关 `deferrable`
 - **上下文长度限制（Endpoint 可选）** — 配置 `max_context_k` 后，超出 Endpoint 上限的请求会跳过该 Endpoint
-- **多协议转换** — 对外统一 OpenAI-compatible 接口，可管理 OpenAI-compatible 与 Anthropic 上游 Endpoint；已验收文本、流式、工具调用、多轮工具结果、跨协议工具历史、base64 PNG 图片和 Hermes 实际工具循环，详见 [`docs/anthropic-compatibility-matrix.md`](docs/anthropic-compatibility-matrix.md)
-- **多模态兼容处理** — 目标 Endpoint 不支持视觉时，可配置视觉模型进行图片预处理
+- **多协议入口与上游桥接** — 入站支持 `/v1/chat/completions` 与 `/v1/responses`；上游 Endpoint 可按 `openai` / `anthropic` / `responses` 三种协议接入并在同一次请求内跨协议桥接。已验收文本、流式、工具调用、多轮工具结果、跨协议工具历史、base64 PNG 图片和 Hermes 实际工具循环，详见 [`docs/anthropic-compatibility-matrix.md`](docs/anthropic-compatibility-matrix.md)
+- **视觉池组** — 图片转译的候选来源是专用分组（`role: vision`，全池唯一），不再从请求所在组内任意抓取视觉端点；该分组无可用成员时图片原样转发
 - **工具调用兼容** — 支持 tool call 转换、工具结果回传，以及按 Endpoint 配置 `tool_call_id_prefix` 修正跨上游切换后的 ID 格式
-- **入口敏感词过滤** — 请求进入路由前统一清洗已知字段，覆盖普通消息、多模态文本、reasoning、消息名称和工具调用参数；范围可配置，默认不扫描整个 payload
+- **客户端伪装（client_profile）** — Endpoint 级出站头伪装，三态：透传客户端原头 / `auto` 按入站客户端 UA 自动匹配 profile / 指定静态 profile；用于通过上游的客户端指纹校验
+- **入口敏感词过滤** — 请求进入路由前统一清洗已知字段，覆盖普通消息、多模态文本、reasoning、消息名称和工具调用参数；范围可配置，默认不扫描整个 payload；管理面板 `🛡 敏感词过滤` 可视化维护并热重载
 - **独立入口与内部路由** — Hermes 只需连接稳定的 `api-pool` 入口模型名，API Pool 2.0 使用目标 Endpoint 自己的 `model` 转发
-- **统计大盘** — Token 消耗、缓存命中、请求数趋势
+- **统计大盘** — Token 消耗、缓存命中、请求数趋势；「异常」统计卡可点击筛选异常端点
 - **零依赖** — 只需 Python 3.13，单文件即可运行
 
 ## 快速开始
@@ -38,12 +41,20 @@ cd api-pool
 python api_pool_server.py
 ```
 
-访问 http://localhost:5200 打开 API Pool 2.0 管理面板。
-API 接口：http://localhost:5200/v1/chat/completions
+启动后（默认端口 `5100`，可用 `API_POOL_PORT` 覆盖）：
+
+- 管理面板：http://localhost:5100
+- API 入口：http://localhost:5100/v1/chat/completions
+
+在管理面板添加 Endpoint 并点「📥」入池后，用分组入口模型名调用：main 组为 `api-pool`，其他分组的选择器见分组标签与 `GET /v1/models`。
+
+完整使用说明见 [Wiki](https://github.com/849506054/api-pool/wiki)。
 
 ## 入口敏感词过滤
 
 API Pool 可在请求进入 Endpoint 路由前执行一次统一清洗，避免同一份请求在重试或故障转移时重复处理。过滤器只修改请求副本，不改变客户端原始 payload；词典加载或执行失败时拒绝请求，不会降级放行未清洗内容。
+
+规则在管理面板右上角 `🛡 敏感词过滤` 中可视化维护，保存后服务端**热重载生效，无需重启**。
 
 ### 私有配置文件
 
@@ -105,10 +116,76 @@ content_filter.json
 
 ### 维护与部署注意事项
 
+- 改配置优先走管理面板或管理 API：`GET /api/content-filter` 读取、`PUT /api/content-filter` 保存（写前时间戳备份 → 原子写 → 热重载校验，结构无效自动回滚并返回 400）、`POST /api/content-filter/test` 用样例文本试跑当前规则。
 - `content_filter.json` 是客户私有配置，不进入 Git 流程；规则原文不得写入 README、源码、测试或日志。
 - 工具层可能对敏感词 `pattern` 自动脱敏。写入规则时，必须避免让待替换的 `pattern` 被错误改写；禁止把经过脱敏的工作区副本当成生产词典。
 - 部署前后应比较每条规则的类型、pattern/replacement 长度和脱敏后的 SHA-256 指纹，不打印规则原文。
 - 如果预期是替换规则，却出现 `pattern == replacement`，应立即停止部署并从宿主机备份恢复规则，再只做字段级修改。
+
+## 池组与选择器
+
+- 每个分组对外暴露一个**选择器**（客户端填写的模型名）：`mixed` 组的选择器由组定义（缺省=组名），`dedicated` 组的选择器就是绑定的真实模型名。
+- `main` 组始终存在，类型固定 `mixed`、选择器固定 `api-pool`；不做特殊分组的端点默认归入 main 组。
+- 每个分组独立维护：当前端点指针、手动切换、组内优先级（`priority_by_group`）、延迟回切锁与兜底锁。子组端点全部失效时按优先级回落 main 组端点；手动切换只影响当前组。
+- `GET /v1/models` 返回全部组选择器，可直接当作当前可用模型目录。
+- 分组带**用途**字段：`普通分组` 或 `图片解析池（role: vision）`。后者是图片转译的唯一来源，全池最多一个；该池无可用成员时图片原样转发给目标 Endpoint。
+
+## 协议支持
+
+| 层 | 取值 |
+|---|---|
+| 入站接口 | `POST /v1/chat/completions`、`POST /v1/responses`，另有 `GET /v1/models` 与 `GET`/`DELETE /v1/responses/{id}` |
+| 上游 `protocol` | `openai`（`/chat/completions`）、`anthropic`（`/messages`）、`responses`（`/responses`） |
+
+同协议保真透传，跨协议按需转换（消息体、流式、工具调用与工具历史、图片）。`protocol` 为纯手动配置，无自动检测：「🔍 获取模型」按钮始终按 `GET {base}/models` 请求，拉取成功不代表协议选对。
+
+## 客户端伪装（client_profile）
+
+部分上游校验客户端指纹或 UA 白名单（UA 不符可能直接 401/403）。Endpoint 级 `client_profile` 提供三态出站头伪装：
+
+| 取值 | 行为 |
+|---|---|
+| 空（默认） | 不伪装，透传客户端原始请求头；UA 缺失时回退默认库标识 |
+| `auto` | 按入站客户端 UA 匹配已注册 profile，命中即应用 |
+| profile 名 | 固定使用该 profile 的头集合 |
+
+出站头合并优先级：客户端 UA → profile → `default_headers` → `extra_headers`。`Host`、`Content-Length`、`Authorization`、`x-api-key`、`anthropic-version` 为保留头，profile 不可覆盖。内建 `hermes` profile 取自 Hermes 真实出站头样本；自定义 profile 在端点表单 `⚙️` 弹层维护，保存在 `api_config.json` 的 `client_profiles` 键。启用 `Accept-Encoding: gzip, deflate` 时由服务端解压上游响应（含 SSE 流）。
+
+## 端点配置字段
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| 站点名称 `site_name` | string | 空 | 端点列表按站点筛选；同一站点的多个端点填相同名称 |
+| 端点名称 `name` | string | 自动识别 | 留空时随 Base URL 输入自动补全 |
+| 上游地址 `base_url` | string | - | 按 `protocol` 填写对应入口的 API 根地址 |
+| 上游密钥 `api_key` | string | - | 该上游的密钥，不是客户端连 API Pool 的网关密钥 |
+| 模型 `model` | string | `gpt-4o-mini` | 发送给该上游的真实模型名；不被入口选择器覆盖 |
+| 协议 `protocol` | string | `openai` | `openai` / `anthropic` / `responses` |
+| 优先级 `priority` | int | `999` | 组内优先级，数值小者优先；各组值存于 `priority_by_group` |
+| 单次超时 `timeout` | int（秒） | `60` | 连接、上传请求体、等待响应头超时 |
+| 额外重试 `max_retries` | int | `1` | 可恢复错误时同一端点内重发完整请求的次数 |
+| 冷却 `cooldown_minutes` | int（分钟） | `5` | 失败后进入冷却的时长 |
+| 启用 `enabled` | bool | `true` | 停用后不参与任何路由 |
+| 加入聚合池 `in_pool` | bool | `false` | 未入池的端点不参与路由与故障转移 |
+| 入池分组 `pool_groups` | list | `[]` | 端点加入的分组；入池未指定时归入 `main` |
+| 延迟回迁 `deferrable` | bool | `true` | `true`=本端点工作时延迟切走（保护缓存） |
+| 上下文限制 `max_context_k` | int（K tokens） | `0` | 请求超限时自动跳过该端点，`0`=不限 |
+| 代理 `use_proxy` | bool | `false` | 是否随系统代理转发请求 |
+| 客户端伪装 `client_profile` | string | 空 | 三态：空=透传 / `auto`=动态识别 / profile 名=静态 |
+| 原生视觉 `is_vision` | bool | `false` | 标记端点原生支持视觉，图片直接透传 |
+| 假成功检测 `check_fake_success` | bool | `false` | 检测 200 OK 但内容为拒绝的「假成功」 |
+| ToolCall ID 前缀 `tool_call_id_prefix` | string | 空 | 重写请求中的 tool call id 前缀 |
+| 思考策略 `reasoning_policy` | string | `auto` | `auto`=保留回传家族 + 其余剥离 / `keep` / `strip` |
+| 保留式思考 `preserved_thinking` | bool | `false` | GLM 保留式思考：注入 `thinking.clear_thinking=false` |
+| 额外参数 `extra_payload` | object | `{}` | 注入该端点的供应商参数，只在本端点转发时生效 |
+| 请求头 `default_headers` / `extra_headers` | object | `{}` | 追加到上游请求的 HTTP 头（后者优先级更高） |
+| 流首包超时 `stream_first_packet_timeout` | int（秒） | `120` | 流式请求等待首个数据包的超时 |
+| 流停滞超时 `stream_stall_timeout` | int（秒） | `60` | 流式传输中途无新数据的停滞超时 |
+| 流总时长上限 `stream_max_duration` | int（秒） | `0` | `0`=禁用；正常持续输出不截断 |
+| 健康检测 `health_mode` | string | 新建表单默认 `chat` | `models`=零成本 Models 探针 / `chat`=真实对话探针 / `none`=关闭后台监测 |
+| 计费模式 `billing_mode` | string | `subscription` | `subscription` / `pay_per_use`（按次计费自动使用零成本探针） |
+
+完整字段说明、状态徽章含义和分组操作见 [Wiki](https://github.com/849506054/api-pool/wiki)。
 
 ## 部署
 
@@ -122,7 +199,7 @@ systemctl enable --now api-pool2.service
 
 ## Hermes 侧配置
 
-API Pool 2.0 对 Hermes 暴露的是 **OpenAI-compatible Chat Completions** 接口。Hermes 只需要配置一个稳定的入口模型名，例如 `api-pool`；真正发送给哪个上游模型、是否切换 Endpoint，由 API Pool 2.0 根据 Endpoint 配置和故障转移策略决定。
+API Pool 2.0 对 Hermes 暴露 OpenAI-compatible 接口（Chat Completions 与 Responses 两种协议）。Hermes 只需要配置一个稳定的入口模型名（main 组固定为 `api-pool`，也可以指向某个分组的选择器）；真正发送给哪个上游模型、是否切换 Endpoint，由 API Pool 2.0 根据 Endpoint 配置和故障转移策略决定。
 
 ### 1. 最小可用配置
 
@@ -160,6 +237,22 @@ API_POOL2_API_KEY=replace-with-your-api-pool-gateway-key
 | `model.context_length` | 符号模型无法从 `/v1/models` 自动解析时的显式上下文上限。API Pool 2 当前不提供可用于该解析的 `/v1/models` 路由，建议显式设置。 |
 | `custom_providers[].base_url` | API Pool 2 的 OpenAI-compatible 根路径，固定为 `http://<host>:5200/v1` 或反向代理后的对应 `/v1`。 |
 | `custom_providers[].model` | 发给 API Pool 2 的入口模型字段，使用 `api-pool` 即可；API Pool 2 转发时使用目标 Endpoint 自己的 `model`。 |
+
+要让 Hermes 走 Responses 入口（`POST /v1/responses`），命名 provider 必须显式声明协议：
+
+```yaml
+model:
+  provider: custom:api-pool2-responses
+
+providers:
+  api-pool2-responses:
+    base_url: http://192.168.5.6:5200/v1
+    api_key: ${API_POOL2_API_KEY}
+    model: api-pool
+    api_mode: codex_responses
+```
+
+把 `api_mode` 写在 `model` 段（`model.provider: custom` 形式）会被静默忽略并回退到 `chat_completions`，必须用命名 provider 才生效。
 
 `context_length` 使用的是 token 数，不是 `max_context_k` 的千 token 单位。示例中的 `1048576` 只是适用于相应上游模型时的示例值；实际部署应按池内所有可能命中的模型的最小上下文上限填写。
 
@@ -238,34 +331,25 @@ curl -sS "$BASE_URL/chat/completions" \\
 
 | 现象 | 原因与处理 |
 |------|------------|
-| `404 Not found` | `base_url` 少了 `/v1`、重复了 `/v1`，或把 1.0 的 `5100` 端口写进了 2.0 配置。 |
+| `404 Not found` | `base_url` 少了 `/v1`、重复了 `/v1`，或端口写错（2.0 默认 5100，生产示例 5200）。 |
 | `Could not determine context length` | `model` 使用了符号名 `api-pool`，且没有设置 `model.context_length`；补上显式值。 |
 | 已设置 `context_length` 但仍 fallback 到 256K | `model` 段缺少与 Provider 一致的 `base_url`，运行时路由匹配可能清除 context pin；补齐 `model.base_url`。 |
-| `401` 或 `403` | Hermes 的 `api_key` 与 API Pool 2 网关鉴权不匹配；这不是上游 Endpoint Key 的问题。 |
+| `401` 或 `403` | 由上游 Endpoint 侧产生：上游 Key 无效、WAF/网关拦截，或上游校验客户端指纹（如要求特定 UA），需在 Endpoint 上配置 `client_profile` 或检查 `extra_headers`；API Pool 网关本身不校验客户端 Key。 |
 | 上游 Endpoint 返回 400 | 检查 API Pool 2 UI 中该 Endpoint 的 `protocol`、`model`、`extra_payload` 和 thinking 设置；不要先在 Hermes 全局注入参数。 |
 | Hermes fallback 没按预期切换 | 检查 `hermes fallback list`；每一跳都要有明确的 `provider` 和 `model`，并确认目标 Endpoint 没有处于冷却状态。 |
-### API Pool Endpoint 配置字段
 
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `name` | string | - | Endpoint 显示名称。 |
-| `base_url` | string | - | 上游 API 根地址；按 Endpoint 协议填写对应的 API 入口。 |
-| `api_key` | string | - | 该 Endpoint 的上游密钥；不要与 Hermes 连接 API Pool 的网关密钥混淆。 |
-| `model` | string | - | 发送给该上游的实际模型名；不会被 Hermes 的符号入口模型名覆盖。 |
-| `protocol` | string | `openai` | 上游协议类型，支持 OpenAI-compatible 和 Anthropic 兼容转换路径。 |
-| `priority` | int | - | Endpoint 选择优先级，具体数值关系以管理面板和当前路由实现为准。 |
-| `deferrable` | bool | `true` | 冷却到期后是否延迟回迁（保 cache）。false=上游恢复立即回迁；当前端点故障时，延迟回迁端点仍可参与故障转移。 |
-| `max_context_k` | int | `0` | 最大上下文长度（K=1000 tokens），0=不限。超过时自动跳过该 Endpoint。 |
-| `tool_call_id_prefix` | string | 空 | 按 Endpoint 重写 tool call ID 前缀，用于兼容特定上游格式。 |
-| `extra_payload` | object | `{}` | 注入该 Endpoint 的供应商参数；应按目标模型/协议配置，不要把 DeepSeek 专属字段全局化。 |
+## 文档
+
+- [Wiki](https://github.com/849506054/api-pool/wiki)：快速开始、端点配置详解、分组与路由、管理面板、健康检测与故障转移、调用 API、部署与安全、FAQ
+- [`docs/`](docs/)：协议兼容矩阵、错误处置矩阵、设计与阶段文档
 
 ## 堆栈
 
 | 组件 | 选择 |
 |------|------|
 | 后端 | Python 标准库 (urllib, http.server, threading) |
-| 前端 | 单文件内嵌 HTML/JS/CSS |
-| 存储 | SQLite（token_stats.db, chat_logs.db） |
+| 前端 | 单文件 `static/index.html`（原生 HTML/CSS/JS，无构建步骤） |
+| 存储 | SQLite（`token_stats.db` 统计、`chat_logs.db` 请求日志、`responses_store.db` Responses 存储） |
 | 部署 | systemd 单进程，Restart=always |
 
 ## 项目状态
