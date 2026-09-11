@@ -260,3 +260,9 @@ profile 管理弹层重做为列表/表单双视图（可编辑已有 profile、
 生产 hash 后端 05970e18 / 前端 2c9ae0ea（备份 api_pool_server.py.bak-20260911-clientmode、static/index.html.bak-20260911-clientmode、api_config.json.bak-20260911-pre-flatten）。
 验证：隔离实例端到端四项（回显上游实证透传全量头、伪装不混入客户端头、探活复用基线、无基线回退）+ 全量 36 个测试文件 0 失败（原基线 1 例过时断言一并修正）+ 生产真实流量 200 与健康检测无 WARN；前端代码级断言脚本 scripts/verify_client_profile_ui.js。
 详见 skill api-pool-management references/client-transparent-gateway-implemented-2026-09-11.md。
+
+## 2026-09-11 GLM-5.3 关闭思考映射 + 严格校验重试收口 已部署生产
+现象：`[main]AgentRouter-glm: glm-5.3` 返回 400「该模型始终思考，不支持关闭思考；请使用 low、high 或 max」（req=befc3e5e，22:29:33），此前 22:29:09 曾命中 DeepSeek 严格校验 400 并触发同端点重试。
+根因两条：① GLM-5.3 官方契约 `thinking.type` 仅支持 `enabled`（思考不可关闭），池侧只做了 `reasoning_effort` 数值映射，没有处理 `thinking` 形态——官方迁移建议是原发 `{"type":"disabled"}` 的调用方改为 `{"type":"enabled"}` + `reasoning_effort: "low"`；② 2026-09-10 严格校验防御的 `disable_thinking_forced` 是**请求级**标志，置真后轮转中的每个后续端点都被注入 `thinking={"type":"disabled"}`，轮到 GLM 即 400（跨端点污染）。
+修复：① 新增 `_normalize_glm_thinking`——GLM-5.3 系列把 `disabled`/`none`/`off` 折叠为 `{"type":"enabled"}` + `reasoning_effort: low`（显式档位不覆盖；数据式映射，与 Hermes `agent/reasoning_effort.py` 的 GLM53/OX_ALPHA 声明同型）；② 删除严格校验 400 的原第 2 次「显式关闭 thinking」重试，同端点重试维持**请求级总上限 1**——该类 400 校验的是历史消息形态（旧轮 assistant 的 `" "` 占位 reasoning_content），请求级 `thinking=disabled` 改不了已发历史，结构性无效（42h 窗口内 0 成功），且该字段会随轮转污染异构端点（本次 GLM 400 的直接触发路径）。
+验证：直连对照（未折叠原始 `disabled` 仍 400 原文一致；折叠后 `disabled`/`none`/`off` 均 200；显式 `high` 保留档位 200；preserved_thinking 注入体 200）；全量 36 个测试文件 0 失败（GLM 适配测试新增关闭思考映射与「不再注入 disabled thinking」护栏断言）；生产 hash 后端 `33636e88`；重启后无 ERROR/WARN、请求正常成功。改前备份 `backups/api_pool_server.py.20260911-231948.bak`（本轮首次部署前备份 `backups/api_pool_server.py.20260911-230616.bak`）。

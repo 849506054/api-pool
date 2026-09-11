@@ -90,4 +90,33 @@ pool.add_endpoint({"name": "g", "base_url": "https://x/v1", "api_key": "k", "mod
 d = pool.list_endpoints()[0]
 assert d["reasoning_policy"] == "keep" and d["preserved_thinking"] is True
 
+# 6) 关闭思考的 GLM 折叠（2026-09-11）：disabled/none → enabled + effort low
+p = {"thinking": {"type": "disabled"}}
+APIPool._normalize_glm_thinking(p, ep("glm-5.3"))
+assert p["thinking"] == {"type": "enabled"} and p["reasoning_effort"] == "low", p
+p = {"thinking": {"type": "none"}}
+APIPool._normalize_glm_thinking(p, ep("glm-5.3-flash"))
+assert p["thinking"] == {"type": "enabled"} and p["reasoning_effort"] == "low", p
+# 客户端已显式给档位：只折叠 thinking，不覆盖更高档
+p = {"thinking": {"type": "disabled"}, "reasoning_effort": "high"}
+APIPool._normalize_glm_thinking(p, ep("glm-5.3"))
+assert p["reasoning_effort"] == "high" and p["thinking"] == {"type": "enabled"}, p
+# preserved_thinking 的注入体（enabled + clear_thinking）不动
+p = {"thinking": {"type": "enabled", "clear_thinking": False}}
+APIPool._normalize_glm_thinking(p, ep("glm-5.3"))
+assert p["thinking"] == {"type": "enabled", "clear_thinking": False}, p
+# glm-5.2 支持关闭思考；非 GLM 端点：不干预
+p = {"thinking": {"type": "disabled"}}
+APIPool._normalize_glm_thinking(p, ep("glm-5.2"))
+assert p["thinking"] == {"type": "disabled"} and "reasoning_effort" not in p, p
+
+# 7) 回归护栏：不再有「关闭 thinking」注入（结构性无效 + 会污染轮转后的异构端点），
+#    严格校验重试维持请求级总上限 1
+src = open("/opt/data/work/api-pool2/api_pool_server.py", encoding="utf-8").read()
+assert "disable_thinking_forced" not in src
+assert "disable_thinking_eps" not in src
+assert 'payload["thinking"] = {"type": "disabled"}' not in src
+assert "strict_validation_retries = 0" in src
+assert "strict_validation_retries < 1" in src
+
 print("ALL ASSERTS PASSED")

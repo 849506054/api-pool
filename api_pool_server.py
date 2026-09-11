@@ -4378,6 +4378,30 @@ class APIPool:
         "medium": "high", "high": "high",
         "xhigh": "max", "max": "max",
     }
+    # GLM-5.3 官方契约：thinking.type 仅支持 enabled —— 思考不可关闭，传 disabled
+    # 直接 400「该模型始终思考，不支持关闭思考；请使用 low、high 或 max」。
+    # 官方迁移建议：原发 {"type":"disabled"} 的调用方改为 {"type":"enabled"} +
+    # reasoning_effort "low"。直连实测（ps.air-outer glm-5.3，2026-09-11）：
+    # disabled / reasoning_effort none / medium 命中同一 400；low 正常。
+    _GLM_DISABLE_THINKING_TYPES = frozenset({"disabled", "none", "off"})
+
+    @classmethod
+    def _normalize_glm_thinking(cls, payload, ep):
+        """把 GLM-5.3 端点上「关闭思考」的表达折叠成官方允许的形态。
+
+        数据式映射（与 Hermes agent/reasoning_effort.py 的 GLM53/OX_ALPHA 声明
+        同型），不在调用点按 vendor 名散写分支。仅处理显式关闭意图。
+        """
+        model = str(getattr(ep, "model", "") or "").lower()
+        if "glm-5.3" not in model:
+            return
+        thinking = payload.get("thinking")
+        if not isinstance(thinking, dict):
+            return
+        if str(thinking.get("type", "") or "").lower() not in cls._GLM_DISABLE_THINKING_TYPES:
+            return
+        payload["thinking"] = {"type": "enabled"}
+        payload.setdefault("reasoning_effort", "low")
     _KIMI_K3_EFFORT_MAP = {
         "none": "low", "minimal": "low", "low": "low",
         "medium": "high", "high": "high",
@@ -4543,8 +4567,7 @@ class APIPool:
         errors = []
         client_error_tried = set()  # 本请求内已因客户端类错误轮转过的端点（防不冻结路径死循环）
         role_downgraded = False  # 已因角色不兼容 400 触发 developer→system 降级（每请求一次）
-        strict_validation_retries = 0  # DeepSeek 严格校验 400 的同端点重试次数（上限 2）
-        disable_thinking_forced = False  # 严格校验重试第 2 次起显式关闭 thinking
+        strict_validation_retries = 0  # 请求级总上限 1：同端点重试一次（2026-09-11 收口）
         tried = 0
         total = len(active)
         # 按优先级排序：每次从最高优先级端点开始尝试，故障自动降级，恢复后自动回迁
@@ -4653,16 +4676,15 @@ class APIPool:
             # preserved_thinking 开关：注入 clear_thinking=False 开启保留式思考
             if not is_anthropic:
                 self._map_reasoning_effort(payload, ep)
-                if disable_thinking_forced:
-                    # 严格校验重试第 2 次：显式关闭 thinking，绕开 reasoning_content
-                    # 回传校验（历史形态不变时唯一可靠的方式，2026-09-10）
-                    payload["thinking"] = {"type": "disabled"}
-                elif getattr(ep, "preserved_thinking", False):
+                if getattr(ep, "preserved_thinking", False):
                     t = payload.get("thinking")
                     if isinstance(t, dict):
                         t["clear_thinking"] = False
                     else:
                         payload["thinking"] = {"type": "enabled", "clear_thinking": False}
+                # GLM-5.3 思考不可关闭：客户端/nightly LLM 下发的 disabled 在这里
+                # 折叠为官方形态（enabled + effort low），避免上游 400。
+                self._normalize_glm_thinking(payload, ep)
             
             # [VISION TRANSLATION INTERCEPT]
             if self._has_images(payload["messages"]) and getattr(ep, "is_vision", True) is False:
@@ -4822,18 +4844,17 @@ class APIPool:
             # 避免"探活通过→重试超时"空转。超时/连接错误仍走探活（瞬态防误杀）。
             gateway_error = any(f"HTTP {c}" in error for c in ("502", "503", "504"))
             # DeepSeek thinking 严格校验 400（2026-09-10，V4.1-Flash 起观测）：同端点重试
-            # 一次；第二次显式关闭 thinking（历史形态不变时唯一可靠的绕开方式）。
-            # 放在冻结/轮转之前：这两类错误是客户端类（不冻结、不计账），且证据显示
+            # 一次。放在冻结/轮转之前：这两类错误是客户端类（不冻结、不计账），且证据显示
             # 相邻请求在同一端点上时通时不通 —— 先原地重试比直接换成别的模型代价小。
-            # 上限 2 次，避免与 _rotate 的轮转预算叠加成空转。
-            if self._is_strict_validation_400(error) and strict_validation_retries < 2:
+            # 2026-09-11 收口：删除原第 2 次「显式关闭 thinking」重试。该 400 校验的是
+            # 历史消息形态（旧轮 assistant 的 " " 占位 reasoning_content），请求级
+            # thinking=disabled 改不了已发历史 → 结构性无效（42h 窗口内 0 成功），且
+            # 该字段会随轮转污染异构端点（GLM 报「不支持关闭思考」）。上限维持请求级 1。
+            if self._is_strict_validation_400(error) and strict_validation_retries < 1:
                 strict_validation_retries += 1
-                if strict_validation_retries >= 2:
-                    disable_thinking_forced = True
                 sys_log(
                     f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 命中 DeepSeek 严格校验 400，"
-                    f"同端点重试（第 {strict_validation_retries}/2 次"
-                    f"{'，本次关闭 thinking' if disable_thinking_forced else ''}）",
+                    f"同端点重试（第 {strict_validation_retries}/1 次）",
                     "WARN",
                 )
                 # 释放本尝试的在途占用，循环顶部会重新 acquire（否则计数器泄漏）
