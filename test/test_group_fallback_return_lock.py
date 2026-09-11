@@ -140,10 +140,13 @@ class GroupFallbackReturnLockTests(unittest.TestCase):
         self.pool.chat([{"role": "user", "content": "hi"}], model="api-pool")
         self.assertEqual(seen, ["main-a"])
 
-    def test_locked_group_logs_once_per_lock_episode(self):
-        """锁定期内不再逐请求刷「fallback 锁定中」；新锁定周期重新报一次。
+    def test_locked_group_is_silent_per_request(self):
+        """锁定期路由静默（与端点 defer 同构）；转移事件由 WARN 行承担。
 
-        2026-09-12 用户报：该行每个请求打一次（实测 24h 235 行、227 行来自一个组）。
+        2026-09-12 用户定稿：该行曾逐请求刷屏（24h 235 行）；先改每周期一次，
+        再按「整组 fallback 延迟回切 ≈ 端点延迟切换同构」收敛为完全静默——
+        状态走 /api/chain 的 fallback_lock_remaining + ↩main 徽标，与端点
+        defer（is_deferred / defer_remaining）同一呈现模式。
         """
         self.pool._group_fallback_lock_until["api-pool-gpt"] = time.time() + 120
         logs = []
@@ -157,17 +160,16 @@ class GroupFallbackReturnLockTests(unittest.TestCase):
             self.pool._try_endpoint = fake_try
             for _ in range(5):
                 self.pool.chat([{"role": "user", "content": "hi"}], model="gpt-5.6-sol")
-            lock_logs = [m for m in logs if "fallback 锁定中" in m]
-            self.assertEqual(len(lock_logs), 1, lock_logs)
+            # 锁定期内：不逐请求打任何「锁定中」行
+            self.assertEqual([m for m in logs if "锁定中" in m], [])
 
-            # 锁过期 + 组端点仍不可用 → 入口 fallback 重建锁 → 新周期应再报一次
+            # 锁过期 + 组端点不可用 → 重建锁的转移 WARN 保留（状态变更信号）
             self.pool._group_fallback_lock_until["api-pool-gpt"] = time.time() - 1
             self.gpt._cooldown_until = time.time() + 600
             logs.clear()
             self.pool.chat([{"role": "user", "content": "hi"}], model="gpt-5.6-sol")
-            self.assertEqual(len([m for m in logs if "fallback 锁定中" in m]), 0, logs)
-            self.pool.chat([{"role": "user", "content": "hi"}], model="gpt-5.6-sol")
-            self.assertEqual(len([m for m in logs if "fallback 锁定中" in m]), 1, logs)
+            self.assertEqual(len([m for m in logs if "无可用端点，入口 fallback" in m]), 1, logs)
+            self.assertEqual([m for m in logs if "锁定中" in m], [])
         finally:
             self.module.sys_log = original_sys_log
 

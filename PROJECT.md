@@ -301,16 +301,16 @@ vision 池定位修正：由「`role: vision` 标记的普通组」改为与 mai
 
 生产 hash 后端 `f7aff399`（改前 `99dccd6a`），备份 `api_pool_server.py.bak-20260912-0217-usage-accounting`，重启 2026-09-12 02:16。验证工具 `scripts/probe_prefix_growth.py`、`scripts/mock_responses_usage.py`、`scripts/check_accounting.py`、`scripts/run_accounting_trial.sh`、`scripts/verify_prod_hit_accounting.py`；排查笔记见 skill references/responses-usage-accounting-2026-09-12.md。
 
-## 2026-09-12 锁定日志降噪（fallback 锁定中每周期只报一次）已部署生产
+## 2026-09-12 锁定日志降噪（与端点 defer 同构：锁定期路由静默）已部署生产
 
 现象：`组 'pool-gpt6' fallback 锁定中（剩余 Ns），本请求走 main 组` 逐请求刷屏——近 24h **235 行**（`pool-gpt6` 227 + `pool-bg` 8），近 1h 52 行（约每 15 秒一行）。
 
 根因：锁定分支位于滑动窗口顺延循环内、命中即打日志，而滑动锁又被每次请求顺延 → 锁期内请求越密刷得越勤。
 
-修复：新增 `_group_fallback_lock_logged` 标记，**每个锁定周期只报一次**；入口 fallback 与轮转耗尽 fallback **重建锁时 discard 标记**（新周期重新报一次），组改名同步 discard。日志前缀保持不变（监控 grep 配方不失效），尾部追加「（本周期不重复提示）」。两条触发点 WARN 行（入口/耗尽 fallback）作为状态变更信号保留。
+修复（两段收敛，终态=与端点延迟切换同构）：先按「每锁定周期只报一次」去重（`_group_fallback_lock_logged`，hash `d98f89f2`）；随后按用户口径定稿——**整组 fallback 延迟回切与端点 defer 是同一类语义（延迟回迁窗口保护当前工作对象），日志处理同构即可**：锁定期路由**完全静默**走 main（删除该 INFO 行与去重标记，回退到无日志形态），状态经 `/api/chain` 的 `fallback_lock_remaining` + `↩main` 徽标呈现（与端点 defer 的 `is_deferred`/`defer_remaining` 同一模式），转移事件由入口/耗尽 fallback 两条 WARN 行承担。
 
-边界：`↩N` 累计计数已于 **2026-09-07 整体移除**（后端 `_group_fallback_count`、`/api/chain` 的 `counts`、前端 `↩N` 全删，徽标改为锁定期实时 `↩main`，数据源 `fallback_lock_remaining`），该计数属已废弃设计 → 本次降噪不损失任何保留语义（逐请求计数本就不是要保留的语义）。
+边界：`↩N` 累计计数已于 **2026-09-07 整体移除**（后端 `_group_fallback_count`、`/api/chain` 的 `counts`、前端 `↩N` 全删），该计数属已废弃设计 → 降噪无任何保留语义损失。
 
-验证：A/B（旧码 5 请求 → 5 行；新码 → 1 行）；新增回归 `test_locked_group_logs_once_per_lock_episode`（旧码 FAIL / 新码 PASS，含「新周期重新报一次」断言）；全量 38 测试文件 0 失败 + `unittest discover` 322 项 OK；生产验证：重启后连发 3 个 gpt-6 请求，日志只见 1 行。
+验证：A/B（旧码 5 请求 → 5 行；中间版 → 1 行；终态 → 0 行，转移 WARN 保留 1 条）；回归测试 `test_locked_group_is_silent_per_request`（旧码 FAIL / 新码 PASS，含「转移 WARN 保留」断言）；全量 38 测试文件 0 失败；生产验证：重启后连发 3 个 gpt-6 请求（组处于锁定态），「锁定中」行数为 **0**。
 
-生产 hash 后端 `d98f89f2`（改前 `f7aff399`），备份 `api_pool_server.py.bak-20260912-0300-locklog-dedupe`，重启 2026-09-12 02:57。排查签名见 skill references/incident-pattern-signatures.md「锁定日志逐请求刷屏」节。
+生产 hash 后端 `48833601`（改前 `d98f89f2`→`f7aff399`），备份 `api_pool_server.py.bak-20260912-0310-locklog-silent`，重启 2026-09-12 03:10。排查签名见 skill references/incident-pattern-signatures.md「锁定日志逐请求刷屏」节（已更新为终态）。
