@@ -2256,6 +2256,10 @@ class APIPool:
         self._route_epoch_by_group: dict[str, int] = {}
         self._persisted_endpoint_by_group: dict[str, str | None] = {}
         self._fallback_lock_until_by_group: dict[str, float] = {}
+        # 锁定日志去重（2026-09-12）：锁定期内每个请求都打一行 INFO 会刷屏
+        # （实测 24h 235 行，227 行来自一个组），改为每个锁定周期只报一次；
+        # 锁在入口 / 耗尽 fallback 建立时清标记，故新周期会重新报一次。
+        self._group_fallback_lock_logged: set[str] = set()
         # 端点在途归属：ep.id → {组名: 在途请求数}。main 可抢占子组共享端点，
         # 因此必须按组计数，避免并发请求覆盖 owner 或提前释放仍在途的占用。
         self._inflight_owner: dict[str, dict[str, int]] = {}
@@ -2927,6 +2931,7 @@ class APIPool:
                     self._fallback_lock_until_by_group[new_name] = self._fallback_lock_until_by_group.pop(name)
                 if name in self._group_fallback_lock_until:
                     self._group_fallback_lock_until[new_name] = self._group_fallback_lock_until.pop(name)
+                self._group_fallback_lock_logged.discard(name)
                 del self._group_defs[name]
 
             self._group_defs[new_name] = {"type": new_type, "model": eff_model}
@@ -4605,7 +4610,9 @@ class APIPool:
                 if lock_until > time.time():
                     self._group_fallback_lock_until[group] = time.time() + self._GROUP_FALLBACK_RETURN_SECONDS
                     group = self.MAIN_GROUP
-                    sys_log(f"组 '{orig_group}' fallback 锁定中（剩余 {int(lock_until - time.time())}s），本请求走 main 组", "INFO")
+                    if orig_group not in self._group_fallback_lock_logged:
+                        self._group_fallback_lock_logged.add(orig_group)
+                        sys_log(f"组 '{orig_group}' fallback 锁定中（剩余 {int(lock_until - time.time())}s），本请求走 main 组（本周期不重复提示）", "INFO")
         request_route_epoch = self._get_route_epoch(group)
         group_fallback_used = False  # bg 组入口/耗尽 fallback 到 main 的标记
         # 终极兜底锁定：锁定期间该组请求直连 prio99（per-group 滑动窗口，prio99 仅 main 组语义生效）
@@ -4632,6 +4639,7 @@ class APIPool:
                 # A0：建立组级延迟回切锁（滑动空闲窗口，无请求 N 秒后回组）
                 with self._lock:
                     self._group_fallback_lock_until[group] = time.time() + self._GROUP_FALLBACK_RETURN_SECONDS
+                    self._group_fallback_lock_logged.discard(group)
                 group = self.MAIN_GROUP
                 request_route_epoch = self._get_route_epoch(group)
         if not active:
@@ -5088,6 +5096,7 @@ class APIPool:
             # A0：耗尽 fallback 同样建立组级延迟回切锁
             with self._lock:
                 self._group_fallback_lock_until[group] = time.time() + self._GROUP_FALLBACK_RETURN_SECONDS
+                self._group_fallback_lock_logged.discard(group)
             try:
                 return self.chat(messages, model=None, extra_payload=extra_payload,
                                  timeout=timeout, return_endpoint=return_endpoint,

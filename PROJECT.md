@@ -300,3 +300,17 @@ vision 池定位修正：由「`role: vision` 标记的普通组」改为与 mai
 验证：隔离 A/B（mock 上游返回 cached=1234/reasoning=56）旧码仅 1 行且 cached=0、非流式无行、客户端 usage 无 details；新码 2 行、cached=1234、reasoning=56、客户端带 details。回归 `test_responses_api.py` 新增 `responses upstream usage accounting`（旧码 FAIL / 新码 PASS，含推理 delta 透传与 `summary:auto` 断言），responses 套件 8/8、全量 38 个测试文件 0 失败、ruff 127 条与基线一致。生产实测（5200，增长式多轮流式）：`#1 cached=0 → #2 cached=10811 → #3 10825 → #4 10839`，token_stats/chat_logs 按真实值落盘。上游真实行为（直连实测）：缓存命中**不稳定**（`#1 write 21607 → #2 cached 21607 → #3/#4 整段重写 → #5 cached 86449`；同站点 deepseek 每轮稳定命中 17k），故修复后 UI 显示的是真实且波动的命中率；推理文本方面，上游**仅在请求体带 `reasoning.summary` 时下发推理摘要**（实测流式 `response.reasoning_summary_text.delta` ×99 / 452 字符；不请求时只有不可读 `encrypted_content`，同一形态偶发零事件），chat 协议则完全不返回 `reasoning_content`——修复后生产流式已实测透出 `reasoning_content`（474 字符），chat_logs `reasoning_tokens=86`。
 
 生产 hash 后端 `f7aff399`（改前 `99dccd6a`），备份 `api_pool_server.py.bak-20260912-0217-usage-accounting`，重启 2026-09-12 02:16。验证工具 `scripts/probe_prefix_growth.py`、`scripts/mock_responses_usage.py`、`scripts/check_accounting.py`、`scripts/run_accounting_trial.sh`、`scripts/verify_prod_hit_accounting.py`；排查笔记见 skill references/responses-usage-accounting-2026-09-12.md。
+
+## 2026-09-12 锁定日志降噪（fallback 锁定中每周期只报一次）已部署生产
+
+现象：`组 'pool-gpt6' fallback 锁定中（剩余 Ns），本请求走 main 组` 逐请求刷屏——近 24h **235 行**（`pool-gpt6` 227 + `pool-bg` 8），近 1h 52 行（约每 15 秒一行）。
+
+根因：锁定分支位于滑动窗口顺延循环内、命中即打日志，而滑动锁又被每次请求顺延 → 锁期内请求越密刷得越勤。
+
+修复：新增 `_group_fallback_lock_logged` 标记，**每个锁定周期只报一次**；入口 fallback 与轮转耗尽 fallback **重建锁时 discard 标记**（新周期重新报一次），组改名同步 discard。日志前缀保持不变（监控 grep 配方不失效），尾部追加「（本周期不重复提示）」。两条触发点 WARN 行（入口/耗尽 fallback）作为状态变更信号保留。
+
+边界：`↩N` 累计计数已于 **2026-09-07 整体移除**（后端 `_group_fallback_count`、`/api/chain` 的 `counts`、前端 `↩N` 全删，徽标改为锁定期实时 `↩main`，数据源 `fallback_lock_remaining`），该计数属已废弃设计 → 本次降噪不损失任何保留语义（逐请求计数本就不是要保留的语义）。
+
+验证：A/B（旧码 5 请求 → 5 行；新码 → 1 行）；新增回归 `test_locked_group_logs_once_per_lock_episode`（旧码 FAIL / 新码 PASS，含「新周期重新报一次」断言）；全量 38 测试文件 0 失败 + `unittest discover` 322 项 OK；生产验证：重启后连发 3 个 gpt-6 请求，日志只见 1 行。
+
+生产 hash 后端 `d98f89f2`（改前 `f7aff399`），备份 `api_pool_server.py.bak-20260912-0300-locklog-dedupe`，重启 2026-09-12 02:57。排查签名见 skill references/incident-pattern-signatures.md「锁定日志逐请求刷屏」节。
