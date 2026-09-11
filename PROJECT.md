@@ -288,3 +288,15 @@ vision 池定位修正：由「`role: vision` 标记的普通组」改为与 mai
 部署：后端 `b6d8f17a` / 前端 `c6e3d153`（01:27 重启；档位精简 01:30 热更新）。生产已填组值：main/pool-bg/pool-cron/pool-gpt6/pool-gpt5=1000K、vision=256K，`/v1/models` 已带 `context_length`。Hermes 侧 `config.yaml` 的 `model.context_length` 保持显式声明不变（该键是 Hermes 解析链第 1 级，未删除前池声明不生效；口径与判定依据见 skill references/group-context-population-2026-09-12.md）。
 
 验证：新增 `test/test_group_context_length.py` 8 项，全量 320 测试 0 失败（另 1 项预存环境错误：缺 `openai` 包）；隔离实例（5299 + HERMES_HOME 隔离）实测池值被 Hermes 真实解析器读出。工作区提交 `3bc75ee`。
+
+## 2026-09-12 Responses 协议上游 usage 记账修复（缓存命中率恒 0 + 推理保真）已部署生产
+
+现象：飞书端窗口观察到 `gpt-6-astra`（pool-gpt6 组，三端点 `protocol=responses`）在池 UI 上缓存命中率恒 0，并附「推理也全为空」。
+
+根因（分流判定为**池侧记账缺陷**，非上游）：① 流式 responses 分支（`_try_endpoint` 的 `response.completed` 处理）只解析 `input_tokens`/`output_tokens`/`total_tokens`，**从不读 `input_tokens_details.cached_tokens`**，而紧随其后的 `has_usage` 判定正是据这三个值置真并记账 → `token_usage.cached_tokens` 恒 0，且返回客户端的 usage 帧也没有 `prompt_tokens_details`；② 非流式 responses 分支直接 `return` 客户端响应，**没有任何 `add_usage`/`add_log` 调用**（对比 anthropic 分支有），连 token_stats 行都不写。佐证：生产 token_stats 内 7 条 gpt-6 记录全为流式且 cached 全 0；deepseek 端点命中率显示正常，因其走 chat 协议分支（解析+记账完整）。上游确有缓存：直连与经池「同 prompt 对拍」命中节奏完全一致（池未破坏缓存 key，`tool_call_id_prefix` 为空）。
+
+修复：① 流式 `response.completed` 解析 `input_tokens_details.cached_tokens` 与 `output_tokens_details.reasoning_tokens`，客户端 usage 帧补 `prompt_tokens_details`/`completion_tokens_details`；② 非流式 responses 分支补 `token_tracker.add_usage` + `chat_logger.add_log` + `_mark_cache_stats_account`；③ 推理保真：桥接体 `reasoning` 追加 `summary: "auto"`（Responses 只在显式请求摘要时返回推理文本），流式识别 `response.reasoning_summary_text.delta`/`response.reasoning_text.delta` → chat `reasoning_content`，并以 `response.output_item.done` 的 reasoning 摘要作兜底（不重复下发），非流式 `_responses_output_to_chat_message` 收集 reasoning item 摘要 → `message["reasoning_content"]`（返回三元组，两个调用点同步更新）。
+
+验证：隔离 A/B（mock 上游返回 cached=1234/reasoning=56）旧码仅 1 行且 cached=0、非流式无行、客户端 usage 无 details；新码 2 行、cached=1234、reasoning=56、客户端带 details。回归 `test_responses_api.py` 新增 `responses upstream usage accounting`（旧码 FAIL / 新码 PASS，含推理 delta 透传与 `summary:auto` 断言），responses 套件 8/8、全量 38 个测试文件 0 失败、ruff 127 条与基线一致。生产实测（5200，增长式多轮流式）：`#1 cached=0 → #2 cached=10811 → #3 10825 → #4 10839`，token_stats/chat_logs 按真实值落盘。上游真实行为（直连实测）：缓存命中**不稳定**（`#1 write 21607 → #2 cached 21607 → #3/#4 整段重写 → #5 cached 86449`；同站点 deepseek 每轮稳定命中 17k），故修复后 UI 显示的是真实且波动的命中率；推理文本方面，上游**仅在请求体带 `reasoning.summary` 时下发推理摘要**（实测流式 `response.reasoning_summary_text.delta` ×99 / 452 字符；不请求时只有不可读 `encrypted_content`，同一形态偶发零事件），chat 协议则完全不返回 `reasoning_content`——修复后生产流式已实测透出 `reasoning_content`（474 字符），chat_logs `reasoning_tokens=86`。
+
+生产 hash 后端 `f7aff399`（改前 `99dccd6a`），备份 `api_pool_server.py.bak-20260912-0217-usage-accounting`，重启 2026-09-12 02:16。验证工具 `scripts/probe_prefix_growth.py`、`scripts/mock_responses_usage.py`、`scripts/check_accounting.py`、`scripts/run_accounting_trial.sh`、`scripts/verify_prod_hit_accounting.py`；排查笔记见 skill references/responses-usage-accounting-2026-09-12.md。
