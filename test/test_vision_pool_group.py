@@ -1,8 +1,8 @@
 """视觉池组（Vision Pool Group，2026-09-10 已拍板设计）测试。
 
 覆盖验收矩阵：
-- role CRUD：创建 vision 组、全池唯一（create/update 拒绝第二个）、非法值拒绝、main 锁定
-- 零迁移：旧配置无 role 键加载为普通组；role 随配置往返持久化
+- 内置池：vision 组恒在（次位）、名字/类型/选择器锁定、不可删除、旧配置 role 键忽略
+- 零迁移：无 role 键往返持久化（was role 字段的配置直接加载）
 - 调度：_vision_pool_candidates 只从视觉池取（请求组内 is_vision 端点不再入选）
 - 降级：无视觉池 → 原样返回不翻译；翻译全失败 → 原样返回
 - 冷却：成员翻译失败写阶梯短冷却并排除后续候选；成功清冷却
@@ -43,7 +43,7 @@ def load_module(tmp_path):
 
 class VisionPoolGroupTests(unittest.TestCase):
     @staticmethod
-    def endpoint(module, eid, is_vision=True, groups=("vision-pool",), in_pool=True, enabled=True, priority=1):
+    def endpoint(module, eid, is_vision=True, groups=("vision",), in_pool=True, enabled=True, priority=1):
         return module.Endpoint(
             id=eid, name=eid, base_url="http://127.0.0.1:1", api_key="k",
             model="vm", priority=priority, in_pool=in_pool, enabled=enabled,
@@ -52,14 +52,14 @@ class VisionPoolGroupTests(unittest.TestCase):
 
     @staticmethod
     def make_pool(module, endpoints=(), groups=()):
-        """建池：先建组实体再入端点。
+        """建池：先建组实体再入端点（图片解析池为内置组，无需创建）。
 
         端点声明组名后该组名在 _all_group_names() 中即"已存在"，create_group 会拒绝；
         与真实运维顺序一致（先在 UI 建组，再放入成员）。
         """
         pool = module.APIPool([])
-        for name, gtype, model, role in groups:
-            ok, msg = pool.create_group(name, gtype, model, role)
+        for name, gtype, model in groups:
+            ok, msg = pool.create_group(name, gtype, model)
             assert ok, msg
         for ep in endpoints:
             pool.add_endpoint(ep)
@@ -73,77 +73,78 @@ class VisionPoolGroupTests(unittest.TestCase):
     def ok_result(*_args, **_kwargs):
         return {"choices": [{"message": {"content": "desc"}}]}, ""
 
-    # ── role CRUD ──
+    # ── 内置池：存在性 / 锁定 / 不可删 ──
 
-    def test_create_vision_group_and_uniqueness(self):
+    def test_vision_group_is_builtin(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             pool = module.APIPool([])
-            ok, msg = pool.create_group("vision", "mixed", "api-pool-vision", "vision")
-            self.assertTrue(ok, msg)
-            self.assertEqual(pool._vision_group_name(), "vision")
-            ok, msg = pool.create_group("vision2", "mixed", "x", "vision")
+            self.assertEqual(pool._group_defs[pool.VISION_GROUP],
+                             {"type": "mixed", "model": "api-pool-vision"})
+            # 全池唯一：同名组不可再创建（保留名）
+            ok, msg = pool.create_group("vision", "mixed", "x")
             self.assertFalse(ok)
-            self.assertIn("已存在", msg)
+            self.assertIn("保留名", msg)
 
-    def test_update_to_vision_rejected_when_exists(self):
+    def test_vision_group_name_type_selector_locked(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             pool = module.APIPool([])
-            pool.create_group("vision", "mixed", "api-pool-vision", "vision")
-            pool.create_group("bg", "mixed", "api-pool-bg")
-            ok, msg = pool.update_group("bg", {"role": "vision"})
-            self.assertFalse(ok)
-            self.assertIn("已存在", msg)
+            for updates in ({"name": "vision2"}, {"type": "dedicated"}, {"model": "api-pool-other"}):
+                ok, msg = pool.update_group("vision", updates)
+                self.assertFalse(ok, f"{updates} 应被拒绝：{msg}")
+            ok, _ = pool.update_group("vision", {"name": "vision", "type": "mixed",
+                                                 "model": "api-pool-vision"})
+            self.assertTrue(ok)
 
-    def test_invalid_role_rejected(self):
+    def test_vision_group_not_deletable(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             pool = module.APIPool([])
-            ok, msg = pool.create_group("g", "mixed", "", "image")
+            ok, msg = pool.delete_group("vision")
             self.assertFalse(ok)
-            pool.create_group("bg", "mixed", "")
-            ok, msg = pool.update_group("bg", {"role": "bogus"})
-            self.assertFalse(ok)
+            self.assertIn("内置组", msg)
 
-    def test_main_cannot_be_vision(self):
+    def test_role_key_ignored_on_legacy_config_load(self):
+        """旧配置的 role 键不再生效：图片解析池恒为内置 vision 组。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             pool = module.APIPool([])
-            ok, msg = pool.update_group("main", {"role": "vision"})
-            self.assertFalse(ok)
-
-    def test_legacy_config_without_role_loads_normal(self):
-        with tempfile.TemporaryDirectory() as tmp_path:
-            module = load_module(tmp_path)
-            pool = module.APIPool([])
-            pool._load_group_defs([{"name": "bg", "type": "mixed", "model": "api-pool-bg"}])
+            pool._load_group_defs([
+                {"name": "bg", "type": "mixed", "model": "api-pool-bg", "role": "vision"},
+                {"name": "vision", "type": "mixed", "model": "api-pool-vision", "role": "vision"},
+            ])
             self.assertNotIn("role", pool._group_defs["bg"])
-            self.assertIsNone(pool._vision_group_name())
-            pool._load_group_defs([{"name": "vision", "type": "mixed", "model": "api-pool-vision", "role": "vision"}])
-            self.assertEqual(pool._vision_group_name(), "vision")
+            self.assertEqual(pool._group_defs["vision"], {"type": "mixed", "model": "api-pool-vision"})
+            # 内置组恒在且次位：main → vision → 其余按配置顺序
+            self.assertEqual(list(pool._group_defs)[:3], ["main", "vision", "bg"])
 
-    def test_vision_role_roundtrip_persists(self):
+    def test_config_roundtrip_has_no_role_key_and_keeps_pool(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
-            module.pool.create_group("vision", "mixed", "api-pool-vision", "vision")
             module._sync_to_config()
             raw = module.load_group_defs_config()
-            self.assertTrue(any(g.get("role") == "vision" for g in raw))
+            self.assertFalse(any("role" in g for g in raw))
+            self.assertIn({"name": "vision", "type": "mixed", "model": "api-pool-vision"}, raw)
             restarted = load_module(tmp_path)
-            self.assertEqual(restarted.pool._vision_group_name(), "vision")
+            self.assertEqual(restarted.pool._group_defs["vision"]["model"], "api-pool-vision")
 
-    def test_api_groups_expose_and_accept_role(self):
+    def test_api_groups_expose_is_vision_flag(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
-            status, resp, _ = module.api_handler(
+            status, resp, _ = module.api_handler("GET", "/api/groups", None)
+            self.assertEqual(status, 200)
+            flags = {g["name"]: g["is_vision"] for g in resp["groups"]}
+            self.assertTrue(flags["vision"])
+            self.assertFalse(flags["main"])
+            # POST 的 role 参数已无意义：普通组照建，内置池不受影响
+            status, _, _ = module.api_handler(
                 "POST", "/api/groups",
-                {"name": "vp", "type": "mixed", "model": "api-pool-vision", "role": "vision"},
+                {"name": "vp", "type": "mixed", "model": "api-pool-vp", "role": "vision"},
             )
             self.assertEqual(status, 201)
             status, resp, _ = module.api_handler("GET", "/api/groups", None)
-            g = next(x for x in resp["groups"] if x["name"] == "vp")
-            self.assertEqual(g["role"], "vision")
+            self.assertFalse(next(g for g in resp["groups"] if g["name"] == "vp")["is_vision"])
 
     # ── 调度 ──
 
@@ -154,12 +155,18 @@ class VisionPoolGroupTests(unittest.TestCase):
                 module,
                 [self.endpoint(module, "req-vision", groups=["pool-bg"]),
                  self.endpoint(module, "pool-vision")],
-                [("pool-bg", "mixed", "api-pool-bg", ""),
-                 ("vision-pool", "mixed", "api-pool-vision", "vision")],
+                [("pool-bg", "mixed", "api-pool-bg")],
             )
             cands, grp = pool._vision_pool_candidates()
-            self.assertEqual(grp, "vision-pool")
+            self.assertEqual(grp, "vision")
             self.assertEqual([e.id for e in cands], ["pool-vision"])
+
+    def test_empty_vision_pool_still_reports_group_name(self):
+        """池恒存在：无成员时仍返回组名，降级文案走"无可用端点"（不再有"未配置"态）。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            pool = module.APIPool([])
+            self.assertEqual(pool._vision_pool_candidates(), ([], "vision"))
 
     def test_candidates_exclude_disabled_and_cooldown(self):
         with tempfile.TemporaryDirectory() as tmp_path:
@@ -167,11 +174,10 @@ class VisionPoolGroupTests(unittest.TestCase):
             b1 = self.endpoint(module, "b1", enabled=True)
             b2 = self.endpoint(module, "b2", enabled=False)
             b3 = self.endpoint(module, "b3")
-            pool = self.make_pool(module, [b1, b2, b3],
-                                  [("vision-pool", "mixed", "api-pool-vision", "vision")])
+            pool = self.make_pool(module, [b1, b2, b3])
             b3._cooldown_until = time.time() + 60
             cands, grp = pool._vision_pool_candidates()
-            self.assertEqual(grp, "vision-pool")
+            self.assertEqual(grp, "vision")
             self.assertEqual([e.id for e in cands], ["b1"])
 
     def test_translate_uses_vision_pool_not_request_group(self):
@@ -181,8 +187,7 @@ class VisionPoolGroupTests(unittest.TestCase):
             pool_vision = self.endpoint(module, "pool-vision")
             pool = self.make_pool(
                 module, [req_vision, pool_vision],
-                [("pool-bg", "mixed", "api-pool-bg", ""),
-                 ("vision-pool", "mixed", "api-pool-vision", "vision")],
+                [("pool-bg", "mixed", "api-pool-bg")],
             )
             calls = []
 
@@ -213,8 +218,7 @@ class VisionPoolGroupTests(unittest.TestCase):
             module = load_module(tmp_path)
             b1 = self.endpoint(module, "b1", priority=1)
             b2 = self.endpoint(module, "b2", priority=2)
-            pool = self.make_pool(module, [b1, b2],
-                                  [("vision-pool", "mixed", "api-pool-vision", "vision")])
+            pool = self.make_pool(module, [b1, b2])
             pool._try_endpoint = lambda *_a, **_k: (None, "HTTP 500")
             msgs = self.image_message("data:x")
             out = pool._translate_images_sync(msgs, [b1, b2])
@@ -227,8 +231,7 @@ class VisionPoolGroupTests(unittest.TestCase):
             module = load_module(tmp_path)
             b1 = self.endpoint(module, "b1", priority=1)
             b2 = self.endpoint(module, "b2", priority=2)
-            pool = self.make_pool(module, [b1, b2],
-                                  [("vision-pool", "mixed", "api-pool-vision", "vision")])
+            pool = self.make_pool(module, [b1, b2])
             calls = []
 
             def fake_try(ep, *_a, **_k):
@@ -253,8 +256,7 @@ class VisionPoolGroupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             b1 = self.endpoint(module, "b1")
-            pool = self.make_pool(module, [b1],
-                                  [("vision-pool", "mixed", "api-pool-vision", "vision")])
+            pool = self.make_pool(module, [b1])
             b1._fail_count = 3
             b1._cooldown_reason = "vision_translate_failed"
             pool._try_endpoint = self.ok_result
@@ -268,8 +270,7 @@ class VisionPoolGroupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             b1 = self.endpoint(module, "b1")
-            pool = self.make_pool(module, [b1],
-                                  [("vision-pool", "mixed", "api-pool-vision", "vision")])
+            pool = self.make_pool(module, [b1])
             calls = []
             pool._try_endpoint = lambda *_a, **_k: calls.append(1) or self.ok_result()
             msgs = self.image_message("data:x")

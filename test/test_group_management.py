@@ -282,7 +282,8 @@ class GroupManagementTests(unittest.TestCase):
             self.assertEqual((status, response["ok"]), (200, True))
             with open(module.CONFIG_FILE, encoding="utf-8") as handle:
                 saved = json.load(handle)
-            self.assertEqual([group["name"] for group in saved["pool_group_defs"]], ["main"])
+            # 系统内置组恒落盘：main + 图片解析池（vision）
+            self.assertEqual([group["name"] for group in saved["pool_group_defs"]], ["main", "vision"])
 
     def test_restart_restores_defs_priority_and_current_endpoint_together(self):
         with tempfile.TemporaryDirectory() as tmp_path:
@@ -309,18 +310,18 @@ class GroupManagementTests(unittest.TestCase):
         """新建组尚无成员时，组目录和链摘要仍必须立即返回该实体。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
-            module.pool.create_group("vision", "mixed", "api-pool-vision")
+            module.pool.create_group("vp", "mixed", "api-pool-vp")
 
             status, resp, _ = module.api_handler("GET", "/api/groups", None)
             self.assertEqual(status, 200)
-            vision = next(g for g in resp["groups"] if g["name"] == "vision")
-            self.assertEqual(vision["members"], 0)
-            self.assertEqual(vision["model"], "api-pool-vision")
+            vp = next(g for g in resp["groups"] if g["name"] == "vp")
+            self.assertEqual(vp["members"], 0)
+            self.assertEqual(vp["model"], "api-pool-vp")
 
             status, resp, _ = module.api_handler("GET", "/api/chain", None)
             self.assertEqual(status, 200)
-            self.assertIn("vision", resp["groups"])
-            self.assertEqual(resp["groups"]["vision"]["members"], 0)
+            self.assertIn("vp", resp["groups"])
+            self.assertEqual(resp["groups"]["vp"]["members"], 0)
 
     def test_legacy_config_derives_defs_without_persist(self):
         with tempfile.TemporaryDirectory() as tmp_path:

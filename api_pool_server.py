@@ -2256,7 +2256,11 @@ class APIPool:
         # ── 组实体定义（2026-08-30 组管理）：name → {"type": "mixed"|"dedicated", "model": selector} ──
         # mixed 组 model = Hermes 侧配置的选择器名（如 api-pool-bg）；dedicated 组 model = 绑定的
         # 真实上游模型名（兼作选择器）。main 恒为 mixed，选择器固定 api-pool（历史别名）。
-        self._group_defs: dict[str, dict] = {self.MAIN_GROUP: {"type": "mixed", "model": "api-pool"}}
+        # 系统内置组：main（主组）+ 图片解析池（VISION_GROUP），恒在
+        self._group_defs: dict[str, dict] = {
+            self.MAIN_GROUP: {"type": "mixed", "model": "api-pool"},
+            self.VISION_GROUP: {"type": "mixed", "model": self.VISION_SELECTOR},
+        }
         self._client_profiles: dict = load_client_profiles()
         # 图片翻译短 TTL 缓存：图片集合签名 → (时间戳, 描述)，消除多轮重发历史含图的重译（2026-09-10 视觉池组）
         self._vision_cache: dict[str, tuple[float, str]] = {}
@@ -2652,6 +2656,16 @@ class APIPool:
     # ══════════════ 分组池路由基础设施（2026-08-29 spec）══════════════
 
     MAIN_GROUP = "main"
+    # 图片解析池（2026-09-12）：与 main 同级——全池唯一、系统固定存在，无「用途」配置项；
+    # 名称/类型/选择器锁定且不可删除。图片转译候选恒取本组成员。
+    VISION_GROUP = "vision"
+    VISION_SELECTOR = "api-pool-vision"  # 该组对外选择器（Hermes 侧 model 名），固定
+    # 组级上下文长度（2026-09-12，纯显式声明）：组声明的对外窗口（K=1000 tokens，0=不声明），
+        # 取值只认组实体 context_k，不做成员推导；
+    # 经 /v1/models 的 context_length 暴露给 Hermes（其解析链第 4/5 级）。
+    # 边界来自 Hermes `_coerce_reasonable_int`（1024–10,000,000 tokens）：越界值会被它忽略。
+    GROUP_CONTEXT_MIN_K = 2
+    GROUP_CONTEXT_MAX_K = 10000
 
     @classmethod
     def _endpoint_log_label(cls, ep, group=None, model=None):
@@ -2688,17 +2702,41 @@ class APIPool:
     def _valid_group_type(self, gtype):
         return gtype in ("mixed", "dedicated")
 
-    @staticmethod
-    def _valid_group_role(role):
-        """组用途角色："" = 普通组；"vision" = 图片解析池（全池唯一）。"""
-        return role in ("", "vision")
-
-    def _vision_group_name(self):
-        """当前标记为图片解析池的组名（无 → None）。"""
-        for grp, gd in self._group_defs.items():
-            if gd.get("role") == "vision":
-                return grp
+    def _valid_group_context_k(self, value):
+        """组上下文长度（K）归一化：0=未声明；非法/越界 → None（调用方拒绝）。"""
+        try:
+            k = int(value or 0)
+        except (TypeError, ValueError):
+            return None
+        if k == 0:
+            return 0
+        if self.GROUP_CONTEXT_MIN_K <= k <= self.GROUP_CONTEXT_MAX_K:
+            return k
         return None
+
+    def _group_context_k(self, group):
+        """组显式声明的上下文长度（K）；未声明或存值非法 → 0。"""
+        return self._valid_group_context_k(self._group_defs.get(group, {}).get("context_k")) or 0
+
+    def _group_context_tokens(self, group):
+        """该组对外声明的上下文窗口（tokens）；未显式声明 → None（不对外声明该键）。"""
+        k = self._group_context_k(group)
+        return k * 1000 if k > 0 else None
+
+    def _set_group_context_k(self, group, k):
+        """写入/清除组的显式 context_k，返回是否有变更。"""
+        gd = self._group_defs.get(group)
+        if gd is None:
+            return False
+        if k:
+            if gd.get("context_k") == k:
+                return False
+            gd["context_k"] = k
+        else:
+            if gd.pop("context_k", None) is None:
+                return False
+        sys_log(f"组 '{group}' 上下文长度声明为 {'%dK' % k if k else '取消声明'}", "INFO")
+        return True
 
     def _group_selector(self, name):
         """组选择器（Hermes 侧 model 名）：有实体定义取其 model，否则回退组名。"""
@@ -2713,8 +2751,15 @@ class APIPool:
         return None
 
     def _load_group_defs(self, defs_raw):
-        """启动/配置加载：归一化组实体定义（外部传入 list[dict]）。"""
-        self._group_defs = {self.MAIN_GROUP: {"type": "mixed", "model": "api-pool"}}
+        """启动/配置加载：归一化组实体定义（外部传入 list[dict]）。
+
+        系统内置组 main（首位）/ VISION_GROUP（次位）恒在，配置里其余组按配置顺序追加；
+        旧配置遗留的 role 键一律忽略（2026-09-12 起图片解析池不再由「用途」指定）。
+        """
+        self._group_defs = {
+            self.MAIN_GROUP: {"type": "mixed", "model": "api-pool"},
+            self.VISION_GROUP: {"type": "mixed", "model": self.VISION_SELECTOR},
+        }
         if isinstance(defs_raw, list):
             for d in defs_raw:
                 if not isinstance(d, dict):
@@ -2722,14 +2767,29 @@ class APIPool:
                 name = str(d.get("name", "")).strip()
                 gtype = d.get("type", "mixed")
                 model = str(d.get("model", "")).strip()
-                role = d.get("role", "")
-                if not name or name == self.MAIN_GROUP or not self._valid_group_type(gtype):
+                if not name or not self._valid_group_type(gtype):
                     continue
-                if not self._valid_group_role(role):
-                    role = ""
-                self._group_defs[name] = {"type": gtype, "model": model or name}
-                if role:
-                    self._group_defs[name]["role"] = role
+                if name == self.MAIN_GROUP:
+                    # main 类型/选择器恒内置；组级上下文长度声明随配置恢复
+                    ck = self._valid_group_context_k(d.get("context_k", 0))
+                    if ck:
+                        self._group_defs[self.MAIN_GROUP]["context_k"] = ck
+                    continue
+                if name == self.VISION_GROUP:
+                    # 内置图片解析池：类型恒 mixed，选择器沿用配置（缺省 VISION_SELECTOR）
+                    entry = {"type": "mixed", "model": model or self.VISION_SELECTOR}
+                    ck = self._valid_group_context_k(d.get("context_k", 0))
+                    if ck:
+                        entry["context_k"] = ck
+                    self._group_defs[name] = entry
+                    continue
+                if str(d.get("role", "") or "").strip():
+                    sys_log(f"忽略组 '{name}' 的 role 键（图片解析池固定为 '{self.VISION_GROUP}'）", "WARNING")
+                entry = {"type": gtype, "model": model or name}
+                ck = self._valid_group_context_k(d.get("context_k", 0))
+                if ck:
+                    entry["context_k"] = ck
+                self._group_defs[name] = entry
         return self._group_defs
 
     def _derive_group_defs(self):
@@ -2740,25 +2800,21 @@ class APIPool:
                 self._group_defs[grp] = {"type": "mixed", "model": grp}
         return self._group_defs
 
-    def create_group(self, name, gtype="mixed", model="", role=""):
-        """新建分组。返回 (ok, message)。role="vision" = 图片解析池（全池唯一）。"""
+    def create_group(self, name, gtype="mixed", model="", context_k=0):
+        """新建分组。返回 (ok, message)。main / 图片解析池为系统内置组，不可由此创建。"""
         with self._lock:
             name = str(name or "").strip()
             if not self._valid_group_name(name):
                 return False, "组名非法（非空、≤32字符、字母数字/连字符/点号/下划线/中文）"
-            if name == self.MAIN_GROUP or name == "api-pool":
+            if name in (self.MAIN_GROUP, self.VISION_GROUP, "api-pool"):
                 return False, f"组名 '{name}' 为保留名"
             if name in self._group_defs or name in self._all_group_names():
                 return False, f"组 '{name}' 已存在"
             if not self._valid_group_type(gtype):
                 return False, "分组类型必须为 mixed 或 dedicated"
-            role = str(role or "").strip()
-            if not self._valid_group_role(role):
-                return False, "用途取值非法（仅支持空或 vision）"
-            if role == "vision":
-                existing = self._vision_group_name()
-                if existing:
-                    return False, f"图片解析池已存在（组 '{existing}'），全池只能有一个"
+            ck = self._valid_group_context_k(context_k)
+            if ck is None:
+                return False, f"上下文长度非法（0=不声明，或 {self.GROUP_CONTEXT_MIN_K}K–{self.GROUP_CONTEXT_MAX_K}K）"
             model = str(model or "").strip()
             if gtype == "dedicated":
                 if not model:
@@ -2773,9 +2829,9 @@ class APIPool:
                     if g != name and gd.get("model") == model:
                         return False, f"选择器 '{model}' 已被组 '{g}' 使用"
             self._group_defs[name] = {"type": gtype, "model": model}
-            if role:
-                self._group_defs[name]["role"] = role
-            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}）", "INFO")
+            if ck:
+                self._group_defs[name]["context_k"] = ck
+            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%dK' % ck if ck else '未声明'}）", "INFO")
             return True, name
 
     def update_group(self, name, updates):
@@ -2795,30 +2851,35 @@ class APIPool:
             new_name = str(updates.get("name", name)).strip() or name
             new_type = updates.get("type", old["type"])
             new_model = str(updates.get("model", old.get("model", "")) or "").strip()
-            new_role = str(updates.get("role", old.get("role", "")) or "").strip()
+            new_ck = self._valid_group_context_k(updates.get("context_k", old.get("context_k", 0)))
+            if new_ck is None:
+                return False, f"上下文长度非法（0=不声明，或 {self.GROUP_CONTEXT_MIN_K}K–{self.GROUP_CONTEXT_MAX_K}K）"
 
             if not self._valid_group_type(new_type):
                 return False, "分组类型必须为 mixed 或 dedicated"
-            if not self._valid_group_role(new_role):
-                return False, "用途取值非法（仅支持空或 vision）"
-            if new_role == "vision":
-                existing = self._vision_group_name()
-                if existing and existing != name:
-                    return False, f"图片解析池已存在（组 '{existing}'），全池只能有一个"
             if name == self.MAIN_GROUP:
                 if new_name != self.MAIN_GROUP or new_type != "mixed":
                     return False, "main 组名称与类型不可修改（仅可改选择器）"
-                if new_role:
-                    return False, "main 组不可设为图片解析池"
                 if new_model and new_model != "api-pool":
                     # main 选择器改名会让存量 Hermes 配置失配，禁止
                     return False, "main 组选择器固定为 api-pool（历史别名）"
+                # 上下文长度不属于锁定项：main 是对外默认窗口，必须可改
+                if self._set_group_context_k(name, new_ck):
+                    return True, name
+                return True, "无变更"
+
+            if name == self.VISION_GROUP:
+                # 系统内置图片解析池：与 main 同级，名称/类型/选择器全锁
+                if new_name != self.VISION_GROUP or new_type != "mixed" or new_model != old.get("model", ""):
+                    return False, "图片解析池为系统内置组：名称/类型/选择器均锁定"
+                if self._set_group_context_k(name, new_ck):
+                    return True, name
                 return True, "无变更"
 
             if new_name != name:
                 if not self._valid_group_name(new_name):
                     return False, "组名非法（非空、≤32字符、字母数字/连字符/点号/下划线/中文）"
-                if new_name == self.MAIN_GROUP or new_name == "api-pool":
+                if new_name in (self.MAIN_GROUP, self.VISION_GROUP, "api-pool"):
                     return False, f"组名 '{new_name}' 为保留名"
                 if new_name in self._group_defs or new_name in self._all_group_names():
                     return False, f"组 '{new_name}' 已存在"
@@ -2854,18 +2915,18 @@ class APIPool:
                 del self._group_defs[name]
 
             self._group_defs[new_name] = {"type": new_type, "model": eff_model}
-            if new_role:
-                self._group_defs[new_name]["role"] = new_role
-            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}）", "INFO")
+            if new_ck:
+                self._group_defs[new_name]["context_k"] = new_ck
+            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%dK' % new_ck if new_ck else '未声明'}）", "INFO")
             return True, new_name
 
     def delete_group(self, name):
-        """删除分组：成员移出该组（最后一组→整体出池），清理指针与计数。main 不可删。
-        返回 (ok, message)。"""
+        """删除分组：成员移出该组（最后一组→整体出池），清理指针与计数。
+        main / 图片解析池为系统内置组，不可删。返回 (ok, message)。"""
         with self._lock:
             name = str(name or "").strip()
-            if name == self.MAIN_GROUP:
-                return False, "main 组不可删除"
+            if name in (self.MAIN_GROUP, self.VISION_GROUP):
+                return False, f"'{name}' 为系统内置组，不可删除"
             if name not in self._group_defs and name not in self._all_group_names():
                 return False, f"组 '{name}' 不存在"
             # 逐成员移出（复用组感知移除语义）
@@ -3063,16 +3124,12 @@ class APIPool:
         return [], False
 
     def _vision_pool_candidates(self):
-        """图片解析的候选来源：role=vision 组的可用端点（2026-09-10 视觉池组）。
+        """图片解析的候选来源 = 系统内置图片解析池（VISION_GROUP）的可用端点。
 
-        取代"在请求组内自动找任意 is_vision 端点"。返回 (候选列表, 视觉池组名)：
-        - 未配置视觉池 → ([], None)
-        - 视觉池无可用成员（禁用/未入池/手动锁/冷却）→ ([], 组名)
+        返回 (候选列表, 视觉池组名)：池无可用成员（禁用/未入池/手动锁/冷却）→ ([], 组名)。
         候选语义与普通请求一致（_group_sticky_candidates：enabled + in_pool + 非锁 + 非冷却）。
         """
-        vision_group = self._vision_group_name()
-        if not vision_group:
-            return [], None
+        vision_group = self.VISION_GROUP
         candidates, _ = self._group_sticky_candidates(vision_group)
         return candidates, vision_group
 
@@ -3389,7 +3446,7 @@ class APIPool:
     def _translate_images_sync(
         self, messages, active_eps, pool_group=None, request_id=None, request_deadline=None,
     ):
-        """图片转译：候选来源 = 视觉池（role: vision 组），不再从请求组内抓取任意视觉端点。
+        """图片转译：候选来源 = 系统内置图片解析池（VISION_GROUP），不再从请求组内抓取任意视觉端点。
 
         降级策略（2026-09-10 拍板 B）：视觉池无可用成员时本函数静默返回原消息，
         图片原样交给目标端点；降级告警由调用方（chat 拦截处）记录一次。
@@ -4692,7 +4749,7 @@ class APIPool:
                 if not vision_cands:
                     # 降级策略 B（2026-09-10）：视觉池无可用端点 → 图片原样直发，
                     # 打一次 WARNING 保持可观测；不回退"组内任意 is_vision 端点"。
-                    _why = "未配置图片解析池" if not vision_grp else f"图片解析池 '{vision_grp}' 无可用端点"
+                    _why = f"图片解析池 '{vision_grp}' 无可用端点"
                     sys_log(f"{_why}，图片未转译，原样转发目标端点", "WARNING")
                 else:
                     if payload.get("stream"):
@@ -6527,19 +6584,35 @@ def api_handler(method, path, body):
         # dedicated 组 selector=真实模型名时即真实可用模型列表。
         # 组管理（2026-08-30）：selector 取组实体 model 字段（无实体定义回退组名）。
         selector_ids = ["api-pool"]
+        context_by_selector = {}
         for grp in pool._all_group_names():
             sid = pool._group_selector(grp) or grp
             if sid not in selector_ids:
                 selector_ids.append(sid)
-        return 200, {
-            "object": "list",
-            "data": [{
-                "id": mid,
-                "object": "model",
-                "created": 0,
-                "owned_by": "api-pool",
-            } for mid in selector_ids],
-        }, False
+            # 组级上下文长度（2026-09-12）：显式声明 → 成员最小值；无值则不带该键
+            ctx = pool._group_context_tokens(grp)
+            if ctx:
+                context_by_selector[sid] = ctx
+        data = []
+        for mid in selector_ids:
+            entry = {"id": mid, "object": "model", "created": 0, "owned_by": "api-pool"}
+            if mid in context_by_selector:
+                entry["context_length"] = context_by_selector[mid]
+            data.append(entry)
+        return 200, {"object": "list", "data": data}, False
+
+    if method == "GET" and cp.startswith("/v1/models/"):
+        # 单模型查询（Hermes 上下文解析链第 5 级本地探针路径）：选择器 → 组声明窗口
+        mid = unquote(cp.split("/v1/models/", 1)[1]).strip("/")
+        for grp in pool._all_group_names():
+            if (pool._group_selector(grp) or grp) == mid:
+                entry = {"id": mid, "object": "model", "created": 0, "owned_by": "api-pool"}
+                ctx = pool._group_context_tokens(grp)
+                if ctx:
+                    entry["context_length"] = ctx
+                return 200, entry, False
+        return 404, {"error": {"message": f"model '{mid}' not found",
+                               "type": "invalid_request_error", "param": None, "code": None}}, False
 
     if method == "GET" and (cp.startswith("/v1/responses/") or cp.startswith("/responses/")):
         rid = unquote(cp.rsplit("/", 1)[-1])
@@ -6678,9 +6751,9 @@ def api_handler(method, path, body):
                 # 整组 fallback 锁剩余秒数（>0 = 该组正借道 main，UI 显示 ↩main）
                 "fallback_lock_remaining": max(0, int(_fb_until - time.time())) if _fb_until else 0,
                 "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)),
-                "role": pool._group_defs.get(grp, {}).get("role", ""),
+                "is_vision": grp == pool.VISION_GROUP,
                 # 图片解析池可用成员数（调度候选口径，与 _vision_pool_candidates 一致）
-                "available": len(pool._vision_pool_candidates()[0]) if pool._group_defs.get(grp, {}).get("role") == "vision" else 0,
+                "available": len(pool._vision_pool_candidates()[0]) if grp == pool.VISION_GROUP else 0,
             }
         return 200, {"chain": chain, "groups": group_summary}, False
     # ================= 组管理（2026-08-30）=================
@@ -6694,7 +6767,8 @@ def api_handler(method, path, body):
                 "name": grp,
                 "type": gd.get("type", "mixed"),
                 "model": gd.get("model", grp),
-                "role": gd.get("role", ""),
+                "context_k": pool._group_context_k(grp),
+                "is_vision": grp == pool.VISION_GROUP,
                 "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)),
                 "current_endpoint": cur_ep.name if cur_ep else None,
                 "is_main": grp == pool.MAIN_GROUP,
@@ -6704,8 +6778,7 @@ def api_handler(method, path, body):
         name = str(body.get("name", "")).strip()
         gtype = body.get("type", "mixed")
         model = str(body.get("model", "") or "").strip()
-        role = str(body.get("role", "") or "").strip()
-        ok, msg = pool.create_group(name, gtype, model, role)
+        ok, msg = pool.create_group(name, gtype, model, body.get("context_k", 0))
         if not ok:
             return 400, {"error": msg}, False
         _sync_to_config()
@@ -7101,8 +7174,8 @@ def _sync_to_config():
     for gname, gd in pool._group_defs.items():
         if gname != pool.MAIN_GROUP:
             entry = {"name": gname, "type": gd.get("type", "mixed"), "model": gd.get("model", gname)}
-            if gd.get("role"):
-                entry["role"] = gd["role"]
+            if gd.get("context_k"):
+                entry["context_k"] = gd["context_k"]
             defs_list.append(entry)
     save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "client_profile": ep.get("client_profile", ""), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
             "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles)
