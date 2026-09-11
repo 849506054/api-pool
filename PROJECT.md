@@ -251,3 +251,12 @@ PUT 走 save_content_filter_config：写前时间戳备份（content_filter.json
 管理弹层控件样式与端点表单统一：规则类型下拉/输入框对齐 34px 高、10px 圆角、13px 字号，类型文案「敏感词 / 正则」，规则列表徽章同步中文。
 生产部署：api_pool_server.py.bak.20260911_180149 + static/index.html.bak.20260911_180149（部署前备份）。
 验证：E2E mock 全绿（新增规则落盘 / 热生效无需重启 / 无效正则 400+回滚 / 结构错误 400 / 关闭后测试仍预览 / 前端断言 8 处 / node --check 通过）+ 生产 curl 验收（服务 active、GET 返回生产词典 2026-08-30b、test 接口、前端新元素、UI 微调断言）。
+
+## 2026-09-11 客户端特征两态模型（本地透明网关）已部署生产
+`client_profile` 收敛为两态：空=透传（出站头=客户端入站头副本，剔除池托管头与连接级头，`Accept-Encoding` 收敛 gzip/deflate/identity）/ profile 名=伪装（出站头=该 profile 的 headers 唯一来源，不混入当前客户端指纹头）。
+出站头解析统一为 `resolve_outbound_headers`（代理、探活、管理页端点测试、拉模型四条路径同源）；无客户端上下文的路径复用客户端基线（进程内最近一次真实入站头），无基线时回退默认库标识——消除拉模型不携带客户端特征、探活在上游校验客户端身份时误判的缺口。
+`hermes` 由硬编码内建改为 `api_config.json` 的 `client_profiles` 条目，全部 profile 均可编辑/覆盖/删除；41 端点默认透传。
+profile 管理弹层重做为列表/表单双视图（可编辑已有 profile、显示由 `User-Agent` 解析出的版本标识如 Hermes 0.21.0），风格对齐既有弹层规范；静态文件按 mtime 热重载免重启。
+生产 hash 后端 05970e18 / 前端 2c9ae0ea（备份 api_pool_server.py.bak-20260911-clientmode、static/index.html.bak-20260911-clientmode、api_config.json.bak-20260911-pre-flatten）。
+验证：隔离实例端到端四项（回显上游实证透传全量头、伪装不混入客户端头、探活复用基线、无基线回退）+ 全量 36 个测试文件 0 失败（原基线 1 例过时断言一并修正）+ 生产真实流量 200 与健康检测无 WARN；前端代码级断言脚本 scripts/verify_client_profile_ui.js。
+详见 skill api-pool-management references/client-transparent-gateway-implemented-2026-09-11.md。
