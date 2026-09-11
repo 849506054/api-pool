@@ -54,57 +54,54 @@ _TRUNCATED_STREAM_REASONS = ("流式总时长超限", "流式无有效业务增�
 # 客户端原始 UA 经线程局部存储送到出站请求构造点。ThreadingHTTPServer 每请求独占
 # 线程，流式生成器与图片翻译都在同一线程内消费，因此该作用域覆盖整个请求生命周期
 # （含流式内部重试与 temperature/top_p 清洗重试）。
-# 只有代理路径写入：后台探活线程与管理页测试/拉模型接口保持默认库标识，避免把浏览器
-# UA 透到上游。端点自定义 UA（default_headers/extra_headers）在此之后 add_header 覆盖，
-# 优先级为 端点自定义 > 客户端原始 > 默认库标识。
+# 只有代理路径写入真实客户端头；探活/管理页测试/拉模型接口无客户端上下文，改用客户端基线
+# （最近一次真实入站头），使其与真实流量携带同一客户端特征。端点自定义头
+# （default_headers/extra_headers）在此之后 add_header 覆盖，优先级为 端点自定义 > 客户端 > 默认库标识。
 _DEFAULT_OUTBOUND_UA = "OpenAI/Python 2.33.0"
 _client_ctx = threading.local()
+# 客户端基线：进程内最近一次真实入站头快照，供无客户端上下文的出站路径复用。
+# ponytail: 单份全局，多客户端混用时代表最近一个客户端；需要区分时改 per-endpoint 基线。
+_client_baseline: dict = {}
+_client_baseline_lock = threading.Lock()
 
-# ── 客户端伪装 Client Profile（2026-09-10）──
-# 让选中端点的出站请求在头层面与真实客户端一致。内建 profile 不落盘；
-# 配置文件 client_profiles 键存用户自定义 profile（与内建重名则忽略+WARN）。
-# 黄金样本来源：/opt/hermes/.venv openai SDK 2.24.0 实测出站头集合。
-_BUILTIN_CLIENT_PROFILES = {
-    "hermes": {
-        "builtin": True,
-        "headers": {
-            "User-Agent": "hermes-agent/0.21.0",
-            "Accept": "application/json",
-            "Accept-Encoding": "gzip, deflate",
-            "X-Stainless-Lang": "python",
-            "X-Stainless-Package-Version": "2.24.0",
-            "X-Stainless-OS": "Linux",
-            "X-Stainless-Arch": "x64",
-            "X-Stainless-Runtime": "CPython",
-            "X-Stainless-Runtime-Version": "3.13.5",
-            "X-Stainless-Async": "false",
-            "x-stainless-retry-count": "0",
-            "x-stainless-read-timeout": "600",
-        },
-    },
-}
+# ── 客户端伪装 Client Profile ──
+# 让选中端点的出站请求在头层面与真实客户端一致：profile.headers 为唯一来源。
+# profile 存配置文件顶层 client_profiles 键，均可编辑（hermes 亦为配置条目，版本号随客户端升级更新）。
+# hermes 黄金样本：/opt/hermes/.venv openai SDK 2.24.0 实测出站头集合。
 # profile 不允许覆盖的保留头（由 pool 按端点协议管理）
 _PROFILE_RESERVED_HEADERS = frozenset({
     "host", "content-length", "authorization", "x-api-key", "anthropic-version",
 })
-# 动态识别规则表：(UA 子串小写, profile 名)，顺序匹配命中即停。
-# 只收录已存在 profile 的规则；新 profile 落地后再补规则。
-_AUTO_PROFILE_RULES = (
-    ("hermes-agent", "hermes"),
-)
+# 透传时跳过的头：连接级/端到端头 + pool 托管头（host/content-length 由 urllib 重算，
+# authorization/x-api-key/anthropic-version 由 pool 按端点协议写入）
+_PASSTHROUGH_SKIP_HEADERS = _PROFILE_RESERVED_HEADERS | frozenset({
+    "connection", "transfer-encoding", "te", "trailer", "upgrade",
+    "proxy-authorization", "proxy-connection", "keep-alive",
+})
+# 解压链（_DecodedResponse）支持的压缩编码；其余 token（br/zstd）透传会让下游收到无法解码的字节
+_SUPPORTED_ACCEPT_ENCODINGS = frozenset({"gzip", "deflate", "identity"})
 
 
-def set_client_user_agent(ua):
-    _client_ctx.user_agent = (ua or "").strip()
+def set_client_headers(headers):
+    """代理路径写入真实入站头，并更新进程级基线供探活/测试/拉模型复用。"""
+    hdrs = {k: v for k, v in dict(headers or {}).items() if isinstance(k, str) and isinstance(v, str)}
+    _client_ctx.headers = hdrs
+    with _client_baseline_lock:
+        _client_baseline.clear()
+        _client_baseline.update(hdrs)
 
 
-def clear_client_user_agent():
-    _client_ctx.user_agent = ""
+def clear_client_headers():
+    _client_ctx.headers = {}
 
 
-def resolve_outbound_user_agent():
-    """出站 UA：客户端原始 UA 优先，缺失时回退默认库标识（避免 Python-urllib 被 WAF 拦）。"""
-    return getattr(_client_ctx, "user_agent", "") or _DEFAULT_OUTBOUND_UA
+def _current_client_headers():
+    """当前线程的客户端头；无（探活/测试/管理线程）→ 客户端基线；都无 → {}。"""
+    hdrs = getattr(_client_ctx, "headers", None)
+    if hdrs:
+        return hdrs
+    with _client_baseline_lock:
+        return dict(_client_baseline)
 
 
 
@@ -2457,10 +2454,8 @@ class APIPool:
     # ── 客户端伪装 profile 管理（2026-09-10）──
 
     def list_client_profiles(self):
-        """列表：内建（builtin=True，不可删改）+ 自定义。"""
+        """列表：配置文件里的全部 profile（均可编辑/删除）。"""
         out = []
-        for name, entry in _BUILTIN_CLIENT_PROFILES.items():
-            out.append({"name": name, "builtin": True, "headers": entry.get("headers", {})})
         for name, entry in (self._client_profiles or {}).items():
             if not isinstance(entry, dict):
                 continue
@@ -2468,12 +2463,10 @@ class APIPool:
         return out
 
     def save_client_profile(self, name, headers):
-        """新建/覆盖自定义 profile。保留头过滤；重名内建 → 拒绝。"""
+        """新建/覆盖 profile。保留头过滤。"""
         name = (name or "").strip()
         if not name:
             raise ValueError("profile 名称不能为空")
-        if name in _BUILTIN_CLIENT_PROFILES:
-            raise ValueError(f"'{name}' 为内建 profile，不可覆盖")
         clean, dropped = _sanitize_profile_headers(headers)
         if dropped:
             sys_log(f"客户端伪装：profile '{name}' 提交的保留头 {dropped} 已过滤", "WARN")
@@ -2483,10 +2476,8 @@ class APIPool:
         return name
 
     def delete_client_profile(self, name):
-        """删除自定义 profile；被引用端点在解析时自动降级为不伪装（WARN）。"""
+        """删除 profile；被引用端点在解析时自动降级为透传（WARN）。"""
         name = (name or "").strip()
-        if name in _BUILTIN_CLIENT_PROFILES:
-            raise ValueError(f"'{name}' 为内建 profile，不可删除")
         with self._lock:
             if not self._client_profiles or name not in self._client_profiles:
                 raise ValueError(f"profile '{name}' 不存在")
@@ -2508,6 +2499,7 @@ class APIPool:
                 "protocol": ep.protocol,
                 "default_headers": dict(ep.default_headers or {}),
                 "extra_headers": dict(ep.extra_headers or {}),
+                "client_profile": ep.client_profile,
             }
         return self.fetch_models(**connection)
 
@@ -3289,7 +3281,7 @@ class APIPool:
                 models = self.fetch_models(
                     ep.base_url, ep.api_key, timeout=10, use_proxy=ep.use_proxy,
                     protocol=ep.protocol, default_headers=ep.default_headers,
-                    extra_headers=ep.extra_headers,
+                    extra_headers=ep.extra_headers, client_profile=ep.client_profile,
                 )
                 latency = int((time.time() - t0) * 1000)
                 if models:
@@ -5220,9 +5212,11 @@ class APIPool:
                 req.add_header("x-api-key", safe_api_key)
                 req.add_header("anthropic-version", "2023-06-01")
             req.add_header("Authorization", f"Bearer {safe_api_key}")
-            req.add_header("User-Agent", resolve_outbound_user_agent())
-            # 客户端伪装 profile（2026-09-10）：合并优先级 客户端UA < profile < default_headers < extra_headers
-            for k, v in resolve_client_profile(ep, self._client_profiles).items():
+            # 出站客户端特征（2026-09-11 透明网关）：伪装 profile，或客户端透传（探活/测试线程用客户端基线）；
+            # 合并优先级 客户端特征 < default_headers < extra_headers
+            for k, v in resolve_outbound_headers(
+                getattr(ep, "client_profile", ""), self._client_profiles, label=f"端点 '{ep.name}'"
+            ).items():
                 req.add_header(k, v)
             for k, v in ep.default_headers.items():
                 req.add_header(k, v)
@@ -5914,12 +5908,14 @@ class APIPool:
                 return None, f"未知错误: {e}"
         return None, "重试次数用尽"
 
-    def fetch_models(self, base_url, api_key, timeout=10, use_proxy=True, protocol="openai", default_headers=None, extra_headers=None):
+    def fetch_models(self, base_url, api_key, timeout=10, use_proxy=True, protocol="openai", default_headers=None, extra_headers=None, client_profile=""):
         url = base_url.rstrip("/") + "/models"
         req = urllib.request.Request(url, method="GET")
         safe_api_key = api_key.encode('ascii', 'ignore').decode('ascii').strip()
         req.add_header("Authorization", f"Bearer {safe_api_key}")
-        req.add_header("User-Agent", "OpenAI/Python 2.33.0")
+        # 客户端特征与代理路径同源（2026-09-11）：profile 或客户端透传/基线
+        for k, v in resolve_outbound_headers(client_profile, self._client_profiles, label="拉模型").items():
+            req.add_header(k, v)
         for k, v in (default_headers or {}).items():
             req.add_header(k, v)
         for k, v in (extra_headers or {}).items():
@@ -5972,8 +5968,8 @@ class APIPool:
                + _chunk(b"IEND", b""))
         return base64.b64encode(png).decode()
 
-    def test_vision(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai", user_agent=""):
-        ep = Endpoint(name="test_vision", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol, default_headers={"User-Agent": user_agent} if user_agent else {})
+    def test_vision(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai", user_agent="", client_profile=""):
+        ep = Endpoint(name="test_vision", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol, default_headers={"User-Agent": user_agent} if user_agent else {}, client_profile=client_profile)
         tiny_png = self._tiny_png_base64()
         payload = {
             "model": model,
@@ -5997,8 +5993,8 @@ class APIPool:
             unsupported = "image" in err.lower() or "vision" in err.lower() or "content" in err.lower() or "400" in err
             return {"ok": not unsupported, "supports_vision": not unsupported, "latency_ms": latency, "reply": "", "error": err}
 
-    def test_model_latency(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai", user_agent=""):
-        ep = Endpoint(name="test_latency", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol, default_headers={"User-Agent": user_agent} if user_agent else {})
+    def test_model_latency(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai", user_agent="", client_profile=""):
+        ep = Endpoint(name="test_latency", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol, default_headers={"User-Agent": user_agent} if user_agent else {}, client_profile=client_profile)
         payload = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}
         t0 = time.time()
         reply, err = self._try_endpoint(ep, payload, timeout)
@@ -6202,35 +6198,43 @@ def _sanitize_profile_headers(headers):
         clean[k] = v
     return clean, dropped
 
-def resolve_client_profile(ep, client_profiles=None):
-    """返回端点生效的 profile 头 dict（已过滤保留头）。内建优先；未知 profile 名 → 空 + WARN。"""
-    name = (getattr(ep, "client_profile", "") or "").strip()
-    if not name:
-        return {}
-    if name == "auto":
-        # 动态识别（2026-09-10）：按入站客户端 UA 匹配规则表；未命中 → 透传（默认哲学）
-        ua = (getattr(_client_ctx, "user_agent", "") or "").lower()
-        hit = ""
-        for marker, prof in _AUTO_PROFILE_RULES:
-            if marker in ua:
-                hit = prof
-                break
-        if not hit:
-            return {}
-        name = hit
-        sys_log(f"客户端伪装：动态识别 UA '{ua[:80]}' → profile '{hit}'", "INFO")
-    if name in _BUILTIN_CLIENT_PROFILES:
-        headers = _BUILTIN_CLIENT_PROFILES[name].get("headers", {})
-    else:
+def _filter_accept_encoding(headers):
+    """把 Accept-Encoding 收敛到解压链支持的编码；无可用 token 时丢弃该头（不让上游压缩）。"""
+    for k in list(headers):
+        if k.strip().lower() != "accept-encoding":
+            continue
+        keep = [t.strip() for t in str(headers[k]).split(",") if t.strip().lower() in _SUPPORTED_ACCEPT_ENCODINGS]
+        if keep:
+            headers[k] = ", ".join(keep)
+        else:
+            headers.pop(k)
+    return headers
+
+
+def resolve_outbound_headers(profile_name, client_profiles=None, label=""):
+    """出站头统一解析（2026-09-11 透明网关）。
+
+    profile_name 非空 → 伪装：仅用该 profile 的头（不叠加客户端头，避免混合指纹）；
+    为空 → 透传：用客户端真实入站头（探活/测试/拉模型线程无客户端上下文时用客户端基线），
+    客户端无 UA 时回退默认库标识。"""
+    name = (profile_name or "").strip()
+    if name:
         entry = (client_profiles or {}).get(name)
-        if not isinstance(entry, dict):
-            sys_log(f"客户端伪装：端点 '{getattr(ep, 'name', '')}' 引用了未知 profile '{name}'，降级为不伪装", "WARN")
-            return {}
-        headers = entry.get("headers", {})
-    clean, dropped = _sanitize_profile_headers(headers)
-    if dropped:
-        sys_log(f"客户端伪装：profile '{name}' 包含保留头 {sorted(dropped)}，已过滤", "WARN")
-    return clean
+        if isinstance(entry, dict):
+            clean, dropped = _sanitize_profile_headers(entry.get("headers", {}))
+            if dropped:
+                sys_log(f"客户端伪装：profile '{name}' 包含保留头 {sorted(dropped)}，已过滤", "WARN")
+            return _filter_accept_encoding(clean)
+        sys_log(f"客户端伪装：{label or '端点'} 引用了未知 profile '{name}'，降级为透传", "WARN")
+    headers = {}
+    for k, v in _current_client_headers().items():
+        if k.strip().lower() in _PASSTHROUGH_SKIP_HEADERS:
+            continue
+        headers[k] = v
+    headers = _filter_accept_encoding(headers)
+    if not any(k.strip().lower() == "user-agent" for k in headers):
+        headers["User-Agent"] = _DEFAULT_OUTBOUND_UA
+    return headers
 
 def load_group_defs_config():
     """读取组实体定义（2026-08-30 组管理）：pool_group_defs 顶层键。旧配置无此键 → None（走派生）。"""
@@ -6945,6 +6949,7 @@ def api_handler(method, path, body):
                 base_url, api_key, use_proxy=body.get("use_proxy", True),
                 protocol=body.get("protocol", "openai"),
                 default_headers=body.get("default_headers", {"User-Agent": body["user_agent"]} if body.get("user_agent") else {}),
+                client_profile=body.get("client_profile", ""),
             )
             return 200, {"ok": True, "models": models, "count": len(models)}, False
         except urllib.error.HTTPError as e:
@@ -6953,8 +6958,8 @@ def api_handler(method, path, body):
             except Exception: pass
             return 200, {"ok": False, "error": f"HTTP {e.code}: {err_body}"}, False
         except Exception as e: return 200, {"ok": False, "error": str(e)}, False
-    if method == "POST" and cp == "/api/test-model": return 200, pool.test_model_latency(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai"), user_agent=body.get("user_agent", "")), False
-    if method == "POST" and cp == "/api/test-vision": return 200, pool.test_vision(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai"), user_agent=body.get("user_agent", "")), False
+    if method == "POST" and cp == "/api/test-model": return 200, pool.test_model_latency(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai"), user_agent=body.get("user_agent", ""), client_profile=body.get("client_profile", "")), False
+    if method == "POST" and cp == "/api/test-vision": return 200, pool.test_vision(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai"), user_agent=body.get("user_agent", ""), client_profile=body.get("client_profile", "")), False
     if method == "POST" and cp == "/api/test":
         ep_id = body.get("id", "")
         test_msg = body.get("message", "你好")
@@ -7200,11 +7205,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self._read_body()
-        # 出站 UA 透传：仅代理路径把客户端原始 UA 带入本请求线程；管理页与探活保持默认标识。
-        # 流式生成器在本方法内同线程消费，故清理放在 finally，覆盖整个请求生命周期。
+        # 出站客户端透传：仅代理路径把客户端原始头带入本请求线程，并更新客户端基线供
+        # 探活/测试/拉模型复用。流式生成器在本方法内同线程消费，故清理放在 finally。
         proxy_request = self._is_proxy_path()
         if proxy_request:
-            set_client_user_agent(self.headers.get("User-Agent"))
+            set_client_headers(self.headers)
         try:
             res = api_handler("POST", self.path, body)
 
@@ -7227,7 +7232,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(res[0], res[1])
         finally:
             if proxy_request:
-                clear_client_user_agent()
+                clear_client_headers()
 
     def do_PUT(self):
         body = self._read_body()

@@ -27,7 +27,7 @@
 - **多协议入口与上游桥接** — 入站支持 `/v1/chat/completions` 与 `/v1/responses`；上游 Endpoint 可按 `openai` / `anthropic` / `responses` 三种协议接入并在同一次请求内跨协议桥接。已验收文本、流式、工具调用、多轮工具结果、跨协议工具历史、base64 PNG 图片和 Hermes 实际工具循环，详见 [`docs/anthropic-compatibility-matrix.md`](docs/anthropic-compatibility-matrix.md)
 - **视觉池组** — 图片转译的候选来源是专用分组（`role: vision`，全池唯一），不再从请求所在组内任意抓取视觉端点；该分组无可用成员时图片原样转发
 - **工具调用兼容** — 支持 tool call 转换、工具结果回传，以及按 Endpoint 配置 `tool_call_id_prefix` 修正跨上游切换后的 ID 格式
-- **客户端伪装（client_profile）** — Endpoint 级出站头伪装，三态：透传客户端原头 / `auto` 按入站客户端 UA 自动匹配 profile / 指定静态 profile；用于通过上游的客户端指纹校验
+- **客户端特征（client_profile）** — 默认透传客户端真实请求头（本地透明网关），Endpoint 级可指定 profile 伪装成其他客户端；探活、端点测试与拉模型复用同一套出站头，用于通过上游的客户端指纹或 UA 白名单校验
 - **入口敏感词过滤** — 请求进入路由前统一清洗已知字段，覆盖普通消息、多模态文本、reasoning、消息名称和工具调用参数；范围可配置，默认不扫描整个 payload；管理面板 `🛡 敏感词过滤` 可视化维护并热重载
 - **独立入口与内部路由** — Hermes 只需连接稳定的 `api-pool` 入口模型名，API Pool 2.0 使用目标 Endpoint 自己的 `model` 转发
 - **统计大盘** — Token 消耗、缓存命中、请求数趋势；「异常」统计卡可点击筛选异常端点
@@ -139,17 +139,22 @@ content_filter.json
 
 同协议保真透传，跨协议按需转换（消息体、流式、工具调用与工具历史、图片）。`protocol` 为纯手动配置，无自动检测：「🔍 获取模型」按钮始终按 `GET {base}/models` 请求，拉取成功不代表协议选对。
 
-## 客户端伪装（client_profile）
+## 客户端特征（client_profile）
 
-部分上游校验客户端指纹或 UA 白名单（UA 不符可能直接 401/403）。Endpoint 级 `client_profile` 提供三态出站头伪装：
+部分上游校验客户端指纹或 UA 白名单（UA 不符可能直接 401/403）。Endpoint 级 `client_profile` 提供两种出站头模式：
 
 | 取值 | 行为 |
 |---|---|
-| 空（默认） | 不伪装，透传客户端原始请求头；UA 缺失时回退默认库标识 |
-| `auto` | 按入站客户端 UA 匹配已注册 profile，命中即应用 |
-| profile 名 | 固定使用该 profile 的头集合 |
+| 空（默认） | **透传**：出站头 = 客户端真实入站头副本；只剔除由 Pool 托管的头（`Host`、`Content-Length`、`Authorization`、`x-api-key`、`anthropic-version`）与连接级头（`Connection`、`Transfer-Encoding` 等），`Accept-Encoding` 收敛为解压链支持的 `gzip`/`deflate`/`identity`；客户端未带 `User-Agent` 时回退默认库标识 |
+| profile 名 | **伪装**：出站头 = 该 profile 的 `headers`，不混入当前客户端的头（避免混合指纹） |
 
-出站头合并优先级：客户端 UA → profile → `default_headers` → `extra_headers`。`Host`、`Content-Length`、`Authorization`、`x-api-key`、`anthropic-version` 为保留头，profile 不可覆盖。内建 `hermes` profile 取自 Hermes 真实出站头样本；自定义 profile 在端点表单 `⚙️` 弹层维护，保存在 `api_config.json` 的 `client_profiles` 键。启用 `Accept-Encoding: gzip, deflate` 时由服务端解压上游响应（含 SSE 流）。
+伪装只作用于请求头；请求协议与路径由 `protocol` 独立控制，两者正交。
+
+出站头合并优先级：客户端特征/profile → `default_headers` → `extra_headers`，端点级始终可覆盖。`Host`、`Content-Length`、`Authorization`、`x-api-key`、`anthropic-version` 为保留头，由 Pool 按端点协议写入，任何 profile 都不能覆盖。
+
+**探活、管理页端点测试、拉取模型列表**与代理路径共用同一套出站头解析：这些路径没有客户端上下文，复用最近一次真实请求的客户端头（进程内基线），使上游的客户端校验对它们同样放行；服务刚启动、尚无真实请求时回退默认库标识。
+
+profile 在端点表单 `⚙️` 弹层维护（新建 / 编辑 / 删除），保存在 `api_config.json` 的 `client_profiles` 键；列表与下拉显示从 `User-Agent` 解析出的客户端版本标识（如 `Hermes 0.21.0`）。`hermes` profile 内容为 Hermes 真实出站头样本，客户端升级后直接编辑其 `User-Agent` 等头即可。启用 `Accept-Encoding: gzip, deflate` 时由服务端解压上游响应（含 SSE 流）。
 
 ## 端点配置字段
 
@@ -171,7 +176,7 @@ content_filter.json
 | 延迟回迁 `deferrable` | bool | `true` | `true`=本端点工作时延迟切走（保护缓存） |
 | 上下文限制 `max_context_k` | int（K tokens） | `0` | 请求超限时自动跳过该端点，`0`=不限 |
 | 代理 `use_proxy` | bool | `false` | 是否随系统代理转发请求 |
-| 客户端伪装 `client_profile` | string | 空 | 三态：空=透传 / `auto`=动态识别 / profile 名=静态 |
+| 客户端伪装 `client_profile` | string | 空 | 空=透传客户端真实请求头；profile 名=伪装，出站头只用该 profile 的头集 |
 | 原生视觉 `is_vision` | bool | `false` | 标记端点原生支持视觉，图片直接透传 |
 | 假成功检测 `check_fake_success` | bool | `false` | 检测 200 OK 但内容为拒绝的「假成功」 |
 | ToolCall ID 前缀 `tool_call_id_prefix` | string | 空 | 重写请求中的 tool call id 前缀 |
@@ -334,7 +339,7 @@ curl -sS "$BASE_URL/chat/completions" \\
 | `404 Not found` | `base_url` 少了 `/v1`、重复了 `/v1`，或端口写错（2.0 默认 5100，生产示例 5200）。 |
 | `Could not determine context length` | `model` 使用了符号名 `api-pool`，且没有设置 `model.context_length`；补上显式值。 |
 | 已设置 `context_length` 但仍 fallback 到 256K | `model` 段缺少与 Provider 一致的 `base_url`，运行时路由匹配可能清除 context pin；补齐 `model.base_url`。 |
-| `401` 或 `403` | 由上游 Endpoint 侧产生：上游 Key 无效、WAF/网关拦截，或上游校验客户端指纹（如要求特定 UA），需在 Endpoint 上配置 `client_profile` 或检查 `extra_headers`；API Pool 网关本身不校验客户端 Key。 |
+| `401` 或 `403` | 由上游 Endpoint 侧产生：上游 Key 无效、WAF/网关拦截，或上游校验客户端身份（UA 白名单、客户端指纹）。默认透传已转发客户端全部请求头，仍被拒时在 Endpoint 上指定 `client_profile` 伪装成对应客户端，或检查 `extra_headers`；API Pool 网关本身不校验客户端 Key。 |
 | 上游 Endpoint 返回 400 | 检查 API Pool 2 UI 中该 Endpoint 的 `protocol`、`model`、`extra_payload` 和 thinking 设置；不要先在 Hermes 全局注入参数。 |
 | Hermes fallback 没按预期切换 | 检查 `hermes fallback list`；每一跳都要有明确的 `provider` 和 `model`，并确认目标 Endpoint 没有处于冷却状态。 |
 

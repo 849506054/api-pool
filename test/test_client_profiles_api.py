@@ -1,9 +1,9 @@
 """客户端伪装 profile 管理 API（2026-09-10）。
 
-契约：
-- GET /api/client-profiles → 内建（builtin=True）+ 自定义列表
-- POST 新建/覆盖自定义；保留头过滤；重名内建拒绝（400）
-- PUT/DELETE 按名操作；内建不可删（400）
+契约（2026-09-11：profile 全部为配置条目，可编辑/覆盖/删除）：
+- GET /api/client-profiles → 配置文件里的全部 profile
+- POST 新建/覆盖；保留头过滤
+- PUT/DELETE 按名操作；未知名称 400
 - 保存后 _sync_to_config 落盘 client_profiles 键
 """
 
@@ -51,12 +51,16 @@ class ClientProfilesApiTests(unittest.TestCase):
         os.chdir(self._orig_cwd)
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def test_list_includes_builtin_hermes(self):
+    def test_list_returns_saved_profiles(self):
+        self.module.api_handler("POST", "/api/client-profiles", {
+            "name": "hermes",
+            "headers": {"User-Agent": "hermes-agent/0.21.0", "X-Stainless-Lang": "python"},
+        })
         code, data, _ = self.module.api_handler("GET", "/api/client-profiles", {})
         self.assertEqual(code, 200)
         by_name = {p["name"]: p for p in data["profiles"]}
         self.assertIn("hermes", by_name)
-        self.assertTrue(by_name["hermes"]["builtin"])
+        self.assertFalse(by_name["hermes"]["builtin"])
         self.assertIn("X-Stainless-Lang", by_name["hermes"]["headers"])
 
     def test_create_custom_profile(self):
@@ -83,13 +87,19 @@ class ClientProfilesApiTests(unittest.TestCase):
         self.assertNotIn("Host", h)
         self.assertEqual(h.get("Accept"), "application/json")
 
-    def test_builtin_cannot_be_overwritten_or_deleted(self):
+    def test_profile_can_be_overwritten_and_deleted(self):
+        # 客户端版本升级场景：同名覆盖即更新版本号（不再有内建只读限制）
         code, data, _ = self.module.api_handler("POST", "/api/client-profiles", {
-            "name": "hermes", "headers": {"User-Agent": "hacked"},
+            "name": "hermes", "headers": {"User-Agent": "hermes-agent/0.22.0"},
         })
-        self.assertEqual(code, 400)
+        self.assertEqual(code, 201, data)
+        code, data, _ = self.module.api_handler("GET", "/api/client-profiles", {})
+        self.assertEqual(
+            {p["name"]: p for p in data["profiles"]}["hermes"]["headers"]["User-Agent"],
+            "hermes-agent/0.22.0",
+        )
         code, data, _ = self.module.api_handler("DELETE", "/api/client-profiles/hermes", {})
-        self.assertEqual(code, 400)
+        self.assertEqual(code, 200, data)
 
     def test_update_and_delete_custom(self):
         self.module.api_handler("POST", "/api/client-profiles", {

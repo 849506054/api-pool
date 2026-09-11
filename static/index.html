@@ -377,6 +377,16 @@ select option { background: var(--bg); color: var(--text); }
 .cf-rule code{font-family:monospace;background:rgba(0,0,0,0.25);padding:2px 6px;border-radius:5px;font-size:11px;color:var(--accent-light);word-break:break-all}
 .cf-rule .cf-repl{color:var(--text-dim)}
 .cf-del{margin-left:auto;background:none;border:none;color:var(--red);cursor:pointer;font-size:13px}
+/* 客户端伪装 profile 管理（2026-09-11） */
+.form-group textarea{box-sizing:border-box;width:100%;min-height:150px;padding:9px 11px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:12px;font-family:monospace;line-height:1.55;outline:none;resize:vertical;transition:border-color .12s}
+.form-group textarea:focus{border-color:var(--accent)}
+.pf-sec{font-size:12px;font-weight:600;color:var(--text-dim);margin:14px 0 8px}
+.pf-row{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--border);border-radius:10px;background:rgba(0,0,0,0.15);font-size:13px}
+.pf-row .pf-name{font-weight:600}
+.pf-row .pf-ver{font-size:11px;color:var(--text-dim);font-family:monospace}
+.pf-row .pf-meta{margin-left:auto;font-size:11px;color:var(--text-dim);font-family:monospace;white-space:nowrap}
+.pf-row .pf-act{display:flex;gap:4px;flex-shrink:0}
+.pf-empty{padding:14px;text-align:center;font-size:12px;color:var(--text-dim);border:1px dashed var(--border);border-radius:10px}
 </style>
 
 </head>
@@ -585,7 +595,7 @@ select option { background: var(--bg); color: var(--text); }
       <div id="batchBar" style="display:none"></div>
     </div>
     <div class="form-row form-row-request">
-      <div class="form-group" style="grid-column:1/-1"><label title="出站客户端伪装：不使用=透传客户端 UA；自动识别=按入站客户端 UA 匹配 profile；或指定具体 profile">客户端伪装</label><div class="model-row"><select id="fClientProfile" style="flex:0 0 auto;width:auto;min-width:0" onchange="syncProfileUAField()"><option value="">不使用（透传）</option><option value="auto">自动识别</option></select><button class="btn btn-ghost btn-sm" title="管理伪装 profile" onclick="openProfileManager()">⚙️</button><input type="text" id="fUserAgent" placeholder="自定义 UA（仅“不使用”时生效）"></div></div>
+      <div class="form-group" style="grid-column:1/-1"><label title="出站客户端特征：透传=原样转发当前客户端的请求头；伪装=出站头改为所选 profile，模拟其他客户端">客户端伪装</label><div class="model-row"><select id="fClientProfile" style="flex:0 0 auto;width:auto;min-width:0" onchange="syncProfileUAField()"><option value="">透传（当前客户端）</option></select><button class="btn btn-ghost btn-sm" title="管理伪装 profile" onclick="openProfileManager()">⚙️</button><input type="text" id="fUserAgent" placeholder="自定义 UA（仅“透传”时生效）"></div></div>
     </div>
     <div class="form-row form-row-routing">
       <div class="form-group"><label title="流式请求的连接、上传请求体及等待响应头超时；非流式正常请求仍受整体请求预算控制">连接/响应头超时 (秒)</label><input type="number" id="fTimeout" value="60" min="1"></div>
@@ -771,7 +781,7 @@ function renderEndpoints(eps){
     else b+=`<span class="badge badge-priority" style="background:rgba(16,163,127,0.2);color:#2ecc71" title="OpenAI 兼容协议">🟢OpenAI</span>`;
     if(ep.is_current){const cg=ep.current_groups||[];const sub=cg.filter(g=>g!=='main');b+=sub.length?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35)" title="当前服务组：${esc(cg.join(', '))}">● ${esc(cg.join('·'))}</span>`:`<span class="badge badge-current" title="当前服务组：main">● MAIN</span>`;}
     if(!ep.enabled)b+='<span class="badge badge-disabled">禁用</span>';
-    if(ep.client_profile)b+=ep.client_profile==='auto'?'<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35)" title="出站按入站客户端自动识别伪装">🎭自动</span>':`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35)" title="出站伪装为 ${esc(ep.client_profile)}">🎭${esc(ep.client_profile)}</span>`;
+    if(ep.client_profile){const _cp=clientProfiles.find(x=>x.name===ep.client_profile);const _cv=_cp?profileVersion(_cp.headers):'';b+=`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35)" title="出站伪装为 ${esc(ep.client_profile)}${_cv?'（'+esc(_cv)+'）':''}">🎭${esc(ep.client_profile)}</span>`;}
 
       if(ep.is_vision!==false)b+=`<span class=\"badge\" style=\"background:rgba(0,122,255,.15);color:#0a84ff\" title=\"原生支持视觉能力\">👁️视觉</span>`;
     if(ep.manual_unlock_required)b+=`<span class="badge badge-h-bad" title="余额不足：不会自动探活或恢复，需手动解冻">💳余额不足·手动解冻</span>`;
@@ -1280,10 +1290,10 @@ function detectProvider(url) {
 }
 async function fetchModels(){
   const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
-  const up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',ua=document.getElementById('fUserAgent').value.trim();
+  const up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',ua=document.getElementById('fUserAgent').value.trim(),cp=document.getElementById('fClientProfile').value;
   if(!u||!k){toast('填写 URL 和 Key','error');return;}
   const b=document.getElementById('fetchModelsBtn');b.disabled=true;b.innerHTML='⏳';
-  try{const r=await api('POST','/api/fetch-models',{base_url:u,api_key:k,use_proxy:up,protocol:pt,user_agent:ua});
+  try{const r=await api('POST','/api/fetch-models',{base_url:u,api_key:k,use_proxy:up,protocol:pt,user_agent:ua,client_profile:cp});
     if(r.ok&&r.models?.length){allModels=r.models;selectedModels=new Set();latencyResults={};visionResults={};modelPage=1;renderModelBrowser();toast(`${r.count} 个模型`,'success');}
     else{document.getElementById('modelBrowser').innerHTML=`<div style="padding:10px;color:var(--red);font-size:12px">❌ ${esc(r.error||'无模型')}</div>`;document.getElementById('modelBrowser').style.display='block';}
   }catch(e){toast('请求失败','error');}
@@ -1366,22 +1376,22 @@ function updateBatchBar(){
 
 async function testSelectedLatency(){
   const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
-  const up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',ua=document.getElementById('fUserAgent').value.trim();
+  const up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',ua=document.getElementById('fUserAgent').value.trim(),cp=document.getElementById('fClientProfile').value;
   if(!u||!k){toast('填写 URL 和 Key','error');return;}
   if(!selectedModels.size){toast('勾选模型','error');return;}
   const ms=[...selectedModels];toast(`测试 ${ms.length} 个...`,'info');
-  for(const mid of ms){latencyResults[mid]={status:'bad',latency_ms:0};filterModels();try{latencyResults[mid]=await api('POST','/api/test-model',{base_url:u,api_key:k,model:mid,use_proxy:up,protocol:pt,user_agent:ua});}catch(e){latencyResults[mid]={status:'bad',latency_ms:0};}filterModels();}
+  for(const mid of ms){latencyResults[mid]={status:'bad',latency_ms:0};filterModels();try{latencyResults[mid]=await api('POST','/api/test-model',{base_url:u,api_key:k,model:mid,use_proxy:up,protocol:pt,user_agent:ua,client_profile:cp});}catch(e){latencyResults[mid]={status:'bad',latency_ms:0};}filterModels();}
   toast(`✅${Object.values(latencyResults).filter(r=>r.ok).length}/${ms.length}`,'success');
 }
 
 async function testSelectedVision(){
   const u=document.getElementById('fUrl').value.trim(),k=document.getElementById('fKey').value.trim();
-  const up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',ua=document.getElementById('fUserAgent').value.trim();
+  const up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',ua=document.getElementById('fUserAgent').value.trim(),cp=document.getElementById('fClientProfile').value;
   if(!u||!k){toast('填写 URL 和 Key','error');return;}
   if(!selectedModels.size){toast('勾选模型','error');return;}
   const ms=[...selectedModels];toast(`检测 ${ms.length} 个多模态...`,'info');
   let vis=0;
-  for(const mid of ms){visionResults[mid]={supports_vision:false};filterModels();try{const r=await api('POST','/api/test-vision',{base_url:u,api_key:k,model:mid,use_proxy:up,protocol:pt,user_agent:ua});visionResults[mid]=r;if(r.supports_vision)vis++;}catch(e){visionResults[mid]={supports_vision:false};}filterModels();}
+  for(const mid of ms){visionResults[mid]={supports_vision:false};filterModels();try{const r=await api('POST','/api/test-vision',{base_url:u,api_key:k,model:mid,use_proxy:up,protocol:pt,user_agent:ua,client_profile:cp});visionResults[mid]=r;if(r.supports_vision)vis++;}catch(e){visionResults[mid]={supports_vision:false};}filterModels();}
   toast(`多模态: ${vis}/${ms.length} 支持`,'success');
 }
 
@@ -1405,8 +1415,22 @@ function editEndpoint(id){
 }
 function closeModal(){document.getElementById('modal').classList.remove('show');}
 
-// ── 客户端伪装 profile（2026-09-10）──
+// ── 客户端伪装 profile（2026-09-10，管理 UI 重做 2026-09-11）──
 let clientProfiles=[];
+// profile 版本标识：从 User-Agent 提取 `<name>/<version>`，如 hermes-agent/0.21.0 → "Hermes 0.21.0"
+function profileVersion(headers){
+  const h=headers||{};
+  const ua=h['User-Agent']||h['user-agent']||'';
+  const m=String(ua).match(/^([A-Za-z0-9_.\-]+)\/([0-9][A-Za-z0-9_.\-]*)/);
+  if(!m)return '';
+  const base=m[1].replace(/[-_](agent|tui|cli)$/i,'');
+  return base.charAt(0).toUpperCase()+base.slice(1)+' '+m[2];
+}
+function profileOptionLabel(p){const v=profileVersion(p.headers);return v?`${p.name}（${v}）`:p.name;}
+function profileHeadersToText(headers){
+  const h=headers||{};
+  return Object.keys(h).map(k=>`${k}: ${h[k]}`).join('\n');
+}
 function syncProfileUAField(){
   const sel=document.getElementById('fClientProfile');
   const ua=document.getElementById('fUserAgent');
@@ -1422,32 +1446,66 @@ async function loadClientProfiles(){
   const sel=document.getElementById('fClientProfile');
   if(!sel)return;
   const cur=sel.value;
-  sel.innerHTML='<option value="">不使用（透传）</option><option value="auto">自动识别</option>'+clientProfiles.map(p=>`<option value="${esc(p.name)}">${esc(p.name)}${p.builtin?'（内建）':''}</option>`).join('');
+  sel.innerHTML='<option value="">透传（当前客户端）</option>'+clientProfiles.map(p=>`<option value="${esc(p.name)}">${esc(profileOptionLabel(p))}</option>`).join('');
   sel.value=cur;
 }
-function openProfileManager(){
-  const rows=clientProfiles.map(p=>`<div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--border);border-radius:10px;font-size:12px">
-    <b>${esc(p.name)}</b>${p.builtin?'<span class="badge badge-priority" style="font-size:9px">内建</span>':''}
-    <span style="color:var(--text-dim);margin-left:auto">${Object.keys(p.headers||{}).length} 头</span>
-    ${p.builtin?'':`<button class="btn btn-ghost btn-sm" onclick="deleteClientProfile('${esc(p.name)}')" style="color:var(--red)" title="删除">🗑</button>`}
-  </div>`).join('');
-  const overlay=document.createElement('div');
-  overlay.className='modal-overlay show';overlay.id='profileManagerOverlay';
-  overlay.innerHTML=`<div class="modal" style="width:560px">
-    <h2>🎭 客户端伪装 profile</h2>
-    <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px">内建 profile 只读；自定义保存后立即生效。保留头（Host/Content-Length/Authorization/x-api-key/anthropic-version）保存时自动过滤。</div>
-    <div style="display:flex;flex-direction:column;gap:6px;max-height:200px;overflow:auto">${rows||'<div class="empty">暂无</div>'}</div>
-    <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:12px">
-      <div style="font-size:12px;font-weight:600;margin-bottom:6px">新建 / 覆盖自定义 profile</div>
-      <input type="text" id="pmName" placeholder="名称（英文，如 codex-tui；与内建重名会被拒绝）" style="width:100%;box-sizing:border-box;margin-bottom:6px">
-      <textarea id="pmHeaders" rows="6" placeholder="每行一个头：Header-Name: value&#10;例如：&#10;User-Agent: codex-tui/0.118.0&#10;Accept: application/json" style="width:100%;box-sizing:border-box;font-family:monospace;font-size:12px"></textarea>
-      <div class="form-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
-        <button class="btn btn-ghost" onclick="document.getElementById('profileManagerOverlay').remove()">关闭</button>
-        <button class="btn btn-primary" onclick="saveProfileFromManager()">保存</button>
-      </div>
+function openProfileManager(){ renderProfileManager(); }
+function profileOverlay(){
+  let ov=document.getElementById('profileManagerOverlay');
+  if(!ov){
+    ov=document.createElement('div');ov.className='modal-overlay show';ov.id='profileManagerOverlay';
+    document.body.appendChild(ov);
+  }
+  return ov;
+}
+function closeProfileManager(){
+  const o=document.getElementById('profileManagerOverlay');
+  if(o)o.remove();
+}
+function renderProfileManager(){
+  const rows=clientProfiles.map(p=>{
+    const v=profileVersion(p.headers);
+    return `<div class="pf-row">
+      <span class="pf-name">${esc(p.name)}</span>
+      ${v?`<span class="pf-ver">${esc(v)}</span>`:''}
+      <span class="pf-meta">${Object.keys(p.headers||{}).length} 头</span>
+      <span class="pf-act">
+        <button class="btn btn-ghost btn-sm" onclick="editClientProfile('${esc(p.name)}')" title="编辑">✏️</button>
+        <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteClientProfile('${esc(p.name)}')" title="删除">🗑</button>
+      </span>
+    </div>`;
+  }).join('');
+  profileOverlay().innerHTML=`<div class="modal" style="width:560px">
+    <h2>🎭 客户端伪装</h2>
+    <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">伪装=出站请求头改为该 profile 的配置，模拟其他客户端；端点「客户端伪装」留空=透传当前客户端。保存立即生效。</div>
+    <div class="pf-sec">已有 profile</div>
+    <div style="display:flex;flex-direction:column;gap:6px;max-height:240px;overflow:auto">${rows||'<div class="pf-empty">暂无 profile</div>'}</div>
+    <div class="form-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+      <button class="btn btn-ghost" onclick="closeProfileManager()">关闭</button>
+      <button class="btn btn-primary" onclick="renderProfileForm('')">+ 新建 profile</button>
     </div>
   </div>`;
-  document.body.appendChild(overlay);
+}
+function editClientProfile(name){
+  if(!clientProfiles.some(p=>p.name===name)){toast('profile 不存在','error');return;}
+  renderProfileForm(name);
+}
+function renderProfileForm(editName){
+  const p=clientProfiles.find(x=>x.name===editName);
+  const editing=!!p;
+  const v=editing?profileVersion(p.headers):'';
+  profileOverlay().innerHTML=`<div class="modal" style="width:560px">
+    <h2>${editing?'✏️ 编辑 profile':'➕ 新建 profile'}</h2>
+    <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">每行一个请求头（<code style="font-family:monospace">Header-Name: value</code>）。改客户端版本号=改这里的 User-Agent 行。保留头（Host/Content-Length/Authorization/x-api-key/anthropic-version）保存时自动过滤。</div>
+    ${editing&&v?`<div style="font-size:12px;margin-bottom:12px">当前标识：<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35)">🎭 ${esc(v)}</span></div>`:''}
+    <div class="form-group"><label>名称</label><input type="text" id="pmName" value="${esc(editing?editName:'')}" placeholder="英文，如 hermes、codex-tui" ${editing?'disabled':''}></div>
+    <div class="form-group"><label>请求头</label><textarea id="pmHeaders" placeholder="User-Agent: hermes-agent/0.21.0&#10;Accept: application/json">${esc(editing?profileHeadersToText(p.headers):'')}</textarea></div>
+    ${editing?'<div style="font-size:11px;color:var(--text-dim);margin-top:8px">编辑时名称不可改；需改名请新建后删除旧项。</div>':''}
+    <div class="form-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn btn-ghost" onclick="renderProfileManager()">取消</button>
+      <button class="btn btn-primary" onclick="saveProfileForm(${editing?`'${esc(editName)}'`:'null'})">保存</button>
+    </div>
+  </div>`;
 }
 function parseHeadersText(t){
   const h={};
@@ -1458,24 +1516,25 @@ function parseHeadersText(t){
   }
   return h;
 }
-async function saveProfileFromManager(){
-  const name=(document.getElementById('pmName').value||'').trim();
+async function saveProfileForm(editName){
+  const name=editName||(document.getElementById('pmName').value||'').trim();
   const headers=parseHeadersText(document.getElementById('pmHeaders').value);
   if(!name){toast('填写 profile 名称','error');return;}
   if(!Object.keys(headers).length){toast('至少填写一个请求头','error');return;}
   const r=await api('POST','/api/client-profiles',{name,headers});
   if(!r||r.error){toast((r&&r.error)||'保存失败','error');return;}
-  toast('已保存 '+name,'success');
-  const ov=document.getElementById('profileManagerOverlay');if(ov)ov.remove();
+  const v=profileVersion(headers);
+  toast('已保存 '+name+(v?`（${v}）`:''),'success');
   await loadClientProfiles();
+  renderProfileManager();
 }
 async function deleteClientProfile(name){
-  if(!confirm(`删除 profile「${name}」？引用它的端点将降级为不伪装。`))return;
+  if(!confirm(`删除 profile「${name}」？引用它的端点将自动降级为透传。`))return;
   const r=await api('DELETE','/api/client-profiles/'+encodeURIComponent(name));
   if(!r||r.error){toast((r&&r.error)||'删除失败','error');return;}
   toast('已删除 '+name,'success');
-  const ov=document.getElementById('profileManagerOverlay');if(ov)ov.remove();
   await loadClientProfiles();
+  renderProfileManager();
 }
 
 // ── 敏感词过滤管理（2026-09-11）──

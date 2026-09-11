@@ -86,6 +86,7 @@ class SiteModelReplacementTests(unittest.TestCase):
             protocol=ep.protocol,
             default_headers=ep.default_headers,
             extra_headers=ep.extra_headers,
+            client_profile=ep.client_profile,
         )
 
     def test_endpoint_models_unknown_endpoint_is_404(self):
