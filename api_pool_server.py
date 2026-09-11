@@ -6265,6 +6265,68 @@ def save_config(endpoints_data, group_defs=None, client_profiles=None):
             pass
         raise
 
+def save_content_filter_config(section):
+    """原子写 content_filter.json + 热重载；结构无效时回滚旧配置（2026-09-11）。
+
+    - 备份：写前复制当前文件为 content_filter.json.bak.<ts>
+    - 写入：tmp + flush/fsync + os.replace（与 save_config 同模式）
+    - 校验：写入后 content_filter.load() 失败（返回 False 或抛异常）→ 回滚备份并重新 load
+    """
+    if not isinstance(section, dict):
+        raise ValueError("content_filter 配置段必须是对象")
+    directory = os.path.dirname(os.path.abspath(CONTENT_FILTER_FILE))
+    tmp_file = os.path.join(directory, f".{os.path.basename(CONTENT_FILTER_FILE)}.tmp")
+    backup_file = os.path.join(
+        directory,
+        f"{os.path.basename(CONTENT_FILTER_FILE)}.bak.{time.strftime('%Y%m%d_%H%M%S')}",
+    )
+    try:
+        with open(CONTENT_FILTER_FILE, "r", encoding="utf-8") as f:
+            old_content = f.read()
+    except FileNotFoundError:
+        old_content = None
+    except OSError as e:
+        raise ValueError(f"读取当前过滤配置失败: {e}") from e
+    try:
+        if old_content is not None:
+            # 写前落时间戳备份（人工回滚入口；回滚本身走内存副本）
+            with open(backup_file, "w", encoding="utf-8") as f:
+                f.write(old_content)
+                f.flush()
+                os.fsync(f.fileno())
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump({"content_filter": section}, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, CONTENT_FILTER_FILE)
+    except OSError as e:
+        try:
+            os.unlink(tmp_file)
+        except OSError:
+            pass
+        raise ValueError(f"写入过滤配置失败: {e}") from e
+    # 热重载校验：无效正则等异常会以 re.error 直接抛出（282 行 compile 无 try 包裹），
+    # 必须用 Exception 兜底；失败回滚，保证运行态不降级。
+    try:
+        ok = content_filter.load()
+    except Exception:
+        ok = False
+    if not ok:
+        if old_content is not None:
+            try:
+                with open(CONTENT_FILTER_FILE, "w", encoding="utf-8") as f:
+                    f.write(old_content)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except OSError:
+                pass
+        try:
+            content_filter.load()
+        except Exception:
+            pass  # 旧配置自身损坏时 load 内部已降级为禁用
+        raise ValueError("过滤配置结构无效，已回滚")
+    return {"content_filter": section}
+
 def ensure_config():
     if not os.path.exists(CONFIG_FILE): save_config([])
 
@@ -6800,6 +6862,33 @@ def api_handler(method, path, body):
             return 400, {"error": str(e)}, False
         _sync_to_config()
         return 200, {"ok": True}, False
+
+    # ================= 敏感词过滤配置管理（2026-09-11） =================
+    if method == "GET" and cp == "/api/content-filter":
+        return 200, {
+            "content_filter": content_filter._raw.get("content_filter", {}),
+            "known_targets": list(ContentFilter.KNOWN_TARGETS),
+        }, False
+    if method == "PUT" and cp == "/api/content-filter":
+        section = body.get("content_filter")
+        if not isinstance(section, dict):
+            return 400, {"error": "content_filter 配置段缺失或类型错误"}, False
+        try:
+            payload = save_content_filter_config(section)
+        except ValueError as e:
+            return 400, {"error": str(e)}, False
+        return 200, payload, False
+    if method == "POST" and cp == "/api/content-filter/test":
+        text = body.get("text")
+        if not isinstance(text, str):
+            return 400, {"error": "text 必须是字符串"}, False
+        result, matched = content_filter._match_and_replace(text)
+        return 200, {
+            "matched": matched,
+            "result": result,
+            "enabled": content_filter._enabled,
+            "dictionary_version": content_filter._dictionary_version,
+        }, False
 
     if method == "POST" and cp == "/api/endpoints":
         pool.add_endpoint(body); _sync_to_config(); return 201, {"ok": True}, False

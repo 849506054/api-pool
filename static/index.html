@@ -362,6 +362,21 @@ select option { background: var(--bg); color: var(--text); }
   .ep-actions{gap:2px}
   .ep-actions .btn{font-size:8px;padding:2px 4px;min-width:20px}
 }
+/* 敏感词过滤管理（2026-09-11） */
+.cf-switch{width:40px;height:22px;border-radius:11px;background:rgba(255,255,255,0.12);position:relative;cursor:pointer;transition:background .15s;flex-shrink:0}
+.cf-switch.on{background:var(--green)}
+.cf-switch::after{content:'';position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;transition:left .15s}
+.cf-switch.on::after{left:20px}
+.cf-status{font-size:12px;font-weight:600}
+.cf-status.on{color:var(--green)}
+.cf-status.off{color:var(--red)}
+.cf-targets{display:flex;flex-wrap:wrap;gap:6px}
+.tchip{display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border-radius:8px;border:1px solid var(--border);font-size:11px;cursor:pointer;color:var(--text-dim);user-select:none;touch-action:manipulation}
+.tchip.on{border-color:rgba(50,215,75,0.45);background:var(--green-dim);color:var(--green)}
+.cf-rule{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--border);border-radius:10px;font-size:12px;flex-wrap:wrap}
+.cf-rule code{font-family:monospace;background:rgba(0,0,0,0.25);padding:2px 6px;border-radius:5px;font-size:11px;color:var(--accent-light);word-break:break-all}
+.cf-rule .cf-repl{color:var(--text-dim)}
+.cf-del{margin-left:auto;background:none;border:none;color:var(--red);cursor:pointer;font-size:13px}
 </style>
 
 </head>
@@ -376,6 +391,7 @@ select option { background: var(--bg); color: var(--text); }
       </div>
   </div>
   <div class="header-actions" id="poolActions">
+    <button class="btn btn-ghost" onclick="openContentFilterManager()">🛡 敏感词过滤</button>
     <button class="btn btn-ghost" onclick="runHealthCheck()">🩺 健康检测</button>
     <button class="btn btn-ghost" onclick="resetPool()">🔄 重置</button>
     <button class="btn btn-primary" onclick="openAddModal()">＋ 添加端点</button>
@@ -569,16 +585,16 @@ select option { background: var(--bg); color: var(--text); }
       <div id="batchBar" style="display:none"></div>
     </div>
     <div class="form-row form-row-request">
-      <div class="form-group"><label title="出站客户端伪装：不使用=透传客户端 UA；自动识别=按入站客户端 UA 匹配 profile；或指定具体 profile">客户端伪装</label><div class="model-row"><select id="fClientProfile" onchange="syncProfileUAField()"><option value="">不使用（透传）</option><option value="auto">自动识别</option></select><button class="btn btn-ghost btn-sm" title="管理伪装 profile" onclick="openProfileManager()">⚙️</button></div><input type="text" id="fUserAgent" placeholder="自定义 UA（仅“不使用”时生效）" style="margin-top:6px"></div>
-      <div class="form-group"><label title="非空时启用：请求消息里的 tool_call id 重写为该前缀（如 call_00_ET_），解决跨端点切换后 DeepSeek 官方端点 reasoning_text 400">ToolCall ID 前缀</label><input type="text" id="fToolCallPrefix" placeholder="留空=不重写，如 call_00_ET_" value=""></div>
+      <div class="form-group" style="grid-column:1/-1"><label title="出站客户端伪装：不使用=透传客户端 UA；自动识别=按入站客户端 UA 匹配 profile；或指定具体 profile">客户端伪装</label><div class="model-row"><select id="fClientProfile" style="flex:0 0 auto;width:auto;min-width:0" onchange="syncProfileUAField()"><option value="">不使用（透传）</option><option value="auto">自动识别</option></select><button class="btn btn-ghost btn-sm" title="管理伪装 profile" onclick="openProfileManager()">⚙️</button><input type="text" id="fUserAgent" placeholder="自定义 UA（仅“不使用”时生效）"></div></div>
     </div>
     <div class="form-row form-row-routing">
       <div class="form-group"><label title="流式请求的连接、上传请求体及等待响应头超时；非流式正常请求仍受整体请求预算控制">连接/响应头超时 (秒)</label><input type="number" id="fTimeout" value="60" min="1"></div>
       <div class="form-group"><label title="可恢复错误发生后，在同一客户端请求内重新向原端点发送完整请求的额外次数；建议 0-1 次">额外重试次数</label><input type="number" id="fRetries" value="1" min="0" max="3"></div>
       <div class="form-group"><label>冷却 (分钟)</label><input type="number" id="fCooldown" value="5" min="0"></div>
     </div>
-    <div class="form-row form-row-request">
+    <div class="form-row form-row-routing">
       <div class="form-group"><label title="模型上下文长度（K=1000 tokens），0=不限。对话请求超出该长度时自动 fallback 到下一个端点">模型上下文长度 (K)</label><input type="number" id="fMaxContext" value="0" min="0" placeholder="0=不限, 如 128"></div>
+      <div class="form-group"><label title="非空时启用：请求消息里的 tool_call id 重写为该前缀（如 call_00_ET_），解决跨端点切换后 DeepSeek 官方端点 reasoning_text 400">ToolCall ID 前缀</label><input type="text" id="fToolCallPrefix" placeholder="留空=不重写，如 call_00_ET_" value=""></div>
       <div class="form-group"><label title="按次计费的端点健康检查将自动使用零成本 Models 探针，避免产生费用">计费方式</label><select id="fBillingMode"><option value="subscription">按量计费</option><option value="pay_per_use">按次计费</option></select></div>
     </div>
     <div class="form-row form-row-capability">
@@ -1460,6 +1476,130 @@ async function deleteClientProfile(name){
   toast('已删除 '+name,'success');
   const ov=document.getElementById('profileManagerOverlay');if(ov)ov.remove();
   await loadClientProfiles();
+}
+
+// ── 敏感词过滤管理（2026-09-11）──
+const CF_TARGET_LABELS={
+  'messages.content':'messages.content',
+  'messages.text_blocks':'messages.text_blocks',
+  'messages.reasoning':'messages.reasoning',
+  'messages.name':'messages.name',
+  'messages.tool_call_arguments':'messages.tool_call_arguments',
+  'tools.descriptions':'tools.descriptions',
+  'all_strings':'all_strings（全量递归）'
+};
+let cfData={enabled:true,targets:[],rules:[],dictionary_version:'',known_targets:[]};
+async function openContentFilterManager(){
+  const r=await api('GET','/api/content-filter');
+  if(!r){toast('加载失败','error');return;}
+  const cf=r.content_filter||{};
+  cfData={
+    enabled:!!cf.enabled,
+    targets:Array.isArray(cf.targets)?cf.targets:[],
+    rules:Array.isArray(cf.rules)?cf.rules:[],
+    dictionary_version:cf.dictionary_version||'',
+    known_targets:Array.isArray(r.known_targets)?r.known_targets:[]
+  };
+  renderCFManager();
+}
+function cfToggleSwitch(){
+  cfData.enabled=!cfData.enabled;
+  const sw=document.getElementById('cfSwitch');
+  if(sw){sw.classList.toggle('on',cfData.enabled);}
+  const st=document.getElementById('cfStatus');
+  if(st){st.textContent=cfData.enabled?'已开启':'已关闭';st.className='cf-status '+(cfData.enabled?'on':'off');}
+}
+function cfToggleTarget(key){
+  const i=cfData.targets.indexOf(key);
+  if(i>=0)cfData.targets.splice(i,1);else cfData.targets.push(key);
+  renderCFTargets();
+}
+function cfDelRule(i){
+  cfData.rules.splice(i,1);
+  renderCFRules();
+}
+function cfAddRule(){
+  const type=document.getElementById('cfType').value;
+  const pattern=document.getElementById('cfPat').value.trim();
+  const replacement=document.getElementById('cfRep').value;
+  if(!pattern){toast('填写敏感词/正则','error');return;}
+  cfData.rules.push({type,pattern,replacement});
+  renderCFRules();
+}
+function renderCFTargets(){
+  const box=document.getElementById('cfTargets');if(!box)return;
+  box.innerHTML=(cfData.known_targets.length?cfData.known_targets:Object.keys(CF_TARGET_LABELS)).map(k=>
+    `<span class="tchip${cfData.targets.indexOf(k)>=0?' on':''}" onclick="cfToggleTarget('${escAttr(k)}')">${esc(CF_TARGET_LABELS[k]||k)}</span>`
+  ).join('');
+}
+function renderCFRules(){
+  const box=document.getElementById('cfRules');if(!box)return;
+  box.innerHTML=cfData.rules.map((rl,i)=>{
+    const badge=rl.type==='regex'
+      ?'<span class="badge" style="background:var(--blue-dim);color:var(--blue)">正则</span>'
+      :'<span class="badge" style="background:var(--blue-dim);color:var(--blue)">敏感词</span>';
+    const repl=rl.replacement?'→ '+esc(rl.replacement):'→ <span style="color:var(--red)">删除</span>';
+    return `<div class="cf-rule"><span>${badge}</span><code>${esc(rl.pattern)}</code><span class="cf-repl">${repl}</span><button class="cf-del" onclick="cfDelRule(${i})" title="删除">🗑</button></div>`;
+  }).join('')||'<div class="empty" style="font-size:12px">暂无规则</div>';
+}
+function renderCFManager(){
+  const cf=cfData;
+  const overlay=document.createElement('div');
+  overlay.className='modal-overlay show';overlay.id='cfManagerOverlay';
+  overlay.innerHTML=`<div class="modal" style="width:640px">
+    <h2>🛡 敏感词过滤</h2>
+    <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">请求入口清洗（/v1/chat/completions）：命中词替换后转发上游；保存立即生效，无需重启。pattern 为空串=删除命中内容。</div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+      <div class="cf-switch on" id="cfSwitch" onclick="cfToggleSwitch()"></div>
+      <span class="cf-status on" id="cfStatus">已开启</span>
+      <span class="badge" style="background:var(--green-dim);color:var(--green)">热生效</span>
+      <span style="margin-left:auto;font-size:11px;color:var(--text-dim);font-family:monospace">词典 ${esc(cf.dictionary_version||'—')} · ${cf.rules.length} 条规则</span>
+    </div>
+    <div style="font-size:12px;font-weight:600;color:var(--text-dim);margin:14px 0 8px">扫描范围（targets）</div>
+    <div class="cf-targets" id="cfTargets"></div>
+    <div style="font-size:12px;font-weight:600;color:var(--text-dim);margin:16px 0 8px">规则</div>
+    <div id="cfRules" style="display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto"></div>
+    <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;align-items:center">
+      <select id="cfType" style="flex:0 0 auto;width:96px;height:34px;border-radius:10px;background:rgba(0,0,0,0.2);border:1px solid var(--border);padding:0 11px;font-size:13px;color:var(--text)"><option value="literal">敏感词</option><option value="regex">正则</option></select>
+      <input type="text" id="cfPat" placeholder="敏感词 / 正则" style="flex:1;min-width:150px;height:34px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:10px;padding:0 11px;font-size:13px;color:var(--text);box-sizing:border-box">
+      <input type="text" id="cfRep" placeholder="替换为（留空=删除）" style="flex:1;min-width:110px;height:34px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:10px;padding:0 11px;font-size:13px;color:var(--text);box-sizing:border-box">
+      <button class="btn btn-primary btn-sm" onclick="cfAddRule()">+ 添加</button>
+    </div>
+    <div style="font-size:12px;font-weight:600;color:var(--text-dim);margin:16px 0 8px">实时测试（不保存，仅预览当前规则效果）</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+      <input type="text" id="cfTestText" placeholder="粘贴一段文本，预览替换效果" style="flex:1;min-width:200px;height:34px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:10px;padding:0 11px;font-size:13px;color:var(--text);box-sizing:border-box">
+      <button class="btn btn-ghost btn-sm" onclick="cfRunTest()">测试</button>
+    </div>
+    <div id="cfTestRes" style="display:none;background:rgba(0,0,0,0.2);border:1px dashed var(--border);border-radius:8px;padding:8px 10px;font-size:12px;color:var(--text-dim);font-family:monospace;margin-top:6px;white-space:pre-wrap;word-break:break-all"></div>
+    <div class="form-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+      <button class="btn btn-ghost" onclick="document.getElementById('cfManagerOverlay').remove()">关闭</button>
+      <button class="btn btn-primary" onclick="cfSave()">保存</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  renderCFTargets();
+  renderCFRules();
+}
+async function cfRunTest(){
+  const text=document.getElementById('cfTestText').value;
+  if(!text){toast('输入要测试的文本','error');return;}
+  const res=document.getElementById('cfTestRes');
+  res.style.display='block';res.textContent='测试中...';
+  const r=await api('POST','/api/content-filter/test',{text});
+  if(!r||r.error){res.textContent=(r&&r.error)||'测试失败';return;}
+  res.innerHTML=`命中 ${r.matched} 处${r.enabled?'':'（过滤器当前已关闭，仅预览）'}：<br>${esc(r.result)}`;
+}
+async function cfSave(){
+  const payload={content_filter:{
+    enabled:cfData.enabled,
+    targets:cfData.targets,
+    rules:cfData.rules,
+    dictionary_version:cfData.dictionary_version||('manual-'+new Date().toISOString().slice(0,10))
+  }};
+  const r=await api('PUT','/api/content-filter',payload);
+  if(!r||r.error){toast((r&&r.error)||'保存失败','error');return;}
+  toast('已保存，立即生效','success');
+  const ov=document.getElementById('cfManagerOverlay');if(ov)ov.remove();
 }
 
 let _origDraft=null; // 编辑模式打开时的表单快照；仅提交与之不同的字段，未改字段不更新

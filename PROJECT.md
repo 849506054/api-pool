@@ -241,3 +241,13 @@
 口径沿用 `renderStats` 既有定义（全部端点中 `health==='bad'`），与站点筛选互斥、站点筛选行为不变。
 生产 hash 前端 169935a8（部署前备份 .bak-20260911-173950-abnormal-filter），纯前端热更新免重启。
 验证：`node --check` 抽出的 `<script>` 块语法通过 + 7 项运行时断言（默认态可点、激活态高亮、再点返回、5s 自动刷新不重置、筛选结果等于 bad 集合、无异常自动回落、站点筛选不受影响）。
+
+## 2026-09-11 敏感词过滤管理已部署生产
+ContentFilter 管理化：新增 3 管理 API（GET /api/content-filter 读配置+known_targets / PUT 全量保存 / POST /api/content-filter/test 实时预览），
+PUT 走 save_content_filter_config：写前时间戳备份（content_filter.json.bak.<ts>）→ 原子写（tmp+flush/fsync+os.replace）→ content_filter.load() 热重载，
+结构无效/正则编译失败自动回滚内存副本并返回 400，运行态不降级（此前 _reload() 定义但从未被调用，改 json 需重启才生效，本次顺带消除）。
+前端：聚合池操作栏新增「🛡 敏感词过滤」入口（首个全局设置类入口；client-profile 为端点级配置故入口仍在端点表单内）+ 管理弹层（开关 / targets 芯片 / 规则增删 / 实时测试），复用 modal-overlay 模式；测试接口不受 enabled 影响（仅预览规则效果）。
+同批端点表单布局：客户端伪装行跨两列占满整行（下拉 + ⚙️ + 自定义 UA 同行 model-row，UA 输入框 flex:1 吃满剩余宽度）；「模型上下文长度 (K) / ToolCall ID 前缀 / 计费方式」三列同行（form-row-routing）。
+管理弹层控件样式与端点表单统一：规则类型下拉/输入框对齐 34px 高、10px 圆角、13px 字号，类型文案「敏感词 / 正则」，规则列表徽章同步中文。
+生产部署：api_pool_server.py.bak.20260911_180149 + static/index.html.bak.20260911_180149（部署前备份）。
+验证：E2E mock 全绿（新增规则落盘 / 热生效无需重启 / 无效正则 400+回滚 / 结构错误 400 / 关闭后测试仍预览 / 前端断言 8 处 / node --check 通过）+ 生产 curl 验收（服务 active、GET 返回生产词典 2026-08-30b、test 接口、前端新元素、UI 微调断言）。
