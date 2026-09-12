@@ -3355,6 +3355,7 @@ class APIPool:
                     "health": ep._health,
                     "health_latency_ms": ep._health_latency_ms,
                     "health_error": ep._health_error,
+                    "last_error": ep._last_error,
                 }
                 for ep in active
             ]
@@ -3397,7 +3398,7 @@ class APIPool:
                 else:
                     return ep.id, "bad", latency, "获取模型列表失败"
             except Exception as e:
-                return ep.id, "bad", int((time.time() - t0) * 1000), f"Models接口错误: {e}"[:100]
+                return ep.id, "bad", int((time.time() - t0) * 1000), f"Models接口错误: {e}"
                 
         payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3, "stream": False}
         
@@ -3410,7 +3411,7 @@ class APIPool:
             return ep.id, "ok", latency, ""
             
         # Evaluate if we should retry
-        err_str = err[:100] if err else ""
+        err_str = err or ""
         hard_errors = ["auth error", "400", "401", "403", "404", "429"]
         if any(code in err_str for code in hard_errors):
             return ep.id, "bad", latency, err_str
@@ -3638,7 +3639,7 @@ class APIPool:
                     try:
                         results.append(future.result())
                     except Exception as e:
-                        results.append((ep.id, "bad", -1, str(e)[:100]))
+                        results.append((ep.id, "bad", -1, str(e)))
 
             now = time.time()
             with self._lock:
@@ -3849,6 +3850,7 @@ class APIPool:
                     ep._cooldown_reason = ""
                     ep._manual_unlock_required = False
                     ep._health = "ok"
+                    ep._health_error = ""
                     sys_log(f"端点 '{ep.name}' 手动解冻，错误状态已清除", "INFO")
                     return True
         return False
@@ -3877,7 +3879,7 @@ class APIPool:
                 return
 
             ep._health = "bad"
-            ep._health_error = error_text[:100]
+            ep._health_error = error_text
             ep._fail_count += 1
             ep._total_failures += 1
             ep._last_error = error_text
@@ -4428,22 +4430,47 @@ class APIPool:
         DeepSeek 官方（如 Kcne）校验历史里 tool_call id 必须为其生成的格式（call_00_ET_*），
         跨端点切换后历史混入其他端点生成的 id 会导致 HTTP 400。重写为统一前缀后，
         服务端视为新消息跳过校验。md5 保证确定性（跨轮次稳定，不破坏缓存）且配对一致。
+
+        非变异（2026-09-12）：只复制命中的消息与其 tool_calls 列表，绝不改动传入的历史对象。
+        轮转的各次尝试共用同一份 Hermes 历史，原地改写会把「某端点需要的重写结果」带给后续
+        异构端点（违反按端点隔离铁律），并使「改回原始 id 再试一次」在实现上不可能。
+        返回 (新消息列表, 实际重写条数)；未命中任何 id 时 changed=0，调用方据此判定变体重试无意义。
         """
         import hashlib
+
         mapping = {}
-        for m in messages:
-            if m.get("role") == "assistant" and m.get("tool_calls"):
-                for tc in m["tool_calls"]:
-                    oid = tc.get("id", "")
-                    if oid and not oid.startswith(prefix):
-                        if oid not in mapping:
-                            mapping[oid] = prefix + hashlib.md5(oid.encode()).hexdigest()[:16]
-                        tc["id"] = mapping[oid]
-            elif m.get("role") == "tool" and m.get("tool_call_id"):
-                oid = m.get("tool_call_id")
-                if oid and oid in mapping:
-                    m["tool_call_id"] = mapping[oid]
-        return messages
+        out = list(messages)
+        changed = 0
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                new_calls = None
+                for call_index, call in enumerate(message.get("tool_calls") or []):
+                    if not isinstance(call, dict):
+                        continue
+                    original_id = call.get("id", "")
+                    if not original_id or original_id.startswith(prefix):
+                        continue
+                    if original_id not in mapping:
+                        mapping[original_id] = prefix + hashlib.md5(original_id.encode()).hexdigest()[:16]
+                    if new_calls is None:
+                        new_calls = [dict(item) if isinstance(item, dict) else item
+                                     for item in message["tool_calls"]]
+                    new_calls[call_index]["id"] = mapping[original_id]
+                    changed += 1
+                if new_calls is not None:
+                    rewritten = dict(message)
+                    rewritten["tool_calls"] = new_calls
+                    out[index] = rewritten
+            elif message.get("role") == "tool" and message.get("tool_call_id"):
+                original_id = message["tool_call_id"]
+                if original_id and original_id in mapping:
+                    rewritten = dict(message)
+                    rewritten["tool_call_id"] = mapping[original_id]
+                    out[index] = rewritten
+                    changed += 1
+        return out, changed
 
     @staticmethod
     def _is_deepseek_endpoint(ep):
@@ -4616,7 +4643,7 @@ class APIPool:
             ep._health = "ok" if success and latency <= LATENCY_OK_MAX else ("slow" if success else "bad")
             ep._health_latency_ms = latency
             ep._health_last_check = time.time()
-            ep._health_error = "" if success else (str(err)[:100] if err else "未知错误")
+            ep._health_error = "" if success else (str(err) if err else "未知错误")
         return success, err
 
     def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False, request_id=None):
@@ -4682,7 +4709,10 @@ class APIPool:
         errors = []
         client_error_tried = set()  # 本请求内已因客户端类错误轮转过的端点（防不冻结路径死循环）
         role_downgraded = False  # 已因角色不兼容 400 触发 developer→system 降级（每请求一次）
-        strict_validation_retries = 0  # 请求级总上限 1：同端点重试一次（2026-09-11 收口）
+        # 严格校验 400 的请求级重试预算（2026-09-12 定案：上限 1）：唯一一次重试就是
+        # 「改用客户端原始 tool_call id」的换形态请求（替换原「原样复读」重试）。
+        strict_validation_retries = 0
+        skip_prefix_rewrite = False    # 下一次尝试跳过 tool_call_id_prefix 重写（消费一次即清除）
         tried = 0
         total = len(active)
         # 按优先级排序：每次从最高优先级端点开始尝试，故障自动降级，恢复后自动回迁
@@ -4778,10 +4808,13 @@ class APIPool:
             # 生成的 id（不同前缀/格式），Kcne 等 DeepSeek 官方会校验并报 400
             # "reasoning_text must be passed back"；重写为统一格式后服务端视为新消息跳过校验。
             ep_prefix = getattr(ep, "tool_call_id_prefix", "") or ""
-            if ep_prefix and not is_anthropic:
-                if loop_messages is messages:
-                    loop_messages = list(messages)  # 避免原地修改原始消息
-                self._rewrite_tool_call_ids(loop_messages, ep_prefix)
+            attempt_prefix_applied = 0
+            if ep_prefix and not is_anthropic and not skip_prefix_rewrite:
+                # 非变异重写：返回新列表，原始历史（轮转各次尝试共用）不被改动
+                loop_messages, attempt_prefix_applied = self._rewrite_tool_call_ids(loop_messages, ep_prefix)
+            # 变体开关只作用于紧随其后的那一次尝试（消费一次即清除）：轮转后各端点
+            # 按自己的配置重新决定是否重写，不会把本端点的变体状态带给其他端点。
+            skip_prefix_rewrite = False
             
             payload = {
                 "model": ep_model, "messages": loop_messages,
@@ -4965,18 +4998,34 @@ class APIPool:
             # 历史消息形态（旧轮 assistant 的 " " 占位 reasoning_content），请求级
             # thinking=disabled 改不了已发历史 → 结构性无效（42h 窗口内 0 成功），且
             # 该字段会随轮转污染异构端点（GLM 报「不支持关闭思考」）。上限维持请求级 1。
-            if self._is_strict_validation_400(error) and strict_validation_retries < 1:
-                strict_validation_retries += 1
-                sys_log(
-                    f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 命中 DeepSeek 严格校验 400，"
-                    f"同端点重试（第 {strict_validation_retries}/1 次）",
-                    "WARN",
-                )
-                # 释放本尝试的在途占用，循环顶部会重新 acquire（否则计数器泄漏）
-                with self._lock:
-                    self._release_inflight(ep.id, group)
-                idx = active.index(ep)
-                continue
+            if self._is_strict_validation_400(error):
+                strict_label = self._endpoint_log_label(ep, group)
+                retry_now = False
+                # 唯一一次重试＝换形态：跳过 tool_call_id_prefix 重写、改回客户端原始 tool_call id。
+                # 仅当本尝试确实应用过前缀重写时才发——否则这次请求与刚失败的那次完全相同
+                # （同一份被校验的历史原样复读），直接轮转，不白耗一次上游。
+                if strict_validation_retries < 1 and attempt_prefix_applied > 0:
+                    strict_validation_retries = 1
+                    skip_prefix_rewrite = True
+                    retry_now = True
+                    sys_log(
+                        f"{request_tag}端点 '{strict_label}' 命中 DeepSeek 严格校验 400，"
+                        f"同端点改用客户端原始 tool_call id 重试（唯一 1 次，本次跳过前缀重写 '{ep_prefix}'）",
+                        "WARN",
+                    )
+                else:
+                    reason = ("重试预算用尽" if strict_validation_retries >= 1
+                              else "本尝试未应用前缀重写（改回原始 id 无变化）")
+                    sys_log(
+                        f"{request_tag}端点 '{strict_label}' 命中 DeepSeek 严格校验 400，{reason}，转为轮转",
+                        "WARN",
+                    )
+                if retry_now:
+                    # 释放本尝试的在途占用，循环顶部会重新 acquire（否则计数器泄漏）
+                    with self._lock:
+                        self._release_inflight(ep.id, group)
+                    idx = active.index(ep)
+                    continue
             # _try_endpoint 内部已按 max_retries 重试完毕，直接冻结+轮转
             with self._lock:
                 # 端点级活跃判定（2026-08-14）：超时类错误但端点在 timeout 窗口内
@@ -6032,7 +6081,7 @@ class APIPool:
                     
             except urllib.error.HTTPError as e:
                 err_body = ""
-                try: err_body = e.read().decode("utf-8", errors="ignore")[:1000]
+                try: err_body = _DecodedResponse(e).read().decode("utf-8", errors="ignore")[:1000]
                 except Exception: pass
                 msg = f"HTTP {e.code}: {err_body}"
                 retry_after = e.headers.get("Retry-After") if e.headers else None
@@ -6111,7 +6160,12 @@ class APIPool:
                 resp = opener.open(req, timeout=timeout)
             else:
                 resp = urllib.request.urlopen(req, timeout=timeout)
-                
+
+            # 响应解压（2026-09-12）：与 _try_endpoint 同源。profile/客户端基线声明
+            # Accept-Encoding: gzip, deflate 后上游会真实压缩，拉模型此前未解压，
+            # 直接 decode 抛 "'utf-8' codec can't decode byte 0x8b"。
+            resp = _DecodedResponse(resp)
+
             with resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 raw = data.get("data", [])
@@ -6837,7 +6891,7 @@ def api_handler(method, path, body):
         except urllib.error.HTTPError as exc:
             err_body = ""
             try:
-                err_body = exc.read().decode("utf-8", errors="ignore")[:200]
+                err_body = _DecodedResponse(exc).read().decode("utf-8", errors="ignore")[:200]
             except Exception:
                 pass
             return 200, {"ok": False, "error": f"HTTP {exc.code}: {err_body}"}, False
@@ -7172,7 +7226,7 @@ def api_handler(method, path, body):
             return 200, {"ok": True, "models": models, "count": len(models)}, False
         except urllib.error.HTTPError as e:
             err_body = ""
-            try: err_body = e.read().decode("utf-8", errors="ignore")[:200]
+            try: err_body = _DecodedResponse(e).read().decode("utf-8", errors="ignore")[:200]
             except Exception: pass
             return 200, {"ok": False, "error": f"HTTP {e.code}: {err_body}"}, False
         except Exception as e: return 200, {"ok": False, "error": str(e)}, False

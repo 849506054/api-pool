@@ -74,6 +74,7 @@
 - [x] **日志 flush + 流式超时兜底补洞（2026-08-15）** — `sys_log` 强制 flush、首包 socket 超时受 Endpoint timeout 约束、socket 获取失败与流异常不再静默；已部署并纳入 2.0 运行版本。
 - [x] **端点列表卡片自适应** — 卡片高度与右侧列（聚合池管理+聚合链）底部对齐（alignCards），列表内部滚动，5s 自动刷新保持滚动位置；全局滚动条深色细窄风格统一（commit 1996320）
 - [x] **端点列表卡片固定 16px 高度差修复（2026-08-15，commit 14370cc）** — alignCards 原用右侧**容器** `getBoundingClientRect().bottom` 作对齐目标，容器 bottom 包含聚合链卡片 `margin-bottom:16px`，导致左侧 epCard 被固定拉高 16px（实测 epCard.bottom=934 vs 聚合链视觉底部=918）。改为取右侧**最后一个卡片**的视觉底部（`right.lastElementChild.getBoundingClientRect().bottom`），实测 diff=0。前端静态文件热更新，无需重启
+- [x] **[P3] 上游错误体 gzip 未解压导致 last_error 含控制字符**（2026-09-12 已修） — `_try_endpoint` 的 HTTPError 分支用 `e.read().decode('utf-8', errors='ignore')` 直接当文本，上游返回 `Content-Encoding: gzip` 时错误正文变成二进制乱码（实测 Soleapi-gemini：`HTTP 404: \x1f\x8b...`），现在该文本会在端点列表与聚合链两面显示。修法：按 `Content-Encoding` 解压或过滤不可打印字符。
 
 ## 📝 决策日志
 
@@ -329,3 +330,45 @@ vision 池定位修正：由「`role: vision` 标记的普通组」改为与 mai
 验证：新增 `test/test_group_fallback_unlock.py` 5 项——清锁 + 只重置本组成员（别组端点与 defer 不受影响）、无锁阶段点击仍重置端点、重启恢复只保留仍在锁/仍冷却的组、**chat() 端到端：fallback 后点击 → 下一个该组请求落回本组端点**、期满未点击 → 本组请求自行回组并清待回切。全套 343 测试通过（基线 338），`ruff` 基线 125 条不变。生产验证：`/api/chain` 已返回 `fallback_return_pending`；`POST /api/groups/nope-xyz/clear-fallback` → `404 {"error": "组 'nope-xyz' 不存在"}`（未命中路由为 `{"error": "Not found"}`）证明分支已生效；`/` 返回的前端已含 `clearGroupFallback`。对真实组的点击（会解冻该组端点）由用户在生产态执行。
 
 生产 hash 后端 `f6bf97f5`（改前 `48833601`）/ 前端 `7640d0f1`（改前 `c6e3d153`），备份 `api_pool_server.py.bak-20260912-0855-group-fbswitch` / `static/index.html.bak-20260912-0855-group-fbswitch`，重启 2026-09-12 08:43。
+
+## 2026-09-12 端点错误详情完整性 + 异常口径四处统一（epErr）+ 响应体解压补漏 已部署生产
+
+需求（用户）：聚合链里的端点错误信息不完整，且健康状态与聚合池不一致（聚合池看不出异常、聚合链显示 402）；端点列表也只用 ❌ 徽章标记、卡片不高亮，健康异常应当高亮（用户当轮补充）。方案经用户确认后实施（含「错误展示扩到 health_error || last_error」选项）。用户随后定稿：聚合池卡只显示错误高亮边框，**不显示**具体错误详情。第三轮（同日 17:2x）用户反馈：聚合池错误端点仍无红框、聚合链错误端点红块消失、状态卡异常数与实际对不上——根因是四个面各用一套"异常"定义（状态卡 `health==='bad'` 计数、端点列表 `last_error||bad`、池卡仅 `bad`、链红块 `bad||fail_count` 而错误文本却按 `bad?health_error:last_error` 出）。用户定稿口径：**异常 = 健康状态以端点最后可知状态为准**（`epErr = health==='bad' || last_error 非空`），四处统一。另修复 Soleapi 拉模型 gzip 报错（见下）。
+
+改动：
+- 后端 `health_error` 一律存**完整**原文，移除 5 处 `[:100]` 截断：`_probe_endpoint`（chat 探针）、`_check_one_health`（chat 探针 `err_str` 与 models 探针 `Models接口错误`）、`_apply_test_result`（🧪 测试写回）、`check_all_health` 异常分支。上游响应体本身已在 `_try_endpoint` 限长 1000 字符，截断属纯信息丢失。
+- `clear_error()`（⏰ 手动解冻）补清 `_health_error`：原实现只清 `_last_error` 并置 `_health="ok"`，会留下「✅ + 陈旧错误文本」错位（2026-09-12 16:53 AgentRouterP-gpt6a 实测）。
+- `/api/chain` 每项新增 `last_error`，供聚合链兜底显示真实请求失败原因（客户端类 400/404/413/422 只写 `last_error`、不写 `health_error`，此前链上完全看不到这类原因）。
+- 前端异常判据统一为 `epErr(ep)`（helper，L758）：状态卡「异常」计数与点击筛选（`renderStats`，全部端点口径含池外）、端点列表卡红框（`renderEndpoints`）、聚合池卡红框（`renderPoolList`，仅红框不渲染徽章/错误行，保持紧凑）、聚合链红块 `chain-item failed`（`renderChain`，优先级：手动解冻 > 冷却 > 延迟回切 > 当前服务中 > 异常）——「有错误文本必有红块」。错误详情只在端点列表与聚合链：列表错误行 `last_error` 为空时回落 `health==='bad' && health_error`；链详情整段换行显示在 info 列（`.chain-err` 去 `max-width:120px` 单行省略），文本 `health==='bad' ? (health_error||last_error) : last_error`。一致性要求（用户 2026-09-12 定稿）：状态卡「异常」数**只需与端点列表实际相符**——两处共用同一 `epErr` 判据、列表默认「全部」含池外端点，因此天然一一对应（现网实测：计数 2 = 列表红框 2，PM/Soleapi-gemini，两个都在池外）。聚合池/聚合链只含池内成员，其红框数不参与该一致性要求（池外异常不显示在池面板是预期行为）。
+- **响应体解压补漏（Soleapi 拉模型 `'utf-8' codec can't decode byte 0x8b`）**：`fetch_models` 此前未包 `_DecodedResponse`，透传/客户端基线声明 `Accept-Encoding: gzip, deflate` 后上游真压缩，`json.loads(resp.read().decode("utf-8"))` 直接炸；`HTTPError` 错误体三处（`_try_endpoint`、`/api/endpoints/<id>/models`、`/api/fetch-models`）同样未包，gzip 错误体存进 `last_error` 成二进制乱码（Soleapi 实测 `HTTP 404: \x1f\x8b...`）。4 处读取点全部补包，复用既有解压链，未新增机制。
+
+验证：`py_compile` 通过、`ruff` 基线 125 条不变、inline JS `node --check` 通过；渲染层静态断言 `test/render_error_smoke.js` 扩到 11 项全通过（状态卡 epErr 计数、池卡 bad+last_error 双红框且无详情、列表双高亮与回落、链红块与全文）；既有 `test/test_chain_group_ui.js` 因新增 `epErr` 外部依赖同步修补（切片摘取 helper 源）后 PASS；gzip 回归 `test_decoded_response.py::test_fetch_models_decodes_gzip_json` 在旧码上精确复现同一 `UnicodeDecodeError`、新码通过；全量 **344 tests passed**。生产端到端：`POST /api/test` 触发 AgentRouter 真实失败 → `health_error` 长度 **219**（此前恒 100）；部署后 `GET /api/endpoints/<Soleapi id>/models` → `{"ok": true, "models": [...]}`（修复前同请求返回 `❌ 'utf-8' codec...`）；`/` 前端 md5 与工作区一致；`POST /api/test-pool` 返回 `pong`；重启后 journal 0 ERROR；live 快照渲染核对：状态卡/端点列表/池卡/链四处红块数一致。
+
+生产 hash 后端 `35e24c16`（改前 `f6bf97f5`，中间版 `663da144`/`d19d2b32`）/ 前端 `01fd4e50`（改前 `bb2f2c06`，中间版 `db600866`/`781aaead`），备份 `api_pool_server.py.bak-20260912-170358-chain-error-detail`（原版）/ `...-chain-error-detail-v1` / `...-20260912-172842-errsem-gzip`（gzip 修复前）/ `static/index.html.bak-20260912-170358-chain-error-detail` / `...-20260912-171108-pool-no-detail` / `...-20260912-172842-errsem`（epErr 修复前），重启 2026-09-12 17:04:05 / 17:06:17 / **17:28:42（终态，含 gzip 修复）**；前端静态文件热读，最终版随终态重启一并 scp。
+
+## 2026-09-12 严格校验 400「换形态重试」+ tool_call id 重写非变异 已部署生产
+
+需求（用户）：DeepSeek 严格校验 400（`reasoning_text/reasoning_content ... must be passed back`）的本地防御，在既有「一次重试」上增加**清空前缀再请求一次**的设计，并在真实使用场景中观察效果。用户提供关键事实：事故期间曾改过「重写 ToolCall ID 前缀」（加了又删），也试过把协议改成 Responses。
+
+诊断（证据边界）：17:24:52 起（**早于**当日 17:28:43 部署重启）已有该 400；17:29:12 配置快照 `tool_call_id_prefix='call_00_ET_'`，17:34:02 快照已清空；两次手动切回（17:30:10、17:31:01）之后才在 17:32:17 恢复，14 分钟内 3 笔故障请求的**原样重试全部再次失败**（每笔 2 次尝试）。两份快照 `protocol` 均为 openai → 无法把 Responses 临时切换与恢复时刻对应，**不作归因**；前缀清空与恢复在时间上相符，但样本仅 1 次，定位为「最值得优先验证的变量」而非定论。
+
+设计（已实施）：
+
+| 前提 | 唯一一次重试的形态 | 其余情况 |
+|---|---|---|
+| 本尝试**确实应用过前缀重写**（`attempt_prefix_applied>0`） | **跳过前缀重写**、改用客户端原始 tool_call id（换一种历史形态） | — |
+| 未应用前缀重写 | **不重试**、直接轮转（改回原始 id 无变化＝原样复读） | 打日志后转轮转 |
+
+（用户 2026-09-12 定案：**替换**而非追加——唯一一次重试就是「清空前缀」的换形态请求，
+删除原「原样复读」重试；会话内 3 笔故障 6 次尝试全失败，印证原样复读无意义。）
+
+改动：
+- `_rewrite_tool_call_ids` 改**非变异**：返回 `(新消息列表, 实际重写条数)`，只复制命中的消息与其 `tool_calls` 列表。原实现浅拷贝后原地改写嵌套 dict → ① 轮转各次尝试共用同一份 Hermes 历史，某端点的重写结果会带给后续异构端点（违反「payload 改写按端点隔离」铁律）；②「改回原始 id 再试一次」在实现上不可能。
+- `chat()`：请求级标志 `skip_prefix_rewrite`（换形态开关，**消费一次即清除**，轮转后各端点按自己配置重新决定）；严格校验 400 分支：预算 1，命中且 `attempt_prefix_applied>0` 时发「原始 id」变体重试，否则直接轮转；日志分别记录「改用原始 id 重试」与「未应用前缀重写→转轮转」。
+- 明确不做：不自动切换端点 `protocol`；不改端点配置；不恢复 2026-09-11 删除的「thinking=disabled」重试（请求级参数改不了被判定的历史形态，结论仍有效）。
+
+验证：新增 `test/test_strict_validation_prefix_retry.py` 4 例——单元（非变异 + assistant/tool 配对 + 幂等 + changed 计数）；集成用**真实本地 HTTP 上游**（ThreadingHTTPServer，按「历史里是否存在前缀 id」回 400/200）跑 `pool.chat()` 全链路：3 次尝试序列（重写 → 原样 → 原始 id）最终 200 且调用方历史零改动、无前缀时只 1 次原样重试后轮转、前缀重写不泄漏给轮转后的端点。黄金样本：新用例跑在改前文件（`35e24c16`）上 **3/4 失败**，改后 4/4 通过。全量回归 **348 passed**（基线 344）、`py_compile` OK、`ruff` 基线 125 不变、`test/test_glm_reasoning_adaptation.py` 护栏断言同步更新。生产：`/api/endpoints`、`/api/chain` 200，重启后 journal `[ERROR]` 计数 0，`POST /api/test-pool` → `pong`。
+
+生产 hash 后端 `35e24c16` → `e2fe9219`（预算 2 中间版）→ `db05802e`（预算 1 终版，前端本轮未动，仍 `01fd4e50`），备份 `api_pool_server.py.bak-20260912-175606-strict400-idvariant` / `api_pool_server.py.bak-20260912-180558-strict400-budget1`，重启 2026-09-12 18:05:58。
+
+观察口径（待用户在生产真实场景确认）：journal 里统计「改用原始 id 重试」成功率，与「未应用前缀重写→直接轮转」的出现频率。注意当前 `AgentRouter-ds4f` 的 `tool_call_id_prefix` 为空 → 阶段 2 暂不会触发，要观察变体需先给某端点重新配置前缀（配置前建议先按 `tool-call-prefix-direct-probe-2026-08-18.md` 的判定表确认该端点是否真需要前缀）。

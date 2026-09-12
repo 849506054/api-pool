@@ -11,7 +11,10 @@ function section(start, end) {
   assert(a >= 0 && b > a, `source boundaries: ${start}`);
   return html.slice(a, b);
 }
-const source = section("let poolGroupFilter='main';", '\nasync function endpointModels(')
+// epErr 是顶层异常判据（渲染函数之外），切片取不到，单独摘出拼进沙箱
+const epErrSrc = html.match(/function epErr\(ep\)\{[^\n]*\}/)[0];
+const source = epErrSrc + '\n'
+  + section("let poolGroupFilter='main';", '\nasync function endpointModels(')
   + section("let chainGroupFilter='main';", '\nasync function runHealthCheck(');
 const nodes = {};
 const document = {getElementById: id => nodes[id] ||= {innerHTML: '', textContent: ''}};

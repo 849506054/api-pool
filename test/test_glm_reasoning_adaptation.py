@@ -110,13 +110,20 @@ p = {"thinking": {"type": "disabled"}}
 APIPool._normalize_glm_thinking(p, ep("glm-5.2"))
 assert p["thinking"] == {"type": "disabled"} and "reasoning_effort" not in p, p
 
-# 7) 回归护栏：不再有「关闭 thinking」注入（结构性无效 + 会污染轮转后的异构端点），
-#    严格校验重试维持请求级总上限 1
+# 7) 回归护栏：不再有「关闭 thinking」注入（结构性无效 + 会污染轮转后的异构端点）；
+#    严格校验 400 的请求级预算 = 1（2026-09-12 定案：唯一一次重试就是「改用客户端原始
+#    tool_call id」的换形态请求，替换原「原样复读」），且必须受「本尝试确实应用了前缀重写」
+#    约束、开关消费一次即清除。
 src = open("/opt/data/work/api-pool2/api_pool_server.py", encoding="utf-8").read()
 assert "disable_thinking_forced" not in src
 assert "disable_thinking_eps" not in src
 assert 'payload["thinking"] = {"type": "disabled"}' not in src
 assert "strict_validation_retries = 0" in src
 assert "strict_validation_retries < 1" in src
+assert "strict_validation_retries = 1" in src
+assert "if strict_validation_retries < 1 and attempt_prefix_applied > 0:" in src
+assert "skip_prefix_rewrite = True" in src
+assert "原样重试" not in src, "「原样复读」重试已被换形态重试取代"
+assert "loop_messages, attempt_prefix_applied = self._rewrite_tool_call_ids(" in src
 
 print("ALL ASSERTS PASSED")

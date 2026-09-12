@@ -184,5 +184,51 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(result.get("choices", [{}])[0].get("message", {}).get("content"), "ok")
 
 
+    def test_fetch_models_decodes_gzip_json(self):
+        """回归（2026-09-12）：拉模型走 fetch_models，此前未包装 _DecodedResponse，
+        上游声明 gzip 时直接 decode 抛 "'utf-8' codec can't decode byte 0x8b"（Soleapi 实测）。"""
+        module = self.module
+        body = json.dumps({"data": [{"id": "b-model"}, {"id": "a-model"}]}).encode()
+        enc = gzip.compress(body)
+
+        class GzipResp:
+            status = 200
+            headers = {"Content-Encoding": "gzip", "Content-Type": "application/json"}
+
+            def __init__(self):
+                self._data = enc
+                self._pos = 0
+
+            def read(self, size=-1):
+                if size is None or size < 0:
+                    out = self._data[self._pos:]
+                    self._pos = len(self._data)
+                    return out
+                out = self._data[self._pos:self._pos + size]
+                self._pos += len(out)
+                return out
+
+            def readline(self, limit=-1):
+                idx = self._data.find(b"\n", self._pos)
+                if idx == -1:
+                    return self.read()
+                out = self._data[self._pos:idx + 1]
+                self._pos = idx + 1
+                return out
+
+            def close(self):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch.object(module.urllib.request, "urlopen", return_value=GzipResp()):
+            models = module.pool.fetch_models("https://up.example/v1", "sk", timeout=5, use_proxy=True)
+        self.assertEqual([m["id"] for m in models], ["a-model", "b-model"])
+
+
 if __name__ == "__main__":
     unittest.main()

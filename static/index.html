@@ -141,7 +141,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .chain-info .model{font-size:10px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chain-right{display:flex;flex-direction:column;align-items:flex-end;gap:2px;flex-shrink:0}
 .chain-health{font-size:11px;font-weight:600}
-.chain-err{font-size:10px;color:var(--red);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chain-err{font-size:10px;color:var(--red);margin-top:2px;word-break:break-all;line-height:1.35}
 .chain-connector{height:12px;border-left:2px dashed var(--border);margin-left:0}
 
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.65);backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;z-index:1000;opacity:0;pointer-events:none;transition:opacity .15s;overflow:hidden}
@@ -722,7 +722,7 @@ let alignT;window.addEventListener('resize',()=>{clearTimeout(alignT);alignT=set
 
 function renderStats(eps){
   const t=eps.length,en=eps.filter(e=>e.enabled).length,h=eps.filter(e=>e.health==='ok').length;
-  const cl=eps.filter(e=>e.in_cooldown).length,bad=eps.filter(e=>e.health==='bad').length;
+  const cl=eps.filter(e=>e.in_cooldown).length,bad=eps.filter(epErr).length;
   const calls=eps.reduce((s,e)=>s+e.total_calls,0);
   const abn=epFilter===ABN_FILTER;
   const abnCls=bad?(abn?' clickable active':' clickable'):'';
@@ -742,7 +742,7 @@ function renderFilterBar(eps){
     const site=String(ep.site_name||'').trim();
     if(site)sites.set(site,(sites.get(site)||0)+1);
   }
-  if(epFilter===ABN_FILTER&&!eps.some(e=>e.health==='bad'))epFilter='all';
+  if(epFilter===ABN_FILTER&&!eps.some(epErr))epFilter='all';
   if(epFilter!=='all'&&epFilter!==ABN_FILTER&&!sites.has(epFilter))epFilter='all';
   document.getElementById('filterBar').innerHTML=`
     <button class="filter-btn ${epFilter==='all'?'active':''}" onclick="setFilter('all')">全部 ${eps.length}</button>
@@ -752,6 +752,10 @@ function renderFilterBar(eps){
 }
 function setFilter(f){epFilter=f;refresh();}
 
+/* 异常口径（2026-09-12 用户定稿）：健康状态以端点最后可知状态为准 —— 探活判坏，
+   或最近一次请求失败尚未恢复（last_error 在请求成功时清空）。状态卡计数、异常筛选、
+   端点列表/聚合池红框、聚合链红块共用同一判据，避免四处各说各话。 */
+function epErr(ep){return ep.health==='bad'||!!ep.last_error;}
 function hBadge(h,lat){
   const m={ok:['badge-h-ok','✅'],slow:['badge-h-slow','🐢'],bad:['badge-h-bad','❌'],unknown:['badge-h-unknown','❓'],testing:['badge-h-unknown','⏳']};
   const[c,l]=m[h]||m.unknown;
@@ -759,7 +763,7 @@ function hBadge(h,lat){
 }
 
 function renderEndpoints(eps){
-  if(epFilter===ABN_FILTER)eps=eps.filter(e=>e.health==='bad');
+  if(epFilter===ABN_FILTER)eps=eps.filter(epErr);
   else if(epFilter!=='all')eps=eps.filter(e=>String(e.site_name||'').trim()===epFilter);
 
   const c=document.getElementById('filterCount');if(c)c.textContent=`${eps.length} 个`;
@@ -773,7 +777,7 @@ function renderEndpoints(eps){
     if(ep.in_cooldown)cls+=' in-cooldown';
     if(ep.manual_unlock_required)cls+=' has-error';
     if(ep.in_pool)cls+=' in-pool';
-    if(ep.last_error&&!ep.in_cooldown)cls+=' has-error';
+    if(epErr(ep))cls+=' has-error';
     let b=`<span class="badge badge-priority">#${ep.priority}</span>${hBadge(ep.health,ep.health_latency_ms)}`;
     if(ep.in_pool)b+='<span class="badge" style="background:rgba(16,163,127,0.2);color:#2ecc71;border:1px solid rgba(16,163,127,0.3)" title="已加入聚合池">🏊</span>';
     if(ep.protocol==='responses')b+=`<span class="badge" style="background:rgba(94,92,230,0.2);color:#9d9aff;border:1px solid rgba(94,92,230,0.3)" title="OpenAI Responses 原生协议">🔷Responses</span>`;
@@ -809,7 +813,7 @@ function renderEndpoints(eps){
         <span title="绑定的模型名称">🤖${esc(ep.model)}</span><span title="单次请求超时时间">⏱${ep.timeout}s</span><span title="失败后最大重试次数">🔁${ep.max_retries}次</span><span title="请求失败后的冷却惩罚时间">❄️${ep.cooldown_minutes}分</span>${ep.max_context_k>0?`<span title="最大上下文长度限制">📏${ep.max_context_k}K</span>`:''}<span title="累计成功响应次数">📞${ep.total_calls}次</span><span title="最后一次成功响应时间">🕐${last}</span>
       </div>
       ${ep.manual_unlock_required?`<div class="ep-error">💳 余额不足：已冻结，仅支持手动解冻</div>`:''}
-      ${ep.last_error?`<div class="ep-error">⚠ ${esc(ep.last_error)}</div>`:''}
+      ${ep.last_error?`<div class="ep-error">⚠ ${esc(ep.last_error)}</div>`:(ep.health==='bad'&&ep.health_error?`<div class="ep-error">⚠ ${esc(ep.health_error)}</div>`:'')}
     </div>`;
   }).join('');
   el.scrollTop=st; /* 恢复滚动位置 */
@@ -855,6 +859,7 @@ function renderPoolList(eps){
     if(ep.is_current&&(ep.current_groups||[]).includes(displayGroup))cls+=' current';
     if(ep.in_cooldown)cls+=' in-cooldown';
     if(ep.manual_unlock_required)cls+=' has-error';
+    if(epErr(ep))cls+=' has-error';
     if(ep.in_pool)cls+=' in-pool';
     const prioOf=(e)=>((e.priority_by_group&&e.priority_by_group[displayGroup]!==undefined)?e.priority_by_group[displayGroup]:e.priority);
     const groupEps=poolEps.filter(e=>groupsOf(e).includes(displayGroup));
@@ -1099,19 +1104,21 @@ function renderChain(chain){
     else if(it.in_cooldown)cls+=' cooldown';
     else if(it.is_deferred)cls+=' deferred';
     else if(isCurHere)cls+=' active';
-    else if(it.health==='bad'||it.fail_count>0)cls+=' failed';
+    else if(epErr(it)||it.fail_count>0)cls+=' failed';
     const st=it.manual_unlock_required?'<span class="badge badge-h-bad">💳余额不足·手动解冻</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(it.is_deferred?'<span class="badge badge-deferred">⏳延迟回切 '+fmtTime(it.defer_remaining)+'</span>':(isCurHere?'<span class="badge badge-success">服务中</span>':(it.is_current?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:9px;padding:1px 5px" title="本组未使用：它是其他组的当前端点">${esc(cg.filter(g=>g!==chainGroupFilter).join('·'))} 当前</span>`:''))));
     const h=it.health, lat=it.health_latency_ms;
     let rh='';
     if(h==='ok')rh=`<div class="chain-health" style="color:var(--green)">✓${lat>=0?' '+lat+'ms':''}</div>`;
     else if(h==='slow')rh=`<div class="chain-health" style="color:var(--yellow)">🐢${lat>=0?' '+lat+'ms':''}</div>`;
-    else if(h==='bad'){rh=`<div class="chain-health" style="color:var(--red)">✗${lat>=0?' '+lat+'ms':''}</div>`;if(it.health_error)rh+=`<div class="chain-err" title="${esc(it.health_error)}">${esc(it.health_error)}</div>`;}
+    else if(h==='bad'){rh=`<div class="chain-health" style="color:var(--red)">✗${lat>=0?' '+lat+'ms':''}</div>`;}
     else if(h==='testing')rh='<div class="chain-health" style="color:var(--text-dim)">…</div>';
     else rh='<div class="chain-health" style="color:var(--text-dim)">-</div>';
+    /* 错误详情：健康异常优先取 health_error，否则取真实请求的 last_error；全文换行显示，不做单行省略 */
+    const cerr=it.health==='bad'?(it.health_error||it.last_error||''):(it.last_error||'');
     const conn=i<chain.length-1?'<div class="chain-connector"></div>':'';
     const vis = (it.is_vision !== false) ? '<span class="badge" style="background:rgba(0,122,255,.15);color:#0a84ff" title="支持原生视觉">👁️视觉</span>' : '';
     const cp_=prioOf(it);
-    return`<div class="${cls}"><div class="chain-dot"></div><div class="chain-info"><div class="name"><span class="badge badge-priority">#${cp_}</span> ${esc(it.name)} ${st}</div><div class="model">${esc(it.model)} ${vis}</div></div><div class="chain-right">${rh}</div></div>${conn}`;
+    return`<div class="${cls}"><div class="chain-dot"></div><div class="chain-info"><div class="name"><span class="badge badge-priority">#${cp_}</span> ${esc(it.name)} ${st}</div><div class="model">${esc(it.model)} ${vis}</div>${cerr?`<div class="chain-err" title="${esc(cerr)}">⚠ ${esc(cerr)}</div>`:''}</div><div class="chain-right">${rh}</div></div>${conn}`;
   }).join('');
 }
 
