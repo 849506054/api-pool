@@ -828,6 +828,7 @@ function setPoolGroupFilter(g){
   poolGroupFilter=g;
   // 分组切换只改变当前视图，复用最近一次后台快照，不重新请求三个状态接口。
   if(Array.isArray(poolSnapshot.endpoints))renderPoolList(poolSnapshot.endpoints);
+  setChainGroupFilter(poolGroupFilter);
 }
 
 function renderPoolList(eps){
@@ -1066,9 +1067,12 @@ function renderChain(chain){
   const gEl=document.getElementById('groupSummary');
   const chainGroupsOf=(it)=>((it.pool_groups&&it.pool_groups.length)?it.pool_groups:['main']);
   const allGroups=['main'];
+  for(const gd of (window._groupDefs||[])) if(gd.name&&!allGroups.includes(gd.name)) allGroups.push(gd.name);
   for(const it of chain) for(const g of chainGroupsOf(it)) if(g!=='main'&&!allGroups.includes(g)) allGroups.push(g);
   sortGroups(allGroups);
   const multiGroup=allGroups.length>1||allGroups[0]!=='main';
+  if(!chainGroupFilter||!allGroups.includes(chainGroupFilter)) chainGroupFilter='main';
+  const prioOf=(it)=>((it.priority_by_group&&it.priority_by_group[chainGroupFilter]!==undefined)?it.priority_by_group[chainGroupFilter]:it.priority);
   if(gEl){
     if(multiGroup){
       gEl.innerHTML=`<div class="filter-bar" style="margin-bottom:8px">`+allGroups.map(g=>{
@@ -1084,8 +1088,7 @@ function renderChain(chain){
       </div>`;
     } else { gEl.innerHTML=''; }
   }
-  if(!chainGroupFilter||!allGroups.includes(chainGroupFilter)) chainGroupFilter='main';
-  if(multiGroup) chain=chain.filter(it=>chainGroupsOf(it).includes(chainGroupFilter));
+  chain=chain.filter(it=>chainGroupsOf(it).includes(chainGroupFilter)).sort((a,b)=>prioOf(a)-prioOf(b));
   if(!chain.length){el.innerHTML='<div class="empty">该组没有启用的端点</div>';return;}
   el.innerHTML=chain.map((it,i)=>{
     // 分组隔离：仅本组当前端点高亮；其他组的当前端点显示组名 badge 不高亮
@@ -1107,7 +1110,7 @@ function renderChain(chain){
     else rh='<div class="chain-health" style="color:var(--text-dim)">-</div>';
     const conn=i<chain.length-1?'<div class="chain-connector"></div>':'';
     const vis = (it.is_vision !== false) ? '<span class="badge" style="background:rgba(0,122,255,.15);color:#0a84ff" title="支持原生视觉">👁️视觉</span>' : '';
-    const cp_=(it.priority_by_group&&it.priority_by_group[chainGroupFilter]!==undefined)?it.priority_by_group[chainGroupFilter]:it.priority;
+    const cp_=prioOf(it);
     return`<div class="${cls}"><div class="chain-dot"></div><div class="chain-info"><div class="name"><span class="badge badge-priority">#${cp_}</span> ${esc(it.name)} ${st}</div><div class="model">${esc(it.model)} ${vis}</div></div><div class="chain-right">${rh}</div></div>${conn}`;
   }).join('');
 }
