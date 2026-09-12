@@ -1,0 +1,33 @@
+
+  ⚡ Gemini E2E (isolated) 管理面板已启动
+  🌐 管理面板访问: http://localhost:5399
+  🔗 客户端 Base URL: http://localhost:5399/v1
+  📋 已加载 1 个端点
+  🩺 健康检测: 失败时按优先级逐个探活候选端点
+[23:49:08] [INFO] [req=65560916] 收到 API 请求，尝试请求端点 '[main]Soleapi-gemini: gemini-3.8-flash'
+[23:49:12] [INFO] [req=65560916] 端点 '[main]Soleapi-gemini' 请求成功
+[23:49:12] [INFO] [DEBUG] 请求诊断完成 elapsed_ms=4077 switches=0 attempts=[{"endpoint":"Soleapi-gemini","result":"success"}]
+[23:49:12] [INFO] [req=2d8e8777] 收到 API 请求，尝试请求端点 '[main]Soleapi-gemini: gemini-3.8-flash'
+[23:49:15] [INFO] [req=2d8e8777] 端点 '[main]Soleapi-gemini' 请求成功
+[23:49:15] [INFO] [DEBUG] 请求诊断完成 elapsed_ms=3702 switches=0 attempts=[{"endpoint":"Soleapi-gemini","result":"success"}]
+[23:49:15] [INFO] [req=dbb4a617] 收到 API 请求，尝试请求端点 '[main]Soleapi-gemini: gemini-3.8-flash'
+[23:49:20] [INFO] [req=dbb4a617] 端点 '[main]Soleapi-gemini' 请求成功
+[23:49:20] [INFO] [DEBUG] 请求诊断完成 elapsed_ms=4753 switches=0 attempts=[{"endpoint":"Soleapi-gemini","result":"success"}]
+[23:51:14] [INFO] [req=679ebd62] 收到 API 请求，尝试请求端点 '[main]Soleapi-gemini: gemini-3.8-flash'
+[23:51:20] [INFO] [req=679ebd62] 端点 '[main]Soleapi-gemini' 请求成功
+[23:51:20] [INFO] [DEBUG] 请求诊断完成 elapsed_ms=6396 switches=0 attempts=[{"endpoint":"Soleapi-gemini","result":"success"}]
+[23:51:20] [INFO] [req=b2c1dd21] 收到 API 请求，尝试请求端点 '[main]Soleapi-gemini: gemini-3.8-flash'
+[23:51:26] [INFO] [req=b2c1dd21] 端点 '[main]Soleapi-gemini' 请求成功
+[23:51:26] [INFO] [DEBUG] 请求诊断建立 elapsed_ms=5953 switches=0 attempts=[{"endpoint":"Soleapi-gemini","result":"stream_opened"}]
+[23:51:27] [INFO] [req=260db34a] 收到 API 请求，尝试请求端点 '[main]Soleapi-gemini: gemini-3.8-flash'
+[23:51:35] [INFO] [req=260db34a] 端点 '[main]Soleapi-gemini' 请求成功
+[23:51:35] [INFO] [DEBUG] 请求诊断完成 elapsed_ms=7430 switches=0 attempts=[{"endpoint":"Soleapi-gemini","result":"success"}]
+[23:51:35] [INFO] [req=cc421dd0] 收到 API 请求，尝试请求端点 '[main]Soleapi-gemini: gemini-3.8-flash'
+[23:51:38] [INFO] [req=cc421dd0] 端点 '[main]Soleapi-gemini' 请求成功
+[23:51:38] [INFO] [DEBUG] 请求诊断完成 elapsed_ms=2932 switches=0 attempts=[{"endpoint":"Soleapi-gemini","result":"success"}]
+[23:51:38] [INFO] [req=c92693be] 收到 API 请求，尝试请求端点 '[main]Soleapi-gemini: gemini-3.8-flash'
+[23:51:44] [INFO] [req=c92693be] 端点 '[main]Soleapi-gemini' 请求成功
+[23:51:44] [INFO] [DEBUG] 请求诊断完成 elapsed_ms=6102 switches=0 attempts=[{"endpoint":"Soleapi-gemini","result":"success"}]
+[23:51:44] [INFO] [req=d7cbe240] 收到 API 请求，尝试请求端点 '[main]Soleapi-gemini: gemini-3.8-flash'
+[23:51:51] [INFO] [req=d7cbe240] 端点 '[main]Soleapi-gemini' 请求成功
+[23:51:51] [INFO] [DEBUG] 请求诊断完成 elapsed_ms=7096 switches=0 attempts=[{"endpoint":"Soleapi-gemini","result":"success"}]

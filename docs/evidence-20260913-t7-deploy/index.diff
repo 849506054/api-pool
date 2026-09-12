@@ -1,0 +1,19 @@
+--- prod/index.html	2026-09-12 23:58:06.241924695 +0800
++++ /opt/data/work/api-pool2/static/index.html	2026-09-12 22:52:55.656179125 +0800
+@@ -612,7 +612,7 @@
+       <div class="form-group"><label title="GLM 保留式思考：请求注入 thinking.clear_thinking=false，要求历史 reasoning_content 完整回传（需上游支持，默认关）">保留式思考</label><select id="fPreservedThinking"><option value="false">关闭</option><option value="true">开启（GLM）</option></select></div>
+     </div>
+     <div class="form-row form-row-capability">
+-      <div class="form-group"><label title="底层协议类型">协议类型</label><select id="fProtocol"><option value="openai">OpenAI 兼容</option><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic</option></select></div>
++      <div class="form-group"><label title="底层协议类型">协议类型</label><select id="fProtocol"><option value="openai">OpenAI 兼容</option><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic</option><option value="gemini">Gemini 兼容</option></select></div>
+       <div class="form-group"><label title="标识该模型是否原生支持读图。若选“不支持”，收到图片时会自动触发图片解析。">多模态能力</label><select id="fVision"><option value="false" selected>🚫 不支持 (触发自动转译)</option><option value="true">👁️ 原生支持</option></select></div>
+       <div class="form-group"><label title="是否使用系统代理 (如v2ray)。本地或直连接口请选择否。">代理设置</label><select id="fProxy"><option value="false">强制直连</option><option value="true">随系统</option></select></div>
+     </div>
+@@ -782,6 +782,7 @@
+     if(ep.in_pool)b+='<span class="badge" style="background:rgba(16,163,127,0.2);color:#2ecc71;border:1px solid rgba(16,163,127,0.3)" title="已加入聚合池">🏊</span>';
+     if(ep.protocol==='responses')b+=`<span class="badge" style="background:rgba(94,92,230,0.2);color:#9d9aff;border:1px solid rgba(94,92,230,0.3)" title="OpenAI Responses 原生协议">🔷Responses</span>`;
+     else if(ep.protocol==='anthropic')b+=`<span class="badge" style="background:rgba(217,119,87,0.2);color:#ff9e7a;border:1px solid rgba(217,119,87,0.3)" title="Anthropic 原生协议翻译">🧠Anthropic</span>`;
++    else if(ep.protocol==='gemini')b+=`<span class="badge" style="background:rgba(66,133,244,0.2);color:#7aabff;border:1px solid rgba(66,133,244,0.35)" title="Gemini 原生协议翻译">✨Gemini</span>`;
+     else b+=`<span class="badge badge-priority" style="background:rgba(16,163,127,0.2);color:#2ecc71" title="OpenAI 兼容协议">🟢OpenAI</span>`;
+     if(ep.is_current){const cg=ep.current_groups||[];const sub=cg.filter(g=>g!=='main');b+=sub.length?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35)" title="当前服务组：${esc(cg.join(', '))}">● ${esc(cg.join('·'))}</span>`:`<span class="badge badge-current" title="当前服务组：main">● MAIN</span>`;}
+     if(!ep.enabled)b+='<span class="badge badge-disabled">禁用</span>';

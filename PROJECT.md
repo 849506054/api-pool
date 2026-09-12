@@ -12,7 +12,7 @@
 | **Git remote** | `github.com/849506054/api-pool`（唯一正式分支 `main`） |
 | **端口** | 5200 |
 | **Python** | 3.13 (宿主机默认) |
-| **协议** | OpenAI 兼容 + Anthropic (端点级 protocol 属性) |
+| **协议** | OpenAI 兼容 / OpenAI Responses / Anthropic / Gemini 原生（端点级 `protocol` 属性，4 条） |
 | **健康检测** | chat ping / models 探针 (端点级 health_mode) |
 | **故障转移** | 普通请求按优先级轮选 → `_try_endpoint` 内部重试 → 明确端点故障才冻结冷却 → 轮转；单请求饿死不冻结、不切换；流式停滞由 API Pool 流事务层处理，不直接冻结端点 |
 | **代理** | 端点级 use_proxy 控制 (默认强制直连) |
@@ -62,7 +62,7 @@
 
 ### 待办
 
-- [ ] **[P1] Gemini 原生协议适配（方案阶段，2026-09-12）** — 根因（实测）：`Soleapi-gemini` / `Soleapi-gemini-3.7-flash` 端点只开 Gemini 原生方言，`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三入口同一把 Key、同一模型全部 404「没有能承接该入口协议的模型」。方案：端点级协议枚举新增 `gemini`，出站走 `/v1beta/models/{model}:generateContent`，两端点 `protocol` 改判为 `gemini`。方案文档 `docs/gemini-protocol-bridge-plan-2026-09-12.md`；8 卡拆分（T1 桥接 helper → T2 非流式响应/usage → T3 流式 → T4 前端下拉 → …）见 `docs/plans/2026-09-12-gemini-protocol-bridge-implementation.md` 与 kanban。状态：方案阶段，工作区后端与生产逐字节一致，早期未接线草稿存 `/opt/data/backups/gemini-bridge-draft-20260912.patch`。
+- [x] **[P1] Gemini 原生协议适配（2026-09-13 已部署并生产实测）** — 根因（实测）：`Soleapi-gemini` / `Soleapi-gemini-3.7-flash` 端点只开 Gemini 原生方言，`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三入口同一把 Key、同一模型全部 404「没有能承接该入口协议的模型」。方案：端点级协议枚举新增 `gemini`，出站走 `/v1beta/models/{model}:generateContent`，入站仍为 OpenAI 形态；tool 续跑靠 `thoughtSignature` 回填（进程内 TTL 表按池生成的 tool_call id 索引，无签名历史降级为文本）。方案文档 `docs/gemini-protocol-bridge-plan-2026-09-12.md`；8 卡拆分与依赖链见 `docs/plans/2026-09-12-gemini-protocol-bridge-implementation.md` 与 kanban。实现与验证：T1 请求侧接线、T2 非流式、T3 流式（含只带 usage 的收尾帧不误判停滞）、T4 前端下拉、T5 离线单测（`test/test_gemini_bridge.py`，36 条断言）、T6 隔离实例真机 E2E、T7 部署。**E2E 期发现并修复**：工具结果后紧跟 user 文本时转换器把文本并进 `functionResponse` 轮，上游 400 `Requests ending with a model turn are not supported` → `_gemini_payload_from_chat.push()` 改为工具轮不混文本、文本自成一轮（已实测 200，单测钉住）。部署状态（2026-09-13 00:02，生产 hash `ccd8d23687dfbb8aedf0a302d237b3b2`）：后端 + 前端已部署、`Soleapi-gemini` 的 `protocol` 已切 `gemini`，端点仍 `in_pool=false`（停放观察，未并入 main）；`Soleapi-gemini-3.7-flash` 保持 `responses` 待单独决定。生产实测（Hermes 身份、临时 `gemini-verify` 候选集）：非流式 / 流式 / 两轮工具续跑（`finish_reason=tool_calls` → 第二轮拿到时间）/ 图片 data URL 四条全 200，`missing thought_signature` 0 次，客户端请求失败 0 次。证据目录 `docs/evidence-20260912-gemini-e2e/`（隔离 E2E）与 `docs/evidence-20260913-t7-deploy/`（生产）。备份：生产侧 `*.bak-20260913-0002-pre-gemini`。
 - [x] **[P0] 2.0 非 DeepSeek Endpoint fallback 兼容** — 已部署至 5200；按目标 Endpoint 隔离 DeepSeek reasoning 字段，真实端点矩阵和 Hermes 5200 链路均已验收。
 - [x] **[P3] 提交未 commit 的本地改动** — 已随 9303572/4626f16 提交（含探活竞态去重补丁）
 - [x] **[P3] systemd 代理环境收口** — `api-pool2.service` 已内置 HTTPS_PROXY / HTTP_PROXY / NO_PROXY，不再依赖已删除的 1.0 drop-in。

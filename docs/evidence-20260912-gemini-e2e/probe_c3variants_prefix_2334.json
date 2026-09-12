@@ -1,0 +1,84 @@
+{
+  "profile_header_keys": [
+    "accept",
+    "accept-encoding",
+    "content-type",
+    "user-agent",
+    "x-stainless-arch",
+    "x-stainless-async",
+    "x-stainless-lang",
+    "x-stainless-os",
+    "x-stainless-package-version",
+    "x-stainless-read-timeout",
+    "x-stainless-retry-count",
+    "x-stainless-runtime",
+    "x-stainless-runtime-version"
+  ],
+  "variants": {
+    "V1_control_tool_last": {
+      "status": 200,
+      "ms": 13979,
+      "parts_shape": [
+        "user",
+        "assistant",
+        "tool"
+      ],
+      "content": "当前时间为：**2026年9月12日 23:30:00**（北京时间/Asia/Shanghai）。",
+      "error": null
+    },
+    "V2_tool_plus_user_text": {
+      "status": 500,
+      "ms": 11967,
+      "parts_shape": [
+        "user",
+        "assistant",
+        "tool",
+        "user"
+      ],
+      "content": null,
+      "error": {
+        "error": {
+          "message": "所有端点均已失效: ['[Soleapi-gemini] HTTP 400: {\"error\":{\"code\":400,\"message\":\"Provider API error: Requests ending with a model turn are not supported.\",\"status\":\"INVALID_ARGUMENT\"}}']",
+          "type": "server_error"
+        }
+      }
+    },
+    "V3_tool_then_assistant_then_user": {
+      "status": 200,
+      "ms": 12970,
+      "parts_shape": [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "user"
+      ],
+      "content": "2026-09-12 23:30:00",
+      "error": null
+    },
+    "V4_text_user_then_tool": {
+      "status": 200,
+      "ms": 16731,
+      "parts_shape": [
+        "user",
+        "assistant",
+        "user",
+        "tool"
+      ],
+      "content": "23:30:00",
+      "error": null
+    }
+  },
+  "round1": {
+    "status": 200,
+    "ms": 14223,
+    "tool_call": {
+      "id": "call_d6e89d88bf0f4a8d8274",
+      "type": "function",
+      "function": {
+        "name": "get_time",
+        "arguments": "{\"zone\": \"Asia/Shanghai\"}"
+      }
+    }
+  }
+}

@@ -1,0 +1,114 @@
+Sep 13 00:02:51 sunny systemd[1]: Stopping api-pool2.service - API Pool 2.0 - parallel experimental instance...
+Sep 13 00:02:51 sunny python3[550779]: [00:02:51] [INFO] 停止前运行态快照已保存（7 个组，8 个端点冷却态，0 把 fallback 锁）
+Sep 13 00:02:51 sunny systemd[1]: api-pool2.service: Deactivated successfully.
+Sep 13 00:02:51 sunny systemd[1]: Stopped api-pool2.service - API Pool 2.0 - parallel experimental instance.
+Sep 13 00:02:51 sunny systemd[1]: api-pool2.service: Consumed 5min 3.875s CPU time.
+Sep 13 00:02:51 sunny systemd[1]: Started api-pool2.service - API Pool 2.0 - parallel experimental instance.
+Sep 13 00:02:51 sunny python3[789953]: [00:02:51] [INFO] 已恢复 8 个端点的冷却/冻结状态
+Sep 13 00:02:57 sunny python3[789953]:   ⚡ API Pool 2.0 管理面板已启动
+Sep 13 00:02:57 sunny python3[789953]:   🌐 管理面板访问: http://localhost:5200
+Sep 13 00:02:57 sunny python3[789953]:   🔗 客户端 Base URL: http://localhost:5200/v1
+Sep 13 00:02:57 sunny python3[789953]:   📋 已加载 44 个端点
+Sep 13 00:02:57 sunny python3[789953]:   🩺 健康检测: 失败时按优先级逐个探活候选端点
+Sep 13 00:02:57 sunny python3[789953]: [00:02:57] [INFO] [req=502e17f6] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:03:01 sunny python3[789953]: [00:03:01] [INFO] [req=502e17f6] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:03:03 sunny python3[789953]: [00:03:03] [INFO] [req=99d51c6a] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:03:06 sunny python3[789953]: [00:03:06] [INFO] [req=99d51c6a] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:03:11 sunny python3[789953]: [00:03:11] [INFO] [req=ebe76222] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:03:15 sunny python3[789953]: [00:03:15] [INFO] [req=ebe76222] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:03:17 sunny python3[789953]: [00:03:17] [INFO] [req=test-952a1622] 测试端点 '[main]Soleapi-gemini: gemini-3.8-flash'
+Sep 13 00:03:18 sunny python3[789953]: [00:03:18] [INFO] [req=test-952a1622] 端点 '[main]Soleapi-gemini' 3 秒后进行第 1/1 次原端点重试（HTTP 503）
+Sep 13 00:03:22 sunny python3[789953]: [00:03:22] [ERROR] [req=test-952a1622] 端点 '[main]Soleapi-gemini' 测试请求失败: HTTP 503: {"error":{"code":503,"message":"所有货源当前不可用（熔断或已禁用），请稍后重试。","status":"UNAVAILABLE"}}
+Sep 13 00:03:22 sunny python3[789953]: [00:03:22] [WARN] 端点 '[main]Soleapi-gemini' 测试失败（非容量类）：仅记录观测态，不冷却、不计失败次数
+Sep 13 00:03:22 sunny python3[789953]: [00:03:22] [INFO] [req=684f05c2] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:03:28 sunny python3[789953]: [00:03:28] [INFO] [req=684f05c2] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:03:30 sunny python3[789953]: [00:03:30] [INFO] [req=2a1a8a00] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:03:34 sunny python3[789953]: [00:03:34] [INFO] [req=2a1a8a00] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:03:37 sunny python3[789953]: [00:03:37] [INFO] [req=5eb1ed6b] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:03:41 sunny python3[789953]: [00:03:41] [INFO] [req=5eb1ed6b] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:05:01 sunny python3[789953]: [00:05:01] [INFO] [req=test-8e999944] 测试端点 '[main]Soleapi-gemini: gemini-3.8-flash'
+Sep 13 00:05:02 sunny python3[789953]: [00:05:02] [INFO] [req=test-8e999944] 端点 '[main]Soleapi-gemini' 3 秒后进行第 1/1 次原端点重试（HTTP 503）
+Sep 13 00:05:06 sunny python3[789953]: [00:05:06] [ERROR] [req=test-8e999944] 端点 '[main]Soleapi-gemini' 测试请求失败: HTTP 503: {"error":{"code":503,"message":"所有货源当前不可用（熔断或已禁用），请稍后重试。","status":"UNAVAILABLE"}}
+Sep 13 00:05:06 sunny python3[789953]: [00:05:06] [WARN] 端点 '[main]Soleapi-gemini' 测试失败（非容量类）：仅记录观测态，不冷却、不计失败次数
+Sep 13 00:05:06 sunny python3[789953]: [00:05:06] [INFO] [req=eba65c1e] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:05:10 sunny python3[789953]: [00:05:10] [INFO] [req=eba65c1e] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:05:15 sunny python3[789953]: [00:05:15] [INFO] [req=276e54ff] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:05:19 sunny python3[789953]: [00:05:19] [INFO] [req=276e54ff] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:05:19 sunny python3[789953]: [00:05:19] [INFO] [req=f27f795e] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:05:23 sunny python3[789953]: [00:05:23] [INFO] [req=f27f795e] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:05:24 sunny python3[789953]: [00:05:24] [INFO] [req=cd9a9301] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:05:27 sunny python3[789953]: [00:05:27] [INFO] [req=cd9a9301] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:05:30 sunny python3[789953]: [00:05:30] [INFO] [req=4617bf5f] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:05:34 sunny python3[789953]: [00:05:34] [INFO] [req=4617bf5f] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:05:40 sunny python3[789953]: [00:05:40] [INFO] [req=dbd224e6] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:05:44 sunny python3[789953]: [00:05:44] [INFO] [req=dbd224e6] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:05:45 sunny python3[789953]: [00:05:45] [INFO] [req=454a3686] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:05:49 sunny python3[789953]: [00:05:49] [INFO] [req=454a3686] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:05:51 sunny python3[789953]: [00:05:51] [INFO] [req=38960fa9] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:05:55 sunny python3[789953]: [00:05:55] [INFO] [req=38960fa9] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:05:57 sunny python3[789953]: [00:05:57] [INFO] [req=00c62dd5] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:06:01 sunny python3[789953]: [00:06:01] [INFO] [req=00c62dd5] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:06:25 sunny python3[789953]: [00:06:25] [INFO] [req=80a8f51b] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:06:30 sunny python3[789953]: [00:06:30] [INFO] [req=80a8f51b] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:06:35 sunny python3[789953]: [00:06:35] [INFO] [req=3aa7c74b] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:06:38 sunny python3[789953]: [00:06:38] [INFO] [req=3aa7c74b] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:06:50 sunny python3[789953]: [00:06:50] [INFO] [req=0803563a] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:06:54 sunny python3[789953]: [00:06:54] [INFO] [req=0803563a] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:06:56 sunny python3[789953]: [00:06:56] [INFO] [req=ac2299a0] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:07:00 sunny python3[789953]: [00:07:00] [INFO] [req=ac2299a0] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:07:02 sunny python3[789953]: [00:07:02] [INFO] [req=512c60e2] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:07:07 sunny python3[789953]: [00:07:07] [INFO] [req=512c60e2] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:07:12 sunny python3[789953]: [00:07:12] [INFO] [req=626dd7ba] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:07:15 sunny python3[789953]: [00:07:15] [INFO] [req=626dd7ba] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:07:22 sunny python3[789953]: [00:07:22] [INFO] [req=8c84304c] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:07:27 sunny python3[789953]: [00:07:27] [INFO] [req=8c84304c] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:08:11 sunny python3[789953]: [00:08:11] [INFO] [req=ecfe952e] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:08:15 sunny python3[789953]: [00:08:15] [INFO] [req=ecfe952e] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:08:20 sunny python3[789953]: [00:08:20] [INFO] [req=6520f5ee] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:08:24 sunny python3[789953]: [00:08:24] [INFO] [req=6520f5ee] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:08:29 sunny python3[789953]: [00:08:29] [INFO] [req=test-8cddc2e3] 测试端点 '[main]Soleapi-gemini: gemini-3.8-flash'
+Sep 13 00:08:32 sunny python3[789953]: [00:08:32] [INFO] [req=test-8cddc2e3] 端点 '[main]Soleapi-gemini' 测试请求成功
+Sep 13 00:08:32 sunny python3[789953]: [00:08:32] [INFO] [req=dd42b4af] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:08:36 sunny python3[789953]: [00:08:36] [INFO] [req=dd42b4af] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:08:39 sunny python3[789953]: [00:08:39] [INFO] [req=0f02c09e] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:08:43 sunny python3[789953]: [00:08:43] [INFO] [req=0f02c09e] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:08:45 sunny python3[789953]: [00:08:45] [INFO] [req=79c4f6d5] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:08:49 sunny python3[789953]: [00:08:49] [INFO] [req=79c4f6d5] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:08:51 sunny python3[789953]: [00:08:51] [INFO] [req=66ca4019] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:08:55 sunny python3[789953]: [00:08:55] [INFO] [req=66ca4019] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:08:56 sunny python3[789953]: [00:08:56] [INFO] [req=11c17643] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:09:00 sunny python3[789953]: [00:09:00] [INFO] [req=11c17643] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:09:02 sunny python3[789953]: [00:09:02] [INFO] 新建分组 'gemini-verify'（dedicated，选择器 gemini-verify，上下文 1000K）
+Sep 13 00:09:02 sunny python3[789953]: [00:09:02] [INFO] [req=bfbd2d89] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:09:06 sunny python3[789953]: [00:09:06] [INFO] [req=bfbd2d89] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:09:08 sunny python3[789953]: [00:09:08] [INFO] [req=test-6561eea0] 测试端点 '[main]Stepfun: step-3.5-flash'
+Sep 13 00:09:09 sunny python3[789953]: [00:09:09] [INFO] [req=test-6561eea0] 端点 '[main]Stepfun' 测试请求成功
+Sep 13 00:09:09 sunny python3[789953]: [00:09:09] [INFO] [req=983903ff] 收到 API 请求，尝试请求端点 '[gemini-verify]Soleapi-gemini: gemini-3.8-flash'
+Sep 13 00:09:14 sunny python3[789953]: [00:09:14] [INFO] [req=983903ff] 端点 '[gemini-verify]Soleapi-gemini' 请求成功
+Sep 13 00:09:14 sunny python3[789953]: [00:09:14] [INFO] [req=aaa1ec71] 收到 API 请求，尝试请求端点 '[gemini-verify]Soleapi-gemini: gemini-3.8-flash'
+Sep 13 00:09:18 sunny python3[789953]: [00:09:18] [INFO] [req=aaa1ec71] 端点 '[gemini-verify]Soleapi-gemini' 请求成功
+Sep 13 00:09:18 sunny python3[789953]: [00:09:18] [INFO] [req=cb2093fd] 收到 API 请求，尝试请求端点 '[gemini-verify]Soleapi-gemini: gemini-3.8-flash'
+Sep 13 00:09:23 sunny python3[789953]: [00:09:23] [INFO] [req=cb2093fd] 端点 '[gemini-verify]Soleapi-gemini' 请求成功
+Sep 13 00:09:23 sunny python3[789953]: [00:09:23] [INFO] [req=6e5db0a4] 收到 API 请求，尝试请求端点 '[gemini-verify]Soleapi-gemini: gemini-3.8-flash'
+Sep 13 00:09:29 sunny python3[789953]: [00:09:29] [INFO] [req=6e5db0a4] 端点 '[gemini-verify]Soleapi-gemini' 请求成功
+Sep 13 00:09:29 sunny python3[789953]: [00:09:29] [INFO] [req=b4e70ab1] 收到 API 请求，尝试请求端点 '[gemini-verify]Soleapi-gemini: gemini-3.8-flash'
+Sep 13 00:09:36 sunny python3[789953]: [00:09:36] [INFO] [req=b4e70ab1] 端点 '[gemini-verify]Soleapi-gemini' 请求成功
+Sep 13 00:09:36 sunny python3[789953]: [00:09:36] [INFO] [req=4568fcb1] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:09:40 sunny python3[789953]: [00:09:40] [INFO] [req=4568fcb1] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:09:42 sunny python3[789953]: [00:09:42] [INFO] [req=7dad09cc] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:09:46 sunny python3[789953]: [00:09:46] [INFO] [req=7dad09cc] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:09:48 sunny python3[789953]: [00:09:48] [INFO] [req=6b8250b3] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:09:52 sunny python3[789953]: [00:09:52] [INFO] [req=6b8250b3] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:09:58 sunny python3[789953]: [00:09:58] [INFO] [req=test-e4538d8d] 测试端点 '[gemini-verify]Soleapi-gemini: gemini-3.8-flash'
+Sep 13 00:10:07 sunny python3[789953]: [00:10:07] [INFO] [req=test-e4538d8d] 端点 '[gemini-verify]Soleapi-gemini' 测试请求成功
+Sep 13 00:10:08 sunny python3[789953]: [00:10:08] [INFO] [req=4de9044e] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:10:12 sunny python3[789953]: [00:10:12] [INFO] [req=4de9044e] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:10:15 sunny python3[789953]: [00:10:15] [INFO] [req=d5f3d32f] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:10:19 sunny python3[789953]: [00:10:19] [INFO] [req=d5f3d32f] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:10:21 sunny python3[789953]: [00:10:21] [INFO] [req=d0627453] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:10:25 sunny python3[789953]: [00:10:25] [INFO] [req=d0627453] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:10:29 sunny python3[789953]: [00:10:29] [INFO] 删除分组 'gemini-verify'（成员已移出）
+Sep 13 00:10:29 sunny python3[789953]: [00:10:29] [INFO] [req=e4269bd3] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:10:33 sunny python3[789953]: [00:10:33] [INFO] [req=e4269bd3] 端点 '[main]AgentRouter-ds4f' 请求成功
+Sep 13 00:10:35 sunny python3[789953]: [00:10:35] [INFO] [req=84d5fe93] 收到 API 请求，尝试请求端点 '[main]AgentRouter-ds4f: deepseek-v4-flash'
+Sep 13 00:10:39 sunny python3[789953]: [00:10:39] [INFO] [req=84d5fe93] 端点 '[main]AgentRouter-ds4f' 请求成功

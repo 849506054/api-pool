@@ -1,0 +1,88 @@
+{
+  "results": {
+    "E_ping_shape": {
+      "ok": true,
+      "result": "你好"
+    },
+    "A_nonstream": {
+      "status": 200,
+      "content": "因为太阳光穿过大气层时，波长较短的**蓝光**更容易被空气分子向四面八方**散射**（瑞利散射），从而布满了整个天空。",
+      "usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 441,
+        "total_tokens": 451,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 400
+        }
+      }
+    },
+    "B_stream": {
+      "status": 200,
+      "text": "兼具西湖诗意与数字活力的人间天堂。",
+      "chunks": 3,
+      "usage": {
+        "prompt_tokens": 11,
+        "completion_tokens": 501,
+        "total_tokens": 512,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 488
+        }
+      },
+      "finish_reason": "stop"
+    },
+    "C_tool_2round": {
+      "c1_status": 200,
+      "tool_call": {
+        "id": "call_40373c641d4843c6a2a9",
+        "type": "function",
+        "function": {
+          "name": "get_time",
+          "arguments": "{\"zone\": \"Asia/Shanghai\"}"
+        }
+      },
+      "c2_status": 200,
+      "c2_content": "当前时间为：2026-09-12 23:30:00（Asia/Shanghai 时区）。",
+      "c2_usage": {
+        "prompt_tokens": 109,
+        "completion_tokens": 30,
+        "total_tokens": 139,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      }
+    },
+    "D_image": {
+      "status": 200,
+      "content": "红色",
+      "usage": {
+        "prompt_tokens": 1104,
+        "completion_tokens": 97,
+        "total_tokens": 1201,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 96
+        }
+      }
+    }
+  },
+  "errors": {},
+  "passed": [
+    "A_nonstream",
+    "B_stream",
+    "C_tool_2round",
+    "D_image",
+    "E_ping_shape"
+  ],
+  "failed": []
+}

@@ -48,7 +48,7 @@ FAKE_SUCCESS_PATTERNS = ["无法给到相关内容"]
 
 # 流事务中止原因中「答案被截断」的那一类：已向下游输出内容后再中止，回答一定不完整。
 # 这些原因要保留可见的 error finish，让 Hermes 走续写路径（`_timeout_abort`）。
-_TRUNCATED_STREAM_REASONS = ("流式总时长超限", "流式无有效业务增量停滞", "流式无新数据停滞")
+_TRUNCATED_STREAM_REASONS = ("流式总时长超限", "流式无有效业务增量停滞", "流式无新数据停滞", "上游流式错误")
 
 # ── 出站 User-Agent 透传（2026-09-05）──
 # 客户端原始 UA 经线程局部存储送到出站请求构造点。ThreadingHTTPServer 每请求独占
@@ -82,7 +82,7 @@ _client_baseline_lock = threading.Lock()
 # hermes 黄金样本：/opt/hermes/.venv openai SDK 2.24.0 实测出站头集合。
 # profile 不允许覆盖的保留头（由 pool 按端点协议管理）
 _PROFILE_RESERVED_HEADERS = frozenset({
-    "host", "content-length", "authorization", "x-api-key", "anthropic-version",
+    "host", "content-length", "authorization", "x-api-key", "anthropic-version", "x-goog-api-key",
 })
 # 透传时跳过的头：连接级/端到端头 + pool 托管头（host/content-length 由 urllib 重算，
 # authorization/x-api-key/anthropic-version 由 pool 按端点协议写入）
@@ -2186,6 +2186,340 @@ def _anthropic_tool_choice_from_chat(tool_choice):
         if name:
             return {"type": "tool", "name": name}
     return None
+
+
+# ── Gemini 原生方言桥接（2026-09-12）──────────────────────────────────────────
+# SoleAPI 一类网关对 Gemini 系模型只开 /v1beta/models/{model}:generateContent：同一模型
+# 走 /v1/chat/completions、/v1/responses、/v1/messages 一律 404「没有能承接该入口协议
+# 的货源」。端点级 protocol="gemini" → 入站保持 OpenAI chat 形态，出站转 Gemini 原生
+# 方言，响应再转回 OpenAI 形态。
+#
+# thoughtSignature 必须回传（实测 gemini-3.8-flash，thinkingBudget=0 亦然）：functionCall
+# part 不带签名续跑必 400「Function call is missing a thought_signature」。签名只出现在
+# 上游响应里、OpenAI 形态没有对应字段，故按 pool 生成的 tool_call id 记在进程内表里。
+# ponytail: 进程内 TTL 表，进程重启即失忆；失忆（或历史来自其他协议的端点）时该轮工具
+# 调用降级为文本 parts，需要跨重启保真再改存 sqlite。
+_GEMINI_SIG_TTL = 3600
+_GEMINI_SIG_MAX = 4000
+_gemini_tool_sigs: dict = {}          # {tool_call_id: (name, thoughtSignature, ts)}
+_gemini_tool_sigs_lock = threading.Lock()
+_GEMINI_FINISH_REASONS = {
+    "STOP": "stop",
+    "MAX_TOKENS": "length",
+    "SAFETY": "content_filter",
+    "RECITATION": "content_filter",
+    "BLOCKLIST": "content_filter",
+    "PROHIBITED_CONTENT": "content_filter",
+    "SPII": "content_filter",
+    "IMAGE_SAFETY": "content_filter",
+}
+
+
+def _gemini_remember_tool_call(name, signature):
+    """登记一次上游 functionCall，返回下行 OpenAI 形态用的 tool_call id。"""
+    import uuid
+    call_id = "call_" + uuid.uuid4().hex[:20]
+    if signature:
+        with _gemini_tool_sigs_lock:
+            now = time.time()
+            for k in [k for k, v in _gemini_tool_sigs.items() if now - v[2] > _GEMINI_SIG_TTL]:
+                _gemini_tool_sigs.pop(k, None)
+            while len(_gemini_tool_sigs) >= _GEMINI_SIG_MAX:
+                _gemini_tool_sigs.pop(next(iter(_gemini_tool_sigs)), None)
+            _gemini_tool_sigs[call_id] = (name or "", signature, now)
+    return call_id
+
+
+def _gemini_lookup_tool_call(call_id):
+    with _gemini_tool_sigs_lock:
+        entry = _gemini_tool_sigs.get(str(call_id or ""))
+    return (entry[0], entry[1]) if entry else ("", "")
+
+
+def _gemini_url(base_url, model, stream=False):
+    """base_url 三种写法都接受：…/v1、…/v1beta、裸域名。"""
+    base = str(base_url or "").rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3] + "/v1beta"
+    elif not base.endswith("/v1beta"):
+        base += "/v1beta"
+    method = "streamGenerateContent" if stream else "generateContent"
+    return f"{base}/models/{model}:{method}" + ("?alt=sse" if stream else "")
+
+
+def _gemini_text_from_content(content):
+    """OpenAI content（str / block 列表）里的纯文本，用于 system 与工具结果。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("text"):
+                texts.append(b["text"])
+            elif b.get("type") == "image_url":
+                url = (b.get("image_url") or {}).get("url", "") if isinstance(b.get("image_url"), dict) else ""
+                if url:
+                    texts.append(f"[Image URL: {url}]")
+        return "\n".join(texts)
+    if content is None:
+        return ""
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _gemini_parts_from_content(content):
+    """OpenAI content blocks → Gemini parts（图片 data URL → inlineData）。"""
+    if isinstance(content, str):
+        return [{"text": content}] if content else []
+    parts = []
+    if not isinstance(content, list):
+        return parts
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "image_url":
+            url = (b.get("image_url") or {}).get("url", "") if isinstance(b.get("image_url"), dict) else ""
+            if url.startswith("data:image/"):
+                try:
+                    header, b64 = url.split(",", 1)
+                    mime = header.split(";")[0].replace("data:", "") or "image/png"
+                    parts.append({"inlineData": {"mimeType": mime, "data": b64}})
+                except ValueError:
+                    pass
+            elif url:
+                # 远端 URL 不代抓，降级为占位文本（与 Anthropic 桥同策略）
+                parts.append({"text": f"[Image URL: {url}]"})
+        elif b.get("text"):
+            parts.append({"text": b["text"]})
+    return parts
+
+
+def _gemini_tools_from_chat(tools):
+    """OpenAI tools → Gemini functionDeclarations（名称/描述/参数 schema 原样搬）。"""
+    decls = []
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if t.get("type") in (None, "function") else None
+        if not isinstance(fn, dict) or not fn.get("name"):
+            continue
+        decl = {"name": fn["name"]}
+        if fn.get("description"):
+            decl["description"] = fn["description"]
+        params = fn.get("parameters")
+        decl["parameters"] = params if isinstance(params, dict) else {"type": "object", "properties": {}}
+        decls.append(decl)
+    return decls
+
+
+def _gemini_tool_config_from_chat(tool_choice):
+    """OpenAI tool_choice → Gemini toolConfig（auto/none/required/指定函数）。"""
+    mode = None
+    allowed = []
+    if isinstance(tool_choice, str):
+        mode = {"auto": "AUTO", "none": "NONE", "required": "ANY", "any": "ANY"}.get(tool_choice.lower())
+    elif isinstance(tool_choice, dict):
+        fn = tool_choice.get("function") or {}
+        name = fn.get("name") or tool_choice.get("name")
+        if tool_choice.get("type") == "function" and name:
+            mode, allowed = "ANY", [name]
+        elif tool_choice.get("type") == "auto":
+            mode = "AUTO"
+    if not mode:
+        return None
+    cfg = {"mode": mode}
+    if allowed:
+        cfg["allowedFunctionNames"] = allowed
+    return {"functionCallingConfig": cfg}
+
+
+def _gemini_payload_from_chat(payload, ep=None):
+    """OpenAI chat payload → Gemini generateContent 请求体（模型名走 URL 路径）。"""
+    synthetic = {}          # 无签名工具调用 → 对应结果也用文本形态回填
+    call_names = {}         # tool_call_id → 函数名（functionResponse 按名回填）
+    system_texts = []
+    contents = []
+    missing_sig_logged = False
+
+    def push(role, parts):
+        if not parts:
+            return
+        last = contents[-1] if contents else None
+        # 含 functionResponse 的工具轮不能混入普通文本：上游对 "工具结果 + 同轮文本" 直接 400
+        # （Requests ending with a model turn are not supported）→ 另起一轮，保持工具轮纯净。
+        if (last is not None and last["role"] == role
+                and not (any("functionResponse" in p for p in last["parts"])
+                         and not any("functionResponse" in p for p in parts))):
+            last["parts"].extend(parts)
+        else:
+            contents.append({"role": role, "parts": parts})
+
+    for m in payload.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role in ("system", "developer"):
+            text = _gemini_text_from_content(m.get("content"))
+            if text.strip():
+                system_texts.append(text)
+            continue
+        if role == "tool":
+            call_id = m.get("tool_call_id") or ""
+            name = call_names.get(call_id) or "tool"
+            raw = _gemini_text_from_content(m.get("content"))
+            if call_id in synthetic:
+                push("user", [{"text": f"[工具 {name} 返回] {raw}"}])
+            else:
+                obj = None
+                if raw.strip().startswith(("{", "[")):
+                    try:
+                        obj = json.loads(raw)
+                    except (TypeError, ValueError):
+                        obj = None
+                if not isinstance(obj, dict):
+                    obj = {"result": raw}
+                push("user", [{"functionResponse": {"name": name, "response": obj}}])
+            continue
+        if role != "assistant":
+            push("user", _gemini_parts_from_content(m.get("content")))
+            continue
+        parts = _gemini_parts_from_content(m.get("content"))
+        calls = [tc for tc in (m.get("tool_calls") or []) if isinstance(tc, dict)]
+        signed = []
+        for tc in calls:
+            fn = tc.get("function") or {}
+            call_id = tc.get("id") or ""
+            if call_id:
+                call_names[call_id] = fn.get("name") or ""
+            signed.append(_gemini_lookup_tool_call(call_id)[1])
+        if calls and all(signed):
+            for tc, sig in zip(calls, signed):
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args) if args.strip() else {}
+                    except (TypeError, ValueError):
+                        args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                parts.append({
+                    "functionCall": {"name": fn.get("name") or "", "args": args},
+                    "thoughtSignature": sig,
+                })
+        elif calls:
+            # 历史里的工具调用不是本进程生成的（跨协议端点/重启）→ 无签名，原样回传必被
+            # 上游 400，退化成文本让对话继续。
+            if not missing_sig_logged:
+                missing_sig_logged = True
+                if ep is not None:
+                    sys_log(f"端点 '{ep.name}' 历史工具调用无 thoughtSignature（跨协议或重启后的历史），本轮退化为文本形态", "WARN")
+            for tc in calls:
+                fn = tc.get("function") or {}
+                call_id = tc.get("id") or ""
+                if call_id:
+                    synthetic[call_id] = True
+                parts.append({"text": f"[调用工具 {fn.get('name') or ''}，参数 {fn.get('arguments') or '{}'}]"})
+        push("model", parts)
+
+    if not contents:
+        push("user", [{"text": "ping"}])
+    body = {"contents": contents}
+    if system_texts:
+        body["systemInstruction"] = {"parts": [{"text": "\n".join(system_texts)}]}
+    gen = {}
+    if payload.get("temperature") is not None:
+        gen["temperature"] = payload["temperature"]
+    if payload.get("top_p") is not None:
+        gen["topP"] = payload["top_p"]
+    max_tokens = payload.get("max_tokens") or payload.get("max_completion_tokens")
+    if max_tokens:
+        gen["maxOutputTokens"] = max_tokens
+    stop = payload.get("stop")
+    if stop:
+        gen["stopSequences"] = stop if isinstance(stop, list) else [stop]
+    rf = payload.get("response_format")
+    if isinstance(rf, dict) and rf.get("type") == "json_object":
+        gen["responseMimeType"] = "application/json"
+    if gen:
+        body["generationConfig"] = gen
+    decls = _gemini_tools_from_chat(payload.get("tools"))
+    if decls:
+        body["tools"] = [{"functionDeclarations": decls}]
+        cfg = _gemini_tool_config_from_chat(payload.get("tool_choice"))
+        if cfg:
+            body["toolConfig"] = cfg
+    return body
+
+
+def _gemini_finish_reason(raw, has_tool_calls=False):
+    if has_tool_calls:
+        return "tool_calls"
+    return _GEMINI_FINISH_REASONS.get(str(raw or "").upper(), "stop")
+
+
+def _gemini_usage_to_chat_usage(meta):
+    """usageMetadata → OpenAI usage（thoughts 计入 completion，另记 reasoning_tokens）。"""
+    meta = meta if isinstance(meta, dict) else {}
+    prompt_t = meta.get("promptTokenCount", 0) or 0
+    cand_t = meta.get("candidatesTokenCount", 0) or 0
+    thought_t = meta.get("thoughtsTokenCount", 0) or 0
+    cached_t = meta.get("cachedContentTokenCount", 0) or 0
+    completion_t = cand_t + thought_t
+    total_t = meta.get("totalTokenCount") or (prompt_t + completion_t)
+    return {
+        "prompt_tokens": prompt_t,
+        "completion_tokens": completion_t,
+        "total_tokens": total_t,
+        "prompt_tokens_details": {"cached_tokens": cached_t},
+        "completion_tokens_details": {"reasoning_tokens": thought_t},
+    }
+
+
+def _gemini_parts_to_chat(candidate):
+    """一个 candidate 的 parts → (text, reasoning, tool_calls)；工具调用顺带登记签名。"""
+    text = ""
+    reasoning = ""
+    tool_calls = []
+    if not isinstance(candidate, dict):
+        return text, reasoning, tool_calls
+    for p in ((candidate.get("content") or {}).get("parts") or []):
+        if not isinstance(p, dict):
+            continue
+        if p.get("functionCall"):
+            fc = p["functionCall"] or {}
+            name = fc.get("name") or ""
+            call_id = _gemini_remember_tool_call(name, p.get("thoughtSignature") or "")
+            args = fc.get("args")
+            tool_calls.append({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False),
+                },
+            })
+        elif p.get("text"):
+            if p.get("thought"):
+                reasoning += p["text"]
+            else:
+                text += p["text"]
+    return text, reasoning, tool_calls
+
+
+def _gemini_chunk_parts(chunk):
+    """Gemini 流式 chunk → 首 candidate 的 parts（形态不符返回空）。"""
+    if not isinstance(chunk, dict):
+        return []
+    candidates = chunk.get("candidates")
+    cand = candidates[0] if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict) else {}
+    content = cand.get("content") if isinstance(cand.get("content"), dict) else {}
+    parts = content.get("parts")
+    return [p for p in parts if isinstance(p, dict)] if isinstance(parts, list) else []
 
 
 @dataclass
@@ -5426,7 +5760,16 @@ class APIPool:
         # 协议层处理：Anthropic 端点做完整格式转换以保证 Kcne 缓存 key 一致性
         is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
         is_responses = (getattr(ep, "protocol", "openai") == "responses")
-        if is_responses:
+        is_gemini = (getattr(ep, "protocol", "openai") == "gemini")
+        if is_gemini:
+            # Gemini 原生方言：模型名走 URL 路径，body 为 contents/systemInstruction/generationConfig
+            url = _gemini_url(ep.base_url, payload.get("model") or ep.model, stream=bool(payload.get("stream")))
+            data = json.dumps(
+                _gemini_payload_from_chat(payload, ep),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        elif is_responses:
             url = ep.base_url.rstrip("/") + "/responses"
             responses_payload = _responses_body_from_chat(payload)
             responses_payload.setdefault("model", ep.model)
@@ -5541,7 +5884,7 @@ class APIPool:
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
-        elif not is_responses:
+        elif not (is_responses or is_gemini):
             url = ep.base_url.rstrip("/") + "/chat/completions"
             data = json.dumps(payload).encode("utf-8")
             
@@ -5554,6 +5897,8 @@ class APIPool:
             if is_anthropic:
                 req.add_header("x-api-key", safe_api_key)
                 req.add_header("anthropic-version", "2023-06-01")
+            if is_gemini:
+                req.add_header("x-goog-api-key", safe_api_key)
             req.add_header("Authorization", f"Bearer {safe_api_key}")
             # 出站客户端特征（2026-09-11 透明网关；2026-09-12 池自身身份确定性）：
             # 有客户端上下文（代理路径）→ 端点 profile，否则忠实透传当前请求的入站头；
@@ -5636,6 +5981,15 @@ class APIPool:
                     def _is_business_chunk(chunk):
                         if not isinstance(chunk, dict):
                             return False
+                        if is_gemini:
+                            # 首包判定：只有 parts 里的业务增量算（与 openai 分支同语义：
+                            # 只有空收尾帧的流仍按「无业务首包」失败）。
+                            # 例外：整轮被拦截时上游只回 promptFeedback.blockReason（无
+                            # candidates），那是有效终局，不能当 502 触发端点轮转。
+                            _g_pf = chunk.get("promptFeedback")
+                            if isinstance(_g_pf, dict) and _g_pf.get("blockReason"):
+                                return True
+                            return any(p.get("text") or p.get("functionCall") for p in _gemini_chunk_parts(chunk))
                         if is_responses and str(chunk.get("type", "")).startswith("response."):
                             return chunk.get("type") in ("response.output_text.delta", "response.output_item.added", "response.function_call_arguments.delta", "response.completed")
                         if is_anthropic:
@@ -5738,6 +6092,10 @@ class APIPool:
                         has_usage = False
                         final_completion_text = ""
                         final_reasoning_text = ""
+                        gemini_finish_raw = ""
+                        gemini_has_tool_calls = False
+                        gemini_tool_index = 0
+                        gemini_block_reason = ""
                         anthropic_tool_blocks = {}
                         anthropic_stop_reason = None
                         anthropic_message_stopped = False
@@ -5752,6 +6110,15 @@ class APIPool:
                                 "created": int(time.time()),
                                 "model": ep.model,
                                 "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]
+                            }).encode("utf-8") + b"\n\n"
+
+                        def delta_chunk(delta):
+                            return b"data: " + json.dumps({
+                                "id": stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": ep.model,
+                                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
                             }).encode("utf-8") + b"\n\n"
 
                         stall_timeout = getattr(ep, "stream_stall_timeout", 0)
@@ -5837,6 +6204,20 @@ class APIPool:
                         def _business_activity(chunk, is_anthropic_chunk):
                             """该 chunk 是否携带有效业务增量（刷新停滞时钟）。"""
                             try:
+                                if is_gemini:
+                                    # parts 增量 / finishReason / usageMetadata / 拦截终局都算活动：
+                                    # 只带 usage 的收尾帧不得被判为「无业务数据」。
+                                    if any(p.get("text") or p.get("functionCall") for p in _gemini_chunk_parts(chunk)):
+                                        return True
+                                    if not isinstance(chunk, dict):
+                                        return False
+                                    if chunk.get("usageMetadata"):
+                                        return True
+                                    _g_pf = chunk.get("promptFeedback")
+                                    if isinstance(_g_pf, dict) and _g_pf.get("blockReason"):
+                                        return True
+                                    _g_cands = chunk.get("candidates") or []
+                                    return bool(_g_cands and isinstance(_g_cands[0], dict) and _g_cands[0].get("finishReason"))
                                 if not is_anthropic_chunk:
                                     choices = chunk.get("choices") or []
                                     if choices:
@@ -5940,6 +6321,73 @@ class APIPool:
                                     except Exception:
                                         continue
                                     responses_event = ""
+                                    continue
+                                if is_gemini:
+                                    # Gemini 原生 SSE → OpenAI chat.completion.chunk（2026-09-12，T3）
+                                    stripped_line = line.strip()
+                                    if not stripped_line.startswith(b"data:"):
+                                        continue
+                                    raw_data = stripped_line[5:].strip()
+                                    if not raw_data or raw_data == b"[DONE]":
+                                        continue
+                                    try:
+                                        chunk = json.loads(raw_data.decode("utf-8"))
+                                    except (UnicodeDecodeError, json.JSONDecodeError):
+                                        continue
+                                    if stall_timeout > 0 and _business_activity(chunk, False):
+                                        business_stall_deadline = time.time() + stall_timeout
+                                    _g_pf = chunk.get("promptFeedback")
+                                    if isinstance(_g_pf, dict) and _g_pf.get("blockReason"):
+                                        # 整轮被拦截：无 candidates，终局 finish=content_filter
+                                        gemini_block_reason = _g_pf.get("blockReason")
+                                        sys_log(f"{request_tag}端点 '{endpoint_log_label}' Gemini 流式响应被拦截"
+                                                f"（promptFeedback.blockReason={gemini_block_reason}）", "WARN")
+                                    _g_err = _stream_error(chunk)
+                                    if _g_err:
+                                        # 中流错误：与 openai 分支同语义（记录中断），再复用事务失败
+                                        # 收尾让错误对下游可见，绝不伪装成正常 stop。
+                                        sys_log(f"{request_tag}端点 '{endpoint_log_label}' 流式传输中断/异常: upstream stream error: {_g_err}", "ERROR")
+                                        yield from _timeout_abort(f"上游流式错误: {_g_err}")
+                                        return
+                                    _g_cands = chunk.get("candidates") or []
+                                    _g_cand = _g_cands[0] if _g_cands and isinstance(_g_cands[0], dict) else {}
+                                    for _g_part in _gemini_chunk_parts(chunk):
+                                        if _g_part.get("functionCall") is not None:
+                                            _g_fc = _g_part["functionCall"] or {}
+                                            _g_args = _g_fc.get("args")
+                                            gemini_has_tool_calls = True
+                                            # 整段参数一次给全；id 由池生成，签名按 id 登记供续跑回填
+                                            yield delta_chunk({"tool_calls": [{
+                                                "index": gemini_tool_index,
+                                                "id": _gemini_remember_tool_call(
+                                                    _g_fc.get("name") or "", _g_part.get("thoughtSignature") or ""),
+                                                "type": "function",
+                                                "function": {
+                                                    "name": _g_fc.get("name") or "",
+                                                    "arguments": json.dumps(_g_args if isinstance(_g_args, dict) else {},
+                                                                            ensure_ascii=False),
+                                                },
+                                            }]})
+                                            gemini_tool_index += 1
+                                        elif _g_part.get("text"):
+                                            if _g_part.get("thought"):
+                                                final_reasoning_text += _g_part["text"]
+                                                yield delta_chunk({"reasoning_content": _g_part["text"]})
+                                            else:
+                                                final_completion_text += _g_part["text"]
+                                                yield delta_chunk({"content": _g_part["text"]})
+                                    if _g_cand.get("finishReason"):
+                                        gemini_finish_raw = _g_cand.get("finishReason")
+                                    _g_meta = chunk.get("usageMetadata")
+                                    if isinstance(_g_meta, dict) and _g_meta:
+                                        # 写入既有 final_*：finally 的 usage 记账自动生效
+                                        _g_usage = _gemini_usage_to_chat_usage(_g_meta)
+                                        final_prompt_tokens = _g_usage["prompt_tokens"]
+                                        final_completion_tokens = _g_usage["completion_tokens"]
+                                        final_total_tokens = _g_usage["total_tokens"]
+                                        final_cached_tokens = _g_usage["prompt_tokens_details"]["cached_tokens"]
+                                        final_reasoning_tokens = _g_usage["completion_tokens_details"]["reasoning_tokens"]
+                                        has_usage = True
                                     continue
                                 if is_anthropic:
                                     if line.startswith(b"data: [DONE]"):
@@ -6092,6 +6540,29 @@ class APIPool:
                             if is_responses:
                                 # Native Responses streams still end with the Chat-compatible DONE marker.
                                 yield b"data: [DONE]\n\n"
+                            if is_gemini:
+                                # Gemini SSE 没有 [DONE]，finishReason/usageMetadata 也只在候选块里
+                                # 出现；流末统一补 finish + usage + [DONE]，否则下游等不到结束标记。
+                                if gemini_block_reason:
+                                    yield finish_chunk("content_filter")
+                                elif gemini_finish_raw or gemini_has_tool_calls:
+                                    yield finish_chunk(_gemini_finish_reason(gemini_finish_raw, gemini_has_tool_calls))
+                                if has_usage:
+                                    yield b"data: " + json.dumps({
+                                        "id": stream_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": ep.model,
+                                        "choices": [],
+                                        "usage": {
+                                            "prompt_tokens": final_prompt_tokens,
+                                            "completion_tokens": final_completion_tokens,
+                                            "total_tokens": final_total_tokens,
+                                            "prompt_tokens_details": {"cached_tokens": final_cached_tokens},
+                                            "completion_tokens_details": {"reasoning_tokens": final_reasoning_tokens or 0},
+                                        },
+                                    }).encode("utf-8") + b"\n\n"
+                                yield b"data: [DONE]\n\n"
                             if is_anthropic and not anthropic_message_stopped:
                                 yield from _timeout_abort("Anthropic 流在 message_stop 前提前结束")
                                 return
@@ -6115,6 +6586,54 @@ class APIPool:
                     return stream_generator(), ""
                 else:
                     body = json.loads(resp.read().decode("utf-8"))
+                    if is_gemini:
+                        # Gemini 原生响应 → OpenAI chat.completion（2026-09-12，T2）
+                        _candidates = body.get("candidates") or []
+                        _cand = _candidates[0] if _candidates else {}
+                        g_text, g_reasoning, g_tool_calls = _gemini_parts_to_chat(_cand)
+                        g_block = (body.get("promptFeedback") or {}).get("blockReason")
+                        if g_block:
+                            sys_log(f"{request_tag}端点 '{endpoint_log_label}' Gemini 响应被拦截"
+                                    f"（promptFeedback.blockReason={g_block}）", "WARN")
+                        g_finish = "content_filter" if g_block else _gemini_finish_reason(
+                            _cand.get("finishReason"), bool(g_tool_calls))
+                        g_message = {"role": "assistant", "content": g_text}
+                        if g_reasoning:
+                            g_message["reasoning_content"] = g_reasoning
+                        if g_tool_calls:
+                            g_message["tool_calls"] = g_tool_calls
+                        # 假成功检测（仅端点启用时）：与 openai 分支同语义（同端点重试后放弃）
+                        if ep.check_fake_success:
+                            _g_visible = (g_text or g_reasoning or "").strip()
+                            if _g_visible and any(p in _g_visible for p in FAKE_SUCCESS_PATTERNS):
+                                sys_log(f"端点 '{endpoint_log_label}' 假成功（内容匹配拒绝模式）", "WARNING")
+                                if attempt < retries:
+                                    retry_delay = 3 * (2 ** attempt)
+                                    if request_deadline is None or time.time() + retry_delay < request_deadline:
+                                        sys_log(f"{request_tag}端点 '{endpoint_log_label}' {retry_delay} 秒后进行第 {attempt+1}/{retries} 次原端点重试（假成功）", "INFO")
+                                        time.sleep(retry_delay)
+                                        continue
+                                return None, "fake-success: 内容匹配拒绝模式"
+                        g_meta = body.get("usageMetadata")
+                        g_usage = _gemini_usage_to_chat_usage(g_meta)
+                        if log_usage and not ep.name.startswith("test_") and isinstance(g_meta, dict):
+                            stats_cached = 0 if reset_cached_stats else g_usage["prompt_tokens_details"]["cached_tokens"]
+                            token_tracker.add_usage(ep.name, ep.model, g_usage["prompt_tokens"],
+                                                    g_usage["completion_tokens"], g_usage["total_tokens"], stats_cached)
+                            chat_logger.add_log(ep.name, ep.model, prompt_text_to_log,
+                                                g_text.strip() or g_reasoning.strip(),
+                                                g_usage["total_tokens"], int((time.time() - req_t0) * 1000),
+                                                pool_group, g_usage["prompt_tokens"], stats_cached,
+                                                g_usage["completion_tokens_details"]["reasoning_tokens"])
+                            self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
+                        return {
+                            "id": body.get("responseId") or f"chatcmpl-{int(time.time())}",
+                            "object": "chat.completion",
+                            "created": int(time.time()),
+                            "model": body.get("modelVersion") or ep.model,
+                            "choices": [{"index": 0, "message": g_message, "finish_reason": g_finish}],
+                            "usage": g_usage,
+                        }, ""
                     if is_responses:
                         response_text, response_tools, response_reasoning = _responses_output_to_chat_message(body.get("output", []))
                         response_message = {"role": "assistant", "content": response_text}

@@ -1,0 +1,18 @@
+==== token_stats.db
+tables: ['token_usage', 'sqlite_sequence']
+-- token_usage ['id', 'timestamp', 'model', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'endpoint_name', 'cached_tokens']
+    (28487, '2026-09-12 16:10:20', 'deepseek-v4-flash', 110967, 184, 111151, 'AgentRouter-ds4f', 110720)
+    (28486, '2026-09-12 16:10:15', 'deepseek-v4-flash', 110158, 713, 110871, 'AgentRouter-ds4f', 109952)
+    (28485, '2026-09-12 16:10:07', 'gemini-3.8-flash', 7, 123, 130, 'Soleapi-gemini', 0)
+    (28484, '2026-09-12 16:09:57', 'deepseek-v4-flash', 108697, 1284, 109981, 'AgentRouter-ds4f', 106752)
+-- sqlite_sequence ['name', 'seq']
+    ('token_usage', 28487)
+==== chat_logs.db
+tables: ['chat_logs', 'sqlite_sequence']
+-- chat_logs ['id', 'timestamp', 'endpoint_name', 'model', 'prompt', 'completion', 'total_tokens', 'latency_ms', 'pool_group', 'prompt_tokens', 'cached_tokens', 'reasoning_tokens']
+    (28486, '2026-09-12 16:10:20', 'AgentRouter-ds4f', 'deepseek-v4-flash', '[SYSTEM]\n# SOUL.md\n\n你是 Hermes Agent，由 Nous Research 创建，也是用户的专属协作 Agent。目标是贴合用户的工作习惯与沟通风格，精准、高效地完成任务。\n\n## 人格与语气\n\n- 理性、简洁、高效，始终结论先行。\n- 多用短句，避免长段落、重复解释、固定开场和无关铺垫。
+    (28485, '2026-09-12 16:10:15', 'AgentRouter-ds4f', 'deepseek-v4-flash', '[SYSTEM]\n# SOUL.md\n\n你是 Hermes Agent，由 Nous Research 创建，也是用户的专属协作 Agent。目标是贴合用户的工作习惯与沟通风格，精准、高效地完成任务。\n\n## 人格与语气\n\n- 理性、简洁、高效，始终结论先行。\n- 多用短句，避免长段落、重复解释、固定开场和无关铺垫。
+    (28484, '2026-09-12 16:10:07', 'Soleapi-gemini', 'gemini-3.8-flash', '[USER]\n只回答两个字：你好', '你好', 130, 9528, 'gemini-verify', 7, 0, 122)
+    (28483, '2026-09-12 16:09:57', 'AgentRouter-ds4f', 'deepseek-v4-flash', '[SYSTEM]\n# SOUL.md\n\n你是 Hermes Agent，由 Nous Research 创建，也是用户的专属协作 Agent。目标是贴合用户的工作习惯与沟通风格，精准、高效地完成任务。\n\n## 人格与语气\n\n- 理性、简洁、高效，始终结论先行。\n- 多用短句，避免长段落、重复解释、固定开场和无关铺垫。
+-- sqlite_sequence ['name', 'seq']
+    ('chat_logs', 28486)

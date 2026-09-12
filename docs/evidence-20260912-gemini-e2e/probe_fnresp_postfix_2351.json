@@ -1,0 +1,16 @@
+{
+  "V1_control_tool_last": {
+    "status": 200,
+    "ms": 3706,
+    "finish_reason": "stop",
+    "content": "当前时间为：2026年9月12日 23:30:00（Asia/Shanghai 时区）。",
+    "error": null
+  },
+  "V2_tool_then_user_text": {
+    "status": 200,
+    "ms": 4756,
+    "finish_reason": "stop",
+    "content": "2026-09-12 23:30:00",
+    "error": null
+  }
+}
