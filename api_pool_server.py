@@ -2265,6 +2265,11 @@ class APIPool:
         # 顺延到最后一次请求后 N 秒（无请求 N 秒后才回组重试）。期满后第一个请求
         # 回组试探，成功即回组粘性，失败重新锁定（与 prio99 兜底锁语义对齐）。
         self._group_fallback_lock_until: dict[str, float] = {}
+        # 「待回切」状态（2026-09-12）：该组曾 fallback，回切锁已期满但尚无该组请求
+        # 回组试探（回切是懒的，等下一个请求；期间 UI 显示 ⏸待回切 而非隐藏状态）。
+        # 期满后该组首个请求即清除（回切已发生）。不落盘：重启后锁已归零、下一个请求
+        # 本就回组，持久化只会显示一个不存在的待回切状态。
+        self._group_fallback_pending: dict[str, bool] = {}
         # 每组最近一次成功写入 usage 的站点账户 ID；用于识别手动切换、恢复回切
         # 和故障轮转形成的缓存账户边界。仅保存不敏感的 site_id。
         self._cache_stats_site_id_by_group: dict[str, str] = {}
@@ -2927,6 +2932,8 @@ class APIPool:
                     self._fallback_lock_until_by_group[new_name] = self._fallback_lock_until_by_group.pop(name)
                 if name in self._group_fallback_lock_until:
                     self._group_fallback_lock_until[new_name] = self._group_fallback_lock_until.pop(name)
+                if name in self._group_fallback_pending:
+                    self._group_fallback_pending[new_name] = self._group_fallback_pending.pop(name)
                 del self._group_defs[name]
 
             self._group_defs[new_name] = {"type": new_type, "model": eff_model}
@@ -2953,6 +2960,7 @@ class APIPool:
                           self._persisted_endpoint_by_group, self._fallback_lock_until_by_group):
                 state.pop(name, None)
             self._group_fallback_lock_until.pop(name, None)
+            self._group_fallback_pending.pop(name, None)
             sys_log(f"删除分组 '{name}'（成员已移出）", "INFO")
             return True, "deleted"
 
@@ -3148,6 +3156,27 @@ class APIPool:
         candidates, _ = self._group_sticky_candidates(vision_group)
         return candidates, vision_group
 
+    def _reset_endpoint_assertion_state(self, ep, clear_defer=True):
+        """用户断言（「这个端点现在可用」，例如刚续费、上游已恢复）优先于 API Pool
+        上一次观测推导出的不健康状态：把端点视为恢复健康，由随后的真实结果重新分类
+        （请求失败会走既有故障路径重新冷却，代价是一次请求；反过来让观测推论压掉
+        用户指令，会让操作变成静默空操作——候选集先按状态过滤，指针根本读不到）。
+        enabled/in_pool 是配置声明而非健康推论，仍由调用方守卫。
+
+        clear_defer=False 用于组级「立即切回」：defer 是当前工作对象的缓存保护，
+        不属于失败态，且一个端点可属多组，清掉会误伤别组正在工作的工作对象。"""
+        if clear_defer:
+            ep._defer_until = 0
+        ep._cooldown_until = 0
+        ep._cooldown_reason = ""
+        ep._fail_count = 0
+        ep._last_error = ""
+        ep._last_error_ts = 0
+        ep._manual_unlock_required = False
+        ep._health_error = ""
+        # 未经真实请求验证 → unknown；首次成功由 _on_success 置 ok。
+        ep._health = "unknown"
+
     def switch_to_endpoint(self, ep_id, group=None):
         with self._lock:
             for ep in self._endpoints:
@@ -3157,29 +3186,36 @@ class APIPool:
                         return False
                     if group is not None and grp not in self._ep_groups(ep):
                         return False
-                    # 手动切换是用户的显式断言（「这个端点现在可用」，例如刚续费、
-                    # 上游已恢复），优先于 API Pool 上一次观测推导出的不健康状态。
-                    # 因此先把该端点视为恢复健康并真的发请求，再由真实结果重新分类：
-                    # 请求失败会走既有故障路径重新冷却，代价是一次请求；反过来
-                    # 让观测推论压掉用户指令，会让切换变成静默空操作
-                    # （候选集 _group_sticky_candidates 先过滤，指针根本读不到）。
-                    # enabled/in_pool 是配置声明而非健康推论，仍然是硬性守卫。
-                    ep._defer_until = 0
-                    ep._cooldown_until = 0
-                    ep._cooldown_reason = ""
-                    ep._fail_count = 0
-                    ep._last_error = ""
-                    ep._last_error_ts = 0
-                    ep._manual_unlock_required = False
-                    ep._health_error = ""
-                    # 未经真实请求验证 → unknown；首次成功由 _on_success 置 ok。
-                    ep._health = "unknown"
+                    self._reset_endpoint_assertion_state(ep)
                     grp = group or self.MAIN_GROUP
                     self._set_manual(grp, ep_id)
                     self._set_current(grp, ep_id)
                     sys_log(f"手动切换端点: '{self._endpoint_log_label(ep, grp)}'（按用户断言重置为待验证：清除冷却/上游配额/余额冻结与失败计数）", "INFO")
                     return True
         return False
+
+    def clear_group_fallback(self, group):
+        """手动「立即切回」（UI 点击 ↩main / ⏸待回切 徽标）：用户断言优先于观测推论。
+
+        动作 = ①清该组回切锁（滑动空闲窗口立即期满）+ ②清该组端点的冷却/冻结/失败态，
+        于是下一个请求真正落回本组（否则锁一清但端点仍冷全挂，会立刻重新 fallback，
+        点击等于空操作）。端点 defer 不动——那是当前工作对象的缓存保护，非失败态。
+        未清锁时也执行 ②，覆盖「锁已期满、待回切」阶段的点击。
+        返回 {"lock_cleared": bool, "endpoints_reset": int}，由调用方落盘。"""
+        with self._lock:
+            lock_cleared = self._group_fallback_lock_until.pop(group, None) is not None
+            self._group_fallback_pending.pop(group, None)
+            members = [ep for ep in self._endpoints
+                       if ep.enabled and ep.in_pool and group in self._ep_groups(ep)]
+            for ep in members:
+                self._reset_endpoint_assertion_state(ep, clear_defer=False)
+        if lock_cleared or members:
+            sys_log(
+                f"手动立即切回组 '{group}'（清回切锁={'是' if lock_cleared else '否'}，"
+                f"{len(members)} 个端点按用户断言重置为待验证）",
+                "INFO",
+            )
+        return {"lock_cleared": lock_cleared, "endpoints_reset": len(members)}
 
     def get_endpoint(self, ep_id):
         """按 ID 返回主池中的真实端点对象，用于定向管理操作。"""
@@ -4608,6 +4644,10 @@ class APIPool:
                     # （曾逐请求刷屏：24h 235 行）。
                     self._group_fallback_lock_until[group] = time.time() + self._GROUP_FALLBACK_RETURN_SECONDS
                     group = self.MAIN_GROUP
+                else:
+                    # 锁已期满：本请求即回本组试探 = 回切已发生，⏸待回切状态退场
+                    # （组内仍全挂会由下方入口/耗尽 fallback 重新上锁 + 重新标记）
+                    self._group_fallback_pending.pop(group, None)
         request_route_epoch = self._get_route_epoch(group)
         group_fallback_used = False  # bg 组入口/耗尽 fallback 到 main 的标记
         # 终极兜底锁定：锁定期间该组请求直连 prio99（per-group 滑动窗口，prio99 仅 main 组语义生效）
@@ -4631,9 +4671,10 @@ class APIPool:
             if active:
                 group_fallback_used = True
                 sys_log(f"组 '{group}' 无可用端点，入口 fallback 到 main 组", "WARN")
-                # A0：建立组级延迟回切锁（滑动空闲窗口，无请求 N 秒后回组）
+                # A0：建立组级延迟回切锁（滑动空闲窗口，无请求 N 秒后回组）+ 标记待回切
                 with self._lock:
                     self._group_fallback_lock_until[group] = time.time() + self._GROUP_FALLBACK_RETURN_SECONDS
+                    self._group_fallback_pending[group] = True
                 group = self.MAIN_GROUP
                 request_route_epoch = self._get_route_epoch(group)
         if not active:
@@ -5087,9 +5128,10 @@ class APIPool:
         # 仅当请求原生属于非 main 组且尚未 fallback 过（入口触发点 1 会改写 group）。
         if group != self.MAIN_GROUP and not group_fallback_used and errors:
             sys_log(f"组 '{group}' 轮转耗尽仍失败，fallback 到 main 组追加一轮", "WARN")
-            # A0：耗尽 fallback 同样建立组级延迟回切锁
+            # A0：耗尽 fallback 同样建立组级延迟回切锁（+ 标记待回切）
             with self._lock:
                 self._group_fallback_lock_until[group] = time.time() + self._GROUP_FALLBACK_RETURN_SECONDS
+                self._group_fallback_pending[group] = True
             try:
                 return self.chat(messages, model=None, extra_payload=extra_payload,
                                  timeout=timeout, return_endpoint=return_endpoint,
@@ -6814,6 +6856,8 @@ def api_handler(method, path, body):
                 "current_endpoint_id": cur,
                 # 整组 fallback 锁剩余秒数（>0 = 该组正借道 main，UI 显示 ↩main）
                 "fallback_lock_remaining": max(0, int(_fb_until - time.time())) if _fb_until else 0,
+                # 待回切（锁已期满、尚无该组请求回组试探，UI 显示 ⏸待回切，点击立即切回）
+                "fallback_return_pending": bool(pool._group_fallback_pending.get(grp)),
                 "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)),
                 "is_vision": grp == pool.VISION_GROUP,
                 # 图片解析池可用成员数（调度候选口径，与 _vision_pool_candidates 一致）
@@ -6886,6 +6930,22 @@ def api_handler(method, path, body):
             return 400, {"error": msg}, False
         _sync_to_config()
         return 200, {"ok": True}, False
+    if method == "POST" and cp.startswith("/api/groups/") and cp.endswith("/clear-fallback"):
+        # 手动「立即切回」（UI 点击 ↩main 锁定徽标 / ⏸待回切 徽标）：清回切锁 + 清该组
+        # 端点的冷却/冻结/失败态 → 下一个请求真正落回本组。
+        gname = unquote(cp[len("/api/groups/"):-len("/clear-fallback")]).strip("/")
+        if not gname:
+            return 400, {"error": "需要分组名"}, False
+        if gname not in pool._all_group_names():
+            return 404, {"error": f"组 '{gname}' 不存在"}, False
+        result = pool.clear_group_fallback(gname)
+        if result["lock_cleared"] or result["endpoints_reset"]:
+            # 显式落盘（清锁 + 清冷却都是内存态）：崩溃重启（无 SIGTERM 快照）不会把已解除的
+            # 锁/冷却从磁盘复活。合并模式保留 groups，cooldowns/group_fallback 精确覆盖。
+            save_runtime_state_groups(
+                {}, cooldowns=_collect_cooldown_state(), fallback=_collect_fallback_state(),
+            )
+        return 200, {"ok": True, **result}, False
 
     # ================= 聚合池管理 =================
     if method == "GET" and cp == "/api/pool":

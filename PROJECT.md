@@ -314,3 +314,17 @@ vision 池定位修正：由「`role: vision` 标记的普通组」改为与 mai
 验证：A/B（旧码 5 请求 → 5 行；中间版 → 1 行；终态 → 0 行，转移 WARN 保留 1 条）；回归测试 `test_locked_group_is_silent_per_request`（旧码 FAIL / 新码 PASS，含「转移 WARN 保留」断言）；全量 38 测试文件 0 失败；生产验证：重启后连发 3 个 gpt-6 请求（组处于锁定态），「锁定中」行数为 **0**。
 
 生产 hash 后端 `48833601`（改前 `d98f89f2`→`f7aff399`），备份 `api_pool_server.py.bak-20260912-0310-locklog-silent`，重启 2026-09-12 03:10。排查签名见 skill references/incident-pattern-signatures.md「锁定日志逐请求刷屏」节（已更新为终态）。
+
+## 2026-09-12 整组 fallback 手动「立即切回」（↩main / ⏸待回切 徽标可点）已部署生产
+
+需求（用户）：整组 fallback 增加手动解除行为（方式为点击 `↩main`）；以及 fallback 时间结束后同步显示延迟切换状态徽标，点击徽标立即切回。用户定稿口径：①期满后要保留可见的是「锁已期满、尚无该组请求回组试探」的**待回切**中间态；②「立即切回」= 清回切锁 **+** 清该组成员的冷却/冻结/失败态（同「手动切换端点」的用户断言语义），让下一个请求真的落回本组。
+
+改动：
+- `APIPool.clear_group_fallback(group)`：清该组回切锁（滑动空闲窗口立即期满）+ 按用户断言重置该组成员端点状态（抽出 `_reset_endpoint_assertion_state()`，与 `switch_to_endpoint()` 共用同一套重置）；`_defer_until` 保留——defer 是当前工作对象的缓存保护而非失败态，且一个端点可属多组，清掉会误伤别组正在工作的对象。只清锁不重置端点时，仍全冷的成员端点会立刻重新 fallback，点击等于空操作。
+- 新增 `POST /api/groups/<name>/clear-fallback`（组不存在 404）；动作生效时以 `cooldowns` + `group_fallback` 精确覆盖落盘（崩溃重启不复活已解除的锁/冷却）。与「手动切换端点」的落盘处理同口径。
+- 新增 `_group_fallback_pending`「待回切」态：两处 fallback 触发点（入口无可用端点 / 轮转耗尽）置位；锁期满后该组首个请求清除（回切已发生）。不落盘：重启后锁已归零、下一个请求本就回组，落盘只会显示一个不存在的状态。重命名/删组同步迁移清理。
+- `/api/chain` groups 新增 `fallback_return_pending`；前端 `↩main`（锁定期，带剩余时间）与 `⏸待回切`（沿用端点 `⏸延迟回切` 的 `badge-deferred` 形态）两处徽标可点、同调一个接口；徽标字号/内边距与同行 `● 当前端点` 对齐（用户当轮指令），组标签 title 同步提示待回切。
+
+验证：新增 `test/test_group_fallback_unlock.py` 5 项——清锁 + 只重置本组成员（别组端点与 defer 不受影响）、无锁阶段点击仍重置端点、重启恢复只保留仍在锁/仍冷却的组、**chat() 端到端：fallback 后点击 → 下一个该组请求落回本组端点**、期满未点击 → 本组请求自行回组并清待回切。全套 343 测试通过（基线 338），`ruff` 基线 125 条不变。生产验证：`/api/chain` 已返回 `fallback_return_pending`；`POST /api/groups/nope-xyz/clear-fallback` → `404 {"error": "组 'nope-xyz' 不存在"}`（未命中路由为 `{"error": "Not found"}`）证明分支已生效；`/` 返回的前端已含 `clearGroupFallback`。对真实组的点击（会解冻该组端点）由用户在生产态执行。
+
+生产 hash 后端 `f6bf97f5`（改前 `48833601`）/ 前端 `7640d0f1`（改前 `c6e3d153`），备份 `api_pool_server.py.bak-20260912-0855-group-fbswitch` / `static/index.html.bak-20260912-0855-group-fbswitch`，重启 2026-09-12 08:43。
