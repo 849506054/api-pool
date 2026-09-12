@@ -62,6 +62,7 @@
 
 ### 待办
 
+- [ ] **[P1] Gemini 原生协议适配（方案阶段，2026-09-12）** — 根因（实测）：`Soleapi-gemini` / `Soleapi-gemini-3.7-flash` 端点只开 Gemini 原生方言，`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三入口同一把 Key、同一模型全部 404「没有能承接该入口协议的模型」。方案：端点级协议枚举新增 `gemini`，出站走 `/v1beta/models/{model}:generateContent`，两端点 `protocol` 改判为 `gemini`。方案文档 `docs/gemini-protocol-bridge-plan-2026-09-12.md`；8 卡拆分（T1 桥接 helper → T2 非流式响应/usage → T3 流式 → T4 前端下拉 → …）见 `docs/plans/2026-09-12-gemini-protocol-bridge-implementation.md` 与 kanban。状态：方案阶段，工作区后端与生产逐字节一致，早期未接线草稿存 `/opt/data/backups/gemini-bridge-draft-20260912.patch`。
 - [x] **[P0] 2.0 非 DeepSeek Endpoint fallback 兼容** — 已部署至 5200；按目标 Endpoint 隔离 DeepSeek reasoning 字段，真实端点矩阵和 Hermes 5200 链路均已验收。
 - [x] **[P3] 提交未 commit 的本地改动** — 已随 9303572/4626f16 提交（含探活竞态去重补丁）
 - [x] **[P3] systemd 代理环境收口** — `api-pool2.service` 已内置 HTTPS_PROXY / HTTP_PROXY / NO_PROXY，不再依赖已删除的 1.0 drop-in。
