@@ -23,6 +23,8 @@ def load_module(tmp_path):
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
+        # 2026-09-12：池自身出站需确定身份；测试默认模拟"已有真实客户端打过池"。
+        module._client_baseline.update({"User-Agent": "pytest-client/1.0"})
         module.CONFIG_FILE = os.path.join(tmp_path, "api_config.json")
         module.RUNTIME_STATE_FILE = os.path.join(tmp_path, "api_runtime_state.json")
         return module

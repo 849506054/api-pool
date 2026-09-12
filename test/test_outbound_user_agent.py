@@ -28,6 +28,8 @@ def load_module(tmp_path):
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
+        # 2026-09-12：池自身出站需确定身份；测试默认模拟"已有真实客户端打过池"。
+        module._client_baseline.update({"User-Agent": "pytest-client/1.0"})
         return module
     finally:
         os.chdir(previous_cwd)
@@ -141,16 +143,22 @@ class OutboundClientHeadersTests(unittest.TestCase):
         ep = self._endpoint(extra_headers={"User-Agent": "custom-probe/1.0"})
         self.assertEqual(self._capture_outbound_headers(ep).get("user-agent"), "custom-probe/1.0")
 
-    def test_fallback_default_ua_when_client_sent_none(self):
-        h = self._capture_outbound_headers(self._endpoint())
-        self.assertEqual(h.get("user-agent"), self.module._DEFAULT_OUTBOUND_UA)
-        self.assertNotIn("urllib", h.get("user-agent", "").lower())
+    def test_no_identity_skips_outbound_instead_of_fabricating_ua(self):
+        """2026-09-12：池自身出站拿不到身份时**不发请求**（原默认 UA 编造已删除）。"""
+        self.module._client_baseline.clear()
+        self.module.clear_client_headers()
+        self.assertFalse(hasattr(self.module, "_DEFAULT_OUTBOUND_UA"))
+        with self.assertRaises(self.module.PoolIdentityUnavailable):
+            self._capture_outbound_headers(self._endpoint())
 
-    def test_blank_and_none_client_headers_fall_back(self):
+    def test_blank_client_headers_skip_outbound(self):
+        self.module._client_baseline.clear()
         self.module.set_client_headers({})
-        self.assertEqual(self._capture_outbound_headers(self._endpoint()).get("user-agent"), self.module._DEFAULT_OUTBOUND_UA)
-        self.module.set_client_headers(None)
-        self.assertEqual(self._capture_outbound_headers(self._endpoint()).get("user-agent"), self.module._DEFAULT_OUTBOUND_UA)
+        try:
+            with self.assertRaises(self.module.PoolIdentityUnavailable):
+                self._capture_outbound_headers(self._endpoint())
+        finally:
+            self.module.clear_client_headers()
 
     # ── Accept-Encoding 收敛 ──
 
@@ -184,8 +192,11 @@ class OutboundClientHeadersTests(unittest.TestCase):
     def test_thread_local_cleared_but_baseline_kept(self):
         self.module.set_client_headers({"User-Agent": "stale-client/9.9"})
         self.module.clear_client_headers()
+        # 线程内已清 → 回落到基线（保留最近一次真实客户端指纹）
+        self.assertEqual(self.module.resolve_outbound_headers("").get("User-Agent"), "stale-client/9.9")
+        # 基线也没有 → 空头，不编造身份（2026-09-12）
         self.module._client_baseline.clear()
-        self.assertEqual(self.module.resolve_outbound_headers("").get("User-Agent"), self.module._DEFAULT_OUTBOUND_UA)
+        self.assertEqual(self.module.resolve_outbound_headers(""), {})
 
     # ── 路径判定：只有代理路径捕获入站头 ──
 

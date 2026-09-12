@@ -31,6 +31,8 @@ def load_module(tmp_path):
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
+        # 2026-09-12：池自身出站需确定身份；测试默认模拟"已有真实客户端打过池"。
+        module._client_baseline.update({"User-Agent": "pytest-client/1.0"})
         return module
     finally:
         os.chdir(previous_cwd)
@@ -181,10 +183,15 @@ class ClientProfileTests(unittest.TestCase):
         self.assertNotEqual(h.get("content-length"), "1234")
         self.assertNotEqual(h.get("connection"), "keep-alive")
 
-    def test_passthrough_default_ua_when_client_headers_missing(self):
-        h = self._capture_outbound_headers(self._endpoint())
-        self.assertEqual(h.get("user-agent"), self.module._DEFAULT_OUTBOUND_UA)
+    def test_passthrough_without_identity_does_not_fabricate(self):
+        """2026-09-12：透传分支不再补默认 UA；池自身出站无身份时直接跳过（抛 PoolIdentityUnavailable）。"""
+        self.module._client_baseline.clear()
+        self.module.clear_client_headers()
+        h = self.module.resolve_outbound_headers("")
+        self.assertEqual(h, {})
         self.assertNotIn("x-stainless-lang", h)
+        with self.assertRaises(self.module.PoolIdentityUnavailable):
+            self._capture_outbound_headers(self._endpoint())
 
     # ── 优先级链 ──
 

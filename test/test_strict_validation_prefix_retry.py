@@ -1,10 +1,12 @@
 """严格校验 400（reasoning 回传 / tool 配对）的「换形态重试」防御（2026-09-12）。
 
-契约（2026-09-12 定案）：
-- 请求级预算 **1**，且这一次重试**就是换形态**：跳过 `tool_call_id_prefix` 重写、
-  改回客户端原始 tool_call id（替换原先「原样复读」的重试；原样复读只是重复同一份被校验的历史）。
-- 仅当本尝试**确实应用过前缀重写**（`attempt_prefix_applied > 0`）时才发这一次；
-  否则改回原始 id 无变化 → 不重试，直接轮转。
+契约（2026-09-12 二级口径，外部实证 zdsub2api 后定案）：
+- 端点级上限 `strict400_retries`（0/1/2，默认 2）：
+  - **第 1 级**：同端点**原样**重试（带 300/800ms 抖动退避）。该类 400 是上游实例级随机故障
+    （外部实证：同一份 body 背靠背重放失败率 15–25%），原样重放本身命中率高。
+  - **第 2 级**：**换形态**——跳过 `tool_call_id_prefix` 重写、改回客户端原始 tool_call id；
+    仅当本尝试**确实应用过前缀重写**（`attempt_prefix_applied > 0`）时才发（否则与刚失败的请求完全相同，白耗上游）。
+- 两级都失败才轮转；重试只在**首包前**失败上发生（客户端尚未收到任何字节 → 无副作用）。
 - `_rewrite_tool_call_ids` **非变异**：轮转各次尝试共用同一份 Hermes 历史，原地改写会把
   某端点需要的重写结果带给后续异构端点（违反按端点隔离铁律），并使「改回原始 id」不可能。
 
@@ -38,6 +40,8 @@ def load_module(tmp_path):
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
+        # 2026-09-12：池自身出站需确定身份；测试默认模拟"已有真实客户端打过池"。
+        module._client_baseline.update({"User-Agent": "pytest-client/1.0"})
         return module
     finally:
         os.chdir(previous_cwd)
@@ -108,6 +112,7 @@ class StrictValidationPrefixRetryTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.module = load_module(self.tmp.name)
+        self.module._STRICT400_BACKOFF_MS = (0, 0)  # 测试免退避等待
         self.messages = [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "thinking", "reasoning_content": "r",
@@ -139,7 +144,7 @@ class StrictValidationPrefixRetryTests(unittest.TestCase):
         self.assertEqual(changed_again, 0, "已是前缀格式 → 幂等，changed=0")
         self.assertEqual(again, out)
 
-    # ── 集成：前缀命中 400 → 唯一一次重试即「原始 id」变体 → 成功 ────────
+    # ── 集成：前缀命中 400 → 第 1 级原样 → 第 2 级原始 id 变体 → 成功 ─────
     def test_strict_400_retries_with_original_ids(self):
         UpstreamHandler.reject_prefix = PREFIX
         ep = self.endpoint("ds4f", prefix=PREFIX)
@@ -148,15 +153,17 @@ class StrictValidationPrefixRetryTests(unittest.TestCase):
         self.assertEqual(result["choices"][0]["message"]["content"], "ok")
 
         attempts = [ids for ids in UpstreamHandler.records if ids]
-        self.assertEqual(len(attempts), 2, f"期望 2 次尝试（重写 → 原始 id），实际 {attempts}")
+        self.assertEqual(len(attempts), 3, f"期望 3 次尝试（重写 → 原样 → 原始 id），实际 {attempts}")
         self.assertTrue(all(i.startswith(PREFIX) for i in attempts[0]), "首次用重写后的 id")
-        self.assertEqual(attempts[1], ["call_client_1"],
-                         "唯一一次重试必须改回客户端原始 tool_call id（不是原样复读）")
+        self.assertTrue(all(i.startswith(PREFIX) for i in attempts[1]),
+                        "第 1 级原样重试：仍用重写后的 id（同形态复放）")
+        self.assertEqual(attempts[2], ["call_client_1"],
+                         "第 2 级必须改回客户端原始 tool_call id（换形态）")
         self.assertEqual(self.messages[1]["tool_calls"][0]["id"], "call_client_1",
                          "调用方传入的历史不得被改写")
         self.assertEqual(ep._cooldown_until, 0, "客户端类错误不冻结端点")
 
-    # ── 集成：无前缀时改回原始 id 无变化 → 不重试，直接轮转 ─────────────
+    # ── 集成：无前缀 → 只有第 1 级原样重试，不发第 2 级变体 ──────────────
     def test_no_prefix_skips_variant_retry(self):
         UpstreamHandler.always_strict = True
         ep = self.endpoint("plain", prefix="")
@@ -164,8 +171,36 @@ class StrictValidationPrefixRetryTests(unittest.TestCase):
         with self.assertRaises(self.module.AllEndpointsFailed):
             pool.chat(list(self.messages))
         attempts = [ids for ids in UpstreamHandler.records if ids]
-        self.assertEqual(len(attempts), 1, f"无前缀时改回原始 id 无变化，不应重试，实际 {attempts}")
+        self.assertEqual(len(attempts), 2, f"无前缀时只有第 1 级原样重试（2 次尝试），实际 {attempts}")
         self.assertEqual(attempts[0], ["call_client_1"])
+        self.assertEqual(attempts[1], ["call_client_1"], "两次都是原始 id（未做前缀重写）")
+
+    # ── 集成：strict400_retries=0 → 一次都不重试，直接轮转 ────────────────
+    def test_budget_zero_never_retries(self):
+        UpstreamHandler.always_strict = True
+        ep = self.endpoint("noretry", prefix=PREFIX)
+        ep.strict400_retries = 0
+        pool = self.module.APIPool([ep])
+        with self.assertRaises(self.module.AllEndpointsFailed):
+            pool.chat(list(self.messages))
+        attempts = [ids for ids in UpstreamHandler.records if ids]
+        self.assertEqual(len(attempts), 1, f"strict400_retries=0 不应重试，实际 {attempts}")
+
+    # ── 配置：上限钳制 + 落盘（重启不丢端点级设置）──────────────────────
+    def test_budget_is_clamped_and_persisted(self):
+        ep = self.endpoint("cfg", prefix="")
+        # _sync_to_config() 序列化的是模块级 pool，故这里用模块级实例
+        self.module.pool = self.module.APIPool([ep])
+        self.module.pool.update_endpoint("cfg", {"strict400_retries": 9})
+        self.assertEqual(ep.strict400_retries, 2, "上限钳制到 2")
+        self.module.pool.update_endpoint("cfg", {"strict400_retries": -3})
+        self.assertEqual(ep.strict400_retries, 0, "下限钳制到 0")
+        self.module.pool.update_endpoint("cfg", {"strict400_retries": 1})
+        self.module._sync_to_config()
+        with open(self.module.CONFIG_FILE, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        entry = next(e for e in saved["api_endpoints"] if e["name"] == "cfg")
+        self.assertEqual(entry.get("strict400_retries"), 1, "端点级上限必须落盘，否则重启后丢失")
 
     # ── 集成：前缀重写不污染轮转后的异构端点 ──────────────────────────
     def test_prefix_rewrite_does_not_leak_to_next_endpoint(self):

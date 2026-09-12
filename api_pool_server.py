@@ -57,7 +57,19 @@ _TRUNCATED_STREAM_REASONS = ("流式总时长超限", "流式无有效业务增�
 # 只有代理路径写入真实客户端头；探活/管理页测试/拉模型接口无客户端上下文，改用客户端基线
 # （最近一次真实入站头），使其与真实流量携带同一客户端特征。端点自定义头
 # （default_headers/extra_headers）在此之后 add_header 覆盖，优先级为 端点自定义 > 客户端 > 默认库标识。
-_DEFAULT_OUTBOUND_UA = "OpenAI/Python 2.33.0"
+# 池自身发起的出站（探活/健康检测/测试/拉模型/管理接口触发的测试请求）没有客户端上下文：
+# 身份必须来自**确定来源**（端点 client_profile → 池级 probe_client_profile → 最近一次真实客户端
+# 指纹）；三者都没有时**跳过本次出站**，绝不编造身份（2026-09-12：编造 UA 曾被上游判
+# unauthorized client（401），并连带把端点冷却、打掉主组路由）。
+POOL_IDENTITY_SKIP_REASON = "无可用客户端身份，已跳过本次出站"
+_POOL_INITIATED_CTX = threading.local()   # 池自身发起的请求标记（伤害隔离：失败只写观测态）
+# DeepSeek 严格校验 400 的同端点重试退避（毫秒基准，实际 sleep 再乘 1.0–1.4 抖动）：
+# 该类 400 是上游实例级随机故障，隔开一点再打命中率更高；测试可置 0 免等待。
+_STRICT400_BACKOFF_MS = (300, 800)
+
+
+class PoolIdentityUnavailable(RuntimeError):
+    """池自身出站解析不到可用客户端身份 → 调用方必须跳过本次出站（不改任何端点状态）。"""
 _client_ctx = threading.local()
 # 客户端基线：进程内最近一次真实入站头快照，供无客户端上下文的出站路径复用。
 # ponytail: 单份全局，多客户端混用时代表最近一个客户端；需要区分时改 per-endpoint 基线。
@@ -2201,6 +2213,10 @@ class Endpoint:
     check_fake_success: bool = False  # 是否检测假成功（200 OK 但内容含拒绝信息）
     tool_call_id_prefix: str = ""
     reasoning_policy: str = "auto"  # auto=DeepSeek保留+GLM保留+其余剥离 | keep=强制保留回传 | strip=强制剥离
+    # DeepSeek 严格校验 400 的同端点重试上限（0=不重试只轮转 / 1=原样重试 1 次 / 2=原样 1 次 +
+    # 「原始 tool_call id」变体 1 次；变体仅在本次确实应用过 tool_call_id_prefix 重写时才发）。
+    # 依据：该类 400 为上游实例级随机（zdsub2api 2026-09-12 外部实证：同 body 背靠背重放失败率 15–25%）。
+    strict400_retries: int = 2
     preserved_thinking: bool = False  # GLM 保留式思考：注入 thinking.clear_thinking=False
     stream_first_packet_timeout: int = 120
     stream_stall_timeout: int = 60
@@ -2244,8 +2260,6 @@ class APIPool:
         self._lock = threading.RLock()
         self._endpoints: list[Endpoint] = []
         self._restored_endpoint_id: str | None = None  # 兼容旧状态字段；恢复后转为持续手动覆盖
-        self._last_reasoning_content = None  # 缓存上一轮返回的 reasoning_content，用于多轮对话补全
-        self._last_reasoning_text = None  # 缓存上一轮返回的 reasoning_text（DeepSeek V4 request 字段名），用于多轮对话补全
         self._last_pool_activity: float = 0  # 上次池活跃时间（用于 defer 判断）
         # ── 分组池路由状态（2026-08-29 spec：四个路由全局态 per-group 化）──
         # 每组独立的粘性指针/手动覆盖/持久化指针/兜底锁。旧扁平状态在 _migrate_legacy_state 兼容。
@@ -2282,6 +2296,9 @@ class APIPool:
             self.VISION_GROUP: {"type": "mixed", "model": self.VISION_SELECTOR},
         }
         self._client_profiles: dict = load_client_profiles()
+        # 池自身出站的默认身份 profile（探活/测试/拉模型；2026-09-12）
+        self._probe_client_profile: str = load_probe_client_profile()
+        self._identity_skip_log_ts: dict = {}   # 无身份跳过日志去重 {(ep_id, reason): ts}
         # 图片翻译短 TTL 缓存：图片集合签名 → (时间戳, 描述)，消除多轮重发历史含图的重译（2026-09-10 视觉池组）
         self._vision_cache: dict[str, tuple[float, str]] = {}
         # 后台探活基础设施：冷却过期端点在后台线程探活，不阻塞请求路径
@@ -2449,6 +2466,8 @@ class APIPool:
                         ep.pool_groups = sanitized or [self.MAIN_GROUP]
                     if updates.get("max_retries") is not None:
                         ep.max_retries = self._normalize_max_retries(updates["max_retries"])
+                    if updates.get("strict400_retries") is not None:
+                        ep.strict400_retries = self._normalize_strict400_retries(updates["strict400_retries"])
                     # cooldown_minutes 最低 1，防止跳过冷却恢复流程
                     if updates.get("cooldown_minutes") is not None and updates["cooldown_minutes"] < 1:
                         ep.cooldown_minutes = 1
@@ -3288,6 +3307,7 @@ class APIPool:
             "in_pool": ep.in_pool,
             "check_fake_success": ep.check_fake_success,
             "tool_call_id_prefix": ep.tool_call_id_prefix,
+            "strict400_retries": getattr(ep, "strict400_retries", 2),
             "reasoning_policy": getattr(ep, "reasoning_policy", "auto"),
             "preserved_thinking": getattr(ep, "preserved_thinking", False),
             "stream_first_packet_timeout": ep.stream_first_packet_timeout,
@@ -3397,6 +3417,8 @@ class APIPool:
                     return ep.id, "ok", latency, ""
                 else:
                     return ep.id, "bad", latency, "获取模型列表失败"
+            except PoolIdentityUnavailable:
+                return ep.id, "skipped", -1, POOL_IDENTITY_SKIP_REASON
             except Exception as e:
                 return ep.id, "bad", int((time.time() - t0) * 1000), f"Models接口错误: {e}"
                 
@@ -3404,7 +3426,10 @@ class APIPool:
         
         # Attempt 1
         t0 = time.time()
-        reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True, is_probe=True)
+        try:
+            reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True, is_probe=True)
+        except PoolIdentityUnavailable:
+            return ep.id, "skipped", -1, POOL_IDENTITY_SKIP_REASON
         latency = int((time.time() - t0) * 1000)
         
         if reply is not None and latency <= LATENCY_OK_MAX:
@@ -3418,7 +3443,10 @@ class APIPool:
             
         # Attempt 2 (Retry for cold start or transient glitch)
         t1 = time.time()
-        reply2, err2 = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True, is_probe=True)
+        try:
+            reply2, err2 = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True, is_probe=True)
+        except PoolIdentityUnavailable:
+            return ep.id, "skipped", -1, POOL_IDENTITY_SKIP_REASON
         latency2 = int((time.time() - t1) * 1000)
         
         if reply2 is not None and latency2 <= LATENCY_OK_MAX:
@@ -3440,6 +3468,14 @@ class APIPool:
                 for c in content:
                     if c.get("type") == "image_url": return True
         return False
+
+    @staticmethod
+    def _normalize_strict400_retries(value):
+        """严格校验 400 同端点重试上限：只允许 0/1/2（2026-09-12）。"""
+        try:
+            return max(0, min(2, int(value)))
+        except (TypeError, ValueError):
+            return 2
 
     @staticmethod
     def _normalize_max_retries(value):
@@ -3646,11 +3682,15 @@ class APIPool:
                 id_map = {ep.id: ep for ep in self._endpoints}
                 for ep_id, health, latency, error in results:
                     ep = id_map.get(ep_id)
-                    if ep:
-                        ep._health = health
-                        ep._health_latency_ms = latency
-                        ep._health_last_check = now
-                        ep._health_error = error
+                    if ep is None:
+                        continue
+                    if health == "skipped":
+                        # 池自身无可用客户端身份 → 本次未探测：端点状态一个字段都不改（伤害隔离）
+                        continue
+                    ep._health = health
+                    ep._health_latency_ms = latency
+                    ep._health_last_check = now
+                    ep._health_error = error
                 result_map = {
                     ep_id: {"id": ep_id, "health": health, "latency_ms": latency, "error": error}
                     for ep_id, health, latency, error in results
@@ -3878,25 +3918,24 @@ class APIPool:
                 sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 测试返回客户端类错误，不冻结端点: {error_text}", "WARN")
                 return
 
+            # 伤害隔离（2026-09-12）：🧪 测试属于"池自身发起的出站"，非容量类失败**只写观测态**
+            # （health / health_error / last_error），不冷却、不计 fail_count、不动路由指针。
+            # 容量类（余额不足 / 配额耗尽 / 429）例外：必须继续摘端点，否则会被反复选中。
+            capacity_kind, capacity_seconds = self._set_capacity_cooldown(ep, error_text)
             ep._health = "bad"
             ep._health_error = error_text
-            ep._fail_count += 1
-            ep._total_failures += 1
             ep._last_error = error_text
             ep._last_error_ts = time.time()
-            capacity_kind, capacity_seconds = self._set_capacity_cooldown(ep, error_text)
+            test_label = self._endpoint_log_label(ep, group)
             if capacity_kind == "balance_insufficient":
-                sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 测试失败，余额不足，已冻结，仅支持手动解冻", "WARN")
+                sys_log(f"端点 '{test_label}' 测试失败，余额不足，已冻结，仅支持手动解冻", "WARN")
             elif capacity_kind == "quota_exceeded":
                 detail = f"{capacity_seconds} 秒" if capacity_seconds is not None else "默认 5 小时"
-                sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 测试失败，配额不足，冻结 {detail}", "WARN")
+                sys_log(f"端点 '{test_label}' 测试失败，配额不足，冻结 {detail}", "WARN")
             elif capacity_kind == "rate_limited":
-                sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 测试失败，上游限流，按 Retry-After 冷却 {capacity_seconds} 秒", "WARN")
+                sys_log(f"端点 '{test_label}' 测试失败，上游限流，按 Retry-After 冷却 {capacity_seconds} 秒", "WARN")
             else:
-                self._set_cooldown(ep)
-                actual = max(0, (ep._cooldown_until - time.time()) / 60)
-                ep._cooldown_reason = ep._cooldown_reason or "test_failed"
-                sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 测试失败，已写回主端点并触发冷却 {actual:.1f} 分钟", "WARN")
+                sys_log(f"端点 '{test_label}' 测试失败（非容量类）：仅记录观测态，不冷却、不计失败次数", "WARN")
 
     def test_endpoint(self, ep, message="你好", image=None, group=None):
         """在不启用候选轮转的前提下测试主池中的指定端点。"""
@@ -3915,10 +3954,15 @@ class APIPool:
             "messages": [{"role": "user", "content": payload_message}],
         }
         sys_log(f"[req={request_id}] 测试端点 '{self._endpoint_log_label(ep, test_group, ep.model)}'", "INFO")
-        result, error = self._try_endpoint(
-            ep, payload, timeout=ep.timeout, pool_group=test_group,
-            force_no_retry=False, request_id=request_id,
-        )
+        try:
+            result, error = self._try_endpoint(
+                ep, payload, timeout=ep.timeout, pool_group=test_group,
+                force_no_retry=False, request_id=request_id,
+            )
+        except PoolIdentityUnavailable:
+            # 无可用身份 → 不发请求、不写回任何端点状态（伤害隔离）
+            sys_log(f"[req={request_id}] 端点 '{self._endpoint_log_label(ep, test_group)}' {POOL_IDENTITY_SKIP_REASON}", "WARN")
+            return None, POOL_IDENTITY_SKIP_REASON
         latency_ms = int((time.time() - started) * 1000)
         if error:
             sys_log(f"[req={request_id}] 端点 '{self._endpoint_log_label(ep, test_group)}' 测试请求失败: {error}", "ERROR")
@@ -3981,6 +4025,9 @@ class APIPool:
             probe_current_ids = {self.MAIN_GROUP: probe_current_ids} if probe_current_ids else {}
         try:
             probe_ok, probe_error = self._probe_endpoint(ep)
+            if probe_ok is None:
+                # 无可用身份 → 未探测：端点状态保持原样，不做任何恢复/冷却动作（伤害隔离）
+                return False
             if probe_ok:
                 now = time.time()
                 with self._lock:
@@ -4319,6 +4366,18 @@ class APIPool:
                 expected_route_epoch=None, request_id=None):
         grp = group or self.MAIN_GROUP
         request_tag = f"[req={request_id}] " if request_id else ""
+        if getattr(_POOL_INITIATED_CTX, "active", False):
+            # 伤害隔离（2026-09-12）：池自身发起的请求（管理接口测试等）失败**只写观测态**：
+            # 不冷却、不计 fail_count、不改当前/手动指针、不建立 fallback 锁。
+            with self._lock:
+                failed_ep._last_error = error_msg
+                failed_ep._last_error_ts = time.time()
+            sys_log(
+                f"{request_tag}池自身发起的请求在端点 '{self._endpoint_log_label(failed_ep, grp)}' 失败"
+                f"（只记观测态，不改路由）: {error_msg}",
+                "WARN",
+            )
+            return self._get_route_epoch(grp)
         if health_impact:
             failed_ep._fail_count += 1
             failed_ep._total_failures += 1
@@ -4410,20 +4469,6 @@ class APIPool:
                 self._set_current(grp, ep.id)
                 if self._get_manual(grp) and self._get_manual(grp) != ep.id:
                     self._set_manual(grp, None)
-        # 缓存 reasoning_content/reasoning_text 用于多轮对话
-        if result and isinstance(result, dict):
-            try:
-                msg = result.get("choices", [{}])[0].get("message", {})
-                rc = msg.get("reasoning_content")
-                if rc:
-                    self._last_reasoning_content = rc
-                    self._last_reasoning_text = rc
-                rt = msg.get("reasoning_text")
-                if rt:
-                    self._last_reasoning_text = rt
-            except (IndexError, KeyError):
-                pass
-
     def _rewrite_tool_call_ids(self, messages, prefix):
         """确定性重写 tool_call id：原 id → 前缀+md5 后缀，保持 assistant/tool 配对。
 
@@ -4582,15 +4627,53 @@ class APIPool:
         elif cls._is_deepseek_endpoint(ep) and "deepseek-v3" not in model:
             payload["reasoning_effort"] = cls._DEEPSEEK_V4_EFFORT_MAP.get(effort, "high")
 
+    _REASONING_PLACEHOLDER = " "  # tool-call 轮次的空 reasoning 占位（上游要求非空回传）
+
+    @classmethod
+    def _normalize_reasoning_shape(cls, messages):
+        """归一化历史里 assistant 的 reasoning 形态（非变异；仅在需要回传 reasoning 的端点生效）。
+
+        规则（2026-09-12，外部实践 + 我们 09-10 实证：上游对"思考内容为空"的历史直接 400）：
+        - assistant **带 tool_calls**：reasoning 缺失/空串/纯空白 → 补占位 " "（须非空回传）
+        - assistant **不带 tool_calls**：reasoning 缺失/空 → 删掉该字段（不发送空值）
+        - 有真实 reasoning：原样保留
+
+        字段名取该消息已存在的那个（reasoning_content 优先，其次 reasoning_text）；都不存在时补
+        reasoning_content。只复制被改动的消息，原始历史对象不变（轮转各次尝试共用同一份历史）。
+        """
+        out = None
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            field = next((name for name in ("reasoning_content", "reasoning_text") if name in message),
+                         "reasoning_content")
+            value = message.get(field)
+            if value is not None and not (isinstance(value, str) and not value.strip()):
+                continue  # 有真实 reasoning
+            if not message.get("tool_calls"):
+                if "reasoning_content" not in message and "reasoning_text" not in message:
+                    continue  # 本来就没带该字段 → 无需改动（零拷贝）
+                item = dict(message)
+                item.pop("reasoning_content", None)
+                item.pop("reasoning_text", None)
+            else:
+                item = dict(message)
+                item[field] = cls._REASONING_PLACEHOLDER
+            if out is None:
+                out = list(messages)
+            out[index] = item
+        return out if out is not None else messages
+
     @classmethod
     def _messages_for_endpoint(cls, messages, ep):
         """Strip reasoning_content/reasoning_text for endpoints that don't accept them.
 
         GLM（交错/保留式思考）与 DeepSeek 一样要求回传 reasoning_content，一并保留；
         端点级 reasoning_policy=keep/strip 可强制覆盖启发式。
+        保留分支同时做**回传形态归一化**（空 reasoning 按有无 tool_calls 分别补占位/删字段）。
         """
         if cls._keep_reasoning_fields(ep):
-            return messages
+            return cls._normalize_reasoning_shape(messages)
 
         cleaned = []
         for message in messages:
@@ -4620,8 +4703,46 @@ class APIPool:
                         total_chars += len(c.get("text", ""))
         return total_chars // 3  # 中英文混合平均
 
+    def _pool_identity_headers(self, ep, label=""):
+        """池自身出站的出站头（确定性身份，2026-09-12）。
+
+        与"有客户端上下文（代理路径）"分支相对：那时按端点 profile 或忠实透传当前请求头。
+        解析不到任何确定身份时抛 PoolIdentityUnavailable —— 调用方必须跳过本次出站。"""
+        headers, source = resolve_pool_identity(
+            ep, self._client_profiles, self._probe_client_profile, label=label,
+        )
+        if source == "none":
+            self._log_identity_skip(ep, label)
+            raise PoolIdentityUnavailable(POOL_IDENTITY_SKIP_REASON)
+        return headers, source
+
+    def _log_identity_skip(self, ep=None, label=""):
+        """无身份跳过的 WARN 去重（同端点同原因 10 分钟一次），避免探活线程刷屏。"""
+        ep_id = getattr(ep, "id", None) or (ep if isinstance(ep, str) else "") or ""
+        name = getattr(ep, "name", None) or label or ep_id or "?"
+        key = (ep_id, "no-identity")
+        now = time.time()
+        with self._lock:
+            if now - self._identity_skip_log_ts.get(key, 0) < 600:
+                return
+            self._identity_skip_log_ts[key] = now
+        sys_log(
+            f"池自身出站：{name} {POOL_IDENTITY_SKIP_REASON}"
+            "（该端点未配置 client_profile，池级 probe_client_profile 为空，且无客户端基线）",
+            "WARN",
+        )
+
+    @staticmethod
+    def _strict400_backoff(level):
+        """严格校验 400 重试前的抖动退避秒数（模块常量 _STRICT400_BACKOFF_MS，测试可置 0）。"""
+        import random
+        base_ms = _STRICT400_BACKOFF_MS[min(level, len(_STRICT400_BACKOFF_MS) - 1)]
+        if base_ms <= 0:
+            return 0.0
+        return (base_ms * random.uniform(1.0, 1.4)) / 1000.0
+
     def _probe_endpoint(self, ep):
-        """对单个端点做快速探活，成功返回 True，失败返回 False。统一用 chat ping 检测。"""
+        """对单个端点做快速探活，成功返回 True、失败返回 False、无可用身份返回 None（跳过）。统一用 chat ping 检测。"""
         started = time.time()
         if ep.health_mode == "none":
             with self._lock:
@@ -4632,11 +4753,19 @@ class APIPool:
             return True, ""  # 关闭检测视为可用
         # 统一使用 chat ping 探活：models 接口可访问不代表模型可响应
         with self._lock:
+            prev_health, prev_health_error = ep._health, ep._health_error
             ep._health = "testing"
             ep._health_last_check = started
             ep._health_error = ""
         payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3, "stream": False}
-        reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True, is_probe=True)
+        try:
+            reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True, is_probe=True)
+        except PoolIdentityUnavailable:
+            # 无可用客户端身份 → 本次未探测；恢复 probing 前的观测态（不改动任何状态）
+            with self._lock:
+                ep._health = "unknown" if prev_health == "testing" else prev_health
+                ep._health_error = prev_health_error
+            return None, POOL_IDENTITY_SKIP_REASON
         latency = int((time.time() - started) * 1000)
         success = reply is not None
         with self._lock:
@@ -4711,7 +4840,11 @@ class APIPool:
         role_downgraded = False  # 已因角色不兼容 400 触发 developer→system 降级（每请求一次）
         # 严格校验 400 的请求级重试预算（2026-09-12 定案：上限 1）：唯一一次重试就是
         # 「改用客户端原始 tool_call id」的换形态请求（替换原「原样复读」重试）。
+        # 严格校验 400 的同端点重试（2026-09-12 两级口径）：第 1 级原样重试（实例级随机故障），
+        # 第 2 级「原始 tool_call id」变体（仅当本次尝试确实应用过前缀重写）；上限取端点
+        # strict400_retries（0/1/2，默认 2；前缀为空的端点实际只走第 1 级）。
         strict_validation_retries = 0
+        strict_variant_used = False    # 第 2 级变体是否已用（每请求最多 1 次）
         skip_prefix_rewrite = False    # 下一次尝试跳过 tool_call_id_prefix 重写（消费一次即清除）
         tried = 0
         total = len(active)
@@ -4999,33 +5132,53 @@ class APIPool:
             # thinking=disabled 改不了已发历史 → 结构性无效（42h 窗口内 0 成功），且
             # 该字段会随轮转污染异构端点（GLM 报「不支持关闭思考」）。上限维持请求级 1。
             if self._is_strict_validation_400(error):
+                # 前提（硬约束）：本分支只处理 _try_endpoint 在**首包前**返回的失败——流式响应在
+                # 返回给 chat() 之前已预读首个业务 chunk，因此此刻客户端尚未收到任何字节，
+                # 重试无副作用（不会出现"半截响应 + 重新计费"）。不要在流中途重试。
                 strict_label = self._endpoint_log_label(ep, group)
+                budget = self._normalize_strict400_retries(getattr(ep, "strict400_retries", 2))
                 retry_now = False
-                # 唯一一次重试＝换形态：跳过 tool_call_id_prefix 重写、改回客户端原始 tool_call id。
-                # 仅当本尝试确实应用过前缀重写时才发——否则这次请求与刚失败的那次完全相同
-                # （同一份被校验的历史原样复读），直接轮转，不白耗一次上游。
-                if strict_validation_retries < 1 and attempt_prefix_applied > 0:
+                retry_desc = ""
+                delay = 0.0
+                if strict_validation_retries < 1 and budget >= 1:
+                    # 第 1 级：同端点原样重试（带抖动退避）。该类 400 是上游实例级随机故障，
+                    # 外部实证同 body 背靠背重放失败率 15–25% → 原样重放本身就有较高命中率。
                     strict_validation_retries = 1
-                    skip_prefix_rewrite = True
+                    delay = self._strict400_backoff(0)
                     retry_now = True
+                    retry_desc = f"第 1 级 原样重试（退避 {delay:.2f}s）"
+                elif budget >= 2 and not strict_variant_used and attempt_prefix_applied > 0:
+                    # 第 2 级：换形态——跳过 tool_call_id_prefix 重写、改回客户端原始 tool_call id。
+                    # 仅当本尝试确实应用过前缀重写时才发（否则与刚失败的请求完全相同，白耗上游）。
+                    strict_validation_retries = 2
+                    strict_variant_used = True
+                    skip_prefix_rewrite = True
+                    delay = self._strict400_backoff(1)
+                    retry_now = True
+                    retry_desc = f"第 2 级 改用客户端原始 tool_call id 重试（跳过前缀重写 '{ep_prefix}'，退避 {delay:.2f}s）"
+                if retry_now and request_deadline is not None and time.time() + delay >= request_deadline:
+                    retry_now = False
                     sys_log(
                         f"{request_tag}端点 '{strict_label}' 命中 DeepSeek 严格校验 400，"
-                        f"同端点改用客户端原始 tool_call id 重试（唯一 1 次，本次跳过前缀重写 '{ep_prefix}'）",
-                        "WARN",
-                    )
-                else:
-                    reason = ("重试预算用尽" if strict_validation_retries >= 1
-                              else "本尝试未应用前缀重写（改回原始 id 无变化）")
-                    sys_log(
-                        f"{request_tag}端点 '{strict_label}' 命中 DeepSeek 严格校验 400，{reason}，转为轮转",
+                        f"但请求预算不足以再等 {delay:.2f}s，转为轮转",
                         "WARN",
                     )
                 if retry_now:
+                    sys_log(f"{request_tag}端点 '{strict_label}' 命中 DeepSeek 严格校验 400，同端点{retry_desc}", "WARN")
+                    if delay > 0:
+                        time.sleep(delay)
                     # 释放本尝试的在途占用，循环顶部会重新 acquire（否则计数器泄漏）
                     with self._lock:
                         self._release_inflight(ep.id, group)
                     idx = active.index(ep)
                     continue
+                if not retry_now:
+                    reason = ("重试预算用尽" if strict_validation_retries >= 1
+                              else "端点未开启严格校验重试（strict400_retries=0）")
+                    sys_log(
+                        f"{request_tag}端点 '{strict_label}' 命中 DeepSeek 严格校验 400，{reason}，转为轮转",
+                        "WARN",
+                    )
             # _try_endpoint 内部已按 max_retries 重试完毕，直接冻结+轮转
             with self._lock:
                 # 端点级活跃判定（2026-08-14）：超时类错误但端点在 timeout 窗口内
@@ -5087,6 +5240,10 @@ class APIPool:
                     # 对候选端点做探活
                     sys_log(f"对候选端点 '{self._endpoint_log_label(next_ep, group)}' 进行探活...", "INFO")
                     probe_ok, probe_error = self._probe_endpoint(next_ep)
+                    if probe_ok is None:
+                        # 无可用身份：探活无信息量（同网关错误处理），跳过探活直接用它试一次
+                        sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' {POOL_IDENTITY_SKIP_REASON}，跳过探活直接重试", "WARN")
+                        continue
                     if probe_ok:
                         sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' 探活通过，准备重试请求", "INFO")
                         continue  # 探活通过，回到循环顶部用 next_ep 发起实际请求
@@ -5398,11 +5555,18 @@ class APIPool:
                 req.add_header("x-api-key", safe_api_key)
                 req.add_header("anthropic-version", "2023-06-01")
             req.add_header("Authorization", f"Bearer {safe_api_key}")
-            # 出站客户端特征（2026-09-11 透明网关）：伪装 profile，或客户端透传（探活/测试线程用客户端基线）；
+            # 出站客户端特征（2026-09-11 透明网关；2026-09-12 池自身身份确定性）：
+            # 有客户端上下文（代理路径）→ 端点 profile，否则忠实透传当前请求的入站头；
+            # 无客户端上下文（探活/测试/拉模型/健康检测/管理接口触发的测试）→ 确定性身份，
+            # 解析不到则抛 PoolIdentityUnavailable 跳过本次出站（绝不编造身份）。
             # 合并优先级 客户端特征 < default_headers < extra_headers
-            for k, v in resolve_outbound_headers(
-                getattr(ep, "client_profile", ""), self._client_profiles, label=f"端点 '{ep.name}'"
-            ).items():
+            if getattr(_client_ctx, "headers", None):
+                outbound_headers = resolve_outbound_headers(
+                    getattr(ep, "client_profile", ""), self._client_profiles, label=f"端点 '{ep.name}'"
+                )
+            else:
+                outbound_headers, _identity_source = self._pool_identity_headers(ep, label=f"端点 '{ep.name}'")
+            for k, v in outbound_headers.items():
                 req.add_header(k, v)
             for k, v in ep.default_headers.items():
                 req.add_header(k, v)
@@ -6146,8 +6310,10 @@ class APIPool:
         req = urllib.request.Request(url, method="GET")
         safe_api_key = api_key.encode('ascii', 'ignore').decode('ascii').strip()
         req.add_header("Authorization", f"Bearer {safe_api_key}")
-        # 客户端特征与代理路径同源（2026-09-11）：profile 或客户端透传/基线
-        for k, v in resolve_outbound_headers(client_profile, self._client_profiles, label="拉模型").items():
+        # 客户端特征与代理路径同源（2026-09-11）；2026-09-12：拉模型属于"池自身出站"，
+        # 走确定性身份；解析不到直接抛 PoolIdentityUnavailable（调用方按"跳过"处理，不编造身份）
+        identity_headers, _identity_source = self._pool_identity_headers(client_profile, label="拉模型")
+        for k, v in identity_headers.items():
             req.add_header(k, v)
         for k, v in (default_headers or {}).items():
             req.add_header(k, v)
@@ -6215,7 +6381,10 @@ class APIPool:
             "max_tokens": 10,
         }
         t0 = time.time()
-        reply, err = self._try_endpoint(ep, payload, timeout)
+        try:
+            reply, err = self._try_endpoint(ep, payload, timeout)
+        except PoolIdentityUnavailable as exc:
+            return {"ok": False, "supports_vision": False, "skipped": True, "latency_ms": 0, "reply": "", "error": str(exc)}
         latency = int((time.time() - t0) * 1000)
         
         if reply is not None:
@@ -6235,7 +6404,10 @@ class APIPool:
         ep = Endpoint(name="test_latency", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol, default_headers={"User-Agent": user_agent} if user_agent else {}, client_profile=client_profile)
         payload = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}
         t0 = time.time()
-        reply, err = self._try_endpoint(ep, payload, timeout)
+        try:
+            reply, err = self._try_endpoint(ep, payload, timeout)
+        except PoolIdentityUnavailable as exc:
+            return {"ok": False, "status": "skipped", "skipped": True, "latency_ms": 0, "reply": "", "error": str(exc)}
         latency = int((time.time() - t0) * 1000)
         
         if reply is not None:
@@ -6424,6 +6596,15 @@ def load_client_profiles():
     except Exception:
         return {}
 
+def load_probe_client_profile():
+    """读取 probe_client_profile 顶层键：池自身出站（探活/测试/拉模型/健康检测）的默认身份
+    profile 名（2026-09-12）；旧配置/key 缺失 → ""（此时退化为"最近一次真实客户端指纹"）。"""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return str(json.load(f).get("probe_client_profile", "") or "")
+    except (OSError, ValueError, TypeError):
+        return ""
+
 def _sanitize_profile_headers(headers):
     """过滤 profile 保留头（由 pool 按端点协议管理）；返回 (清洗后 dict, 被过滤头名列表)。"""
     clean, dropped = {}, []
@@ -6464,15 +6645,44 @@ def resolve_outbound_headers(profile_name, client_profiles=None, label=""):
                 sys_log(f"客户端伪装：profile '{name}' 包含保留头 {sorted(dropped)}，已过滤", "WARN")
             return _filter_accept_encoding(clean)
         sys_log(f"客户端伪装：{label or '端点'} 引用了未知 profile '{name}'，降级为透传", "WARN")
+    return passthrough_client_headers()
+
+
+def passthrough_client_headers():
+    """透传分支：当前线程客户端头 → 客户端基线；按 skip 表过滤 + Accept-Encoding 收敛。
+
+    不为缺失的 UA 补任何默认值（2026-09-12：原 `_DEFAULT_OUTBOUND_UA` 编造值已删除）——
+    真实客户端没带 UA 就原样转发，由上游自己判。"""
     headers = {}
     for k, v in _current_client_headers().items():
         if k.strip().lower() in _PASSTHROUGH_SKIP_HEADERS:
             continue
         headers[k] = v
-    headers = _filter_accept_encoding(headers)
-    if not any(k.strip().lower() == "user-agent" for k in headers):
-        headers["User-Agent"] = _DEFAULT_OUTBOUND_UA
-    return headers
+    return _filter_accept_encoding(headers)
+
+
+def resolve_pool_identity(ep, client_profiles=None, probe_profile="", label=""):
+    """池自身出站的**确定性身份**（2026-09-12）。
+
+    优先级：端点 client_profile → 池级 probe_client_profile → 最近一次真实客户端指纹。
+    返回 (headers, source)，source ∈ {"endpoint-profile", "pool-profile", "client-baseline", "none"}；
+    source == "none" 时 headers 为空 dict，调用方**必须跳过本次出站**（不得编造身份）。
+
+    ep 可传端点对象，也可直接传 profile 名字符串（fetch_models 等只有名字的调用点）。"""
+    endpoint_profile = (ep if isinstance(ep, str) else str(getattr(ep, "client_profile", "") or "")).strip()
+    if endpoint_profile:
+        headers = resolve_outbound_headers(endpoint_profile, client_profiles, label=label or endpoint_profile)
+        if headers:
+            return headers, "endpoint-profile"
+    pool_profile = str(probe_profile or "").strip()
+    if pool_profile:
+        headers = resolve_outbound_headers(pool_profile, client_profiles, label=label or pool_profile)
+        if headers:
+            return headers, "pool-profile"
+    headers = passthrough_client_headers()
+    if headers:
+        return headers, "client-baseline"
+    return {}, "none"
 
 def load_group_defs_config():
     """读取组实体定义（2026-08-30 组管理）：pool_group_defs 顶层键。旧配置无此键 → None（走派生）。"""
@@ -6481,7 +6691,7 @@ def load_group_defs_config():
     except Exception:
         return None
 
-def save_config(endpoints_data, group_defs=None, client_profiles=None):
+def save_config(endpoints_data, group_defs=None, client_profiles=None, probe_client_profile=None):
     tmp_file = os.path.join(
         os.path.dirname(os.path.abspath(CONFIG_FILE)),
         f".{os.path.basename(CONFIG_FILE)}.tmp",
@@ -6493,6 +6703,9 @@ def save_config(endpoints_data, group_defs=None, client_profiles=None):
     # 客户端伪装（2026-09-10）：与组管理同模式，None=不落盘
     if client_profiles is not None:
         payload["client_profiles"] = client_profiles
+    # 池自身出站身份（2026-09-12）：None=不落盘，保持与组管理/伪装同模式
+    if probe_client_profile is not None:
+        payload["probe_client_profile"] = probe_client_profile
     try:
         with _config_lock:
             with open(tmp_file, "w", encoding="utf-8") as f:
@@ -7114,7 +7327,12 @@ def api_handler(method, path, body):
         return 200, {"ok": ok}, False
     # ================= 客户端伪装 profile 管理（2026-09-10） =================
     if method == "GET" and cp == "/api/client-profiles":
-        return 200, {"profiles": pool.list_client_profiles()}, False
+        return 200, {
+            "profiles": pool.list_client_profiles(),
+            # 池自身出站（探活/测试/拉模型）的默认身份 profile（2026-09-12）
+            "probe_client_profile": getattr(pool, "_probe_client_profile", ""),
+            "has_client_baseline": bool(_current_client_headers()),
+        }, False
     if method == "POST" and cp == "/api/client-profiles":
         try:
             name = pool.save_client_profile(body.get("name", ""), body.get("headers", {}))
@@ -7122,6 +7340,16 @@ def api_handler(method, path, body):
             return 400, {"error": str(e)}, False
         _sync_to_config()
         return 201, {"ok": True, "name": name}, False
+    if method == "POST" and cp == "/api/probe-client-profile":
+        # 池自身出站身份（探活/测试/拉模型；2026-09-12）：空串=用最近一次真实客户端指纹
+        probe_name = str(body.get("name", "") or "").strip()
+        if probe_name and not any(p["name"] == probe_name for p in pool.list_client_profiles()):
+            return 400, {"error": f"profile '{probe_name}' 不存在"}, False
+        with pool._lock:
+            pool._probe_client_profile = probe_name
+        _sync_to_config()
+        sys_log(f"池自身出站身份 probe_client_profile = '{probe_name or '未设置（用最近一次真实客户端指纹）'}'", "INFO")
+        return 200, {"ok": True, "probe_client_profile": probe_name}, False
     if method == "PUT" and cp.startswith("/api/client-profiles/"):
         name = unquote(cp[len("/api/client-profiles/"):]).strip("/")
         try:
@@ -7258,7 +7486,12 @@ def api_handler(method, path, body):
         if img:
             test_msg = [{"type": "text", "text": test_msg}, {"type": "image_url", "image_url": {"url": img}}]
         try:
-            res_dict, served_ep = pool.chat([{"role": "user", "content": test_msg}], return_endpoint=True)
+            # 池自身发起的请求（2026-09-12 伤害隔离）：失败只写观测态，不打生产路由
+            _POOL_INITIATED_CTX.active = True
+            try:
+                res_dict, served_ep = pool.chat([{"role": "user", "content": test_msg}], return_endpoint=True)
+            finally:
+                _POOL_INITIATED_CTX.active = False
             res_str = res_dict.get("choices", [{}])[0].get("message", {}).get("content", "") if isinstance(res_dict, dict) else res_dict
             return 200, {"ok": True, "result": res_str, "served_by": f"{served_ep.name} ({served_ep.model})"}, False
         except AllEndpointsFailed as e: return 200, {"ok": False, "errors": e.errors}, False
@@ -7356,7 +7589,8 @@ def _sync_to_config():
                 entry["context_k"] = gd["context_k"]
             defs_list.append(entry)
     save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "client_profile": ep.get("client_profile", ""), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
-            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles)
+            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "strict400_retries": ep.get("strict400_retries", 2), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles,
+        probe_client_profile=getattr(pool, "_probe_client_profile", ""))
 
 
 GUI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")

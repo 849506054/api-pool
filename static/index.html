@@ -1445,6 +1445,8 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 
 // ── 客户端伪装 profile（2026-09-10，管理 UI 重做 2026-09-11）──
 let clientProfiles=[];
+let probeClientProfile='';      // 池自身出站身份（探活/测试/拉模型；2026-09-12）
+let hasClientBaseline=false;    // 当前是否有真实客户端指纹基线
 // profile 版本标识：从 User-Agent 提取 `<name>/<version>`，如 hermes-agent/0.21.0 → "Hermes 0.21.0"
 function profileVersion(headers){
   const h=headers||{};
@@ -1471,6 +1473,8 @@ async function loadClientProfiles(){
   const r=await api('GET','/api/client-profiles');
   if(!r||!r.profiles)return;
   clientProfiles=r.profiles;
+  probeClientProfile=r.probe_client_profile||'';
+  hasClientBaseline=!!r.has_client_baseline;
   const sel=document.getElementById('fClientProfile');
   if(!sel)return;
   const cur=sel.value;
@@ -1506,6 +1510,14 @@ function renderProfileManager(){
   profileOverlay().innerHTML=`<div class="modal" style="width:560px">
     <h2>🎭 客户端伪装</h2>
     <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">伪装=出站请求头改为该 profile 的配置，模拟其他客户端；端点「客户端伪装」留空=透传当前客户端。保存立即生效。</div>
+    <div class="pf-sec">池自身出站身份（探活 / 🧪测试 / 拉模型）</div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+      <select class="btn btn-ghost btn-sm" style="flex:1" onchange="setProbeClientProfile(this.value)">
+        <option value="" ${probeClientProfile?'':'selected'}>跟随最近一次真实客户端指纹</option>
+        ${clientProfiles.map(p=>`<option value="${escAttr(p.name)}" ${probeClientProfile===p.name?'selected':''}>${esc(profileOptionLabel(p))}</option>`).join('')}
+      </select>
+    </div>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">这类请求没有客户端上下文，身份按「端点客户端伪装 → 此处设置 → 最近一次真实客户端指纹」解析；三者都没有时**跳过本次出站**（不编造身份）。${hasClientBaseline?'当前有客户端基线':'⚠ 当前无客户端基线（重启后还没有真实请求）'}</div>
     <div class="pf-sec">已有 profile</div>
     <div style="display:flex;flex-direction:column;gap:6px;max-height:240px;overflow:auto">${rows||'<div class="pf-empty">暂无 profile</div>'}</div>
     <div class="form-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
@@ -1513,6 +1525,12 @@ function renderProfileManager(){
       <button class="btn btn-primary" onclick="renderProfileForm('')">+ 新建 profile</button>
     </div>
   </div>`;
+}
+async function setProbeClientProfile(v){
+  const r=await api('POST','/api/probe-client-profile',{name:v});
+  if(r&&r.ok){probeClientProfile=v;toast('池自身出站身份已更新','success');}
+  else toast((r&&r.error)||'设置失败','error');
+  renderProfileManager();
 }
 function editClientProfile(name){
   if(!clientProfiles.some(p=>p.name===name)){toast('profile 不存在','error');return;}

@@ -343,11 +343,13 @@ vision 池定位修正：由「`role: vision` 标记的普通组」改为与 mai
 - 前端异常判据统一为 `epErr(ep)`（helper，L758）：状态卡「异常」计数与点击筛选（`renderStats`，全部端点口径含池外）、端点列表卡红框（`renderEndpoints`）、聚合池卡红框（`renderPoolList`，仅红框不渲染徽章/错误行，保持紧凑）、聚合链红块 `chain-item failed`（`renderChain`，优先级：手动解冻 > 冷却 > 延迟回切 > 当前服务中 > 异常）——「有错误文本必有红块」。错误详情只在端点列表与聚合链：列表错误行 `last_error` 为空时回落 `health==='bad' && health_error`；链详情整段换行显示在 info 列（`.chain-err` 去 `max-width:120px` 单行省略），文本 `health==='bad' ? (health_error||last_error) : last_error`。一致性要求（用户 2026-09-12 定稿）：状态卡「异常」数**只需与端点列表实际相符**——两处共用同一 `epErr` 判据、列表默认「全部」含池外端点，因此天然一一对应（现网实测：计数 2 = 列表红框 2，PM/Soleapi-gemini，两个都在池外）。聚合池/聚合链只含池内成员，其红框数不参与该一致性要求（池外异常不显示在池面板是预期行为）。
 - **响应体解压补漏（Soleapi 拉模型 `'utf-8' codec can't decode byte 0x8b`）**：`fetch_models` 此前未包 `_DecodedResponse`，透传/客户端基线声明 `Accept-Encoding: gzip, deflate` 后上游真压缩，`json.loads(resp.read().decode("utf-8"))` 直接炸；`HTTPError` 错误体三处（`_try_endpoint`、`/api/endpoints/<id>/models`、`/api/fetch-models`）同样未包，gzip 错误体存进 `last_error` 成二进制乱码（Soleapi 实测 `HTTP 404: \x1f\x8b...`）。4 处读取点全部补包，复用既有解压链，未新增机制。
 
-验证：`py_compile` 通过、`ruff` 基线 125 条不变、inline JS `node --check` 通过；渲染层静态断言 `test/render_error_smoke.js` 扩到 11 项全通过（状态卡 epErr 计数、池卡 bad+last_error 双红框且无详情、列表双高亮与回落、链红块与全文）；既有 `test/test_chain_group_ui.js` 因新增 `epErr` 外部依赖同步修补（切片摘取 helper 源）后 PASS；gzip 回归 `test_decoded_response.py::test_fetch_models_decodes_gzip_json` 在旧码上精确复现同一 `UnicodeDecodeError`、新码通过；全量 **344 tests passed**。生产端到端：`POST /api/test` 触发 AgentRouter 真实失败 → `health_error` 长度 **219**（此前恒 100）；部署后 `GET /api/endpoints/<Soleapi id>/models` → `{"ok": true, "models": [...]}`（修复前同请求返回 `❌ 'utf-8' codec...`）；`/` 前端 md5 与工作区一致；`POST /api/test-pool` 返回 `pong`；重启后 journal 0 ERROR；live 快照渲染核对：状态卡/端点列表/池卡/链四处红块数一致。
+验证：`py_compile` 通过、`ruff` 基线 125 条不变、inline JS `node --check` 通过；渲染层静态断言 `test/render_error_smoke.js` 扩到 11 项全通过（状态卡 epErr 计数、池卡 bad+last_error 双红框且无详情、列表双高亮与回落、链红块与全文）；既有 `test/test_chain_group_ui.js` 因新增 `epErr` 外部依赖同步修补（切片摘取 helper 源）后 PASS；gzip 回归 `test_decoded_response.py::test_fetch_models_decodes_gzip_json` 在旧码上精确复现同一 `UnicodeDecodeError`、新码通过；全量 **344 tests passed**。生产端到端：`POST /api/test` 打 AgentRouter 触发失败写回 → `health_error` 长度 **219**（此前恒 100）。⚠ 该次 401（`unauthorized_client_error`）**不是上游状态**，而是池用编造身份发出测试请求造成的自伤 → 见本日「池自身出站身份确定性 + 伤害隔离」节；部署后 `GET /api/endpoints/<Soleapi id>/models` → `{"ok": true, "models": [...]}`（修复前同请求返回 `❌ 'utf-8' codec...`）；`/` 前端 md5 与工作区一致；`POST /api/test-pool` 返回 `pong`；重启后 journal 0 ERROR；live 快照渲染核对：状态卡/端点列表/池卡/链四处红块数一致。
 
 生产 hash 后端 `35e24c16`（改前 `f6bf97f5`，中间版 `663da144`/`d19d2b32`）/ 前端 `01fd4e50`（改前 `bb2f2c06`，中间版 `db600866`/`781aaead`），备份 `api_pool_server.py.bak-20260912-170358-chain-error-detail`（原版）/ `...-chain-error-detail-v1` / `...-20260912-172842-errsem-gzip`（gzip 修复前）/ `static/index.html.bak-20260912-170358-chain-error-detail` / `...-20260912-171108-pool-no-detail` / `...-20260912-172842-errsem`（epErr 修复前），重启 2026-09-12 17:04:05 / 17:06:17 / **17:28:42（终态，含 gzip 修复）**；前端静态文件热读，最终版随终态重启一并 scp。
 
 ## 2026-09-12 严格校验 400「换形态重试」+ tool_call id 重写非变异 已部署生产
+
+> ⚠ 本节的「预算 1、唯一一次重试＝换形态」口径已被同日后文《严格校验 400 二级重试 + 出站 reasoning 形态归一化》取代（外部实证后改为二级：原样重试 + 退避，再变体）。保留本节作为演进记录。
 
 需求（用户）：DeepSeek 严格校验 400（`reasoning_text/reasoning_content ... must be passed back`）的本地防御，在既有「一次重试」上增加**清空前缀再请求一次**的设计，并在真实使用场景中观察效果。用户提供关键事实：事故期间曾改过「重写 ToolCall ID 前缀」（加了又删），也试过把协议改成 Responses。
 
@@ -373,3 +375,70 @@ vision 池定位修正：由「`role: vision` 标记的普通组」改为与 mai
 生产 hash 后端 `35e24c16` → `e2fe9219`（预算 2 中间版）→ `db05802e`（预算 1 终版，前端本轮未动，仍 `01fd4e50`），备份 `api_pool_server.py.bak-20260912-175606-strict400-idvariant` / `api_pool_server.py.bak-20260912-180558-strict400-budget1`，重启 2026-09-12 18:05:58。
 
 观察口径（待用户在生产真实场景确认）：journal 里统计「改用原始 id 重试」成功率，与「未应用前缀重写→直接轮转」的出现频率。注意当前 `AgentRouter-ds4f` 的 `tool_call_id_prefix` 为空 → 阶段 2 暂不会触发，要观察变体需先给某端点重新配置前缀（配置前建议先按 `tool-call-prefix-direct-probe-2026-08-18.md` 的判定表确认该端点是否真需要前缀）。
+
+
+## 2026-09-12 池自身出站身份确定性 + 伤害隔离 已部署生产
+
+需求（用户）：漏身份（非 Hermes 指纹出站）导致 ps.air 系 AgentRouter 端点 401 并连带冷却、打掉 main 组路由；
+要求**结构性堵死**而不是靠 skill 提记——"不考虑给意外崩溃情况兜底，主要场景是开发测试期间的主动操作"，
+故不做落盘快照、不做管理接口闸门，只做身份确定性 + 伤害隔离（用户定稿）。
+
+根因：重启后进程内客户端基线为空 + 管理接口（`/api/test`、`/api/test-pool`）无客户端上下文
+→ 出站回退 `_DEFAULT_OUTBOUND_UA`（池编造的身份）→ ps.air 判 unauthorized client → 401 被当端点故障冷却。
+历史对照：09-06~09-11 端点 `default_headers` 里的 `User-Agent: hermes-agent/0.21.0` 一直堵着这个洞。
+
+改动：
+- `resolve_pool_identity()`：身份优先级 = 端点 `client_profile` → 池级 `probe_client_profile` → 最近一次真实客户端指纹
+  → 都没有则**跳过本次出站**（`PoolIdentityUnavailable` + 10 分钟去重 WARN），**删除 `_DEFAULT_OUTBOUND_UA` 编造兜底**；
+  透传分支抽为 `passthrough_client_headers()`（不再补 UA）
+- `_try_endpoint` 按 `_client_ctx` 是否为空自动区分"代理路径透传"与"池自身出站确定性身份"（代理路径行为不变）
+- 跳过语义贯穿调用点：`_probe_endpoint` 返回 `None`、`_check_one_health` 返回 `"skipped"`（`check_all_health` 不写字段）、
+  `fetch_models`/`test_endpoint`/`test_model_latency`/`test_vision` 抛出并在回执给出原因——跳过时**零出站、零状态改动**
+- 伤害隔离：`_rotate()` 入口守卫（`/api/test-pool` 期间置 `_POOL_INITIATED_CTX`）→ 池自身请求失败只写 `last_error`，
+  不冷却/不计 fail_count/不改指针/不建 fallback 锁；`_apply_test_result()`（🧪）非容量类失败只写观测态，
+  **容量类例外**（余额不足→手动解冻、配额耗尽→冷却、429→Retry-After）仍写路由态
+- 新配置键 `probe_client_profile`（顶层，生产设 `hermes`）+ `GET /api/client-profiles` 回带、
+  `POST /api/probe-client-profile` 设置即落盘 + 管理页「🎭 客户端伪装」内下拉
+
+验证：新增 `test/test_pool_identity_isolation.py` 10 例（四级优先级／无身份零 HTTP 请求且状态零改动／
+池级 profile 生效／代理透传不变／skipped 不写／`_rotate` 隔离 vs 真实路径仍冷却／非容量隔离 + 容量仍写路由态）；
+黄金样本：新测试跑改前文件 7 失败；全量 **358 passed**（基线 348）；`py_compile` OK；`ruff` 基线 125 不变；
+`node --check` + 渲染断言 + 组视图断言通过。生产验收：`probe_client_profile=hermes` 落盘回读一致；
+健康检测 22 端点 **0 条 401**（8 个 bad 均为真实上游状态）；`/api/test` 打 `AgentRouter-ds4f`（无客户端上下文 →
+走池级 profile）**200 pong** 且端点无冷却/fail_count=0；journal 无 `unauthorized client`、无 Traceback。
+
+生产 hash 后端 `db05802e` → `27921027`，前端 `01fd4e50` → `f18183b8`；备份
+`api_pool_server.py.bak-20260912-191xxx-pool-identity` / `static/index.html.bak-…-pool-identity`，重启 2026-09-12 19:15:08。
+
+
+## 2026-09-12 严格校验 400 二级重试 + 出站 reasoning 形态归一化 已部署生产
+
+需求（用户）：依据同类站点用户提供的经验（同 body 背靠背重放 15–25% 随机 400；且"上游给的思考内容为空"是另一半成因——
+带 tool_calls 的轮次必须回传非空 reasoning，不带 tool_calls 的空 reasoning 应删字段）改进 400 防御。
+
+改动：
+- **二级重试**（取代"预算 1、仅变体"）：端点级 `strict400_retries`（0/1/2，默认 2，落盘 + `PUT` 可改、钳制）；
+  第 1 级同端点**原样**重试 + 300ms×抖动退避；第 2 级「跳过前缀重写、改用客户端原始 tool_call id」仅在本次确实
+  应用过前缀重写时发 + 800ms×抖动退避；请求预算不足（`request_deadline`）时不重试直接轮转；配置序列化补字段
+  （原缺失会导致端点级设置重启后丢失）。退避常量 `_STRICT400_BACKOFF_MS`（测试可置 0）。
+- **出站 reasoning 形态归一化** `_normalize_reasoning_shape()`：仅对需要回传 reasoning 的端点（DeepSeek/GLM/Kimi/MiMo
+  或 `reasoning_policy=keep`）生效——带 tool_calls 的空/缺失 reasoning → 补占位 `" "`（沿用已有字段名）；不带 tool_calls
+  的空/缺失 reasoning → 删字段；真实值原样；**非变异**（只复制被改动的消息）。`strip` 端点继续整体剥离。
+- 硬约束记录在代码里：重试只在**首包前**失败上发生（流式首包在 `_try_endpoint` 内预读，客户端未收到任何字节），
+  护栏断言该分支全文件唯一。
+
+验证：`test/test_strict_validation_prefix_retry.py` 6 例（3 次尝试/2 次/0 次、钳制与落盘、非变异、不泄漏）；
+`test/test_reasoning_shape_normalization.py` 8 例（占位/删字段/真值/字段名/零拷贝/strip 端点 + 真实 HTTP 上游收到的 body 断言）；
+黄金样本：分别 3/6 与 5/8 失败于改前文件；全量 **368 passed**；`ruff` 基线 125 不变。生产：44 端点默认 2，
+`PUT 9`→钳 2 并落盘，`probe_client_profile=hermes` 保持，重启后 journal 0 ERROR/Traceback。
+
+生产 hash 后端 `27921027` → `dcea95bf` → `38042bc7` → `de882009`（前端未动，仍 `f18183b8`）；备份
+`api_pool_server.py.bak-20260912-193831-strict400-twolevel` / `…-strict400-persist` / `…-194708-reasoning-shape`，重启 19:38 / 19:41 / 19:47。
+
+[已办 2026-09-12] **[P3] `_last_reasoning_content/_last_reasoning_text` 写了没读 → 已删除（只保留记录）**。
+来历：2026-08-06 `a847e05` 为 Kcne 做"reasoning_text 逐条注入"时加的缓存；2026-08-07 `4626f16` 删除注入逻辑（H/K 矩阵证伪，根因是 tool_call id 格式、与 reasoning 无关），**当时明确"保留缓存（无害）"**，故只留写侧。
+处置方向更正：**不要"接上补全"**——注入路径已被证伪，且 08-19 诊断文档把"用进程级 `_last_reasoning_content` 冒充当前会话原文"列为禁止的旧路径；正确选项是删除（4 行写入 + 2 行初始化，零行为影响），或按当年决定继续留作无害残留。暂不处理。
+
+[清理已部署 2026-09-12] 删除写了没读的 `_last_reasoning_content/_last_reasoning_text`（初始化 2 行 + `_on_success` 写入块）：
+后端 `de882009` → `96fa77d5`，备份 `api_pool_server.py.bak-20260912-200101-drop-dead-reasoning-cache`，20:01:01 重启；
+全量 **369 passed**（新增源码护栏 1 例）、`ruff` 基线 125 不变、生产残留计数 0、endpoints/chain 200、journal 0 错误。

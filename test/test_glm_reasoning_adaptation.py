@@ -110,20 +110,23 @@ p = {"thinking": {"type": "disabled"}}
 APIPool._normalize_glm_thinking(p, ep("glm-5.2"))
 assert p["thinking"] == {"type": "disabled"} and "reasoning_effort" not in p, p
 
-# 7) 回归护栏：不再有「关闭 thinking」注入（结构性无效 + 会污染轮转后的异构端点）；
-#    严格校验 400 的请求级预算 = 1（2026-09-12 定案：唯一一次重试就是「改用客户端原始
-#    tool_call id」的换形态请求，替换原「原样复读」），且必须受「本尝试确实应用了前缀重写」
-#    约束、开关消费一次即清除。
+# 7) 回归护栏：不再有「关闭 thinking」注入（结构性无效 + 会污染轮转后的异构端点）。
+#    严格校验 400 重试为**二级口径**（2026-09-12，外部实证 zdsub2api 后定案）：端点级上限
+#    strict400_retries（0/1/2，默认 2）；第 1 级同端点原样重试 + 抖动退避，第 2 级
+#    「原始 tool_call id」变体仅在本次确实应用过前缀重写时发；且只在**首包前**失败分支上重试。
 src = open("/opt/data/work/api-pool2/api_pool_server.py", encoding="utf-8").read()
 assert "disable_thinking_forced" not in src
 assert "disable_thinking_eps" not in src
 assert 'payload["thinking"] = {"type": "disabled"}' not in src
 assert "strict_validation_retries = 0" in src
-assert "strict_validation_retries < 1" in src
+assert "strict_validation_retries < 1 and budget >= 1" in src, "第 1 级：同端点原样重试"
 assert "strict_validation_retries = 1" in src
-assert "if strict_validation_retries < 1 and attempt_prefix_applied > 0:" in src
+assert "budget >= 2 and not strict_variant_used and attempt_prefix_applied > 0" in src, "第 2 级：变体受前缀约束"
 assert "skip_prefix_rewrite = True" in src
-assert "原样重试" not in src, "「原样复读」重试已被换形态重试取代"
+assert "strict400_retries: int = 2" in src, "端点级上限默认 2"
+assert "_STRICT400_BACKOFF_MS" in src, "重试前抖动退避"
+assert "第 1 级 原样重试" in src and "第 2 级 改用客户端原始 tool_call id" in src
+assert src.count("self._is_strict_validation_400(error)") == 1, "重试只在首包前的失败分支上发生"
 assert "loop_messages, attempt_prefix_applied = self._rewrite_tool_call_ids(" in src
 
 print("ALL ASSERTS PASSED")

@@ -27,6 +27,8 @@ def load_module(tmp_path):
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
+        # 2026-09-12：池自身出站需确定身份；测试默认模拟"已有真实客户端打过池"。
+        module._client_baseline.update({"User-Agent": "pytest-client/1.0"})
         return module
     finally:
         os.chdir(previous_cwd)
@@ -46,8 +48,8 @@ class TestEndpointWritebackTests(unittest.TestCase):
         self.assertTrue(pool.get_endpoint(ep.id) is ep)
         return pool
 
-    def test_failed_test_sets_cooldown_on_real_endpoint(self):
-        """测试失败（普通错误）必须冷却主池端点，而不是临时副本。"""
+    def test_failed_test_records_observation_only_for_non_capacity(self):
+        """测试失败（非容量类）命中主池真实端点、只写观测态：不冷却、不计失败次数（2026-09-12 伤害隔离）。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             ep = self.endpoint(module, "target")
@@ -63,10 +65,12 @@ class TestEndpointWritebackTests(unittest.TestCase):
             self.assertIsNone(result)
             self.assertIn("503", error)
             self.assertEqual(ep._health, "bad")
-            self.assertGreater(ep._cooldown_until, time.time())
-            self.assertEqual(ep._cooldown_reason, "test_failed")
-            self.assertGreaterEqual(ep._fail_count, 1)
+            self.assertEqual(ep._health_error, "HTTP 503: simulated upstream failure")
             self.assertEqual(ep._last_error, "HTTP 503: simulated upstream failure")
+            # 伤害隔离：非容量类失败不写路由态
+            self.assertEqual(ep._cooldown_until, 0)
+            self.assertEqual(ep._cooldown_reason, "")
+            self.assertEqual(ep._fail_count, 0)
 
     def test_failed_test_does_not_rotate_or_touch_other_endpoints(self):
         """测试失败不轮转当前端点，也不影响其他端点状态。"""
@@ -78,7 +82,8 @@ class TestEndpointWritebackTests(unittest.TestCase):
             pool._set_current(pool.MAIN_GROUP, other.id)
             pool._try_endpoint = lambda ep, payload, timeout, **kw: (None, "HTTP 502: gw")
             pool.test_endpoint(target, message="hi")
-            self.assertGreater(target._cooldown_until, time.time())
+            self.assertEqual(target._cooldown_until, 0, "非容量类测试失败不再冷却（伤害隔离）")
+            self.assertIn("502", target._last_error)
             self.assertEqual(pool._get_current(pool.MAIN_GROUP), other.id)
             self.assertEqual(other._cooldown_until, 0)
             self.assertEqual(other._fail_count, 0)
@@ -155,14 +160,14 @@ class TestEndpointWritebackTests(unittest.TestCase):
             )
             self.assertEqual(status, 404)
 
-    def test_rest_failed_test_persists_cooldown_snapshot(self):
-        """/api/test 失败后冷却快照必须落盘，重启不复活已冻结前的旧状态。"""
+    def test_rest_failed_test_persists_cooldown_snapshot_for_capacity(self):
+        """/api/test 命中容量类失败（配额）仍冷却并落盘；重启不复活已冻结前的旧状态（2026-09-12：非容量类只写观测态、不落盘冷却）。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             ep = self.endpoint(module, "real-ep")
             module.pool = module.APIPool([ep])
             module.pool._try_endpoint = lambda ep_, payload, timeout, **kw: (
-                None, "HTTP 503: boom"
+                None, "HTTP 429: rate limit exceeded, retry-after: 300"
             )
             status, body, _ = module.api_handler(
                 "POST", "/api/test", {"id": "real-ep", "message": "hi"}
