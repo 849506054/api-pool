@@ -506,10 +506,7 @@ profile=hermes → 上游收到 `hermes-agent/0.21.0` + 黄金样本全套头、
 列表与指纹表同步移除；容器层已生效热修保留现状（下次镜像重建自然回上游行为）。撤回记录见 hermes-runtime-fix
 `pending/archived/custom-provider-client-identity.patch.README.md.retracted-20260913-224544`。
 
-遗留（方案已定，待发话再开发）：`client_profiles.hermes` 的 UA 写死 `hermes-agent/0.21.0`，会随 Hermes 升级过期。做**手动同步**：
-代理路径入站头 UA 匹配 `hermes-agent/<ver>` 时采样（**仅内存、不落盘**），profile 弹层给「从最近 Hermes 流量同步」+ diff 预览，
-更新策略 **b**（只更新身份字段：UA 版本号 + `X-Stainless-Package-Version/OS/Arch/Runtime/Runtime-Version`，其余保留），
-沿用 `_PROFILE_RESERVED_HEADERS` 过滤。
+遗留（**已于同日实现，见下节**）：`client_profiles.hermes` 的 UA 是静态快照，会随 Hermes 升级过期 → 改为「代理路径采样真实 Hermes 身份 + profile 行 🔄 一键同步」。
 
 
 ## 2026-09-13 客户端伪装 profile 身份手动同步（Hermes 流量采样） 已部署生产
@@ -530,3 +527,5 @@ profile=hermes → 上游收到 `hermes-agent/0.21.0` + 黄金样本全套头、
 隔离端到端（`workspace/verify-transparent-identity/`，零接触生产池）：客户端发 `UA: hermes-agent/0.21.2` + `X-Stainless-Package-Version: 9.9.9`（profile 原为 0.21.0 / 2.24.0）→ 采样 version=0.21.2 → `POST sync-identity` 返回 2 项变更 → profile 落盘为 0.21.2 / 9.9.9 且**键数仍 12**（其余头未被增删）。
 
 生产部署：hash `api_pool_server.py` `ed0ad611…`→`94fcab57…`、`static/index.html` 同步更新；备份 `api_pool_server.py.bak-20260913-2303xx-profile-sync` / `static/index.html.bak-…`（cp 回 + `systemctl restart api-pool2` 即回滚）；重启 2026-09-13 23:04。验收：服务 `active`、44 端点、13 个 ps.air 端点仍带 `hermes` profile、`GET /api/client-profiles` 200 且含 `hermes_sample`；真实流量采样 `available=true, version=0.21.0, source=/v1/chat/completions`；此刻 `POST sync-identity` 幂等返回 `changes: []`（采样值=profile 值，均为 0.21.0）；未知 profile → 400。
+
+**同日 23:35 终态复核**：Hermes 侧改为**用户级 provider 插件**动态身份（`/opt/data/plugins/model-providers/custom/`，UA 随版本自动跟随，config 里的 UA 字面量已删）→ 采样 version 变为 **0.21.2**；受控实测（临时把 profile 置回 0.21.0 再同步）返回**精确 1 项变更** `User-Agent: 0.21.0 → 0.21.2`、12 头未增删、13 端点引用不变、磁盘落盘一致；再点则幂等 `changes: []`。链路闭环：Hermes 动态 UA → 池采样 → 🔄 一键对齐。
