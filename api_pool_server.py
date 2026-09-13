@@ -3033,12 +3033,18 @@ class APIPool:
     # 名称/类型/选择器锁定且不可删除。图片转译候选恒取本组成员。
     VISION_GROUP = "vision"
     VISION_SELECTOR = "api-pool-vision"  # 该组对外选择器（Hermes 侧 model 名），固定
-    # 组级上下文长度（2026-09-12，纯显式声明）：组声明的对外窗口（K=1000 tokens，0=不声明），
-        # 取值只认组实体 context_k，不做成员推导；
+    # 组级上下文长度（2026-09-12，纯显式声明）：组声明的对外窗口（tokens，0=不声明），
+        # 取值只认组实体 context_tokens，不做成员推导；
+    # 2026-09-13 起单位由 K 改为 tokens 精确值（适配各家模型窗口差异，如 200000 / 202752 / 1048576），
+    # 旧配置的 context_k（K=1000 tokens）读入时自动换算。
     # 经 /v1/models 的 context_length 暴露给 Hermes（其解析链第 4/5 级）。
     # 边界来自 Hermes `_coerce_reasonable_int`（1024–10,000,000 tokens）：越界值会被它忽略。
-    GROUP_CONTEXT_MIN_K = 2
-    GROUP_CONTEXT_MAX_K = 10000
+    GROUP_CONTEXT_MIN_TOKENS = 2000
+    GROUP_CONTEXT_MAX_TOKENS = 10000000
+    # 池自身发起的探活/自检请求的输出上限（2026-09-13）：Responses API 要求 max_output_tokens ≥ 16，
+    # 原先的 3 / 5 / 10 会让 protocol=responses 端点的探活必然 400 并被误标 bad
+    # （探活实际只输出 1-2 token，成本无实质变化）。
+    PROBE_MAX_TOKENS = 16
 
     @classmethod
     def _endpoint_log_label(cls, ep, group=None, model=None):
@@ -3075,40 +3081,45 @@ class APIPool:
     def _valid_group_type(self, gtype):
         return gtype in ("mixed", "dedicated")
 
-    def _valid_group_context_k(self, value):
-        """组上下文长度（K）归一化：0=未声明；非法/越界 → None（调用方拒绝）。"""
+    def _valid_group_context_tokens(self, value):
+        """组上下文长度（tokens）归一化：0=未声明；非法/越界 → None（调用方拒绝）。"""
         try:
-            k = int(value or 0)
+            n = int(value or 0)
         except (TypeError, ValueError):
             return None
-        if k == 0:
+        if n == 0:
             return 0
-        if self.GROUP_CONTEXT_MIN_K <= k <= self.GROUP_CONTEXT_MAX_K:
-            return k
+        if self.GROUP_CONTEXT_MIN_TOKENS <= n <= self.GROUP_CONTEXT_MAX_TOKENS:
+            return n
         return None
 
-    def _group_context_k(self, group):
-        """组显式声明的上下文长度（K）；未声明或存值非法 → 0。"""
-        return self._valid_group_context_k(self._group_defs.get(group, {}).get("context_k")) or 0
-
     def _group_context_tokens(self, group):
-        """该组对外声明的上下文窗口（tokens）；未显式声明 → None（不对外声明该键）。"""
-        k = self._group_context_k(group)
-        return k * 1000 if k > 0 else None
+        """该组显式声明的上下文窗口（tokens）；未声明或存值非法 → None（不对外声明该键）。"""
+        return self._valid_group_context_tokens(self._group_defs.get(group, {}).get("context_tokens")) or None
 
-    def _set_group_context_k(self, group, k):
-        """写入/清除组的显式 context_k，返回是否有变更。"""
+    def _loaded_group_context_tokens(self, d):
+        """配置读入：context_tokens 优先；旧 context_k（K=1000 tokens）自动换算（2026-09-13）。"""
+        raw = d.get("context_tokens")
+        if raw is None:
+            try:
+                raw = int(d.get("context_k") or 0) * 1000
+            except (TypeError, ValueError):
+                return 0
+        return self._valid_group_context_tokens(raw) or 0
+
+    def _set_group_context_tokens(self, group, tokens):
+        """写入/清除组的显式 context_tokens，返回是否有变更。"""
         gd = self._group_defs.get(group)
         if gd is None:
             return False
-        if k:
-            if gd.get("context_k") == k:
+        if tokens:
+            if gd.get("context_tokens") == tokens:
                 return False
-            gd["context_k"] = k
+            gd["context_tokens"] = tokens
         else:
-            if gd.pop("context_k", None) is None:
+            if gd.pop("context_tokens", None) is None:
                 return False
-        sys_log(f"组 '{group}' 上下文长度声明为 {'%dK' % k if k else '取消声明'}", "INFO")
+        sys_log(f"组 '{group}' 上下文长度声明为 {'%s tokens' % format(tokens, ',') if tokens else '取消声明'}", "INFO")
         return True
 
     def _group_selector(self, name):
@@ -3144,24 +3155,24 @@ class APIPool:
                     continue
                 if name == self.MAIN_GROUP:
                     # main 类型/选择器恒内置；组级上下文长度声明随配置恢复
-                    ck = self._valid_group_context_k(d.get("context_k", 0))
+                    ck = self._loaded_group_context_tokens(d)
                     if ck:
-                        self._group_defs[self.MAIN_GROUP]["context_k"] = ck
+                        self._group_defs[self.MAIN_GROUP]["context_tokens"] = ck
                     continue
                 if name == self.VISION_GROUP:
                     # 内置图片解析池：类型恒 mixed，选择器沿用配置（缺省 VISION_SELECTOR）
                     entry = {"type": "mixed", "model": model or self.VISION_SELECTOR}
-                    ck = self._valid_group_context_k(d.get("context_k", 0))
+                    ck = self._loaded_group_context_tokens(d)
                     if ck:
-                        entry["context_k"] = ck
+                        entry["context_tokens"] = ck
                     self._group_defs[name] = entry
                     continue
                 if str(d.get("role", "") or "").strip():
                     sys_log(f"忽略组 '{name}' 的 role 键（图片解析池固定为 '{self.VISION_GROUP}'）", "WARNING")
                 entry = {"type": gtype, "model": model or name}
-                ck = self._valid_group_context_k(d.get("context_k", 0))
+                ck = self._loaded_group_context_tokens(d)
                 if ck:
-                    entry["context_k"] = ck
+                    entry["context_tokens"] = ck
                 self._group_defs[name] = entry
         return self._group_defs
 
@@ -3173,7 +3184,7 @@ class APIPool:
                 self._group_defs[grp] = {"type": "mixed", "model": grp}
         return self._group_defs
 
-    def create_group(self, name, gtype="mixed", model="", context_k=0):
+    def create_group(self, name, gtype="mixed", model="", context_tokens=0):
         """新建分组。返回 (ok, message)。main / 图片解析池为系统内置组，不可由此创建。"""
         with self._lock:
             name = str(name or "").strip()
@@ -3185,9 +3196,10 @@ class APIPool:
                 return False, f"组 '{name}' 已存在"
             if not self._valid_group_type(gtype):
                 return False, "分组类型必须为 mixed 或 dedicated"
-            ck = self._valid_group_context_k(context_k)
+            ck = self._valid_group_context_tokens(context_tokens)
             if ck is None:
-                return False, f"上下文长度非法（0=不声明，或 {self.GROUP_CONTEXT_MIN_K}K–{self.GROUP_CONTEXT_MAX_K}K）"
+                return False, ("上下文长度非法（0=不声明，或 "
+                               f"{self.GROUP_CONTEXT_MIN_TOKENS:,}–{self.GROUP_CONTEXT_MAX_TOKENS:,} tokens）")
             model = str(model or "").strip()
             if gtype == "dedicated":
                 if not model:
@@ -3203,8 +3215,8 @@ class APIPool:
                         return False, f"选择器 '{model}' 已被组 '{g}' 使用"
             self._group_defs[name] = {"type": gtype, "model": model}
             if ck:
-                self._group_defs[name]["context_k"] = ck
-            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%dK' % ck if ck else '未声明'}）", "INFO")
+                self._group_defs[name]["context_tokens"] = ck
+            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%s tokens' % format(ck, ',') if ck else '未声明'}）", "INFO")
             return True, name
 
     def update_group(self, name, updates):
@@ -3224,9 +3236,10 @@ class APIPool:
             new_name = str(updates.get("name", name)).strip() or name
             new_type = updates.get("type", old["type"])
             new_model = str(updates.get("model", old.get("model", "")) or "").strip()
-            new_ck = self._valid_group_context_k(updates.get("context_k", old.get("context_k", 0)))
+            new_ck = self._valid_group_context_tokens(updates.get("context_tokens", old.get("context_tokens", 0)))
             if new_ck is None:
-                return False, f"上下文长度非法（0=不声明，或 {self.GROUP_CONTEXT_MIN_K}K–{self.GROUP_CONTEXT_MAX_K}K）"
+                return False, ("上下文长度非法（0=不声明，或 "
+                               f"{self.GROUP_CONTEXT_MIN_TOKENS:,}–{self.GROUP_CONTEXT_MAX_TOKENS:,} tokens）")
 
             if not self._valid_group_type(new_type):
                 return False, "分组类型必须为 mixed 或 dedicated"
@@ -3237,7 +3250,7 @@ class APIPool:
                     # main 选择器改名会让存量 Hermes 配置失配，禁止
                     return False, "main 组选择器固定为 api-pool（历史别名）"
                 # 上下文长度不属于锁定项：main 是对外默认窗口，必须可改
-                if self._set_group_context_k(name, new_ck):
+                if self._set_group_context_tokens(name, new_ck):
                     return True, name
                 return True, "无变更"
 
@@ -3245,7 +3258,7 @@ class APIPool:
                 # 系统内置图片解析池：与 main 同级，名称/类型/选择器全锁
                 if new_name != self.VISION_GROUP or new_type != "mixed" or new_model != old.get("model", ""):
                     return False, "图片解析池为系统内置组：名称/类型/选择器均锁定"
-                if self._set_group_context_k(name, new_ck):
+                if self._set_group_context_tokens(name, new_ck):
                     return True, name
                 return True, "无变更"
 
@@ -3291,8 +3304,8 @@ class APIPool:
 
             self._group_defs[new_name] = {"type": new_type, "model": eff_model}
             if new_ck:
-                self._group_defs[new_name]["context_k"] = new_ck
-            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%dK' % new_ck if new_ck else '未声明'}）", "INFO")
+                self._group_defs[new_name]["context_tokens"] = new_ck
+            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}）", "INFO")
             return True, new_name
 
     def delete_group(self, name):
@@ -3756,7 +3769,7 @@ class APIPool:
             except Exception as e:
                 return ep.id, "bad", int((time.time() - t0) * 1000), f"Models接口错误: {e}"
                 
-        payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3, "stream": False}
+        payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": self.PROBE_MAX_TOKENS, "stream": False}
         
         # Attempt 1
         t0 = time.time()
@@ -5091,7 +5104,7 @@ class APIPool:
             ep._health = "testing"
             ep._health_last_check = started
             ep._health_error = ""
-        payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 3, "stream": False}
+        payload = {"model": ep.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": self.PROBE_MAX_TOKENS, "stream": False}
         try:
             reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True, is_probe=True)
         except PoolIdentityUnavailable:
@@ -6897,7 +6910,7 @@ class APIPool:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": [{"type": "text", "text": "describe this image in 3 words"}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{tiny_png}"}}]}],
-            "max_tokens": 10,
+            "max_tokens": self.PROBE_MAX_TOKENS,
         }
         t0 = time.time()
         try:
@@ -6921,7 +6934,7 @@ class APIPool:
 
     def test_model_latency(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai", user_agent="", client_profile=""):
         ep = Endpoint(name="test_latency", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol, default_headers={"User-Agent": user_agent} if user_agent else {}, client_profile=client_profile)
-        payload = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}
+        payload = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": self.PROBE_MAX_TOKENS}
         t0 = time.time()
         try:
             reply, err = self._try_endpoint(ep, payload, timeout)
@@ -7661,7 +7674,7 @@ def api_handler(method, path, body):
                 "name": grp,
                 "type": gd.get("type", "mixed"),
                 "model": gd.get("model", grp),
-                "context_k": pool._group_context_k(grp),
+                "context_tokens": pool._group_context_tokens(grp) or 0,
                 "is_vision": grp == pool.VISION_GROUP,
                 "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)),
                 "current_endpoint": cur_ep.name if cur_ep else None,
@@ -7672,7 +7685,7 @@ def api_handler(method, path, body):
         name = str(body.get("name", "")).strip()
         gtype = body.get("type", "mixed")
         model = str(body.get("model", "") or "").strip()
-        ok, msg = pool.create_group(name, gtype, model, body.get("context_k", 0))
+        ok, msg = pool.create_group(name, gtype, model, body.get("context_tokens", 0))
         if not ok:
             return 400, {"error": msg}, False
         _sync_to_config()
@@ -8104,8 +8117,8 @@ def _sync_to_config():
     for gname, gd in pool._group_defs.items():
         if gname != pool.MAIN_GROUP:
             entry = {"name": gname, "type": gd.get("type", "mixed"), "model": gd.get("model", gname)}
-            if gd.get("context_k"):
-                entry["context_k"] = gd["context_k"]
+            if gd.get("context_tokens"):
+                entry["context_tokens"] = gd["context_tokens"]
             defs_list.append(entry)
     save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "client_profile": ep.get("client_profile", ""), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
             "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "strict400_retries": ep.get("strict400_retries", 2), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles,

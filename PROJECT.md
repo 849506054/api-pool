@@ -442,3 +442,18 @@ vision 池定位修正：由「`role: vision` 标记的普通组」改为与 mai
 [清理已部署 2026-09-12] 删除写了没读的 `_last_reasoning_content/_last_reasoning_text`（初始化 2 行 + `_on_success` 写入块）：
 后端 `de882009` → `96fa77d5`，备份 `api_pool_server.py.bak-20260912-200101-drop-dead-reasoning-cache`，20:01:01 重启；
 全量 **369 passed**（新增源码护栏 1 例）、`ruff` 基线 125 不变、生产残留计数 0、endpoints/chain 200、journal 0 错误。
+
+## 2026-09-13 组级上下文长度改 tokens 精确值 + responses 探活输出上限修复 已部署生产
+
+需求（用户）：「给 apipool 池组上下文长度添加支持 1048576 这种写法」——目的是**适配各模型真实窗口**（K 整数表达不了 202752 / 1048576）。用户定稿：精确存储 + 支持 K/M 后缀输入；同链的 responses 探活缺陷一并修（「一起修复」），授权部署。
+
+改动（两批同批上线，同一份文件）：
+- **组级上下文单位 K → tokens 精确值**：字段 `context_k`（K 整数）→ `context_tokens`（tokens 精确值），边界 **2000–10,000,000 tokens**（对齐 Hermes `_coerce_reasonable_int` 的 1024–10,000,000）；`_valid_group_context_k` → `_valid_group_context_tokens`，`_group_context_k` 并入 `_group_context_tokens`，新增 `_loaded_group_context_tokens`（旧 `context_k` ×1000 兼容读入），`_set_group_context_k` → `_set_group_context_tokens`；create/update_group 参数与错误文案随单位改；`GET /v1/models` 的 `context_length` 取精确值；`GET /api/groups` 字段名改 `context_tokens`；`_sync_to_config` 写 `context_tokens`。
+- **前端**：组弹窗输入 `type=number`(max 10000) → `type=text` + 新 `parseCtxTokens(raw)`（纯数字=tokens；`K`/`M` 后缀换算；容忍空白/千分位；空/0=不声明；非法=NaN），datalist 档位改 200000/256000/400000/512000/1000000/1048576，校验文案改 2000–10,000,000 tokens。
+- **探活/自检输出上限**：新增 `APIPool.PROBE_MAX_TOKENS = 16`，批量探活 ping、单端点探活 ping（原 `max_tokens: 3`）、模型自检（原 5）、视觉自检（原 10）统一引用。根因：Responses API 要求 `max_output_tokens ≥ 16`，而 ping 的 `max_tokens: 3` 被 `_responses_body_from_chat` 原样抄成 `max_output_tokens: 3` → `protocol=responses` 端点探活恒 400（`Invalid 'max_output_tokens': integer below minimum value. Expected a value >= 16, but got 3 instead.`）并标 bad；生产实证 `AgentRouterZ-gpt6a`、`AgentRouterP-gpt6a`（同协议 `AgentRouter-gpt6a` 上游容忍 3，故为 ok）。真实用户请求不改写（未在桥接层夹取）。
+
+验证：`test/test_group_context_length.py` 重写（10 例：显式取值/非法忽略/未声明不外发/边界/精确值不取整/内置组锁定项仍拒/目录+单 selector/`/api/groups` 字段/落盘往返/旧键兼容）+ 新增 `test/test_group_context_input.js`（`parseCtxTokens`）+ 新增 `test/test_probe_max_tokens.py`（5 例：四类池自发请求的 `max_tokens ≥ 16` 且桥接后 `max_output_tokens` 达标），**全量 360 测试 0 失败**；ruff 与基线同数、`py_compile` 通过。
+
+生产 hash 后端 `ccd8d23687dfbb8aedf0a302d237b3b2` → `ed0ad611d12fc73b25972512e369befc` / 前端 `5e139ec4c31f511dc7e014eecbd3fccc` → `a2aa7d82dc72be2da5585a98561d7dfb`，备份 `/opt/data/backups/api-pool2-ctx-tokens-20260913-091804/`（cp 回 + `systemctl restart api-pool2` 即回滚），重启 2026-09-13 09:18。部署后验收：服务 active、44 端点加载、启动日志无异常；**`/v1/models` 输出与部署前逐项一致**（`api-pool`/`pool-bg`/`pool-cron`/`gpt-6-astra`/`gpt-5.6-sol`/`deepseek-flash` = 1000000、`api-pool-vision` = 256000，旧 `context_k` 兼容换算生效）；`GET /api/groups` 已返回 `context_tokens`。
+
+遗留（用户 2026-09-13 确认）：`api_config.json` 的 `pool_group_defs` 仍为旧 `context_k` 键（main=1000、vision=256），**不迁移**（读入自动换算，功能无影响；下次编辑任意分组时 `_sync_to_config` 自然写成 `context_tokens`）；Hermes `config.yaml` 的 `model.context_length` 首级 override 未删（删了 Hermes 才吃池值）；探活恢复状态由用户自行验收。独立事项（不在本链）：`AgentRouter`/`AgentRouterP-gpt` 探活报 HTTP 402 额度耗尽、`Kcne-gpt0.2x` 读超时。

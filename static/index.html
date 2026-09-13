@@ -985,8 +985,8 @@ function openGroupModal(editName){
   const nameDisabled=builtin?'disabled':'';
   const typeDisabled=builtin?'disabled':'';
   const modelLabel=g.type==='dedicated'?'绑定模型（真实模型名，兼作选择器）':'选择器（Hermes 侧配置的 model 名）';
-  const ctxHint=g.context_k
-    ?`对外声明 ${g.context_k}K（${(g.context_k*1000).toLocaleString()} tokens）`
+  const ctxHint=g.context_tokens
+    ?`对外声明 ${g.context_tokens.toLocaleString()} tokens`
     :'未声明：本组不对外声明窗口（Hermes 侧回落到其自身配置）';
   const overlay=document.createElement('div');
   overlay.className='modal-overlay show';
@@ -1001,13 +1001,15 @@ function openGroupModal(editName){
           <option value="dedicated" ${g.type==='dedicated'?'selected':''}>专用型（dedicated）</option>
         </select></div>
       <div class="form-group"><label id="gModelLabel">${modelLabel}</label><input type="text" id="gModel" value="${esc(g.model||'')}" placeholder="${g.type==='dedicated'?'如 deepseek-v4-flash':'缺省=组名'}"></div>
-      <div class="form-group"><label title="本组对外声明的上下文窗口（K=1000 tokens）。Hermes 经 GET /v1/models 的 context_length 读取；留空或 0 = 不声明，由 Hermes 侧自行决定">上下文长度 (K)</label>
-        <input type="number" id="gContext" min="0" max="10000" list="gContextPresets" value="${g.context_k||''}" placeholder="留空/0 = 不声明">
+      <div class="form-group"><label title="本组对外声明的上下文窗口（tokens，可写 1048576 / 1M / 512K）。Hermes 经 GET /v1/models 的 context_length 读取；留空或 0 = 不声明，由 Hermes 侧自行决定">上下文长度 (tokens)</label>
+        <input type="text" id="gContext" list="gContextPresets" value="${g.context_tokens||''}" placeholder="留空/0 = 不声明，如 1048576 / 1M / 512K">
         <datalist id="gContextPresets">
-          <option value="256" label="256K"></option>
-          <option value="400" label="400K"></option>
-          <option value="512" label="512K"></option>
-          <option value="1000" label="1000K (1M)"></option>
+          <option value="200000" label="200K"></option>
+          <option value="256000" label="256K"></option>
+          <option value="400000" label="400K"></option>
+          <option value="512000" label="512K"></option>
+          <option value="1000000" label="1M (1,000,000)"></option>
+          <option value="1048576" label="1M (1,048,576)"></option>
         </datalist>
         <div style="font-size:11px;color:var(--text-dim)">${ctxHint}</div>
       </div>
@@ -1025,21 +1027,29 @@ function closeGroupModal(){
   const o=document.getElementById('groupEditOverlay');
   if(o)o.remove();
 }
+// 上下文长度输入解析（2026-09-13）：纯数字=tokens；K/M 后缀（1000K、1M、1.5M）换算为 tokens；空/0=不声明
+function parseCtxTokens(raw){
+  const s=String(raw??'').trim().toUpperCase().replace(/[\s,_]/g,'');
+  if(!s)return 0;
+  const m=s.match(/^(\d+(?:\.\d+)?)([KM])?$/);
+  if(!m)return NaN;
+  return Math.round(parseFloat(m[1])*(m[2]==='M'?1000000:(m[2]==='K'?1000:1)));
+}
 async function savePoolGroup(editName){
   const name=document.getElementById('gName').value.trim();
   const type=document.getElementById('gType').value;
   const model=document.getElementById('gModel').value.trim();
-  const context_k=parseInt(document.getElementById('gContext').value,10)||0;
+  const context_tokens=parseCtxTokens(document.getElementById('gContext').value);
   if(!name){toast('填写分组名称','error');return;}
-  if(context_k>0&&(context_k<2||context_k>10000)){toast('上下文长度需为 0（不声明）或 2K–10000K','error');return;}
+  if(Number.isNaN(context_tokens)||(context_tokens>0&&(context_tokens<2000||context_tokens>10000000))){toast('上下文长度需为 0（不声明）或 2000–10,000,000 tokens（支持 K/M 后缀，如 1048576、1M）','error');return;}
   const btn=document.getElementById('gSaveBtn');
   if(btn){btn.disabled=true;btn.textContent='保存中...';}
   try{
     let r;
     if(editName){
-      r=await api('PUT',`/api/groups/${encodeURIComponent(editName)}`,{name,type,model,context_k});
+      r=await api('PUT',`/api/groups/${encodeURIComponent(editName)}`,{name,type,model,context_tokens});
     }else{
-      r=await api('POST','/api/groups',{name,type,model,context_k});
+      r=await api('POST','/api/groups',{name,type,model,context_tokens});
     }
     if(r.ok){toast(editName?'✅ 分组已更新':'✅ 分组已创建','success');closeGroupModal();refresh();}
     else{toast(r.error||'操作失败','error');if(btn){btn.disabled=false;btn.textContent=editName?'保存':'创建';}}
