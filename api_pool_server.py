@@ -75,6 +75,19 @@ _client_ctx = threading.local()
 # ponytail: 单份全局，多客户端混用时代表最近一个客户端；需要区分时改 per-endpoint 基线。
 _client_baseline: dict = {}
 _client_baseline_lock = threading.Lock()
+# ── Hermes 真实身份采样（2026-09-13）──
+# 代理路径上 UA 为 `hermes-agent/<ver>` 的入站请求会被采样，供「手动同步 profile 身份」使用：
+# 上游只认 Hermes 客户端指纹，而 profile 是静态快照，Hermes 升级后版本号会过期 ——
+# 采样让配置能一键对齐最近一次真实流量。**仅内存、不落盘**（重启后等下一次真实流量即可）。
+# ponytail: 只留最近一份；需要历史/多客户端区分时改环形缓冲或按 profile 分桶。
+_hermes_identity_sample: dict = {}
+_hermes_identity_lock = threading.Lock()
+_HERMES_UA_RE = re.compile(r"^hermes-agent/([^\s/]+)$", re.IGNORECASE)
+# 手动同步（策略 b）只动这些身份字段，profile 其余头保持原值 —— 全量覆盖会把偶发头写进 profile。
+_PROFILE_SYNC_IDENTITY_KEYS = (
+    "User-Agent", "Accept-Encoding", "X-Stainless-Lang", "X-Stainless-Package-Version",
+    "X-Stainless-OS", "X-Stainless-Arch", "X-Stainless-Runtime", "X-Stainless-Runtime-Version",
+)
 
 # ── 客户端伪装 Client Profile ──
 # 让选中端点的出站请求在头层面与真实客户端一致：profile.headers 为唯一来源。
@@ -94,13 +107,91 @@ _PASSTHROUGH_SKIP_HEADERS = _PROFILE_RESERVED_HEADERS | frozenset({
 _SUPPORTED_ACCEPT_ENCODINGS = frozenset({"gzip", "deflate", "identity"})
 
 
-def set_client_headers(headers):
+def set_client_headers(headers, source=""):
     """代理路径写入真实入站头，并更新进程级基线供探活/测试/拉模型复用。"""
     hdrs = {k: v for k, v in dict(headers or {}).items() if isinstance(k, str) and isinstance(v, str)}
     _client_ctx.headers = hdrs
     with _client_baseline_lock:
         _client_baseline.clear()
         _client_baseline.update(hdrs)
+    _sample_hermes_identity(hdrs, source=source)
+
+
+def _sample_hermes_identity(headers, source=""):
+    """UA 为 `hermes-agent/<ver>` 时记一份身份样本（内存，仅留最近一次），供 profile 手动同步。"""
+    ua = ""
+    for k, v in (headers or {}).items():
+        if k.strip().lower() == "user-agent":
+            ua = str(v or "").strip()
+            break
+    m = _HERMES_UA_RE.match(ua)
+    if not m:
+        return
+    clean, _dropped = _sanitize_profile_headers(dict(headers or {}))
+    clean = _filter_accept_encoding(clean)
+    with _hermes_identity_lock:
+        _hermes_identity_sample.clear()
+        _hermes_identity_sample.update({
+            "headers": clean,
+            "version": m.group(1),
+            "user_agent": ua,
+            "ts": time.time(),
+            "source": str(source or ""),
+        })
+
+
+def get_hermes_identity_sample():
+    """最近一次 Hermes 真实身份采样（只读快照）；无采样 → {"available": False}。"""
+    with _hermes_identity_lock:
+        sample = {k: (dict(v) if isinstance(v, dict) else v) for k, v in _hermes_identity_sample.items()}
+    if not sample:
+        return {"available": False}
+    sample["available"] = True
+    return sample
+
+
+def _hermes_sample_meta():
+    """采样元信息（不含头值），供前端展示「最近 Hermes 流量」。"""
+    sample = get_hermes_identity_sample()
+    if not sample.get("available"):
+        return {"available": False}
+    return {
+        "available": True,
+        "version": sample.get("version"),
+        "ts": sample.get("ts"),
+        "source": sample.get("source"),
+    }
+
+
+def _header_value_ci(headers, name):
+    """大小写不敏感取头值；缺失 → None。"""
+    target = name.strip().lower()
+    for k, v in (headers or {}).items():
+        if isinstance(k, str) and k.strip().lower() == target:
+            return v
+    return None
+
+
+def _profile_identity_sync_diff(profile_headers, sample_headers):
+    """策略 b 差异计算：只用采样值更新身份白名单键，profile 其余头保持原值。
+
+    返回 (新 headers, 变更列表)；采样里没有的键保持原值（不删不增），值相同则不计入变更。
+    """
+    new_headers = dict(profile_headers or {})
+    changes = []
+    for key in _PROFILE_SYNC_IDENTITY_KEYS:
+        sample_val = _header_value_ci(sample_headers, key)
+        if sample_val is None:
+            continue
+        existing_key = next(
+            (k for k in new_headers if isinstance(k, str) and k.strip().lower() == key.lower()), key,
+        )
+        old_val = new_headers.get(existing_key)
+        if old_val is not None and str(old_val) == str(sample_val):
+            continue
+        changes.append({"header": existing_key, "old": old_val, "new": sample_val})
+        new_headers[existing_key] = sample_val
+    return new_headers, changes
 
 
 def clear_client_headers():
@@ -2851,6 +2942,31 @@ class APIPool:
             self._client_profiles[name] = {"headers": clean}
         sys_log(f"客户端伪装：profile '{name}' 已保存（{len(clean)} 头）", "INFO")
         return name
+
+    def sync_client_profile_identity(self, name):
+        """用最近一次 Hermes 真实流量采样更新 profile 的身份字段（策略 b）。
+
+        只覆盖 `_PROFILE_SYNC_IDENTITY_KEYS` 且在采样中存在的键；profile 其余头保持原值。
+        返回 (变更列表, 采样元信息)；无采样或 profile 不存在时抛 ValueError。
+        """
+        sample = get_hermes_identity_sample()
+        if not sample.get("available"):
+            raise ValueError("暂无 Hermes 流量采样（需有一条 UA 为 hermes-agent/<ver> 的请求经过池）")
+        name = (name or "").strip()
+        with self._lock:
+            entry = (self._client_profiles or {}).get(name)
+        if entry is None:
+            raise ValueError(f"profile '{name}' 不存在")
+        current = dict((entry or {}).get("headers") or {})
+        new_headers, changes = _profile_identity_sync_diff(current, sample.get("headers") or {})
+        if changes:
+            self.save_client_profile(name, new_headers)
+        sys_log(
+            f"客户端伪装：profile '{name}' 身份同步自最近 Hermes 流量（v{sample.get('version')}，"
+            f"{len(changes)} 项变更）",
+            "INFO",
+        )
+        return changes, sample
 
     def delete_client_profile(self, name):
         """删除 profile；被引用端点在解析时自动降级为透传（WARN）。"""
@@ -7916,7 +8032,18 @@ def api_handler(method, path, body):
             # 池自身出站（探活/测试/拉模型）的默认身份 profile（2026-09-12）
             "probe_client_profile": getattr(pool, "_probe_client_profile", ""),
             "has_client_baseline": bool(_current_client_headers()),
+            # 最近一次 Hermes 真实流量身份采样（仅内存，供 profile 手动同步；2026-09-13）
+            "hermes_sample": _hermes_sample_meta(),
         }, False
+    if method == "POST" and cp == "/api/client-profiles/sync-identity":
+        # 手动同步：用最近一次 Hermes 真实流量的身份字段更新该 profile（策略 b；2026-09-13）
+        try:
+            changes, _sample = pool.sync_client_profile_identity(body.get("name", ""))
+        except ValueError as e:
+            return 400, {"error": str(e)}, False
+        if changes:
+            _sync_to_config()
+        return 200, {"ok": True, "changes": changes}, False
     if method == "POST" and cp == "/api/client-profiles":
         try:
             name = pool.save_client_profile(body.get("name", ""), body.get("headers", {}))
@@ -8299,7 +8426,7 @@ class Handler(BaseHTTPRequestHandler):
         # 探活/测试/拉模型复用。流式生成器在本方法内同线程消费，故清理放在 finally。
         proxy_request = self._is_proxy_path()
         if proxy_request:
-            set_client_headers(self.headers)
+            set_client_headers(self.headers, source=self.path)
         try:
             res = api_handler("POST", self.path, body)
 

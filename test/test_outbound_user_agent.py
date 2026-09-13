@@ -235,9 +235,13 @@ class OutboundClientHeadersTests(unittest.TestCase):
             self.assertFalse(is_proxy(path), f"{path} must not be a proxy path")
 
     def test_proxy_handler_captures_full_header_map(self):
-        """do_POST 代理分支必须把整个入站头映射交给 set_client_headers（而非只取 UA）。"""
+        """do_POST 代理分支必须把整个入站头映射交给 set_client_headers（而非只取 UA）。
+
+        `source=` 是 2026-09-13 加的身份采样来源标记（Hermes 流量采样 → profile 手动同步），
+        不影响"整份头映射"这一契约。
+        """
         source = open(MODULE_PATH, encoding="utf-8").read()
-        self.assertIn("set_client_headers(self.headers)", source)
+        self.assertIn("set_client_headers(self.headers, source=self.path)", source)
         self.assertIn("clear_client_headers()", source)
 
     # ── fetch_models 复用同一来源 ──

@@ -1458,6 +1458,7 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 let clientProfiles=[];
 let probeClientProfile='';      // 池自身出站身份（探活/测试/拉模型；2026-09-12）
 let hasClientBaseline=false;    // 当前是否有真实客户端指纹基线
+let hermesSample={available:false};    // 最近一次 Hermes 真实流量身份采样（内存，供 profile 手动同步；2026-09-13）
 // profile 版本标识：从 User-Agent 提取 `<name>/<version>`，如 hermes-agent/0.21.0 → "Hermes 0.21.0"
 function profileVersion(headers){
   const h=headers||{};
@@ -1486,6 +1487,7 @@ async function loadClientProfiles(){
   clientProfiles=r.profiles;
   probeClientProfile=r.probe_client_profile||'';
   hasClientBaseline=!!r.has_client_baseline;
+  hermesSample=r.hermes_sample||{available:false};
   const sel=document.getElementById('fClientProfile');
   if(!sel)return;
   const cur=sel.value;
@@ -1506,6 +1508,9 @@ function closeProfileManager(){
   if(o)o.remove();
 }
 function renderProfileManager(){
+  const syncTitle=hermesSample.available
+    ? `用最近一次 Hermes 流量（v${esc(hermesSample.version)}${hermesSample.source?` · ${esc(hermesSample.source)}`:''}）更新该 profile 的身份字段`
+    : '暂无 Hermes 流量采样：需有一条 UA 为 hermes-agent/<ver> 的请求经过池';
   const rows=clientProfiles.map(p=>{
     const v=profileVersion(p.headers);
     return `<div class="pf-row">
@@ -1513,6 +1518,7 @@ function renderProfileManager(){
       ${v?`<span class="pf-ver">${esc(v)}</span>`:''}
       <span class="pf-meta">${Object.keys(p.headers||{}).length} 头</span>
       <span class="pf-act">
+        <button class="btn btn-ghost btn-sm" onclick="syncProfileIdentity('${esc(p.name)}')" title="${syncTitle}" ${hermesSample.available?'':'disabled'}>🔄</button>
         <button class="btn btn-ghost btn-sm" onclick="editClientProfile('${esc(p.name)}')" title="编辑">✏️</button>
         <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteClientProfile('${esc(p.name)}')" title="删除">🗑</button>
       </span>
@@ -1529,7 +1535,7 @@ function renderProfileManager(){
       </select>
     </div>
     <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">这类请求没有客户端上下文，身份按「端点客户端伪装 → 此处设置 → 最近一次真实客户端指纹」解析；三者都没有时**跳过本次出站**（不编造身份）。${hasClientBaseline?'当前有客户端基线':'⚠ 当前无客户端基线（重启后还没有真实请求）'}</div>
-    <div class="pf-sec">已有 profile</div>
+    <div class="pf-sec">已有 profile（🔄 = 用最近 Hermes 流量的身份字段更新该 profile）</div>
     <div style="display:flex;flex-direction:column;gap:6px;max-height:240px;overflow:auto">${rows||'<div class="pf-empty">暂无 profile</div>'}</div>
     <div class="form-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
       <button class="btn btn-ghost" onclick="closeProfileManager()">关闭</button>
@@ -1541,6 +1547,16 @@ async function setProbeClientProfile(v){
   const r=await api('POST','/api/probe-client-profile',{name:v});
   if(r&&r.ok){probeClientProfile=v;toast('池自身出站身份已更新','success');}
   else toast((r&&r.error)||'设置失败','error');
+  renderProfileManager();
+}
+async function syncProfileIdentity(name){
+  // 手动同步（策略 b）：只用最近一次 Hermes 真实流量的身份字段更新该 profile，其余头保持原值
+  const r=await api('POST','/api/client-profiles/sync-identity',{name});
+  if(!r||r.error){toast((r&&r.error)||'同步失败','error');return;}
+  const ch=r.changes||[];
+  if(!ch.length){toast(`${name} 身份已是最近 Hermes 流量值（无变更）`,'success');return;}
+  toast(`${name} 已更新 ${ch.length} 项：${ch.map(c=>c.header).join('、')}`,'success');
+  await loadClientProfiles();
   renderProfileManager();
 }
 function editClientProfile(name){

@@ -481,3 +481,52 @@ vision 池定位修正：由「`role: vision` 标记的普通组」改为与 mai
 - **体积假设已证伪**：直连重放（同端点、同 URL、同 `hermes` 身份、不经池）152 B 与 **1,258,974 B** 都得应用层 JSON 402 → 1.2 MiB 体穿过边缘，405 ≠ 大 body 必拦。
 - **变量分离**：`AgentRouter*-ds4f`（`/chat/completions`）与 `AgentRouter*-gpt6a`（`/responses`）**共享同一 key 与 `site_id`**，前者持续正常 → 排除出口 IP/账号/身份/站点/时间，只剩「路径 + 模型」两维（单维均不成立，因探活同路径同模型却通过）→ 指向**站点 WAF 的时段性阻断态**。
 - **待办**：额度恢复后跑四维直连矩阵（路径 × 模型，脚本在宿主机 `/tmp/replay_upstream_405.py`）定位变量；gpt6 三端点需上游充值/提额后手动解冻。机制与判读已登记 `api-pool-management/references/endpoint-error-classification.md`（405 章节）。
+
+## 2026-09-13 校验客户端端点改用 client_profile 伪装（漏马甲改在池侧解决） 已部署生产
+
+背景：ps.air 系端点对入站身份做客户端校验，出站 UA 一旦不是 Hermes 身份即回 `401 unauthorized client detected`
+（14 天池日志 31 条 401 全部为该报文：`AgentRouterZ-ds4f` 10 / `AgentRouter-ds4f` 9 / `AgentRouter-glm` 8 / gpt6a 三个各 1 / `AgentRouter` 1）。
+此前修在 Hermes 客户端侧（provider profile 默认头 + aux 两臂），属对症状打补丁。**定稿（用户 2026-09-13）**：
+身份问题留在池侧解决 —— 校验客户端的端点用 profile 伪装、不校验的端点继续透传；Hermes 不再做身份补丁。
+
+改动（纯配置，池进程内即时生效，**无需重启**）：
+- ps.air 系 **13 个** `AgentRouter*` 端点 `client_profile: "" → "hermes"`：`AgentRouter-ds4f`/`AgentRouterZ-ds4f`/`AgentRouter-glm`/
+  `AgentRouter`/`AgentRouterP`/`AgentRouterZ`/`AgentRouter-gpt6a`/`AgentRouterZ-gpt6a`/`AgentRouterP-gpt6a`/`AgentRouterP-gpt`/
+  `AgentRouter-opus`/`AgentRouterP-opus4.8`/`AgentRouter-claude`。
+- 其余 31 个端点保持透传（`client_profile=''`）——透传保留真实客户端特征，只有校验型站点需要伪装。
+- 走 `PUT /api/endpoints/<id> {"client_profile":"hermes"}`（13/13 成功，`_sync_to_config` 落盘；改前备份 `api_config.json.bak-20260913-223841-profile-preset`）。
+
+验证（隔离实例 A/B，零接触生产池；环境 `/opt/data/work/api-pool2/workspace/verify-transparent-identity/`）：
+同源生产代码（sha256 `8604646a…`）+ 本地 mock 上游，客户端固定发 `User-Agent: OpenAI/Python 2.24.0` ——
+profile=hermes → 上游收到 `hermes-agent/0.21.0` + 黄金样本全套头、HTTP 200；profile='' → 上游收到 `OpenAI/Python 2.24.0`（漏马甲复现）。
+判据：**出站身份只由端点这一条配置决定，与客户端怎么发无关**。
+
+配套（Hermes 侧回滚）：客户端身份补丁不再登记、不再进入镜像 —— `fork.patch` 剥离 `plugins/model-providers/custom/__init__.py` 块
+（36,418B → 34,138B，文件块 13 → 12；pristine v2026.9.11 树 `git apply --check` 通过），`patchbuild/Dockerfile` 的 `py_compile`
+列表与指纹表同步移除；容器层已生效热修保留现状（下次镜像重建自然回上游行为）。撤回记录见 hermes-runtime-fix
+`pending/archived/custom-provider-client-identity.patch.README.md.retracted-20260913-224544`。
+
+遗留（方案已定，待发话再开发）：`client_profiles.hermes` 的 UA 写死 `hermes-agent/0.21.0`，会随 Hermes 升级过期。做**手动同步**：
+代理路径入站头 UA 匹配 `hermes-agent/<ver>` 时采样（**仅内存、不落盘**），profile 弹层给「从最近 Hermes 流量同步」+ diff 预览，
+更新策略 **b**（只更新身份字段：UA 版本号 + `X-Stainless-Package-Version/OS/Arch/Runtime/Runtime-Version`，其余保留），
+沿用 `_PROFILE_RESERVED_HEADERS` 过滤。
+
+
+## 2026-09-13 客户端伪装 profile 身份手动同步（Hermes 流量采样） 已部署生产
+
+需求（用户）：profile 是静态快照，`hermes-agent/<ver>` 会随 Hermes 升级过期；上游只认 Hermes 指纹，手工改版本号易漏 → 做**手动同步**，让 profile 一键对齐最近一次真实 Hermes 流量。
+
+定稿（用户）：**策略 b**（只更新身份字段，其余 profile 头保持原值）+ 采样**仅内存不落盘** + UI 只加一个按钮。
+
+改动（`api_pool_server.py` / `static/index.html` / 测试）：
+- 采样：`set_client_headers(headers, source="")` 内新增 `_sample_hermes_identity()` —— 入站 UA 匹配 `^hermes-agent/([^\s/]+)$` 才记样本；样本经 `_sanitize_profile_headers()`（保留头过滤）+ `_filter_accept_encoding()`（gzip/deflate/identity 收敛）；**只留最近一份**（`_hermes_identity_sample` + 锁），重启即空，等下一次真实流量。
+- 差异计算（策略 b）：`_profile_identity_sync_diff()` 只覆盖 `_PROFILE_SYNC_IDENTITY_KEYS`（User-Agent / Accept-Encoding / X-Stainless-Lang / -Package-Version / -OS / -Arch / -Runtime / -Runtime-Version）且在采样中存在的键；采样没有的键保留原值（不增不删），值相同不计变更。
+- API：`GET /api/client-profiles` 增加 `hermes_sample`（available/version/ts/source，不含头值）；新增 `POST /api/client-profiles/sync-identity {name}` → 200 `{ok, changes[]}`，无采样或 profile 不存在 → 400（错误原文透传给前端）。
+- UI：profile 管理弹层「已有 profile」每行加 🔄（有采样可点、无采样禁用，tooltip 显示采样版本与来源）；点击 → 同步 → toast 报「更新 N 项 + 被改头名」/「已是最近值」/ 后端错误原文。
+- 契约微调：代理路径调用改为 `set_client_headers(self.headers, source=self.path)`；`test/test_outbound_user_agent.py` 的源码断言同步更新（断言意图不变：整份头映射）。
+
+验证：新增 `test/test_client_profile_sync.py` **9 例**（采样仅认 hermes UA / 只留最近一份 / 保留头与 AE 过滤 / 策略 b 只改身份字段且不新增键 / 幂等 / 无采样 400 / 未知 profile 400 / 落盘 / GET 暴露采样元信息）全过；新增 `test/test_profile_sync_ui.js` **10 项渲染断言**（无采样禁用 + 有采样可点 + tooltip + 绑定 + 端点正确 + 三种 toast 分支）全过；既有 JS 断言（`render_error_smoke.js` / `test_chain_group_ui.js`）回归通过；`py_compile` OK、inline JS `new Function()` 语法检查 OK、`ruff` **125 条与基线同数**；全量 **373 tests** 仅 2 例 `test_hermes_stream_error_e2e` 错误（`HermesAgentStub` 缺 `_capture_nous_model_switch`，在 pristine HEAD 副本上同样复现 → 与本改动无关）。
+
+隔离端到端（`workspace/verify-transparent-identity/`，零接触生产池）：客户端发 `UA: hermes-agent/0.21.2` + `X-Stainless-Package-Version: 9.9.9`（profile 原为 0.21.0 / 2.24.0）→ 采样 version=0.21.2 → `POST sync-identity` 返回 2 项变更 → profile 落盘为 0.21.2 / 9.9.9 且**键数仍 12**（其余头未被增删）。
+
+生产部署：hash `api_pool_server.py` `ed0ad611…`→`94fcab57…`、`static/index.html` 同步更新；备份 `api_pool_server.py.bak-20260913-2303xx-profile-sync` / `static/index.html.bak-…`（cp 回 + `systemctl restart api-pool2` 即回滚）；重启 2026-09-13 23:04。验收：服务 `active`、44 端点、13 个 ps.air 端点仍带 `hermes` profile、`GET /api/client-profiles` 200 且含 `hermes_sample`；真实流量采样 `available=true, version=0.21.0, source=/v1/chat/completions`；此刻 `POST sync-identity` 幂等返回 `changes: []`（采样值=profile 值，均为 0.21.0）；未知 profile → 400。
