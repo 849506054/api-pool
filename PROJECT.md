@@ -457,3 +457,27 @@ vision 池定位修正：由「`role: vision` 标记的普通组」改为与 mai
 生产 hash 后端 `ccd8d23687dfbb8aedf0a302d237b3b2` → `ed0ad611d12fc73b25972512e369befc` / 前端 `5e139ec4c31f511dc7e014eecbd3fccc` → `a2aa7d82dc72be2da5585a98561d7dfb`，备份 `/opt/data/backups/api-pool2-ctx-tokens-20260913-091804/`（cp 回 + `systemctl restart api-pool2` 即回滚），重启 2026-09-13 09:18。部署后验收：服务 active、44 端点加载、启动日志无异常；**`/v1/models` 输出与部署前逐项一致**（`api-pool`/`pool-bg`/`pool-cron`/`gpt-6-astra`/`gpt-5.6-sol`/`deepseek-flash` = 1000000、`api-pool-vision` = 256000，旧 `context_k` 兼容换算生效）；`GET /api/groups` 已返回 `context_tokens`。
 
 遗留（用户 2026-09-13 确认）：`api_config.json` 的 `pool_group_defs` 仍为旧 `context_k` 键（main=1000、vision=256），**不迁移**（读入自动换算，功能无影响；下次编辑任意分组时 `_sync_to_config` 自然写成 `context_tokens`）；Hermes `config.yaml` 的 `model.context_length` 首级 override 未删（删了 Hermes 才吃池值）；探活恢复状态由用户自行验收。独立事项（不在本链）：`AgentRouter`/`AgentRouterP-gpt` 探活报 HTTP 402 额度耗尽、`Kcne-gpt0.2x` 读超时。
+
+## 2026-09-13 失败尝试「出站摘要」日志（405 边缘拦截可观测性） 已部署生产
+
+需求（用户）：「先加日志」——`ps.air-outer.com` 三个 `gpt-6-astra` 端点（`protocol=responses`）的真实请求被阿里云边缘拦成 **405 + 拦截页**，而同秒的探活/手动测试（小 ping）通过，池日志里没有任何出站形态证据，无法判定边缘层到底按什么区分两者。
+
+改动（单文件，同一批上线）：
+- 新增 `APIPool._outbound_digest(url, data)`（`@staticmethod`）+ `_OUTBOUND_DIGEST_KEYS` 白名单（`input`/`instructions`/`messages`/`system`/`contents`/`tools`/`stream`/`store`/`previous_response_id`/`max_tokens`/`max_output_tokens`/`reasoning`/`reasoning_effort`/`temperature`/`response_format`）。
+- `_try_endpoint` 的三个失败 except 分支（`HTTPError` / 连接超时 / 未知异常）各打一行 `WARN`：`出站摘要(失败[(探活)]): url=… body_bytes=… <字段>=<项数>/<字节数|字符数>`。**只报体积与项数，不含任何明文内容**；只在失败 attempt 上执行（正常路径零开销），**不依赖 DEBUG 开关**（DEBUG 的 trace 只有 `{endpoint,result,kind}`，拿不到 URL/body）。
+- 探活行带 `(探活)` 标记，方便与真实请求行直接对比体积差。
+
+验证：新增 `test/test_outbound_digest.py`（4 例：字段规模与字节数、摘要不含明文、非法输入不抛异常、失败必打日志且成功路径不打）；**全量 364 测试 0 失败**；`ruff` 125 与基线同数（差值仅为对比副本缺可执行位的 EXE002 假阳性）；`py_compile` 通过；本地 E2E（`/tmp/ap-e2e`、端口 5299、本地 mock 405 上游）实证两种行都打出来：真实请求 `url=http://127.0.0.1:5999/v1/responses body_bytes=142 input=1项/82B …`、探活 `出站摘要(失败(探活))`。
+
+生产 hash `ed0ad611d12fc73b25972512e369befc` → `662bda43deff62eca9bc750139da520b`，备份 `/opt/data/backups/api-pool2-outbound-digest-20260913-103935/api_pool_server.py.before`（cp 回 + `systemctl restart api-pool2` 即回滚），重启 2026-09-13 10:41。部署后验收：服务 `active`、`/api/endpoints` 正常返回、44 端点加载、重启后请求持续成功（`[main]AgentRouter-ds4f` / `[pool-ds]AgentRouterZ-ds4f`）。
+
+验收：重启后首个真实失败样本已出现（2026-09-13 10:43:00，req=f01466b1）——摘要行如期打出：`body_bytes=1087612 input=885项/909862B instructions=37977字符 tools=53项/80270B stream=True`，同秒探活行 `body_bytes=152`；该次失败码是 **HTTP 402 budget pool 额度耗尽**（三个 gpt6a 端点逐各自冻结 18000 秒 = 5 小时），非 405。
+
+## 2026-09-13 ps.air `gpt-6-astra` 405 边缘拦截：证据链与待复现矩阵
+
+活跃事项（等上游额度恢复后复现）：
+- **定性**：405 响应体是阿里云**安全防护拦截页**（页面文案 `Your request has been blocked as it may cause potential threats to the server's security` + `renderData.traceid`；字段由 JS 填充，池只存响应体前 1000 字符故日志里为空）。
+- **探活假健康**：同秒对照，探活（152 B、stream=false、无 tools）通过而真实请求（1,037,612 B）被拦 → 池探活无法鉴别边缘拦截（已知局限）。
+- **体积假设已证伪**：直连重放（同端点、同 URL、同 `hermes` 身份、不经池）152 B 与 **1,258,974 B** 都得应用层 JSON 402 → 1.2 MiB 体穿过边缘，405 ≠ 大 body 必拦。
+- **变量分离**：`AgentRouter*-ds4f`（`/chat/completions`）与 `AgentRouter*-gpt6a`（`/responses`）**共享同一 key 与 `site_id`**，前者持续正常 → 排除出口 IP/账号/身份/站点/时间，只剩「路径 + 模型」两维（单维均不成立，因探活同路径同模型却通过）→ 指向**站点 WAF 的时段性阻断态**。
+- **待办**：额度恢复后跑四维直连矩阵（路径 × 模型，脚本在宿主机 `/tmp/replay_upstream_405.py`）定位变量；gpt6 三端点需上游充值/提额后手动解冻。机制与判读已登记 `api-pool-management/references/endpoint-error-classification.md`（405 章节）。

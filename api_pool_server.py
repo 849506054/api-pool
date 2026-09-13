@@ -5760,6 +5760,43 @@ class APIPool:
             "underscore_paths": self._cf_probe_paths(payload, und),
         }
 
+    # 失败尝试的出站摘要：URL + body 体积 + 字段规模，**绝不含明文内容**。
+    # 背景（2026-09-13）：ps.air `/responses` 真实请求被阿里云边缘 405 拦截，而探活小 ping 通过；
+    # 池日志此前没有任何出站形态证据，无法证明「探活 vs 真实请求」在 body 上的差异。
+    # 只在失败 attempt 上执行（正常路径零开销）；DEBUG 开关不覆盖此项——它的 trace 只有
+    # {endpoint, result, kind}，开 DEBUG 也拿不到 URL/body 规模。
+    _OUTBOUND_DIGEST_KEYS = (
+        "input", "instructions", "messages", "system", "contents", "systemInstruction",
+        "tools", "stream", "store", "previous_response_id", "max_tokens", "max_output_tokens",
+        "reasoning", "reasoning_effort", "temperature", "response_format",
+    )
+
+    @staticmethod
+    def _outbound_digest(url, data):
+        """出站请求摘要（体积/字段规模，无明文）。不抛异常：失败时也必须打得出这行日志。"""
+        parts = [f"url={url}", f"body_bytes={len(data)}"]
+        try:
+            obj = json.loads(data.decode("utf-8", errors="ignore"))
+        except (UnicodeDecodeError, ValueError):
+            return " ".join(parts)
+        if not isinstance(obj, dict):
+            return " ".join(parts)
+        for key in APIPool._OUTBOUND_DIGEST_KEYS:
+            value = obj.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (list, dict)):
+                try:
+                    size = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+                except (TypeError, ValueError, RecursionError):
+                    size = -1
+                parts.append(f"{key}={len(value)}项/{size}B")
+            elif isinstance(value, str):
+                parts.append(f"{key}={len(value)}字符")
+            else:
+                parts.append(f"{key}={value}")
+        return " ".join(parts)
+
     def _try_endpoint(
         self, ep, payload, timeout, log_usage=True, force_no_retry=False,
         is_probe=False, stream_stall_retry_used=False, debug_trace=None,
@@ -6776,6 +6813,11 @@ class APIPool:
                     
                     
             except urllib.error.HTTPError as e:
+                sys_log(
+                    f"{request_tag}端点 '{endpoint_log_label}' 出站摘要(失败{'(探活)' if is_probe else ''}): "
+                    f"{self._outbound_digest(url, data)}",
+                    "WARN",
+                )
                 err_body = ""
                 try: err_body = _DecodedResponse(e).read().decode("utf-8", errors="ignore")[:1000]
                 except Exception: pass
@@ -6815,6 +6857,11 @@ class APIPool:
                     return None, msg
                 return None, msg
             except (urllib.error.URLError, TimeoutError, OSError) as e:
+                sys_log(
+                    f"{request_tag}端点 '{endpoint_log_label}' 出站摘要(失败{'(探活)' if is_probe else ''}): "
+                    f"{self._outbound_digest(url, data)}",
+                    "WARN",
+                )
                 msg = f"连接/超时错误: {e}"
                 if attempt < retries:
                     if debug_trace is not None:
@@ -6834,6 +6881,11 @@ class APIPool:
                     continue
                 return None, msg
             except Exception as e:
+                sys_log(
+                    f"{request_tag}端点 '{endpoint_log_label}' 出站摘要(失败{'(探活)' if is_probe else ''}): "
+                    f"{self._outbound_digest(url, data)}",
+                    "WARN",
+                )
                 return None, f"未知错误: {e}"
         return None, "重试次数用尽"
 
