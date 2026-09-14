@@ -914,7 +914,7 @@ class TokenTracker:
 token_tracker = TokenTracker()
 
 class ChatLogger:
-    RETENTION_DAYS = 30  # 对话日志滚动保留天数（2026-08-15 新增：超过该天数的记录定时删除）
+    RETENTION_DAYS = 7  # 对话日志滚动保留天数（2026-08-15 新增；2026-09-14 由 30 调为 7，降低 chat_logs.db 体积）
     BATCH_SIZE = 50  # 批量写攒批上限（条）
 
     def __init__(self, db_path="chat_logs.db"):
