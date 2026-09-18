@@ -28,6 +28,9 @@ api_pool.log
 # Runtime route state
 api_runtime_state.json
 
+# 待办/临时协作目录（升级与补丁构建的中间产物，不入库；当前工作区无此目录）
+pending/
+
 # Local workspace artifacts: snapshots, experiments, records, tools, and repository clones
 workspace/
 responses_store.db
