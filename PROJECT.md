@@ -529,3 +529,58 @@ profile=hermes → 上游收到 `hermes-agent/0.21.0` + 黄金样本全套头、
 生产部署：hash `api_pool_server.py` `ed0ad611…`→`94fcab57…`、`static/index.html` 同步更新；备份 `api_pool_server.py.bak-20260913-2303xx-profile-sync` / `static/index.html.bak-…`（cp 回 + `systemctl restart api-pool2` 即回滚）；重启 2026-09-13 23:04。验收：服务 `active`、44 端点、13 个 ps.air 端点仍带 `hermes` profile、`GET /api/client-profiles` 200 且含 `hermes_sample`；真实流量采样 `available=true, version=0.21.0, source=/v1/chat/completions`；此刻 `POST sync-identity` 幂等返回 `changes: []`（采样值=profile 值，均为 0.21.0）；未知 profile → 400。
 
 **同日 23:35 终态复核**：Hermes 侧改为**用户级 provider 插件**动态身份（`/opt/data/plugins/model-providers/custom/`，UA 随版本自动跟随，config 里的 UA 字面量已删）→ 采样 version 变为 **0.21.2**；受控实测（临时把 profile 置回 0.21.0 再同步）返回**精确 1 项变更** `User-Agent: 0.21.0 → 0.21.2`、12 头未增删、13 端点引用不变、磁盘落盘一致；再点则幂等 `changes: []`。链路闭环：Hermes 动态 UA → 池采样 → 🔄 一键对齐。
+
+## 2026-09-14 对话日志保留期 30→7 天 + 停服 VACUUM 已部署生产
+
+背景：`chat_logs.db` 达 **8.86G**，`/vol1` 可用空间吃紧。`RETENTION_DAYS` 由 30 调为 **7**
+（宿主机 `api_pool_server.py:917`），22:20 部署并 `systemctl restart api-pool2`
+（备份 `.deploy-backups/20260914-2220.retention7.api_pool_server.py`）。
+
+重启后首次清理：删 **21,369 条**、耗时约 3.5 分钟（守护线程，不阻塞启动），WAL 峰值 **5.96GB**
+—— 期间 `/vol1` 可用空间一度由 21G 降到 9.2G（**大删前先确认余量 ≥ WAL 预估增量**），
+commit 后自动 checkpoint、`-wal` 归零。保留窗口实测最早记录 = 09-07 23:01。
+
+**DELETE 不缩文件**：库仍 8.86G、`freelist_count` 6.21GB → 22:29–22:32 **停服 VACUUM**：
+`wal_checkpoint(TRUNCATE)` → `(0,0,0)`；`integrity_check` 前后均 `ok`；VACUUM 耗时 **123.5s**，
+`chat_logs.db` **8.86G → 2.65G**（2,648,621,056 字节）→ 服务复启正常。
+
+流程与实测 → `references/chat-logs-retention-vacuum-2026-08-15.md`、`references/log-retention-cleanup-2026-09-02.md` 顶部注；工作区代码已镜像入库（commit `8d2721d`）。
+
+
+## 2026-09-18 子组空闲借用 main 工作端点（idle 窗口） 已部署生产
+
+需求（用户 2026-09-18）：① 子池组允许使用主池组当前工作端点，前提是端点空闲；② main 组编辑窗口新增空闲时间配置（秒）。
+
+**语义契约（用户最终确认）**：**不是**「子组整组不可用时 fallback 主池」（那是候选枯竭 fallback 的既有出口，与之无关）。
+**正确语义**：正常情况下子组与 main 当前端点是同一端点时，当 main 在该端点空闲满窗口后，**子组可正常使用该端点**（不再避免它），而不是等候选耗尽才兜底。
+窗口按 main 组实体 `idle_seconds` 配置；`0`/未配置 = 关闭 → 行为与现状相同。空闲判定 = 端点全局最后访问时间（`_last_success_ts`/`_last_error_ts` 较新者）距现在 ≥ 窗口；有在途（任意组 inflight）不算空闲。手动指定的 main 端点同样适用；不涉及指向翻转。
+
+实现位点：共享避让判定 `_is_ep_sticky_elsewhere` 子组分支不再剔/避让空闲已满窗口的 main 工作端点（`_idle_borrow_eligible` 语义改为 `_ep_idle_ready`）。
+
+验证：单测 `test/test_group_idle_borrow.py`（8 项）+ 端到端 `pool.chat(model='bg')` 三态对照（无窗口/未满/已满）；前端 `test/test_group_idle_input.js`（仅 main 弹窗渲染、输入校验）。
+
+部署：后端 hash `d414c448febdec39d8d072528aacf402` / 前端 `8d07c5eb…`，`api-pool2.service` active，
+启动日志 0 ERROR/0 WARN，`/api/groups` 各组 `context_tokens` 与部署前逐条一致（零回归），
+`/v1/chat/completions` 真实请求成功。备份 `/opt/data/backups/api-pool2-idle-borrow-20260918-174456/`
+（宿主机同批 `.bak-20260918-1745-idle-borrow` 就地回滚）。
+
+**当前所有组 `idle_seconds=0` → 行为与未部署完全一致**。启用：UI 编辑分组(main) → 「空闲时间 (秒)」填 10–86400 保存（留空/0=关闭）。前端热加载，视觉实测用户接管。
+
+契约全文 → `references/idle-borrow-contract-2026-09-18.md`。
+
+
+## 2026-09-19 上游 SSE 裸 `data: null` 帧透传修复 已部署生产
+
+**症状**：cron job 报 `RuntimeError: 'NoneType' object has no attribute 'choices'`，多发在上下文大（~36K tokens / 11 tools）的任务（knowledge-sync 连续 3 次全败）；同上游同时段小任务靠 Hermes 重试侥幸跑完。池侧日志显示请求「请求成功」——**池不报错，下游被毒死**。首次出现 2026-09-18 14:45:41（`errors.log.1` 覆盖至 04:30 为 0 次）。
+
+**根因（两层）**：① openai 兼容上游（ps.air-outer / deepseek-v4-flash）SSE 流里夹带裸帧 `data: null`（在同一条含 reasoning/tool_call 分片的流里）；② openai SDK `_process_response_data` 对 `data: null` 返回 `None` 并原样 yield → Hermes 主循环 `chat_completion_helpers.py:2808` 执行 `if not chunk.choices:` → `AttributeError`。池侧 openai 协议分支原为 `else: yield line` 原样转发每一行，gemini/anthropic 分支都有空帧过滤，**唯独 openai 没有**。
+
+**修复**：openai 分支 `yield line` 前丢弃载荷为 null 的帧（+6 行，与 gemini/anthropic 分支同构）。按 `data:` 后载荷判定，覆盖 `data: null` / `data:null` / `data:  null ` 等空白变体，而非枚举精确拼写。
+
+**验证（三层）**：① mock 黄金样本（含 null 帧）→ 修复前下游收到 None chunk、修复后 6 chunk 完整；② 真实字节流回放（ps.air-outer 抓 4366 帧含 2 个 null 帧）→ 基线复现 `AttributeError`、修复后 2179 chunk 走完；③ 反向回归（4364 帧无 null 流）→ 修复前后字节级一致（chunks/reasoning_len/tool_args_len/finish 全等）。回归测试入库 `test/test_null_sse_frame_filter.py`（2 例：null 帧不透传 + 业务帧不被误伤）。
+
+**部署**：初版 `511875fd`（2026-09-19 00:48）只挡精确拼写；当日 01:09 推加固版 hash `38f436f2`（变体覆盖），备份 `api_pool_server.py.bak-20260919-004818-null-frame` / `.bak-20260919-010902-null-frame-hardened`；`api-pool2.service` active、47 端点、真实请求成功。工作区 commit `171650a`。
+
+**上游处置**：上游 main（=0.21.3）该函数**无任何 None 守卫**（blob 逐字节对比确认）；有 4 个同类 PR（#89575/#80822/#75525/#39978）**全部 open、零 review、未合并**，最早挂 3 个月 → **不指望上游，本地池侧扛**。上游 09-15 的 `71281fb2`（空 `data:` 帧→切非流式重试）只覆盖 `JSONDecodeError` 路径，与裸 `data: null` 是两条独立代码路径。
+
+机制与判读 → `references/incident-pattern-signatures.md`「上游 SSE 夹带裸 `data: null` 帧」节。

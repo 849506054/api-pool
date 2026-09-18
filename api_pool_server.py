@@ -6758,10 +6758,12 @@ class APIPool:
                                     except Exception:
                                         pass
                                 else:
-                                    # 裸 `data: null` 帧：合法 JSON 但反序列化成 None，openai SDK
-                                    # 原样 yield None → 下游 Hermes 读 chunk.choices 崩（AttributeError）。
-                                    # 与 gemini/anthropic 分支同构，此处丢弃后再透传（2026-09-19）。
-                                    if line.strip() == b"data: null":
+                                    # 裸 null 帧：`data:` 后载荷就是 JSON null（含 `data:null`、
+                                    # `data:  null ` 等空白变体）。openai SDK 反序列化成 None 后
+                                    # 原样 yield → 下游 Hermes 读 chunk.choices 崩（AttributeError）。
+                                    # 载荷为 null 即无数据，丢弃恒安全；与 gemini/anthropic 分支同构。
+                                    # （多行 SSE data 字段本分支不支持，逐行转发，故按行判定无歧义。）
+                                    if line.strip().startswith(b"data:") and line.strip()[5:].strip() == b"null":
                                         continue
                                     yield line
                                     if line.strip() and line.startswith(b"data: ") and not line.startswith(b"data: [DONE]"):
