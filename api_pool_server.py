@@ -6758,6 +6758,11 @@ class APIPool:
                                     except Exception:
                                         pass
                                 else:
+                                    # 裸 `data: null` 帧：合法 JSON 但反序列化成 None，openai SDK
+                                    # 原样 yield None → 下游 Hermes 读 chunk.choices 崩（AttributeError）。
+                                    # 与 gemini/anthropic 分支同构，此处丢弃后再透传（2026-09-19）。
+                                    if line.strip() == b"data: null":
+                                        continue
                                     yield line
                                     if line.strip() and line.startswith(b"data: ") and not line.startswith(b"data: [DONE]"):
                                         try:
