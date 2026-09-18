@@ -3161,6 +3161,11 @@ class APIPool:
     # 原先的 3 / 5 / 10 会让 protocol=responses 端点的探活必然 400 并被误标 bad
     # （探活实际只输出 1-2 token，成本无实质变化）。
     PROBE_MAX_TOKENS = 16
+    # 子组「空闲借用」main 当前工作端点的等待窗口（2026-09-18，配在 main 组实体上）：
+    # main 的当前/手动端点完全空闲满 N 秒后，子组候选耗尽时可直接借用它；
+    # 0=关闭（保持既有「子组 fallback 到 main 组」出口）。
+    GROUP_IDLE_MIN_SECONDS = 10
+    GROUP_IDLE_MAX_SECONDS = 86400
 
     @classmethod
     def _endpoint_log_label(cls, ep, group=None, model=None):
@@ -3212,6 +3217,40 @@ class APIPool:
     def _group_context_tokens(self, group):
         """该组显式声明的上下文窗口（tokens）；未声明或存值非法 → None（不对外声明该键）。"""
         return self._valid_group_context_tokens(self._group_defs.get(group, {}).get("context_tokens")) or None
+
+    def _valid_group_idle_seconds(self, value):
+        """组级空闲借用窗口（秒）归一化：0=关闭；非法/越界 → None（调用方拒绝）。"""
+        try:
+            n = int(value or 0)
+        except (TypeError, ValueError):
+            return None
+        if n == 0:
+            return 0
+        if self.GROUP_IDLE_MIN_SECONDS <= n <= self.GROUP_IDLE_MAX_SECONDS:
+            return n
+        return None
+
+    def _group_idle_seconds(self, group):
+        """该组声明的空闲借用窗口（秒）；未声明/存值非法 → 0（不启用空闲借用）。"""
+        return self._valid_group_idle_seconds(self._group_defs.get(group, {}).get("idle_seconds")) or 0
+
+    def _loaded_group_idle_seconds(self, d):
+        """配置读入：idle_seconds 归一化，非法值当未声明（不阻断启动）。"""
+        return self._valid_group_idle_seconds(d.get("idle_seconds")) or 0
+
+    def _set_group_idle_seconds(self, group, seconds):
+        """写入/清除组的空闲借用窗口，返回是否有变更。"""
+        gd = self._group_defs.get(group)
+        if gd is None:
+            return False
+        if seconds:
+            if gd.get("idle_seconds") == seconds:
+                return False
+            gd["idle_seconds"] = seconds
+        elif gd.pop("idle_seconds", None) is None:
+            return False
+        sys_log(f"组 '{group}' 空闲借用窗口设为 {('%s 秒' % seconds) if seconds else '关闭'}", "INFO")
+        return True
 
     def _loaded_group_context_tokens(self, d):
         """配置读入：context_tokens 优先；旧 context_k（K=1000 tokens）自动换算（2026-09-13）。"""
@@ -3270,10 +3309,13 @@ class APIPool:
                 if not name or not self._valid_group_type(gtype):
                     continue
                 if name == self.MAIN_GROUP:
-                    # main 类型/选择器恒内置；组级上下文长度声明随配置恢复
+                    # main 类型/选择器恒内置；组级上下文长度/空闲借用窗口随配置恢复
                     ck = self._loaded_group_context_tokens(d)
                     if ck:
                         self._group_defs[self.MAIN_GROUP]["context_tokens"] = ck
+                    idle = self._loaded_group_idle_seconds(d)
+                    if idle:
+                        self._group_defs[self.MAIN_GROUP]["idle_seconds"] = idle
                     continue
                 if name == self.VISION_GROUP:
                     # 内置图片解析池：类型恒 mixed，选择器沿用配置（缺省 VISION_SELECTOR）
@@ -3281,6 +3323,9 @@ class APIPool:
                     ck = self._loaded_group_context_tokens(d)
                     if ck:
                         entry["context_tokens"] = ck
+                    idle = self._loaded_group_idle_seconds(d)
+                    if idle:
+                        entry["idle_seconds"] = idle
                     self._group_defs[name] = entry
                     continue
                 if str(d.get("role", "") or "").strip():
@@ -3289,6 +3334,9 @@ class APIPool:
                 ck = self._loaded_group_context_tokens(d)
                 if ck:
                     entry["context_tokens"] = ck
+                idle = self._loaded_group_idle_seconds(d)
+                if idle:
+                    entry["idle_seconds"] = idle
                 self._group_defs[name] = entry
         return self._group_defs
 
@@ -3300,7 +3348,7 @@ class APIPool:
                 self._group_defs[grp] = {"type": "mixed", "model": grp}
         return self._group_defs
 
-    def create_group(self, name, gtype="mixed", model="", context_tokens=0):
+    def create_group(self, name, gtype="mixed", model="", context_tokens=0, idle_seconds=0):
         """新建分组。返回 (ok, message)。main / 图片解析池为系统内置组，不可由此创建。"""
         with self._lock:
             name = str(name or "").strip()
@@ -3316,6 +3364,10 @@ class APIPool:
             if ck is None:
                 return False, ("上下文长度非法（0=不声明，或 "
                                f"{self.GROUP_CONTEXT_MIN_TOKENS:,}–{self.GROUP_CONTEXT_MAX_TOKENS:,} tokens）")
+            idle = self._valid_group_idle_seconds(idle_seconds)
+            if idle is None:
+                return False, ("空闲时间非法（0=关闭，或 "
+                               f"{self.GROUP_IDLE_MIN_SECONDS}–{self.GROUP_IDLE_MAX_SECONDS} 秒）")
             model = str(model or "").strip()
             if gtype == "dedicated":
                 if not model:
@@ -3332,7 +3384,9 @@ class APIPool:
             self._group_defs[name] = {"type": gtype, "model": model}
             if ck:
                 self._group_defs[name]["context_tokens"] = ck
-            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%s tokens' % format(ck, ',') if ck else '未声明'}）", "INFO")
+            if idle:
+                self._group_defs[name]["idle_seconds"] = idle
+            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%s tokens' % format(ck, ',') if ck else '未声明'}，空闲借用 {('%s 秒' % idle) if idle else '关闭'}）", "INFO")
             return True, name
 
     def update_group(self, name, updates):
@@ -3356,6 +3410,10 @@ class APIPool:
             if new_ck is None:
                 return False, ("上下文长度非法（0=不声明，或 "
                                f"{self.GROUP_CONTEXT_MIN_TOKENS:,}–{self.GROUP_CONTEXT_MAX_TOKENS:,} tokens）")
+            new_idle = self._valid_group_idle_seconds(updates.get("idle_seconds", old.get("idle_seconds", 0)))
+            if new_idle is None:
+                return False, ("空闲时间非法（0=关闭，或 "
+                               f"{self.GROUP_IDLE_MIN_SECONDS}–{self.GROUP_IDLE_MAX_SECONDS} 秒）")
 
             if not self._valid_group_type(new_type):
                 return False, "分组类型必须为 mixed 或 dedicated"
@@ -3365,18 +3423,20 @@ class APIPool:
                 if new_model and new_model != "api-pool":
                     # main 选择器改名会让存量 Hermes 配置失配，禁止
                     return False, "main 组选择器固定为 api-pool（历史别名）"
-                # 上下文长度不属于锁定项：main 是对外默认窗口，必须可改
-                if self._set_group_context_tokens(name, new_ck):
-                    return True, name
-                return True, "无变更"
+                # 上下文长度/空闲借用窗口不属于锁定项：main 是对外默认窗口，必须可改
+                changed = self._set_group_context_tokens(name, new_ck)
+                if self._set_group_idle_seconds(name, new_idle):
+                    changed = True
+                return True, (name if changed else "无变更")
 
             if name == self.VISION_GROUP:
                 # 系统内置图片解析池：与 main 同级，名称/类型/选择器全锁
                 if new_name != self.VISION_GROUP or new_type != "mixed" or new_model != old.get("model", ""):
                     return False, "图片解析池为系统内置组：名称/类型/选择器均锁定"
-                if self._set_group_context_tokens(name, new_ck):
-                    return True, name
-                return True, "无变更"
+                changed = self._set_group_context_tokens(name, new_ck)
+                if self._set_group_idle_seconds(name, new_idle):
+                    changed = True
+                return True, (name if changed else "无变更")
 
             if new_name != name:
                 if not self._valid_group_name(new_name):
@@ -3421,7 +3481,9 @@ class APIPool:
             self._group_defs[new_name] = {"type": new_type, "model": eff_model}
             if new_ck:
                 self._group_defs[new_name]["context_tokens"] = new_ck
-            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}）", "INFO")
+            if new_idle:
+                self._group_defs[new_name]["idle_seconds"] = new_idle
+            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}，空闲借用 {('%s 秒' % new_idle) if new_idle else '关闭'}）", "INFO")
             return True, new_name
 
     def delete_group(self, name):
@@ -3602,16 +3664,43 @@ class APIPool:
                 self._release_inflight(ep_id, group)
 
     def _is_ep_sticky_elsewhere(self, ep, group):
-        """子组仅避让 main 粘性/手动端点；main 不受子组指针约束。"""
+        """子组避让 main 的当前/手动工作端点；main 不受子组指针约束。
+
+        例外（2026-09-18）：main 在该端点已空闲满窗口时不再避让 —— 端点回到子组的
+        正常候选序列，按本组组内优先级参与选择（不是等候选耗尽才用）。
+        """
         if group == self.MAIN_GROUP or self._group_defs.get(group, {}).get("type") == "dedicated":
             return False
-        return ep.id in {
+        if ep.id not in {
             self._get_current(self.MAIN_GROUP),
             self._get_manual(self.MAIN_GROUP),
-        }
+        }:
+            return False
+        return not self._ep_idle_ready(ep)
+
+    def _is_ep_inflight_anywhere(self, ep):
+        """端点是否有任何组在途（空闲借用要求端点完全空闲）。"""
+        return bool(self._inflight_owner.get(ep.id))
+
+    def _ep_idle_ready(self, ep):
+        """端点是否已空闲满 main 组配置的空闲窗口（2026-09-18 需求 1）。
+
+        窗口配在 main 组实体（`idle_seconds`），0/未声明=关闭 → 恒 False（行为同现状）；
+        空闲时间取端点全局最后一次成功/失败时间（子组借用本身也会顺带刷新该时间，
+        用户已确认此口径），从未工作过的端点（无时间戳）视为一直空闲。
+        """
+        window = self._group_idle_seconds(self.MAIN_GROUP)
+        if not window:
+            return False
+        if self._is_ep_inflight_anywhere(ep):
+            return False
+        return (time.time() - max(ep._last_success_ts, ep._last_error_ts)) >= window
 
     def _group_sticky_candidates(self, group):
-        """组内可用端点：main 无跨组约束；子组避让 main 粘性与在途端点。"""
+        """组内可用端点：main 无跨组约束；子组避让 main 当前/手动工作端点与其在途占用。
+
+        main 工作端点空闲满窗口时不再被剔除（2026-09-18 需求 1，见 _is_ep_sticky_elsewhere）。
+        """
         base = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
                 and group in self._ep_groups(ep)
                 and not ep._manual_unlock_required
@@ -7843,6 +7932,7 @@ def api_handler(method, path, body):
                 "type": gd.get("type", "mixed"),
                 "model": gd.get("model", grp),
                 "context_tokens": pool._group_context_tokens(grp) or 0,
+                "idle_seconds": pool._group_idle_seconds(grp),
                 "is_vision": grp == pool.VISION_GROUP,
                 "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)),
                 "current_endpoint": cur_ep.name if cur_ep else None,
@@ -7853,7 +7943,8 @@ def api_handler(method, path, body):
         name = str(body.get("name", "")).strip()
         gtype = body.get("type", "mixed")
         model = str(body.get("model", "") or "").strip()
-        ok, msg = pool.create_group(name, gtype, model, body.get("context_tokens", 0))
+        ok, msg = pool.create_group(name, gtype, model, body.get("context_tokens", 0),
+                                    body.get("idle_seconds", 0))
         if not ok:
             return 400, {"error": msg}, False
         _sync_to_config()
@@ -8298,6 +8389,8 @@ def _sync_to_config():
             entry = {"name": gname, "type": gd.get("type", "mixed"), "model": gd.get("model", gname)}
             if gd.get("context_tokens"):
                 entry["context_tokens"] = gd["context_tokens"]
+            if gd.get("idle_seconds"):
+                entry["idle_seconds"] = gd["idle_seconds"]
             defs_list.append(entry)
     save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "client_profile": ep.get("client_profile", ""), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
             "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "strict400_retries": ep.get("strict400_retries", 2), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles,
