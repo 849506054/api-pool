@@ -251,6 +251,8 @@ class ContentFilter:
     - 词典：私有 content_filter.json，key=替换词映射；值取空串表示删除。
     - 匹配：正则多分支，单次扫描，长词优先（按词长降序排列）。
     - 替换结果不参与二次匹配（single-pass，A->B 后不再用 B 匹配）。
+    - 零宽插入：rules 里 `type=zero_width` 保留命中文本、只在片段内部插入不可见字符
+      （默认 U+200B，可用 char 覆盖、at 指定插入位置），用于标识符类命中词。
     - 结构保护：messages 中非字符串 content、图像块等字段不触碰。
     - 快速路径：未启用或词典为空时直接返回原对象（不深拷贝）。
 
@@ -275,6 +277,9 @@ class ContentFilter:
         "tools.descriptions",
         "all_strings",
     )
+
+    # 零宽插入的默认不可见字符（U+200B 零宽空格）：实测上游关键词过滤不归一化此字符
+    ZERO_WIDTH_CHAR = "\u200b"
 
     def __init__(self, file_path=CONTENT_FILTER_FILE, logger=None):
         self.file_path = file_path
@@ -357,6 +362,19 @@ class ContentFilter:
                     replacement = rule.get("replacement", "")
                     if not isinstance(pattern, str) or not pattern:
                         continue
+                    if kind == "zero_width":
+                        # 零宽插入（2026-09-20）：不改变可见文本，只在命中片段内部插入不可见字符，
+                        # 用于标识符类命中词（工具名/ID/代码/路径）——替换形态会永久改坏这些词形。
+                        char = rule.get("char", self.ZERO_WIDTH_CHAR)
+                        if not isinstance(char, str) or not char:
+                            raise ValueError("zero_width 规则的 char 必须是非空字符串")
+                        at = rule.get("at")
+                        if at is not None and not isinstance(at, int):
+                            raise ValueError("zero_width 规则的 at 必须是整数")
+                        if not rule.get("regex"):
+                            pattern = re.escape(pattern)
+                        pairs.append((pattern, self._zero_width_replacer(char, at)))
+                        continue
                     if not isinstance(replacement, str):
                         replacement = str(replacement)
                     if kind == "literal":
@@ -396,6 +414,17 @@ class ContentFilter:
     def _reload(self):
         self.load()
 
+    @staticmethod
+    def _zero_width_replacer(char, at):
+        """构造「保留命中文本 + 内部插入不可见字符」的替换函数（零宽插入规则用）。
+
+        at 缺省为命中片段中点；越界或缺省都退回中点。
+        """
+        def _insert(matched):
+            pos = at if isinstance(at, int) and 0 <= at <= len(matched) else len(matched) // 2
+            return matched[:pos] + char + matched[pos:]
+        return _insert
+
     def _match_and_replace(self, text):
         """对单个字符串执行单次扫描替换，替换结果不参与二次匹配。"""
         if not text:
@@ -411,7 +440,9 @@ class ContentFilter:
             matched_count += 1
             for index, group in enumerate(m.groups()):
                 if group is not None:
-                    return replacements[index]
+                    replacement = replacements[index]
+                    # 零宽插入规则存的是函数（保留命中文本），其余规则存替换字符串
+                    return replacement(group) if callable(replacement) else replacement
             return m.group(0)
 
         new_text = pattern.sub(_repl, text)

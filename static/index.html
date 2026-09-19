@@ -1700,7 +1700,8 @@ function cfAddRule(){
   const pattern=document.getElementById('cfPat').value.trim();
   const replacement=document.getElementById('cfRep').value;
   if(!pattern){toast('填写敏感词/正则','error');return;}
-  cfData.rules.push({type,pattern,replacement});
+  // 零宽插入：保留命中词形，只在片段内部插入不可见字符（无需替换值）
+  cfData.rules.push(type==='zero_width'?{type,pattern}:{type,pattern,replacement});
   renderCFRules();
 }
 function renderCFTargets(){
@@ -1712,10 +1713,14 @@ function renderCFTargets(){
 function renderCFRules(){
   const box=document.getElementById('cfRules');if(!box)return;
   box.innerHTML=cfData.rules.map((rl,i)=>{
-    const badge=rl.type==='regex'
+    const badge=rl.type==='zero_width'
+      ?'<span class="badge" style="background:var(--green-dim);color:var(--green)">零宽</span>'
+      :(rl.type==='regex'
       ?'<span class="badge" style="background:var(--blue-dim);color:var(--blue)">正则</span>'
-      :'<span class="badge" style="background:var(--blue-dim);color:var(--blue)">敏感词</span>';
-    const repl=rl.replacement?'→ '+esc(rl.replacement):'→ <span style="color:var(--red)">删除</span>';
+      :'<span class="badge" style="background:var(--blue-dim);color:var(--blue)">敏感词</span>');
+    const repl=rl.type==='zero_width'
+      ?'→ 插入零宽字符（词形不变）'
+      :(rl.replacement?'→ '+esc(rl.replacement):'→ <span style="color:var(--red)">删除</span>');
     return `<div class="cf-rule"><span>${badge}</span><code>${esc(rl.pattern)}</code><span class="cf-repl">${repl}</span><button class="cf-del" onclick="cfDelRule(${i})" title="删除">🗑</button></div>`;
   }).join('')||'<div class="empty" style="font-size:12px">暂无规则</div>';
 }
@@ -1737,7 +1742,7 @@ function renderCFManager(){
     <div style="font-size:12px;font-weight:600;color:var(--text-dim);margin:16px 0 8px">规则</div>
     <div id="cfRules" style="display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto"></div>
     <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;align-items:center">
-      <select id="cfType" style="flex:0 0 auto;width:96px;height:34px;border-radius:10px;background:rgba(0,0,0,0.2);border:1px solid var(--border);padding:0 11px;font-size:13px;color:var(--text)"><option value="literal">敏感词</option><option value="regex">正则</option></select>
+      <select id="cfType" style="flex:0 0 auto;width:96px;height:34px;border-radius:10px;background:rgba(0,0,0,0.2);border:1px solid var(--border);padding:0 11px;font-size:13px;color:var(--text)"><option value="literal">敏感词</option><option value="regex">正则</option><option value="zero_width">零宽插入</option></select>
       <input type="text" id="cfPat" placeholder="敏感词 / 正则" style="flex:1;min-width:150px;height:34px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:10px;padding:0 11px;font-size:13px;color:var(--text);box-sizing:border-box">
       <input type="text" id="cfRep" placeholder="替换为（留空=删除）" style="flex:1;min-width:110px;height:34px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:10px;padding:0 11px;font-size:13px;color:var(--text);box-sizing:border-box">
       <button class="btn btn-primary btn-sm" onclick="cfAddRule()">+ 添加</button>
@@ -1764,7 +1769,7 @@ async function cfRunTest(){
   res.style.display='block';res.textContent='测试中...';
   const r=await api('POST','/api/content-filter/test',{text});
   if(!r||r.error){res.textContent=(r&&r.error)||'测试失败';return;}
-  res.innerHTML=`命中 ${r.matched} 处${r.enabled?'':'（过滤器当前已关闭，仅预览）'}：<br>${esc(r.result)}`;
+  res.innerHTML=`命中 ${r.matched} 处${r.enabled?'':'（过滤器当前已关闭，仅预览）'}：<br>${esc(r.result).replace(/\u200b/g,'⟨ZW⟩').replace(/\u200c/g,'⟨ZWNJ⟩').replace(/\u2060/g,'⟨WJ⟩').replace(/\u00ad/g,'⟨SHY⟩')}`;
 }
 async function cfSave(){
   const payload={content_filter:{

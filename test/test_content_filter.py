@@ -425,6 +425,96 @@ class ContentFilterTests(unittest.TestCase):
         self.assertEqual(stats["matched"], 3)
         self.assertEqual(flt.status()["word_count"], 2)
 
+    def test_zero_width_rule_keeps_visible_text(self):
+        # 零宽插入：可见文本不变，只在命中片段内部插入不可见字符
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        path = os.path.join(td.name, "content_filter.json")
+        config = {
+            "content_filter": {
+                "enabled": True,
+                "targets": ["messages.content"],
+                "rules": [{"type": "zero_width", "pattern": "token_a"}],
+            }
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f)
+        flt = module.ContentFilter(file_path=path)
+        payload = {"messages": [{"role": "user", "content": "do token_a test"}]}
+        cleaned, stats = flt.filter_payload(payload, return_stats=True)
+        text = cleaned["messages"][0]["content"]
+        self.assertEqual(stats["matched"], 1)
+        self.assertEqual(text.count("\u200b"), 1)
+        self.assertEqual(text.replace("\u200b", ""), "do token_a test")
+        # 原 payload 不被修改
+        self.assertEqual(payload["messages"][0]["content"], "do token_a test")
+
+    def test_zero_width_rule_honours_char_and_at(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        path = os.path.join(td.name, "content_filter.json")
+        config = {
+            "content_filter": {
+                "enabled": True,
+                "targets": ["messages.content"],
+                "rules": [
+                    {"type": "zero_width", "pattern": "token_a", "char": "\u200c", "at": 0},
+                    # at 越界 → 退回中点
+                    {"type": "zero_width", "pattern": "foo_bar", "at": 99},
+                ],
+            }
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f)
+        flt = module.ContentFilter(file_path=path)
+        cleaned, stats = flt.filter_payload(
+            {"messages": [{"role": "user", "content": "token_a foo_bar"}]}, return_stats=True
+        )
+        self.assertEqual(cleaned["messages"][0]["content"], "\u200ctoken_a foo\u200b_bar")
+        self.assertEqual(stats["matched"], 2)
+
+    def test_zero_width_rule_rejects_empty_char(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        path = os.path.join(td.name, "content_filter.json")
+        config = {
+            "content_filter": {
+                "enabled": True,
+                "rules": [{"type": "zero_width", "pattern": "token_a", "char": ""}],
+            }
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f)
+        with self.assertRaises(ValueError):
+            module.ContentFilter(file_path=path)
+
+    def test_zero_width_rule_mixes_with_replacement_rules(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        path = os.path.join(td.name, "content_filter.json")
+        config = {
+            "content_filter": {
+                "enabled": True,
+                "targets": ["messages.content"],
+                "rules": [
+                    {"type": "literal", "pattern": "fixed prompt.", "replacement": "rewritten prompt."},
+                    {"type": "zero_width", "pattern": "token_a"},
+                ],
+            }
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f)
+        flt = module.ContentFilter(file_path=path)
+        cleaned, stats = flt.filter_payload(
+            {"messages": [{"role": "user", "content": "token_a fixed prompt."}]}, return_stats=True
+        )
+        self.assertEqual(
+            cleaned["messages"][0]["content"].replace("\u200b", ""),
+            "token_a rewritten prompt.",
+        )
+        self.assertEqual(cleaned["messages"][0]["content"].count("\u200b"), 1)
+        self.assertEqual(stats["matched"], 2)
+
     def test_delete_semantics(self):
         # 替换值为空串 = 删除
         f = self._make_filter({"token_a": ""})
