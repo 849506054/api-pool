@@ -56,9 +56,11 @@ class RetryBoundaryTests(unittest.TestCase):
             pool.add_endpoint({"id": "high", "name": "high", "max_retries": 99})
             pool.add_endpoint({"id": "low", "name": "low", "max_retries": -4})
             pool.add_endpoint({"id": "bad", "name": "bad", "max_retries": "bad"})
-            self.assertEqual([ep.max_retries for ep in pool._endpoints], [3, 0, 1])
+            self.assertEqual([ep.max_retries for ep in pool._endpoints], [99, 0, 1])
             pool.update_endpoint("low", {"max_retries": 8})
-            self.assertEqual(next(ep for ep in pool._endpoints if ep.id == "low").max_retries, 3)
+            self.assertEqual(next(ep for ep in pool._endpoints if ep.id == "low").max_retries, 8)
+            pool.update_endpoint("low", {"max_retries": -1})
+            self.assertEqual(next(ep for ep in pool._endpoints if ep.id == "low").max_retries, 0)
 
     def test_remaining_request_budget_caps_upstream_timeout(self):
         with tempfile.TemporaryDirectory() as tmp_path:
