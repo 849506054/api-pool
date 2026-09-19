@@ -601,3 +601,17 @@ commit 后自动 checkpoint、`-wal` 归零。保留窗口实测最早记录 = 0
 
 机制与判读 → `references/incident-pattern-signatures.md`「非流式 OpenAI 响应被包进私有信封」节。
 
+## 2026-09-19 探活输出预算 16→256 + 日志清理固定时刻可配 + 冷却时长小时展示 已部署生产
+
+**部署**：后端 md5 `eba7e38a87f6b8997929b092daea355c`、前端 `e923935b224caba455e58954b3bd5409`（宿主机实读，与工作区逐字节一致）；`systemctl restart api-pool2` 于 22:53:30，`active`、启动日志 0 ERROR / 0 WARN。
+
+**三项改动**
+
+1. **探活/自检输出预算 16 → 256**（`APIPool.PROBE_MAX_TOKENS`，池自身 4 处请求统一引用）。16 对**推理模型**仍太小：reasoning 先吃预算、正文为空，上游直接回 `HTTP 500 {"error":"empty response content"}` → 请求路径的候选探活被判失败、端点进短冷却；日志里的 `失败(探活)` 是**伪失败**（端点健康，非故障）。根因链：`chat()` → `_probe_next_candidate`（`ping` + `max_tokens`）。实测 ping 的 reasoning_tokens 约 34–90、正文在 ~40 之后才出现；非推理模型 `finish_reason=stop` 早停、成本不变。
+2. **对话日志清理改固定时刻调度**：原「每小时无条件 prune」→「每日本地 `cleanup_at` 一次 + 当天错过则启动补跑」；新增顶层配置 `log_retention.{days,cleanup_at}`（默认 `7` / `03:00`，**无前端 UI 入口**），线程每分钟重读 `api_config.json`、改文件即生效；`save_config()` / `_sync_to_config()` 携带该键，避免面板编辑把它冲掉；`RETENTION_DAYS` 降级为默认值。
+3. **冷却时长展示加小时单位**（前端）：配置值走 `fmtCdMin`、剩余徽标走 `fmtCdSec`，≥60 分钟显示 `X.XH`；输入端仍按分钟，后端未动。
+
+**验收**：部署会话 `py_compile` + 重启验收 0 ERROR/0 WARN；本轮复验 `test/test_log_retention_schedule.py` 5 例 OK（同一本地日期只跑一次 / 当天错过补跑 / 缺键与非法时刻回落默认）、`test/test_cooldown_hours_display.js` OK、`test/render_error_smoke.js` 补 `fmtCdMin`/`fmtCdSec` 桩。
+
+机制与判读 → `references/responses-probe-max-tokens-2026-09-13.md`、`references/log-retention-cleanup-2026-09-02.md` §2；运行事实 → skill `SKILL.md` 任务路由表「部署信息/探活/健康检测」「日志保留窗口/每日清理时刻」两行。
+

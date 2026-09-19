@@ -913,16 +913,70 @@ class TokenTracker:
 
 token_tracker = TokenTracker()
 
+CONFIG_FILE = "api_config.json"
+
+# 对话日志滚动清理后台配置（顶层键 `log_retention`，无前端 UI 入口，直接改 api_config.json）：
+#   {"log_retention": {"days": 7, "cleanup_at": "03:00"}}
+#   days        保留天数（默认 7）
+#   cleanup_at  每日清理时刻 "HH:MM"（**本地时间**，与 sys_log 时间戳同口径，默认 03:00）
+DEFAULT_LOG_RETENTION_DAYS = 7
+DEFAULT_LOG_CLEANUP_AT = "03:00"
+
+
+def _normalize_hhmm(value):
+    """归一化 "H:MM"/"HH:MM" → "HH:MM"；非法（缺冒号/越界/非数字）→ None。"""
+    text = str(value or "").strip()
+    hh, sep, mm = text.partition(":")
+    if not sep:
+        return None
+    try:
+        h, m = int(hh), int(mm)
+    except ValueError:
+        return None
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return None
+    return f"{h:02d}:{m:02d}"
+
+
+def load_log_retention():
+    """读取 `log_retention` 顶层键；缺键/字段非法 → 回落到默认（7 天 / 03:00）。"""
+    days, cleanup_at = DEFAULT_LOG_RETENTION_DAYS, DEFAULT_LOG_CLEANUP_AT
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f).get("log_retention") or {}
+    except (OSError, ValueError, TypeError):
+        return {"days": days, "cleanup_at": cleanup_at}
+    try:
+        parsed_days = int(str(raw.get("days")))
+        if parsed_days >= 1:
+            days = parsed_days
+    except (TypeError, ValueError):
+        pass
+    hhmm = _normalize_hhmm(raw.get("cleanup_at"))
+    if hhmm:
+        cleanup_at = hhmm
+    return {"days": days, "cleanup_at": cleanup_at}
+
+
+def _log_cleanup_due(now, cleanup_at, last_run_date):
+    """当日清理是否到点：同一本地日期只跑一次，本地时刻到达/超过 cleanup_at 即触发。"""
+    hh, mm = (int(part) for part in cleanup_at.split(":"))
+    return time.strftime("%Y-%m-%d", now) != last_run_date and (now.tm_hour, now.tm_min) >= (hh, mm)
+
+
 class ChatLogger:
-    RETENTION_DAYS = 7  # 对话日志滚动保留天数（2026-08-15 新增；2026-09-14 由 30 调为 7，降低 chat_logs.db 体积）
+    RETENTION_DAYS = DEFAULT_LOG_RETENTION_DAYS  # 默认保留天数（可被 log_retention.days 覆盖）
+    CLEANUP_AT = DEFAULT_LOG_CLEANUP_AT  # 默认每日清理时刻（本地时间）
     BATCH_SIZE = 50  # 批量写攒批上限（条）
 
     def __init__(self, db_path="chat_logs.db"):
         self.db_path = db_path
         self._lock = threading.Lock()  # 仅串行化写路径（SQLite 单写者）；读路径无锁，WAL 下多读并发
         self._log_queue = queue.Queue(maxsize=512)
+        self.retention_days = self.RETENTION_DAYS  # 生效值，由 _retention_loop 按 log_retention 刷新
+        self.cleanup_at = self.CLEANUP_AT
         self._init_db()
-        # 后台守护线程：每小时滚动清理一次过期日志（daemon 线程，失败不影响主服务）
+        # 后台守护线程：每日固定时刻滚动清理过期日志（daemon 线程，失败不影响主服务）
         threading.Thread(target=self._retention_loop, daemon=True).start()
         # 后台守护线程：批量写对话日志（攒批单事务提交，减少锁竞争与 fsync）
         threading.Thread(target=self._batch_writer, daemon=True).start()
@@ -935,28 +989,41 @@ class ChatLogger:
         return conn
 
     def _retention_loop(self):
+        """每日 `cleanup_at`（本地时间）清理一次过期日志；当天错过则补跑一次。
+
+        每分钟轮询一次时钟（非固定间隔累积）：跨天且已过时刻才触发 prune，因此
+        一天至多清理一次；启动时刻已过当天 cleanup_at 时会在首轮补跑（进程曾在
+        该时刻停机也不漏清理）。配置每分钟从 api_config.json 重读，改文件即生效。
+        """
+        last_run_date = ""
         while True:
             try:
-                self.prune_old_logs()
+                cfg = load_log_retention()
+                self.retention_days = cfg["days"]
+                self.cleanup_at = cfg["cleanup_at"]
+                now = time.localtime()
+                if _log_cleanup_due(now, self.cleanup_at, last_run_date):
+                    self.prune_old_logs()
+                    last_run_date = time.strftime("%Y-%m-%d", now)
             except Exception as e:
                 sys_log(f"滚动清理对话日志失败: {e}", "ERROR")
-            time.sleep(3600)
+            time.sleep(60)
 
     def prune_old_logs(self):
-        """删除超过 RETENTION_DAYS 天的对话日志（按 UTC 时间戳比较），返回删除行数。"""
+        """删除超过 retention_days 天的对话日志（按 UTC 时间戳比较），返回删除行数。"""
         with self._lock:
             try:
                 conn = self._connect()
                 c = conn.cursor()
                 c.execute(
                     "DELETE FROM chat_logs WHERE timestamp < datetime('now', ?)",
-                    (f"-{self.RETENTION_DAYS} days",)
+                    (f"-{self.retention_days} days",)
                 )
                 deleted = c.rowcount
                 conn.commit()
                 conn.close()
                 if deleted > 0:
-                    sys_log(f"滚动清理对话日志: 删除 {deleted} 条超过 {self.RETENTION_DAYS} 天的记录")
+                    sys_log(f"滚动清理对话日志: 删除 {deleted} 条超过 {self.retention_days} 天的记录")
                 return deleted
             except Exception as e:
                 sys_log(f"滚动清理对话日志失败: {e}", "ERROR")
@@ -3157,10 +3224,15 @@ class APIPool:
     # 边界来自 Hermes `_coerce_reasonable_int`（1024–10,000,000 tokens）：越界值会被它忽略。
     GROUP_CONTEXT_MIN_TOKENS = 2000
     GROUP_CONTEXT_MAX_TOKENS = 10000000
-    # 池自身发起的探活/自检请求的输出上限（2026-09-13）：Responses API 要求 max_output_tokens ≥ 16，
-    # 原先的 3 / 5 / 10 会让 protocol=responses 端点的探活必然 400 并被误标 bad
-    # （探活实际只输出 1-2 token，成本无实质变化）。
-    PROBE_MAX_TOKENS = 16
+    # 池自身发起的探活/自检请求的输出上限：
+    #  - 2026-09-13：Responses API 要求 max_output_tokens ≥ 16，原先的 3 / 5 / 10
+    #    会让 protocol=responses 端点的探活必然 400 并被误标 bad。
+    #  - 2026-09-19：16 对**推理模型**仍太小。reasoning 先吃 token，16 时模型
+    #    把预算全花在 reasoning 上、正文为空，Cline（cline-free/deepseek-v4.1-flash）
+    #    直接回 HTTP 500 {"error":"empty response content"} → 探活误判失败、端点被短冷却。
+    #    实测「ping」的 reasoning_tokens 约 34–90，正文在 ~40 之后才出现。
+    #    256 覆盖该尾部并留余量；非推理模型 finish_reason=stop 早停，成本不变。
+    PROBE_MAX_TOKENS = 256
     # 子组「空闲借用」main 当前工作端点的等待窗口（2026-09-18，配在 main 组实体上）：
     # main 的当前/手动端点完全空闲满 N 秒后，子组候选耗尽时可直接借用它；
     # 0=关闭（保持既有「子组 fallback 到 main 组」出口）。
@@ -7219,7 +7291,6 @@ class APIPool:
         else:
             return {"ok": False, "status": "bad", "latency_ms": latency, "reply": "", "error": err}
 
-CONFIG_FILE = "api_config.json"
 RUNTIME_STATE_FILE = "api_runtime_state.json"
 _config_lock = threading.Lock()
 _runtime_state_lock = threading.Lock()
@@ -7494,7 +7565,7 @@ def load_group_defs_config():
     except Exception:
         return None
 
-def save_config(endpoints_data, group_defs=None, client_profiles=None, probe_client_profile=None):
+def save_config(endpoints_data, group_defs=None, client_profiles=None, probe_client_profile=None, log_retention=None):
     tmp_file = os.path.join(
         os.path.dirname(os.path.abspath(CONFIG_FILE)),
         f".{os.path.basename(CONFIG_FILE)}.tmp",
@@ -7509,6 +7580,9 @@ def save_config(endpoints_data, group_defs=None, client_profiles=None, probe_cli
     # 池自身出站身份（2026-09-12）：None=不落盘，保持与组管理/伪装同模式
     if probe_client_profile is not None:
         payload["probe_client_profile"] = probe_client_profile
+    # 日志滚动清理后台配置（2026-09-19）：None=不落盘
+    if log_retention is not None:
+        payload["log_retention"] = log_retention
     try:
         with _config_lock:
             with open(tmp_file, "w", encoding="utf-8") as f:
@@ -8408,7 +8482,8 @@ def _sync_to_config():
             defs_list.append(entry)
     save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "client_profile": ep.get("client_profile", ""), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
             "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "strict400_retries": ep.get("strict400_retries", 2), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles,
-        probe_client_profile=getattr(pool, "_probe_client_profile", ""))
+        probe_client_profile=getattr(pool, "_probe_client_profile", ""),
+        log_retention=load_log_retention())
 
 
 GUI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")

@@ -18,6 +18,8 @@ const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;'
 const escAttr=esc;
 const hBadge=(h,lat)=>{const m={ok:'OK',slow:'SLOW',bad:'BAD',unknown:'UNK',testing:'TEST'};return '['+(m[h]||m.unknown)+']';};
 const fmtTime=s=>s+'s';
+const fmtCdMin=m=>m+'分';
+const fmtCdSec=s=>s+'s';
 const timeAgo=()=>'ago';
 const siteUrl=u=>u;
 const clientProfiles=[];const profileVersion=()=>'';
