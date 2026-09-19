@@ -641,6 +641,7 @@ commit 后自动 checkpoint、`-wal` 归零。保留窗口实测最早记录 = 0
 - `VENDOR_RULES` 关键词→厂商映射，包含匹配（覆盖 `cline-free/…`、`cn:…`、`global:…` 渠道前缀与大小写变体），未命中归「其他」；顺序敏感，先具体后泛化。
 - 新增状态 `epVendorFilter` 与 `#vendorBar`（位于 `#filterBar` 上方，`.filter-bar-vendor` 间距 8px 与站点栏成组）；两栏各自保留选中态，`renderEndpoints` 先按厂商、再按站点（含 `__abnormal__` 哨兵）叠加过滤。
 - 两栏标签计数限定在对侧筛选结果内（选站点后厂商栏只列该站点的厂商，反之亦然）；计数为 0 的当前选中项保留在栏内，避免联动静默清空选择。
+- 触屏适配（用户报视觉缺陷）：`.filter-btn:hover` 限定在 `@media (hover:hover)`，触屏点按后不再残留与选中态同色的空心高亮。
 **厂商映射实测（52 端点）**：DeepSeek 25 / OpenAI 7 / Anthropic 5 / 智谱 4 / Google 4 / Qwen 2 / 阶跃星辰 1 / 其他 4（agnes-2.5-flash ×2、auto、Auto-Model）。
-**验证**：`node test/render_error_smoke.js` 22 项断言全绿（新增 11 项：映射表、两级叠加、两栏计数收窄与选中态）；内联脚本 `node --check` 通过；6 个 JS UI 自检全通过；全量 Python 单测 398 例（396 通过 + `test_hermes_stream_error_e2e` 2 例既有 stub 失败）。
-**部署**：前端 md5 `934f8266…`；`curl http://localhost:5200/` 页面 md5 与部署文件一致、含 `vendorBar`、HTTP 200；服务进程未重启。回滚备份 `static/index.html.bak-pre-vendorfilter-20260920-012911`。
+**验证**：`node test/render_error_smoke.js` 23 项断言全绿（新增 12 项：映射表、两级叠加、两栏计数收窄与选中态、hover 媒体查询）；内联脚本 `node --check` 通过；6 个 JS UI 自检全通过；全量 Python 单测 398 例（396 通过 + `test_hermes_stream_error_e2e` 2 例既有 stub 失败）。
+**部署**：前端 md5 `689a3843…`；`curl http://localhost:5200/` 页面 md5 与部署文件一致、含 `vendorBar` 与 `@media (hover:hover)`、HTTP 200；服务进程未重启。回滚备份 `static/index.html.bak-pre-vendorfilter-20260920-012911`、`static/index.html.bak-pre-hoverfix-20260920-014408`。

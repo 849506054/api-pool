@@ -72,6 +72,7 @@ chk(chain.includes('⚠ HTTP 500: upstream boom'),'聚合链：last_error 兜底
 chk((chain.split('chain-err').length-1)===2,'聚合链：两条错误行');
 chk(!/<div class="chain-right">[^<]*<div class="chain-err"/.test(chain),'聚合链：错误详情已移出右列');
 chk(!/max-width:120px/.test(src),'CSS：旧的单行省略已移除');
+chk(/@media \(hover:hover\)\{\.filter-btn:hover\{/.test(src)&&!/\n\.filter-btn:hover\{/.test(src),'CSS：hover 高亮限定在支持悬停的设备（触屏点按不留残留态）');
 /* ── 厂商筛选（2026-09-20）：映射表 + 厂商/站点两层互相二级 ── */
 chk(vendorOf('deepseek-v4-flash')==='DeepSeek'&&vendorOf('cline-free/deepseek-v4.1-flash')==='DeepSeek'
   &&vendorOf('cn:deepseek-v4.1-flash')==='DeepSeek'&&vendorOf('DeepSeek-V4-Flash[free]')==='DeepSeek','厂商映射：渠道前缀/大小写变体命中 DeepSeek');

@@ -92,7 +92,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 
 .filter-bar{display:flex;gap:5px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
 .filter-btn{padding:4px 12px;border-radius:16px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--text-dim);transition:all .12s}
-.filter-btn:hover{border-color:var(--accent);color:var(--accent-light)}
+/* 触屏无悬停语义：hover 高亮仅限支持悬停的设备，避免点按后残留空心高亮被读成选中态 */
+@media (hover:hover){.filter-btn:hover{border-color:var(--accent);color:var(--accent-light)}}
 .filter-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
 .filter-count{font-size:11px;color:var(--text-dim);margin-left:auto}
 /* 厂商筛选栏与站点筛选栏上下成组（间距小于筛选区与上下的间距） */
