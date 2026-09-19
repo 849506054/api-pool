@@ -4106,8 +4106,9 @@ class APIPool:
 
     @staticmethod
     def _normalize_max_retries(value):
+        """原端点额外重试次数：非负整数，上限由配置方自定（2026-09-20 取消 3 次上限）。"""
         try:
-            return min(3, max(0, int(value)))
+            return max(0, int(value))
         except (TypeError, ValueError):
             return 1
 

@@ -599,7 +599,7 @@ select option { background: var(--bg); color: var(--text); }
     </div>
     <div class="form-row form-row-routing">
       <div class="form-group"><label title="流式请求的连接、上传请求体及等待响应头超时；非流式正常请求仍受整体请求预算控制">连接/响应头超时 (秒)</label><input type="number" id="fTimeout" value="60" min="1"></div>
-      <div class="form-group"><label title="可恢复错误发生后，在同一客户端请求内重新向原端点发送完整请求的额外次数；建议 0-1 次">额外重试次数</label><input type="number" id="fRetries" value="1" min="0" max="3"></div>
+      <div class="form-group"><label title="可恢复错误发生后，在同一客户端请求内重新向原端点发送完整请求的额外次数；建议 0-1 次">额外重试次数</label><input type="number" id="fRetries" value="1" min="0"></div>
       <div class="form-group"><label>冷却 (分钟)</label><input type="number" id="fCooldown" value="5" min="0"></div>
     </div>
     <div class="form-row form-row-routing">

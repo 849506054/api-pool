@@ -625,3 +625,11 @@ commit 后自动 checkpoint、`-wal` 归零。保留窗口实测最早记录 = 0
 **部署**：后端 sha256 `8660a00e…`（md5 `83308efb…`）/ 前端 sha256 `0cd770d8…`；`api-pool2.service` active（启动 2026-09-20 00:20:14，NRestarts=0）；`/api/endpoints` 200 / 52 端点 / `defer_by_group` 就位；启动后 journal 0 ERROR/0 WARN；真实请求成功。就地回滚备份 `api_pool_server.py.bak-20260920_002008` + `static/index.html.bak-20260920_002008`（宿主机 `/vol1/1000/tool/api-pool2/`）。
 **未覆盖**：本次未产生新的冷却过期事件（唯一冷却端点 Cline-ds4.1f 剩余约 15h），行为验证由单测复现生产日志对覆盖；下一次真实冷却过期事件自然给出倒计时或立即回迁。
 **工作区**：`/opt/data/work/api-pool2` commit `905bcac`（修复）+ `3723fc1`（本台账）——已推送 `origin/main`（远端 HEAD `3723fc1`）。
+
+## 2026-09-20 额外重试次数取消 3 次上限 已部署生产
+**症状（用户报）**：前端编辑/新增端点时「额外重试次数」可填任意数字，保存后回落为 3。
+**根因**：后端 `_normalize_max_retries` 为 `min(3, max(0, int(value)))`，所有写入路径（新增 `add_endpoint`、更新 `update_endpoint`、配置加载）都经它归一化，>3 的输入一律压到 3；前端 `#fRetries` 另有 `max="3"` 属性限制步进器。
+**实现**：`_normalize_max_retries` 改为 `max(0, int(value))`（保留非负下限，负值/非法值回退规则不变：非法→默认 1）；前端 `#fRetries` 删除 `max="3"`，保留 `min="0"`。标签提示「建议 0-1 次」为建议值，非上限。改动 2 处、共 3 行。
+**验证**：① AST 提取真函数断言 `0/1/3/5/10/99/-3/非法` 逐一符合预期；② 生产 PUT `max_retries=5` → `/api/endpoints` 读回 5、`api_config.json` 落盘 5；PUT `=12` → 落盘 12；③ 重启 `api-pool2` 后配置与 API 读回仍为 47×1 / 2×0 / 3×3（原分布），确认加载路径不再回压；④ 实测端点已还原为 1；⑤ 运行中页面 `#fRetries` 无 `max` 属性、全页 `max="3"` 出现 0 次；`py_compile` 通过，`ruff` 128 项与改动前一致（无新增），LSP 报错为既有基线。
+**部署**：后端 sha256 `e295b99c…`（md5 `411af03a…`）/ 前端 sha256 `770beb52…`（md5 `5b63c01a…`）；`api-pool2.service` active，`/api/endpoints` 200 / 52 端点。回滚备份 `api_pool_server.py.bak-pre-maxretries-20260920-005825` + `static/index.html.bak-pre-maxretries-20260920-005825`（宿主机 `/vol1/1000/tool/api-pool2/`）。
+**契约口径**：`max_retries` 非负整数、无上限，默认 1；重试仍受 530 秒整体请求预算约束，指数退避为 3s·2ⁿ，大值由配置方自负时长与重复计算风险。
