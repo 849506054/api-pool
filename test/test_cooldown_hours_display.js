@@ -1,5 +1,5 @@
-// 冷却时长小时展示自检：node test_cooldown_hours_display.js
-// 规则（2026-09-19）：冷却时长 ≥60 分钟显示为 X.XH；<60 分钟维持原样；输入仍以分钟计。
+// 冷却时长 dhms 展示自检：node test_cooldown_hours_display.js
+// 规则（2026-09-19）：dhms 格式，默认只显示最高两个单位（1d4h3m4s → 1d4h）；输入仍以分钟计。
 const fs=require('fs'),path=require('path');
 const candidates=[path.join(__dirname,'..','static','index.html'),path.join(__dirname,'..','index.html')];
 const src=fs.readFileSync(candidates.find(p=>fs.existsSync(p)),'utf8');
@@ -7,8 +7,9 @@ const src=fs.readFileSync(candidates.find(p=>fs.existsSync(p)),'utf8');
 function assert(cond,msg){ if(!cond){ console.error('FAIL: '+msg); process.exit(1);} }
 
 // 1) 展示辅助函数存在且公式正确
-assert(/function fmtCdMin\(m\)\{return m>=60\?\(m\/60\)\.toFixed\(1\)\+'H':m\+'分';\}/.test(src), 'fmtCdMin 定义缺失/公式不符');
-assert(/function fmtCdSec\(s\)\{return s>=3600\?\(s\/3600\)\.toFixed\(1\)\+'H':fmtTime\(s\);\}/.test(src), 'fmtCdSec 定义缺失/公式不符');
+assert(/function fmtDhms\(s\)\{/.test(src), 'fmtDhms 定义缺失');
+assert(/function fmtCdMin\(m\)\{return fmtDhms\(\(m\|\|0\)\*60\);\}/.test(src), 'fmtCdMin 未走 fmtDhms');
+assert(/function fmtCdSec\(s\)\{return fmtDhms\(s\);\}/.test(src), 'fmtCdSec 未走 fmtDhms');
 
 // 2) 配置冷却（❄️）走 fmtCdMin；剩余冷却（⏳）走 fmtCdSec；输入框不变
 assert(/❄️\$\{fmtCdMin\(ep\.cooldown_minutes\)\}/.test(src), '配置冷却未改用 fmtCdMin');
@@ -18,13 +19,20 @@ assert(/cooldown_minutes:Math\.max\(1,parseInt\(document\.getElementById\('fCool
 
 // 3) 复现展示逻辑，锁定边界
 const fmtTime=s=>{if(s<=0)return'';if(s<60)return s+'s';const m=Math.floor(s/60);return(s%60)?`${m}m${s%60}s`:`${m}m`;};
-const fmtCdMin=m=>m>=60?(m/60).toFixed(1)+'H':m+'分';
-const fmtCdSec=s=>s>=3600?(s/3600).toFixed(1)+'H':fmtTime(s);
-assert(fmtCdMin(59)==='59分','59 分钟应保持分');
-assert(fmtCdMin(60)==='1.0H','60 分钟应转小时');
-assert(fmtCdMin(90)==='1.5H','90 分钟应为 1.5H');
-assert(fmtCdMin(1020)==='17.0H','1020 分钟应为 17.0H');
-assert(fmtCdSec(3599)===fmtTime(3599),'3599s 维持原样');
-assert(fmtCdSec(3600)==='1.0H','3600s 应转小时');
-assert(fmtCdSec(5400)==='1.5H','5400s 应为 1.5H');
-console.log('OK: 冷却时长小时展示自检通过');
+const fmtDhms=s=>{s=Math.max(0,Math.floor(s||0));const u=[[Math.floor(s/86400),'d'],[Math.floor(s%86400/3600),'h'],[Math.floor(s%3600/60),'m'],[s%60,'s']];const i=u.findIndex(x=>x[0]>0);if(i<0)return '0s';let r=u[i][0]+u[i][1];if(i+1<u.length&&u[i+1][0]>0)r+=u[i+1][0]+u[i+1][1];return r;};
+const fmtCdMin=m=>fmtDhms((m||0)*60);
+const fmtCdSec=s=>fmtDhms(s);
+assert(fmtDhms(90064)==='1d1h','1d1h3m4s 应只显示两位');
+assert(fmtDhms(100984)==='1d4h','1d4h3m4s 应只显示两位');
+assert(fmtDhms(288)==='4m48s','4m48s 两位单位');
+assert(fmtDhms(45)==='45s','不足一分钟只显示秒');
+assert(fmtDhms(3600)==='1h','整小时不补零单位');
+assert(fmtDhms(0)==='0s','零时长');
+assert(fmtCdMin(59)==='59m','59 分钟应为 59m');
+assert(fmtCdMin(60)==='1h','60 分钟应为 1h');
+assert(fmtCdMin(90)==='1h30m','90 分钟应为 1h30m');
+assert(fmtCdMin(1020)==='17h','1020 分钟应为 17h');
+assert(fmtCdSec(55387)==='15h23m','15 小时级冷却应为 15h23m');
+assert(fmtCdSec(3600)==='1h','3600s 应为 1h');
+assert(fmtCdSec(5400)==='1h30m','5400s 应为 1h30m');
+console.log('OK: 冷却时长 dhms 展示自检通过');

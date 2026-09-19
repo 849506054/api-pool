@@ -60,7 +60,7 @@ class GroupFallbackUnlockTests(unittest.TestCase):
         ep._last_error = "HTTP 429"
         ep._manual_unlock_required = True
         ep._health = "bad"
-        ep._defer_until = now + 600  # 缓存保护：不属于失败态，切回时不应被清
+        ep._defer_until_by_group["main"] = now + 600  # 缓存保护：不属于失败态，切回时不应被清
 
     def test_clear_resets_group_members_only_and_clears_lock(self):
         """清锁 + 只重置该组成员的冷却/冻结/失败态；别组端点与 defer 不受影响。"""
@@ -88,7 +88,7 @@ class GroupFallbackUnlockTests(unittest.TestCase):
             self.assertFalse(mine._manual_unlock_required)
             self.assertEqual("unknown", mine._health)
             # defer 是缓存保护，不是失败态 → 保留
-            self.assertGreater(mine._defer_until, time.time())
+            self.assertGreater(mine._defer_until_by_group.get("main", 0), time.time())
             # 别组端点不受影响
             self.assertGreater(other._cooldown_until, time.time())
             self.assertTrue(other._manual_unlock_required)

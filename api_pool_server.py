@@ -2726,7 +2726,7 @@ class Endpoint:
     _cooldown_until: float = field(default=0, repr=False)
     _cooldown_reason: str = field(default="", repr=False)
     _manual_unlock_required: bool = field(default=False, repr=False)
-    _defer_until: float = field(default=0, repr=False)  # 延迟回迁到期时间，在此期间不主动回迁到此端点
+    _defer_until_by_group: dict[str, float] = field(default_factory=dict, repr=False)  # 延迟回迁到期时间（按组）；该组在此期间不主动回迁到此端点
     
     health_mode: str = field(default="models")
     billing_mode: str = field(default="subscription")
@@ -2897,7 +2897,7 @@ class APIPool:
                         self._clear_pointers_for(ep_id)
                     # 手动移出池再移回 = 显式信任该端点 → 清除延迟回迁状态，恢复最高优先级
                     if in_pool:
-                        ep._defer_until = 0
+                        self._defer_clear(ep)
                     break
             self._renumber_pool_priorities()
 
@@ -3799,7 +3799,7 @@ class APIPool:
         candidates, _ = self._group_sticky_candidates(vision_group)
         return candidates, vision_group
 
-    def _reset_endpoint_assertion_state(self, ep, clear_defer=True):
+    def _reset_endpoint_assertion_state(self, ep, clear_defer=True, defer_group=None):
         """用户断言（「这个端点现在可用」，例如刚续费、上游已恢复）优先于 API Pool
         上一次观测推导出的不健康状态：把端点视为恢复健康，由随后的真实结果重新分类
         （请求失败会走既有故障路径重新冷却，代价是一次请求；反过来让观测推论压掉
@@ -3807,9 +3807,10 @@ class APIPool:
         enabled/in_pool 是配置声明而非健康推论，仍由调用方守卫。
 
         clear_defer=False 用于组级「立即切回」：defer 是当前工作对象的缓存保护，
-        不属于失败态，且一个端点可属多组，清掉会误伤别组正在工作的工作对象。"""
+        不属于失败态，且一个端点可属多组，清掉会误伤别组正在工作的工作对象。
+        defer_group 指定时只清该组的延迟回切；None 清全部组。"""
         if clear_defer:
-            ep._defer_until = 0
+            self._defer_clear(ep, [defer_group] if defer_group else None)
         ep._cooldown_until = 0
         ep._cooldown_reason = ""
         ep._fail_count = 0
@@ -3829,7 +3830,7 @@ class APIPool:
                         return False
                     if group is not None and grp not in self._ep_groups(ep):
                         return False
-                    self._reset_endpoint_assertion_state(ep)
+                    self._reset_endpoint_assertion_state(ep, defer_group=grp)
                     grp = group or self.MAIN_GROUP
                     self._set_manual(grp, ep_id)
                     self._set_current(grp, ep_id)
@@ -3951,8 +3952,9 @@ class APIPool:
             "cooldown_reason": ep._cooldown_reason,
             "manual_unlock_required": ep._manual_unlock_required,
             "deferrable": ep.deferrable,
-            "is_deferred": ep._defer_until > now,
-            "defer_remaining": max(0, int(ep._defer_until - now)),
+            "is_deferred": self._is_deferred(ep),
+            "defer_remaining": self._defer_remaining_max(ep),
+            "defer_by_group": self._defer_by_group_view(ep),
             "max_context_k": ep.max_context_k,
             "health": ep._health,
             "health_latency_ms": ep._health_latency_ms,
@@ -3990,8 +3992,9 @@ class APIPool:
                     "cooldown_reason": ep._cooldown_reason,
                     "manual_unlock_required": ep._manual_unlock_required,
                     "deferrable": ep.deferrable,
-                    "is_deferred": ep._defer_until > now,
-                    "defer_remaining": max(0, int(ep._defer_until - now)),
+                    "is_deferred": self._is_deferred(ep),
+                    "defer_remaining": self._defer_remaining_max(ep),
+                    "defer_by_group": self._defer_by_group_view(ep),
             "max_context_k": ep.max_context_k,
                     "use_proxy": ep.use_proxy,
                     "is_vision": ep.is_vision,
@@ -4013,7 +4016,7 @@ class APIPool:
                 ep._cooldown_until = 0
                 ep._cooldown_reason = ""
                 ep._manual_unlock_required = False
-                ep._defer_until = 0
+                self._defer_clear(ep)
             self._current_endpoint_by_group.clear()
             self._manual_override_by_group.clear()
 
@@ -4365,8 +4368,32 @@ class APIPool:
     def _is_fallback_locked(self):
         return self._is_fallback_locked_group(self.MAIN_GROUP)
 
-    def _is_deferred(self, ep):
-        return ep._defer_until > time.time()
+    def _is_deferred(self, ep, group=None):
+        """延迟回切判定。group=None → 任一组处于延迟回切（展示口径）；
+        指定组 → 只看该组（分组池：main 与子组的延迟回切互不影响）。"""
+        now = time.time()
+        if group is not None:
+            return ep._defer_until_by_group.get(group, 0) > now
+        return any(u > now for u in ep._defer_until_by_group.values())
+
+    def _defer_clear(self, ep, groups=None):
+        """清除延迟回切：groups=None 清全部组；否则只清指定组。"""
+        if groups is None:
+            ep._defer_until_by_group.clear()
+        else:
+            for grp in groups:
+                ep._defer_until_by_group.pop(grp, None)
+
+    @staticmethod
+    def _defer_remaining_max(ep, now=None):
+        now = now if now is not None else time.time()
+        return max([0] + [max(0, int(u - now)) for u in ep._defer_until_by_group.values()])
+
+    @staticmethod
+    def _defer_by_group_view(ep, now=None):
+        """仅输出仍在延迟中的组，供前端按组视图渲染倒计时。"""
+        now = now if now is not None else time.time()
+        return {grp: max(0, int(u - now)) for grp, u in ep._defer_until_by_group.items() if u > now}
 
     @staticmethod
     def _classify_capacity_error(error_msg):
@@ -4507,7 +4534,7 @@ class APIPool:
             for ep in self._endpoints:
                 if ep.id == ep_id:
                     ep._cooldown_until = 0
-                    ep._defer_until = 0
+                    self._defer_clear(ep)
                     ep._fail_count = 0
                     ep._last_error = ""
                     ep._last_error_ts = 0
@@ -4678,13 +4705,15 @@ class APIPool:
                     )
                     if protect_current_cache:
                         with self._lock:
-                            ep._defer_until = now + 300
+                            # 按组写入：同端点其他组的延迟状态不受本轮影响
+                            # （端点级共享字段曾被后一组的 else 分支覆盖清零）
+                            ep._defer_until_by_group[grp] = now + 300
                         current_label = self._endpoint_log_label(current_ep, grp) if current_ep else f"[{grp}]无"
                         sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 冷却过期探活通过；当前端点 '{current_label}' 已开启缓存保护，延迟回切 5 分钟", "INFO")
                     else:
                         switched = False
                         with self._lock:
-                            ep._defer_until = 0
+                            ep._defer_until_by_group.pop(grp, None)
                             # 手动指定端点不被后台恢复覆盖；自动路由则立即回切
                             # 到刚恢复的端点，兑现"关闭缓存保护=立即回切"。
                             if not self._get_manual(grp):
@@ -4757,31 +4786,33 @@ class APIPool:
                 grp: next((e for e in self._endpoints if e.id == eid), None)
                 for grp, eid in current_by_group.items() if eid
             }
-            released = []
+            released = []  # [(ep, grp)]
             for ep in self._endpoints:
-                if not (ep.in_pool and ep._defer_until > 0):
+                if not ep.in_pool or not ep._defer_until_by_group:
                     continue
-                # 兜底使用的 defer 清除已由 _on_success(clear_defer=True) 处理；
-                # 这里若用实时 current 判断会误清"defer 前进入的并发请求"产生的 defer
-                # （探活/请求期间 current 被并发修改，如场景9 竞态）。
-                # 分组池：任一组的当前端点保护 cache 且池活跃即保持 defer。
-                protected = any(
-                    cur is not None and cur is not ep and cur.deferrable
-                    for cur in current_eps.values()
-                )
-                if protected and pool_active:
-                    ep._defer_until = now + defer_window  # 滚动延长，保持 cache
-                else:
-                    ep._defer_until = 0
-                    released.append(ep)
-                    reason = "池空闲" if not pool_active else "当前端点未开启缓存保护"
-                    for grp in self._ep_groups(ep):
+                for grp in list(ep._defer_until_by_group):
+                    until = ep._defer_until_by_group.get(grp, 0)
+                    if until <= 0:
+                        ep._defer_until_by_group.pop(grp, None)
+                        continue
+                    # 兜底使用的 defer 清除已由 _on_success(clear_defer=True) 处理；
+                    # 这里若用实时 current 判断会误清「defer 前进入的并发请求」产生的 defer
+                    # （探活/请求期间 current 被并发修改，如场景9 竞态）。
+                    # 分组池：只按本组当前端点判断——main 不受子组指针影响，子组也不替 main 决定。
+                    cur = current_eps.get(grp)
+                    protected = cur is not None and cur is not ep and cur.deferrable
+                    if protected and pool_active:
+                        ep._defer_until_by_group[grp] = now + defer_window  # 滚动延长，保持 cache
+                    else:
+                        ep._defer_until_by_group.pop(grp, None)
+                        released.append((ep, grp))
+                        reason = "池空闲" if not pool_active else "当前端点未开启缓存保护"
                         sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 延迟回切解除（{reason}）", "INFO")
             if released:
                 for grp in self._all_group_names():
                     if self._get_manual(grp):
                         continue
-                    group_eps = [e for e in released if grp in self._ep_groups(e)]
+                    group_eps = [e for e, g in released if g == grp]
                     if group_eps:
                         best = min(group_eps, key=lambda e: self._ep_priority(e, grp))
                         self._set_current(grp, best.id)
@@ -5067,7 +5098,7 @@ class APIPool:
         # 竞态保护：defer 设置前已进入的并发请求（请求开始时不在 defer）成功后
         # 不清 defer，避免并发请求破坏延迟回迁保护窗口。
         if clear_defer:
-            ep._defer_until = 0
+            self._defer_clear(ep, [grp])
         ep._total_calls += 1
         ep._last_success_ts = now
         ep._health = "ok"
@@ -5541,7 +5572,7 @@ class APIPool:
                         continue
             # 快照请求开始时的缓存保护延迟状态：用于 _on_success 判断是否为回切后的请求。
             # 竞态保护：defer 设置前已进入的请求（快照=0）成功后不清 defer。
-            defer_at_request = ep._defer_until
+            defer_at_request = ep._defer_until_by_group.get(group, 0)
             ep_timeout = timeout or ep.timeout
             ep_model = ep.model
             # 分组池在途登记：本请求即将占用该端点（组内互斥用；流式请求在整个

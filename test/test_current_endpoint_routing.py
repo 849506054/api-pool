@@ -92,7 +92,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool._background_probe(recovered, current.id)
 
             self.assertEqual(pool._current_endpoint_id, current.id)
-            self.assertGreater(recovered._defer_until, module.time.time())
+            self.assertGreater(recovered._defer_until_by_group.get("main", 0), module.time.time())
 
     def test_current_endpoint_cache_protection_controls_deferred_failback(self):
         with tempfile.TemporaryDirectory() as tmp_path:
@@ -108,7 +108,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
 
             pool._background_probe(recovered, current.id)
 
-            self.assertGreater(recovered._defer_until, module.time.time())
+            self.assertGreater(recovered._defer_until_by_group.get("main", 0), module.time.time())
             self.assertEqual(pool._current_endpoint_id, current.id)
 
     def test_current_endpoint_without_cache_protection_immediately_fails_back(self):
@@ -125,7 +125,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
 
             pool._background_probe(recovered, current.id)
 
-            self.assertEqual(recovered._defer_until, 0)
+            self.assertEqual(recovered._defer_until_by_group.get("main", 0), 0)
             self.assertEqual(pool._current_endpoint_id, recovered.id)
 
     def test_reconciliation_uses_current_endpoint_cache_protection(self):
@@ -135,14 +135,14 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             current = self.endpoint(module, "current", 3, "gpt-5.6-sol")
             recovered.deferrable = False
             current.deferrable = False
-            recovered._defer_until = module.time.time() + 300
+            recovered._defer_until_by_group["main"] = module.time.time() + 300
             pool = module.APIPool([recovered, current])
             pool._current_endpoint_id = current.id
             pool._last_pool_activity = module.time.time()
 
             pool._reconcile_deferred()
 
-            self.assertEqual(recovered._defer_until, 0)
+            self.assertEqual(recovered._defer_until_by_group.get("main", 0), 0)
             self.assertEqual(pool._current_endpoint_id, recovered.id)
 
     def test_manual_override_is_not_replaced_by_background_recovery(self):
@@ -159,7 +159,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
 
             pool._background_probe(recovered, current.id)
 
-            self.assertEqual(recovered._defer_until, 0)
+            self.assertEqual(recovered._defer_until_by_group.get("main", 0), 0)
             self.assertEqual(pool._current_endpoint_id, current.id)
             self.assertEqual(pool._manual_override_id, current.id)
 
@@ -171,7 +171,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool = module.APIPool([recovered, current])
             pool._current_endpoint_id = current.id
             pool._last_pool_activity = module.time.time()
-            recovered._defer_until = module.time.time() + 300
+            recovered._defer_until_by_group["main"] = module.time.time() + 300
             calls = []
 
             def fake_try(ep, payload, timeout, **kwargs):
@@ -182,7 +182,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool.chat([{"role": "user", "content": "one"}])
 
             self.assertEqual(calls, ["current"])
-            self.assertGreater(recovered._defer_until, module.time.time())
+            self.assertGreater(recovered._defer_until_by_group.get("main", 0), module.time.time())
 
     def test_current_failure_can_fail_over_to_deferred_recovery(self):
         with tempfile.TemporaryDirectory() as tmp_path:
@@ -192,7 +192,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool = module.APIPool([deferred, current])
             pool._current_endpoint_id = current.id
             pool._last_pool_activity = module.time.time()
-            deferred._defer_until = module.time.time() + 300
+            deferred._defer_until_by_group["main"] = module.time.time() + 300
             calls = []
 
             def fake_try(ep, payload, timeout, **kwargs):
@@ -205,7 +205,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool.chat([{"role": "user", "content": "one"}])
 
             self.assertEqual(calls, ["current", "deferred"])
-            self.assertEqual(deferred._defer_until, 0)
+            self.assertEqual(deferred._defer_until_by_group.get("main", 0), 0)
 
     def test_failover_still_excludes_cooldown_and_manual_lock(self):
         with tempfile.TemporaryDirectory() as tmp_path:
@@ -215,7 +215,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             cooldown = self.endpoint(module, "cooldown", 3, "gpt-5.6-sol")
             locked = self.endpoint(module, "locked", 6, "gpt-5.6-sol")
             pool = module.APIPool([failed, deferred, cooldown, locked])
-            deferred._defer_until = module.time.time() + 300
+            deferred._defer_until_by_group["main"] = module.time.time() + 300
             cooldown._cooldown_until = module.time.time() + 300
             locked._manual_unlock_required = True
 

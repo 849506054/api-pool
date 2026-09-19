@@ -1121,13 +1121,15 @@ function renderChain(chain){
     // 分组隔离：仅本组当前端点高亮；其他组的当前端点显示组名 badge 不高亮
     const cg=it.current_groups||[];
     const isCurHere=it.is_current&&cg.includes(chainGroupFilter);
+    // 延迟回切倒计时按组取：main 与子组各自的缓存保护互不影响
+    const _dsec=(it.defer_by_group||{})[chainGroupFilter]||0;
     let cls='chain-item';
     if(it.manual_unlock_required)cls+=' failed';
     else if(it.in_cooldown)cls+=' cooldown';
-    else if(it.is_deferred)cls+=' deferred';
+    else if(_dsec>0)cls+=' deferred';
     else if(isCurHere)cls+=' active';
     else if(epErr(it)||it.fail_count>0)cls+=' failed';
-    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">💳余额不足·手动解冻</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(it.is_deferred?'<span class="badge badge-deferred">⏳延迟回切 '+fmtTime(it.defer_remaining)+'</span>':(isCurHere?'<span class="badge badge-success">服务中</span>':(it.is_current?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:9px;padding:1px 5px" title="本组未使用：它是其他组的当前端点">${esc(cg.filter(g=>g!==chainGroupFilter).join('·'))} 当前</span>`:''))));
+    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">💳余额不足·手动解冻</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(_dsec>0?'<span class="badge badge-deferred">⏳延迟回切 '+fmtTime(_dsec)+'</span>':(isCurHere?'<span class="badge badge-success">服务中</span>':(it.is_current?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:9px;padding:1px 5px" title="本组未使用：它是其他组的当前端点">${esc(cg.filter(g=>g!==chainGroupFilter).join('·'))} 当前</span>`:''))));
     const h=it.health, lat=it.health_latency_ms;
     let rh='';
     if(h==='ok')rh=`<div class="chain-health" style="color:var(--green)">✓${lat>=0?' '+lat+'ms':''}</div>`;
@@ -1793,9 +1795,11 @@ function siteUrl(base){try{const u=new URL(base);u.pathname=u.pathname.replace(/
 function escAttr(s){return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function timeAgo(ts){if(!ts)return'—';const s=Math.floor(Date.now()/1000-ts);if(s<60)return s+'s前';if(s<3600)return Math.floor(s/60)+'m前';if(s<86400)return Math.floor(s/3600)+'h前';return Math.floor(s/86400)+'d前';}
 function fmtTime(s){if(s<=0)return'';if(s<60)return s+'s';const m=Math.floor(s/60);return(s%60)?`${m}m${s%60}s`:`${m}m`;}
-// 冷却时长展示：≥60 分钟改用小时单位 H（X.XH）；输入仍以分钟计。2026-09-19
-function fmtCdMin(m){return m>=60?(m/60).toFixed(1)+'H':m+'分';}
-function fmtCdSec(s){return s>=3600?(s/3600).toFixed(1)+'H':fmtTime(s);}
+// 时长展示：dhms 格式，默认只取最高两个单位（1d4h3m4s → 1d4h，4m48s → 4m48s，45s → 45s）
+function fmtDhms(s){s=Math.max(0,Math.floor(s||0));const u=[[Math.floor(s/86400),'d'],[Math.floor(s%86400/3600),'h'],[Math.floor(s%3600/60),'m'],[s%60,'s']];const i=u.findIndex(x=>x[0]>0);if(i<0)return '0s';let r=u[i][0]+u[i][1];if(i+1<u.length&&u[i+1][0]>0)r+=u[i+1][0]+u[i+1][1];return r;}
+// 冷却时长展示：配置冷却以分钟计，剩余冷却以秒计；两者都走 dhms 两位
+function fmtCdMin(m){return fmtDhms((m||0)*60);}
+function fmtCdSec(s){return fmtDhms(s);}
 function toast(msg,type){const el=document.getElementById('toast');el.textContent=msg;el.className='toast toast-'+type+' show';setTimeout(()=>el.classList.remove('show'),2500);}
 
 function closeStatsModal(){document.getElementById('statsModal').classList.remove('show');}
