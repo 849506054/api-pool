@@ -4331,7 +4331,7 @@ class APIPool:
                             "health": ep._health,
                             "latency_ms": ep._health_latency_ms,
                             "error": (
-                                "余额不足，仅支持手动解冻"
+                                (ep._health_error or "余额不足，仅支持手动解冻")
                                 if ep._manual_unlock_required
                                 else ep._health_error or "健康检测进行中"
                             ),
@@ -4416,6 +4416,15 @@ class APIPool:
         )
         if any(marker in text for marker in quota_markers):
             return "quota_exceeded"
+
+        # 敏感词拦截（2026-09-20）：上游网关按请求体内容拒绝，属内容侧拒绝而非端点故障。
+        # 同端点重放必然同样被拦，因此冻结端点直至手动解冻，并把请求交给候选轮转。
+        sensitive_markers = (
+            "sensitive_words_detected", "sensitive words detected",
+            "sensitive_words", "敏感词",
+        )
+        if any(marker in text for marker in sensitive_markers):
+            return "sensitive_words"
         return ""
 
     @staticmethod
@@ -4471,6 +4480,13 @@ class APIPool:
             ep._cooldown_reason = kind
             ep._health = "bad"
             ep._health_error = "余额不足，仅支持手动解冻"
+            return kind, None
+        if kind == "sensitive_words":
+            ep._manual_unlock_required = True
+            ep._cooldown_until = 0
+            ep._cooldown_reason = kind
+            ep._health = "bad"
+            ep._health_error = "命中上游敏感词拦截，仅支持手动解冻"
             return kind, None
         if kind == "quota_exceeded":
             seconds = self._parse_quota_cooldown_seconds(error_msg)
@@ -4909,6 +4925,7 @@ class APIPool:
         transient_markers = (
             "rate limit", "rate-limited", "429", "quota", "balance",
             "余额", "配额", "限流", "temporarily", "overloaded",
+            "sensitive", "敏感词",
         )
         return not any(marker in lower for marker in transient_markers)
 
@@ -5055,6 +5072,8 @@ class APIPool:
         capacity_kind, capacity_seconds = self._set_capacity_cooldown(failed_ep, error_msg)
         if capacity_kind == "balance_insufficient":
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 余额不足，已冻结，仅支持手动解冻", "WARN")
+        elif capacity_kind == "sensitive_words":
+            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 命中上游敏感词拦截，已冻结，仅支持手动解冻", "WARN")
         elif capacity_kind == "quota_exceeded":
             detail = f"{capacity_seconds} 秒" if capacity_seconds is not None else "默认 5 小时"
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 配额不足，冻结 {detail}", "WARN")
@@ -7168,6 +7187,10 @@ class APIPool:
                 if e.code == 429: return None, msg + " (429 rate-limited)"
                 if e.code in (401, 403): return None, msg + " (auth error)"
                 if e.code >= 500:
+                    if self._classify_capacity_error(msg) == "sensitive_words":
+                        # 内容侧拒绝（2026-09-20）：同端点重放必然再次被同一过滤器拦下，
+                        # 不重试、不消耗预算，直接交给 _rotate 冻结端点并由候选轮转接手。
+                        return None, msg
                     if attempt < retries:
                         if debug_trace is not None:
                             debug_trace.append({"endpoint": ep.name, "result": "retry", "attempt": attempt + 1, "kind": f"http_{e.code}"})

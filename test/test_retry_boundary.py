@@ -137,6 +137,54 @@ class RetryBoundaryTests(unittest.TestCase):
             self.assertEqual(len(timeouts), 2)
             self.assertTrue(all(0 < timeout <= 3 for timeout in timeouts))
 
+    def test_sensitive_words_blocks_retry_and_freezes_until_manual_unlock(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            pool = module.APIPool()
+            endpoint = module.Endpoint(
+                id="cf", name="cf", base_url="http://example/v1", api_key="x",
+                model="m", max_retries=5, use_proxy=True,
+            )
+            body = (b'{"error":{"message":"sensitive words detected '
+                    b'(request id: 20260920015708934581125k8kcOaHJiPfF)","type":"new_api_error",'
+                    b'"code":"sensitive_words_detected"}}')
+            calls = []
+
+            def fake_urlopen(_request, timeout):
+                calls.append(timeout)
+                raise urllib.error.HTTPError(
+                    "http://example/v1/chat/completions", 500, "server error", {}, io.BytesIO(body)
+                )
+
+            with mock.patch.object(module.urllib.request, "urlopen", side_effect=fake_urlopen):
+                result, error = pool._try_endpoint(
+                    endpoint, {"model": "m", "messages": [], "stream": False}, 60, log_usage=False,
+                )
+            # 内容侧拒绝：不消耗同端点重试预算（max_retries=5 但只发 1 次）
+            self.assertIsNone(result)
+            self.assertEqual(len(calls), 1)
+            self.assertIn("sensitive", error)
+
+            pool._rotate(endpoint, error)
+            self.assertTrue(endpoint._manual_unlock_required)
+            self.assertEqual(endpoint._cooldown_reason, "sensitive_words")
+            self.assertEqual(endpoint._cooldown_until, 0)
+
+    def test_sensitive_words_is_not_client_class_error(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            for code in (400, 500):
+                self.assertFalse(module.APIPool._classify_client_error(
+                    f'HTTP {code}: {{"error":{{"code":"sensitive_words_detected"}}}}'
+                ))
+                self.assertEqual(
+                    module.APIPool._classify_capacity_error(
+                        f'HTTP {code}: {{"error":{{"code":"sensitive_words_detected"}}}}'
+                    ),
+                    "sensitive_words",
+                )
+            self.assertEqual(module.APIPool._classify_capacity_error("HTTP 500: 后端故障"), "")
+
     def test_image_translation_forwards_request_context(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)

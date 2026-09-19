@@ -821,7 +821,7 @@ function renderEndpoints(eps){
     if(ep.client_profile){const _cp=clientProfiles.find(x=>x.name===ep.client_profile);const _cv=_cp?profileVersion(_cp.headers):'';b+=`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35)" title="出站伪装为 ${esc(ep.client_profile)}${_cv?'（'+esc(_cv)+'）':''}">🎭${esc(ep.client_profile)}</span>`;}
 
       if(ep.is_vision!==false)b+=`<span class=\"badge\" style=\"background:rgba(0,122,255,.15);color:#0a84ff\" title=\"原生支持视觉能力\">👁️视觉</span>`;
-    if(ep.manual_unlock_required)b+=`<span class="badge badge-h-bad" title="余额不足：不会自动探活或恢复，需手动解冻">💳余额不足·手动解冻</span>`;
+    if(ep.manual_unlock_required){const _mu=muInfo(ep);b+=`<span class="badge badge-h-bad" title="${_mu.badgeTitle}">${_mu.badge}</span>`;}
     else if(ep.in_cooldown)b+=`<span class="badge badge-cooldown">⏳${fmtCdSec(ep.cooldown_remaining)}</span>`;
     if(ep.is_deferred)b+=`<span class="badge badge-deferred" title="当前工作端点已开启缓存保护，恢复端点延迟回切，剩余 ${fmtTime(ep.defer_remaining)}">⏸延迟回切 ${fmtTime(ep.defer_remaining)}</span>`;
     if(ep.use_proxy)b+=`<span class="badge badge-priority" title="随系统代理转发请求">🌐代理</span>`;
@@ -835,7 +835,7 @@ function renderEndpoints(eps){
         <div class="ep-actions">
           <button class="btn btn-ghost btn-sm" title="直达站点：${esc(siteUrl(ep.base_url))}" onclick="window.open(siteUrl('${esc(ep.base_url)}'), '_blank', 'noopener')">🌐</button>
           <button class="btn btn-ghost btn-sm" title="连通性测试" onclick="openTestDrawer('${ep.id}', '${esc(ep.name)} (${esc(ep.model)})')">🧪</button>
-          ${(ep.in_cooldown||ep.manual_unlock_required)?`<button class="btn btn-yellow btn-sm" title="${ep.manual_unlock_required?'手动解冻余额不足端点':'立刻解除冷却'}" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
+          ${(ep.in_cooldown||ep.manual_unlock_required)?`<button class="btn btn-yellow btn-sm" title="${ep.manual_unlock_required?muInfo(ep).btn:'立刻解除冷却'}" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
           <button class="btn btn-ghost btn-sm" title="${ep.enabled?'禁用端点':'启用端点'}" onclick="toggleEndpoint('${ep.id}')">${ep.enabled?'⏸':'▶'}</button>
           <button class="btn btn-ghost btn-sm" title="加入聚合池（选择分组）" onclick="openJoinPoolModal('${ep.id}','${esc(ep.name)}')">📥</button>
           <button class="btn btn-ghost btn-sm" title="编辑端点" onclick="editEndpoint('${ep.id}')">✏️</button>
@@ -845,7 +845,7 @@ function renderEndpoints(eps){
       <div class="ep-meta">
         <span title="绑定的模型名称">🤖${esc(ep.model)}</span><span title="单次请求超时时间">⏱${ep.timeout}s</span><span title="失败后最大重试次数">🔁${ep.max_retries}次</span><span title="请求失败后的冷却惩罚时间">❄️${fmtCdMin(ep.cooldown_minutes)}</span>${ep.max_context_k>0?`<span title="最大上下文长度限制">📏${ep.max_context_k}K</span>`:''}<span title="累计成功响应次数">📞${ep.total_calls}次</span><span title="最后一次成功响应时间">🕐${last}</span>
       </div>
-      ${ep.manual_unlock_required?`<div class="ep-error">💳 余额不足：已冻结，仅支持手动解冻</div>`:''}
+      ${ep.manual_unlock_required?`<div class="ep-error">${muInfo(ep).card}</div>`:''}
       ${ep.last_error?`<div class="ep-error">⚠ ${esc(ep.last_error)}</div>`:(ep.health==='bad'&&ep.health_error?`<div class="ep-error">⚠ ${esc(ep.health_error)}</div>`:'')}
     </div>`;
   }).join('');
@@ -910,7 +910,7 @@ function renderPoolList(eps){
         <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
           ${(()=>{const cg=ep.current_groups||[];if(!ep.is_current||!cg.length)return '';if(cg.includes(displayGroup))return `<span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="当前服务组：${esc(cg.join(', '))}">● 当前</span>`;const others=cg.filter(g=>g!==displayGroup);return `<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:10px;padding:1px 6px" title="本组未使用：它是其他组的当前端点">● ${esc(others.join('·'))}</span>`;})()}
           ${ep.in_cooldown?`<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px">⏳${fmtCdSec(ep.cooldown_remaining)}</span>`:''}
-          ${(ep.in_cooldown||ep.manual_unlock_required)?`<button class="btn btn-yellow btn-sm" style="padding:2px 5px;font-size:11px" title="${ep.manual_unlock_required?'手动解冻余额不足端点':'解除冷却'}" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
+          ${(ep.in_cooldown||ep.manual_unlock_required)?`<button class="btn btn-yellow btn-sm" style="padding:2px 5px;font-size:11px" title="${ep.manual_unlock_required?muInfo(ep).btn:'解除冷却'}" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
         </div>
       </div>
       <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
@@ -1161,7 +1161,7 @@ function renderChain(chain){
     else if(_dsec>0)cls+=' deferred';
     else if(isCurHere)cls+=' active';
     else if(epErr(it)||it.fail_count>0)cls+=' failed';
-    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">💳余额不足·手动解冻</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(_dsec>0?'<span class="badge badge-deferred">⏳延迟回切 '+fmtTime(_dsec)+'</span>':(isCurHere?'<span class="badge badge-success">服务中</span>':(it.is_current?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:9px;padding:1px 5px" title="本组未使用：它是其他组的当前端点">${esc(cg.filter(g=>g!==chainGroupFilter).join('·'))} 当前</span>`:''))));
+    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">'+muInfo(it).badge+'</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(_dsec>0?'<span class="badge badge-deferred">⏳延迟回切 '+fmtTime(_dsec)+'</span>':(isCurHere?'<span class="badge badge-success">服务中</span>':(it.is_current?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:9px;padding:1px 5px" title="本组未使用：它是其他组的当前端点">${esc(cg.filter(g=>g!==chainGroupFilter).join('·'))} 当前</span>`:''))));
     const h=it.health, lat=it.health_latency_ms;
     let rh='';
     if(h==='ok')rh=`<div class="chain-health" style="color:var(--green)">✓${lat>=0?' '+lat+'ms':''}</div>`;
@@ -1832,6 +1832,8 @@ function fmtDhms(s){s=Math.max(0,Math.floor(s||0));const u=[[Math.floor(s/86400)
 // 冷却时长展示：配置冷却以分钟计，剩余冷却以秒计；两者都走 dhms 两位
 function fmtCdMin(m){return fmtDhms((m||0)*60);}
 function fmtCdSec(s){return fmtDhms(s);}
+// 手动解冻端点的措辞按冻结原因分派（余额不足 / 上游敏感词拦截）
+function muInfo(ep){const sw=ep.cooldown_reason==='sensitive_words';return{badge:sw?'🚫敏感词拦截·手动解冻':'💳余额不足·手动解冻',badgeTitle:sw?'命中上游敏感词拦截：不会自动探活或恢复，需手动解冻':'余额不足：不会自动探活或恢复，需手动解冻',btn:sw?'手动解冻（敏感词拦截）端点':'手动解冻余额不足端点',card:sw?'🚫 命中上游敏感词拦截：已冻结，仅支持手动解冻':'💳 余额不足：已冻结，仅支持手动解冻'};}
 function toast(msg,type){const el=document.getElementById('toast');el.textContent=msg;el.className='toast toast-'+type+' show';setTimeout(()=>el.classList.remove('show'),2500);}
 
 function closeStatsModal(){document.getElementById('statsModal').classList.remove('show');}

@@ -645,3 +645,12 @@ commit 后自动 checkpoint、`-wal` 归零。保留窗口实测最早记录 = 0
 **厂商映射实测（52 端点）**：DeepSeek 25 / OpenAI 7 / Anthropic 5 / 智谱 4 / Google 4 / Qwen 2 / 阶跃星辰 1 / 其他 4（agnes-2.5-flash ×2、auto、Auto-Model）。
 **验证**：`node test/render_error_smoke.js` 23 项断言全绿（新增 12 项：映射表、两级叠加、两栏计数收窄与选中态、hover 媒体查询）；内联脚本 `node --check` 通过；6 个 JS UI 自检全通过；全量 Python 单测 398 例（396 通过 + `test_hermes_stream_error_e2e` 2 例既有 stub 失败）。
 **部署**：前端 md5 `689a3843…`；`curl http://localhost:5200/` 页面 md5 与部署文件一致、含 `vendorBar` 与 `@media (hover:hover)`、HTTP 200；服务进程未重启。回滚备份 `static/index.html.bak-pre-vendorfilter-20260920-012911`、`static/index.html.bak-pre-hoverfix-20260920-014408`。
+
+## 2026-09-20 上游敏感词拦截：命中即冻结端点至手动解冻 + 二分定位命中词 已部署生产
+**症状（用户报）**：`req=8e0a5f95` 在 `AgentRouter-ds4f` / `AgentRouterZ-ds4f` 各 500 `sensitive_words_detected`，每条端点先跑满 5 次同端点重试（3/6/12/24/48s，约 4 分钟）才轮转，最终由 Tokenrhythm 成功。
+**根因（两层）**：① 该错误落进 HTTP 5xx 通用分支，按端点瞬时故障处理，重放必然再次被同一内容过滤器拦下，纯浪费预算；② 该错误不属任何已分类类型，端点不冻结，下次同样内容再打同一个端点。
+**命中词定位（二分）**：`chat_logs.db` 同请求 fallback 成功记录（id 36554）的 prompt 166 808 字符，与上一条成功 prompt 前缀完全相同、新增 6 014 字符；`scripts/cf_bisect_direct.py` 直连 `AgentRouterZ-ds4f` 二分 6014→376→24 字符，词形对照判定命中 = 下划线形态 `recall_fact`（大小写任意、任意位置子串；空格形态 `recall fact` 与连字符形态 `recall-fact` 均放行）。命中位置是 tool 输出里 dump 的工具名清单（scope-recall 插件的真实工具名 `scope_recall_fact`）。
+**实现**：`_classify_capacity_error` 新增类型 `sensitive_words`（marker：`sensitive_words_detected` / `sensitive words detected` / `sensitive_words` / `敏感词`）；`_set_capacity_cooldown` 命中即 `_manual_unlock_required=True` + `cooldown_reason="sensitive_words"`（同余额不足：不自动探活、不自动恢复）；`_try_endpoint` 的 5xx 分支对该类型直接返回，不再消耗同端点重试；`_classify_client_error` 排除该错误（400 形态也不落客户端类）；`/api/health` 手动解冻文案改用端点自身 `health_error`；前端手动解冻徽标/卡片/按钮文案按 `cooldown_reason` 分派（余额不足 / 敏感词拦截）。
+**验证**：隔离实例（单端点 + 真实 key，端口 5311，与生产隔离）——控制组安全内容 200 正常答复；含 `recall_fact` 的请求 0.76s 返回 500（无同端点重试，旧行为约 4 分钟）、日志「命中上游敏感词拦截，已冻结，仅支持手动解冻」、`/api/endpoints` 显示 `manual_unlock_required=true` / `cooldown_reason=sensitive_words`；冻结后再发同一内容 1.5ms 返回「没有可用的 API 端点」且上游出站次数 0（不再打到该端点）。实例已停止并清理，未触碰生产池状态。单测新增 2 例（不重试 + 冻结、非客户端类分类）；全量 400 例通过，2 例失败为改动前既存（`test_hermes_stream_error_e2e` 的 `HermesAgentStub._capture_nous_model_switch`）；`py_compile` 通过，ruff 无新增；前端内联脚本 `new Function` 解析 0 错误。
+**部署**：后端 sha256 `27b3afcdf77e`（md5 `de33ac3a…`）/ 前端 sha256 `6c9e26e8df9a`（md5 `9330054f…`）；`api-pool2.service` active，`/api/endpoints` 200。回滚备份 `api_pool_server.py.bak-pre-cf-freeze-20260920-021219`、`static/index.html.bak-pre-maxretries-20260920-005825`。
+**未覆盖**：未在含该词的真实业务请求上验证（避免主动向生产端点发敏感内容）；冻结后的手动解冻按钮仅做代码级与本仓单测覆盖，UI 由用户实测。
