@@ -584,3 +584,20 @@ commit 后自动 checkpoint、`-wal` 归零。保留窗口实测最早记录 = 0
 **上游处置**：上游 main（=0.21.3）该函数**无任何 None 守卫**（blob 逐字节对比确认）；有 4 个同类 PR（#89575/#80822/#75525/#39978）**全部 open、零 review、未合并**，最早挂 3 个月 → **不指望上游，本地池侧扛**。上游 09-15 的 `71281fb2`（空 `data:` 帧→切非流式重试）只覆盖 `JSONDecodeError` 路径，与裸 `data: null` 是两条独立代码路径。
 
 机制与判读 → `references/incident-pattern-signatures.md`「上游 SSE 夹带裸 `data: null` 帧」节。
+
+## 2026-09-19 非流式私有信封解包（Cline `{"success":true,"data":{...}}`）已部署生产
+
+**症状**：🧪 测试端点 `[main]Cline` 反复 `测试请求失败: 未知错误: 'choices'`，同端点流式请求正常；出站摘要显示 HTTP 200 已返回，分类为非容量类（只写观测态，不冷却、不轮转伤害）。
+
+**根因（上游两态不一致）**：Cline `api.cline.bot` 的**非流式** chat/completions 把整个 OpenAI 载荷包进 `{"success":true,"data":{...}}`（`choices`/`usage` 在 `data` 内），**流式** SSE 帧却是标准 OpenAI 形态（顶层 `choices`）。池侧非流式分支 `body = json.loads(...)` 后直接 `body["choices"][0]` → `KeyError: 'choices'`，被通用 `except` 兜成 `未知错误: 'choices'`。上游侧同类 issue：cline/cline#12647。
+
+**修复（池侧单点，非端点级开关）**：`_try_endpoint` 非流式分支 `body = json.loads(...)` 之后加解包——仅当「顶层缺 `choices` 且 `data` 是 dict 且 `data` 内有 `choices`」时 `body = body["data"]`；gemini（`candidates`）/anthropic/标准 chat 响应原样透传，不做任意信封猜测。判据用结构特征而非精确匹配信封键。**未加端点级开关**：协议兼容性归协议桥统一行为。
+
+**验证（三层）**：① 直连上游抓真实非流式响应落盘（顶层键 `['data','success']`，`data.usage.total_tokens=63`）→ 模拟旧解析得 `KeyError 'choices'`、解包后取到正文与 usage；② 回归测试 `test/test_cline_envelope_unwrap.py`（信封解包 + 标准响应不动两例），**基线（未改）该例 FAIL、改后 PASS**；③ 隔离实例全量 385 测试：4 个既有环境性 error（`static/index.html` 未随副本、Hermes stub 属性），信封用例由 FAIL 转 PASS，零新增。
+
+**部署**：后端 hash `38f436f2` → `8e17f526`；宿主机备份 `api_pool_server.py.bak-20260919_123008`；`api-pool2.service` active、启动 0 ERROR、`/api/endpoints` 200。**运行态验收走池自身入口**（不看直连结果）：`POST /api/test` id=`de13a0cf-…` 返回 `{"ok":true,"result":"你好！很高兴见到你 😊…","served_by":"Cline (deepseek/deepseek-v4.1-flash)"}`，日志 `测试请求成功`，端点 `health=slow`（延迟口径）/ `health_error` 空 / `cooldown_until=0` / `fail_count=0`。
+
+**影响面**：只影响非流式路径。Cline 端点当前 `in_pool=false`，故现象仅出现在测试按钮；若入池，Hermes cron 会话（恒非流式）会直接受益。
+
+机制与判读 → `references/incident-pattern-signatures.md`「非流式 OpenAI 响应被包进私有信封」节。
+

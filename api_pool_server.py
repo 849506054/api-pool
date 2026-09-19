@@ -6848,6 +6848,13 @@ class APIPool:
                     return stream_generator(), ""
                 else:
                     body = json.loads(resp.read().decode("utf-8"))
+                    # 非 OpenAI 信封解包（2026-09-19）：Cline 非流式把 OpenAI 载荷整体包在
+                    # {"success": true, "data": {...}} 里（同一端点的流式帧是标准 OpenAI 形态）。
+                    # 判据：顶层缺 choices 且 data 内有 choices → 取 data 为业务体；
+                    # 其余响应（gemini candidates / anthropic / 标准 chat）原样透传。
+                    if (isinstance(body, dict) and "choices" not in body
+                            and isinstance(body.get("data"), dict) and "choices" in body["data"]):
+                        body = body["data"]
                     if is_gemini:
                         # Gemini 原生响应 → OpenAI chat.completion（2026-09-12，T2）
                         _candidates = body.get("candidates") or []
