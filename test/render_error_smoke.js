@@ -1,7 +1,8 @@
 /* 渲染层静态断言：node test/render_error_smoke.js
    直接读取 static/index.html，抽出渲染函数在 stub 环境里执行，断言
    「异常口径四处统一（epErr = health bad || last_error）：状态卡计数/异常筛选、
-   端点列表红框、聚合池红框、聚合链红块；错误原文完整显示」。无需浏览器。 */
+   端点列表红框、聚合池红框、聚合链红块；错误原文完整显示」；
+   并覆盖厂商筛选（vendorOf 映射 + 厂商/站点两层互相二级，2026-09-20）。无需浏览器。 */
 const fs=require('fs');
 const path=require('path');
 const src=fs.readFileSync(path.join(__dirname,'..','static','index.html'),'utf8');
@@ -25,6 +26,7 @@ const siteUrl=u=>u;
 const clientProfiles=[];const profileVersion=()=>'';
 const ABN_FILTER='__abnormal__';
 let epFilter='all';
+let epVendorFilter='all';
 const els={};
 const document={getElementById:id=>els[id]||(els[id]={innerHTML:'',textContent:'',scrollTop:0}),createElement:()=>({style:{},classList:{add(){}},appendChild(){},remove(){}}),body:{appendChild(){}}};
 const window={_poolGroups:{},_groupDefs:[],_lastChain:[]};
@@ -35,7 +37,8 @@ const GROUP_ICONS={main:'M',vision:'V'};
 const groupIcon=g=>GROUP_ICONS[g]||'';
 const groupRank=g=>g==='main'?0:(GROUP_ICONS[g]?1:2);
 const sortGroups=list=>list.sort((a,b)=>groupRank(a)-groupRank(b));
-const FNS=[js.match(/function epErr\(ep\)\{[^\n]*\}/)[0],grab('renderStats'),grab('renderEndpoints'),grab('renderPoolList'),grab('renderChain')].join('\n');
+const VENDOR_SRC=js.match(/const VENDOR_RULES=\[[\s\S]*?\];\nfunction vendorOf\(model\)\{[\s\S]*?\n\}/)[0];
+const FNS=[VENDOR_SRC,js.match(/function epErr\(ep\)\{[^\n]*\}/)[0],grab('renderStats'),grab('renderEndpoints'),grab('renderPoolList'),grab('renderChain')].join('\n');
 eval(FNS);
 
 const ERR='HTTP 402: {"error":{"message":"Budget pool quota has been exhausted. Please ask an administrator to raise it."}}';
@@ -69,5 +72,37 @@ chk(chain.includes('⚠ HTTP 500: upstream boom'),'聚合链：last_error 兜底
 chk((chain.split('chain-err').length-1)===2,'聚合链：两条错误行');
 chk(!/<div class="chain-right">[^<]*<div class="chain-err"/.test(chain),'聚合链：错误详情已移出右列');
 chk(!/max-width:120px/.test(src),'CSS：旧的单行省略已移除');
+/* ── 厂商筛选（2026-09-20）：映射表 + 厂商/站点两层互相二级 ── */
+chk(vendorOf('deepseek-v4-flash')==='DeepSeek'&&vendorOf('cline-free/deepseek-v4.1-flash')==='DeepSeek'
+  &&vendorOf('cn:deepseek-v4.1-flash')==='DeepSeek'&&vendorOf('DeepSeek-V4-Flash[free]')==='DeepSeek','厂商映射：渠道前缀/大小写变体命中 DeepSeek');
+chk(vendorOf('Qwen/Qwen3-VL-32B-Instruct')==='Qwen'&&vendorOf('gemini-3.8-flash')==='Google'
+  &&vendorOf('glm-5.3-flash')==='智谱'&&vendorOf('claude-opus-4-8')==='Anthropic'&&vendorOf('gpt-5.6-sol')==='OpenAI','厂商映射：Qwen/Google/智谱/Anthropic/OpenAI');
+chk(vendorOf('Auto-Model')==='其他'&&vendorOf('auto')==='其他'&&vendorOf('')==='其他','厂商映射：无关键词归「其他」');
+const fEps=[Object.assign({},ep,{id:'f1',name:'AlphaDs',site_name:'Alpha',model:'deepseek-v4-flash'}),
+  Object.assign({},ep,{id:'f2',name:'AlphaGpt',site_name:'Alpha',model:'gpt-5.6-sol'}),
+  Object.assign({},ep,{id:'f3',name:'BetaDs',site_name:'Beta',model:'cn:deepseek-v4.1-flash'}),
+  Object.assign({},ep,{id:'f4',name:'BetaAuto',site_name:'Beta',model:'Auto-Model'})];
+epFilter='all';epVendorFilter='all';renderEndpoints(fEps);
+chk((els['epList'].innerHTML.match(/class="ep-item/g)||[]).length===4&&els['filterCount'].textContent==='4 个','两级均未选：全部 4 条');
+epVendorFilter='DeepSeek';renderEndpoints(fEps);
+chk((els['epList'].innerHTML.match(/class="ep-item/g)||[]).length===2&&els['filterCount'].textContent==='2 个','仅厂商筛选：DeepSeek 2 条');
+epFilter='Alpha';renderEndpoints(fEps);
+chk(els['epList'].innerHTML.includes('AlphaDs')&&!els['epList'].innerHTML.includes('BetaDs')
+  &&els['filterCount'].textContent==='1 个','厂商×站点二级叠加：Alpha 站点内 DeepSeek 仅 1 条');
+epVendorFilter='all';renderEndpoints(fEps);
+chk(els['epList'].innerHTML.includes('AlphaGpt')&&!els['epList'].innerHTML.includes('BetaDs')&&els['filterCount'].textContent==='2 个','回到站点评级：Alpha 站点 2 条');
+epFilter='all';epVendorFilter='其他';renderEndpoints(fEps);
+chk(els['epList'].innerHTML.includes('BetaAuto')&&!els['epList'].innerHTML.includes('AlphaDs')&&els['filterCount'].textContent==='1 个','「其他」厂商：无关键词模型 1 条');
+epVendorFilter='all';
+/* 两栏渲染：厂商栏在上、计数随站点层收窄；站点栏计数随厂商层收窄 */
+eval(grab('renderFilterBar'));
+epFilter='Alpha';epVendorFilter='DeepSeek';renderFilterBar(fEps);
+chk(/>全部厂商 2<\/button>/.test(els['vendorBar'].innerHTML)&&/>DeepSeek 1<\/button>/.test(els['vendorBar'].innerHTML)
+  &&els['vendorBar'].innerHTML.includes('>OpenAI 1<'),'厂商栏：计数限定在「Alpha」站点内（全部厂商 2 / DeepSeek 1 / OpenAI 1）');
+chk(/>全部站点 2<\/button>/.test(els['filterBar'].innerHTML)&&/>Alpha 1<\/button>/.test(els['filterBar'].innerHTML)
+  &&/>Beta 1<\/button>/.test(els['filterBar'].innerHTML),'站点栏：计数限定在「DeepSeek」厂商内（全部站点 2 / Alpha 1 / Beta 1）');
+chk(/class="filter-btn active" onclick="setVendorFilter\('DeepSeek'\)"/.test(els['vendorBar'].innerHTML)
+  &&/class="filter-btn active" onclick="setFilter\('Alpha'\)"/.test(els['filterBar'].innerHTML),'两栏各自保留选中态');
+epFilter='all';epVendorFilter='all';
 console.log(fail?'\n有断言失败':'\n全部断言通过');
 process.exit(fail);

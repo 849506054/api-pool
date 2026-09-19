@@ -633,3 +633,14 @@ commit 后自动 checkpoint、`-wal` 归零。保留窗口实测最早记录 = 0
 **验证**：① AST 提取真函数断言 `0/1/3/5/10/99/-3/非法` 逐一符合预期；② 生产 PUT `max_retries=5` → `/api/endpoints` 读回 5、`api_config.json` 落盘 5；PUT `=12` → 落盘 12；③ 重启 `api-pool2` 后配置与 API 读回仍为 47×1 / 2×0 / 3×3（原分布），确认加载路径不再回压；④ 实测端点已还原为 1；⑤ 运行中页面 `#fRetries` 无 `max` 属性、全页 `max="3"` 出现 0 次；`py_compile` 通过，`ruff` 128 项与改动前一致（无新增），LSP 报错为既有基线。
 **部署**：后端 sha256 `e295b99c…`（md5 `411af03a…`）/ 前端 sha256 `770beb52…`（md5 `5b63c01a…`）；`api-pool2.service` active，`/api/endpoints` 200 / 52 端点。回滚备份 `api_pool_server.py.bak-pre-maxretries-20260920-005825` + `static/index.html.bak-pre-maxretries-20260920-005825`（宿主机 `/vol1/1000/tool/api-pool2/`）。
 **契约口径**：`max_retries` 非负整数、无上限，默认 1；重试仍受 530 秒整体请求预算约束，指数退避为 3s·2ⁿ，大值由配置方自负时长与重复计算风险。
+
+
+## 2026-09-20 端点列表模型厂商筛选（与站点筛选同级、互相二级） 已部署生产
+**需求（用户）**：端点列表新增「模型厂商」筛选，与站点筛选同级、可互相执行二级筛选，布局位于站点筛选上方。
+**实现（纯前端，静态文件热更新）**：
+- `VENDOR_RULES` 关键词→厂商映射，包含匹配（覆盖 `cline-free/…`、`cn:…`、`global:…` 渠道前缀与大小写变体），未命中归「其他」；顺序敏感，先具体后泛化。
+- 新增状态 `epVendorFilter` 与 `#vendorBar`（位于 `#filterBar` 上方，`.filter-bar-vendor` 间距 8px 与站点栏成组）；两栏各自保留选中态，`renderEndpoints` 先按厂商、再按站点（含 `__abnormal__` 哨兵）叠加过滤。
+- 两栏标签计数限定在对侧筛选结果内（选站点后厂商栏只列该站点的厂商，反之亦然）；计数为 0 的当前选中项保留在栏内，避免联动静默清空选择。
+**厂商映射实测（52 端点）**：DeepSeek 25 / OpenAI 7 / Anthropic 5 / 智谱 4 / Google 4 / Qwen 2 / 阶跃星辰 1 / 其他 4（agnes-2.5-flash ×2、auto、Auto-Model）。
+**验证**：`node test/render_error_smoke.js` 22 项断言全绿（新增 11 项：映射表、两级叠加、两栏计数收窄与选中态）；内联脚本 `node --check` 通过；6 个 JS UI 自检全通过；全量 Python 单测 398 例（396 通过 + `test_hermes_stream_error_e2e` 2 例既有 stub 失败）。
+**部署**：前端 md5 `934f8266…`；`curl http://localhost:5200/` 页面 md5 与部署文件一致、含 `vendorBar`、HTTP 200；服务进程未重启。回滚备份 `static/index.html.bak-pre-vendorfilter-20260920-012911`。

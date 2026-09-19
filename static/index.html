@@ -95,6 +95,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .filter-btn:hover{border-color:var(--accent);color:var(--accent-light)}
 .filter-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
 .filter-count{font-size:11px;color:var(--text-dim);margin-left:auto}
+/* 厂商筛选栏与站点筛选栏上下成组（间距小于筛选区与上下的间距） */
+.filter-bar-vendor{margin-bottom:8px}
 .pool-model-select{max-width:240px;padding:2px 5px;cursor:pointer;font-size:11px;color:var(--text-dim)}
 
 .ep-list{display:flex;flex-direction:column;gap:6px;flex:1;overflow-y:auto;min-height:0;overscroll-behavior:contain;padding-right:2px}
@@ -431,6 +433,7 @@ select option { background: var(--bg); color: var(--text); }
     <div class="stats" id="stats"></div>
     <div class="card ep-card" id="epCard" style="margin-bottom:16px">
       <div class="card-title"><span class="icon">📋</span> 端点列表</div>
+      <div class="filter-bar filter-bar-vendor" id="vendorBar"></div>
       <div class="filter-bar" id="filterBar"></div>
       <div class="ep-list" id="epList"></div>
     </div>
@@ -663,7 +666,7 @@ async function api(method,path,body){
 
 let allModels=[],selectedModels=new Set(),latencyResults={},visionResults={};
 const ABN_FILTER='__abnormal__'; /* 异常筛选哨兵值：与站点筛选共用 epFilter */
-let epFilter='all',modelPage=1,PP=50;
+let epFilter='all',epVendorFilter='all',modelPage=1,PP=50; /* epFilter=站点层（含异常哨兵），epVendorFilter=厂商层 */
 const endpointModelsCache=new Map();
 const ENDPOINT_MODELS_CACHE_MS=5*60*1000;
 let loadingPoolModelSelect=null;
@@ -736,21 +739,48 @@ function renderStats(eps){
     <div class="stat-item"><div class="num" style="color:var(--blue)">${calls}</div><div class="label">调用</div></div>`;
 }
 
-function renderFilterBar(eps){
-  const sites=new Map();
-  for(const ep of eps){
-    const site=String(ep.site_name||'').trim();
-    if(site)sites.set(site,(sites.get(site)||0)+1);
-  }
-  if(epFilter===ABN_FILTER&&!eps.some(epErr))epFilter='all';
-  if(epFilter!=='all'&&epFilter!==ABN_FILTER&&!sites.has(epFilter))epFilter='all';
-  document.getElementById('filterBar').innerHTML=`
-    <button class="filter-btn ${epFilter==='all'?'active':''}" onclick="setFilter('all')">全部 ${eps.length}</button>
-    ${[...sites.entries()].sort((a,b)=>a[0].localeCompare(b[0])).map(([site,count])=>`<button class="filter-btn ${epFilter===site?'active':''}" data-site="${escAttr(site)}">${esc(site)} ${count}</button>`).join('')}
-    <span class="filter-count" id="filterCount"></span>`;
-  document.querySelectorAll('#filterBar [data-site]').forEach(btn=>btn.addEventListener('click',()=>setFilter(btn.dataset.site)));
+/* ── 模型厂商筛选（2026-09-20）：按 model 关键词映射厂商，未匹配归「其他」。
+   渠道前缀（`cline-free/…`、`cn:…`、`global:…`）用包含匹配命中，顺序敏感（先具体后泛化）。── */
+const VENDOR_RULES=[
+  ['deepseek','DeepSeek'],['glm','智谱'],['gpt','OpenAI'],['claude','Anthropic'],
+  ['gemini','Google'],['qwen','Qwen'],['step','阶跃星辰'],['grok','xAI'],
+  ['kimi','月之暗面'],['moonshot','月之暗面'],['minimax','MiniMax'],['mimo','小米'],
+  ['seed','字节'],['hy3','Hy3'],['muse','Muse'],['ox-','OX'],
+];
+function vendorOf(model){
+  const m=String(model||'').toLowerCase();
+  for(const [k,v] of VENDOR_RULES){ if(m.includes(k)) return v; }
+  return '其他';
 }
 function setFilter(f){epFilter=f;refresh();}
+function setVendorFilter(v){epVendorFilter=v;refresh();}
+
+function renderFilterBar(eps){
+  /* 厂商层与站点层同级、互相二级：本栏标签计数限定在对侧筛选结果内（0 计数的当前选中项仍保留在栏内） */
+  const vOk=ep=>epVendorFilter==='all'||vendorOf(ep.model)===epVendorFilter;
+  const sOk=ep=>epFilter==='all'||epFilter===ABN_FILTER||String(ep.site_name||'').trim()===epFilter;
+  const allSites=new Set(),sites=new Map(),vendors=new Map();
+  for(const ep of eps){
+    const site=String(ep.site_name||'').trim();
+    if(site){allSites.add(site);if(vOk(ep))sites.set(site,(sites.get(site)||0)+1);}
+    if(sOk(ep)){const v=vendorOf(ep.model);vendors.set(v,(vendors.get(v)||0)+1);}
+  }
+  if(epFilter===ABN_FILTER&&!eps.some(epErr))epFilter='all';
+  if(epFilter!=='all'&&epFilter!==ABN_FILTER&&!allSites.has(epFilter))epFilter='all';
+  if(epVendorFilter!=='all'&&!eps.some(e=>vendorOf(e.model)===epVendorFilter))epVendorFilter='all';
+  const siteNames=[...sites.keys()];
+  if(epFilter!=='all'&&epFilter!==ABN_FILTER&&!siteNames.includes(epFilter))siteNames.push(epFilter);
+  siteNames.sort((a,b)=>a.localeCompare(b));
+  const vendorNames=[...vendors.entries()].sort((a,b)=>(a[0]==='其他')-(b[0]==='其他')||b[1]-a[1]||a[0].localeCompare(b[0]));
+  if(epVendorFilter!=='all'&&!vendors.has(epVendorFilter))vendorNames.push([epVendorFilter,0]);
+  document.getElementById('vendorBar').innerHTML=`
+    <button class="filter-btn ${epVendorFilter==='all'?'active':''}" onclick="setVendorFilter('all')">全部厂商 ${eps.filter(sOk).length}</button>
+    ${vendorNames.map(([v,n])=>`<button class="filter-btn ${epVendorFilter===v?'active':''}" onclick="setVendorFilter('${escAttr(v)}')">${esc(v)} ${n}</button>`).join('')}`;
+  document.getElementById('filterBar').innerHTML=`
+    <button class="filter-btn ${epFilter==='all'?'active':''}" onclick="setFilter('all')">全部站点 ${eps.filter(vOk).length}</button>
+    ${siteNames.map(site=>`<button class="filter-btn ${epFilter===site?'active':''}" onclick="setFilter('${escAttr(site)}')">${esc(site)} ${sites.get(site)||0}</button>`).join('')}
+    <span class="filter-count" id="filterCount"></span>`;
+}
 
 /* 异常口径（2026-09-12 用户定稿）：健康状态以端点最后可知状态为准 —— 探活判坏，
    或最近一次请求失败尚未恢复（last_error 在请求成功时清空）。状态卡计数、异常筛选、
@@ -763,6 +793,7 @@ function hBadge(h,lat){
 }
 
 function renderEndpoints(eps){
+  if(epVendorFilter!=='all')eps=eps.filter(e=>vendorOf(e.model)===epVendorFilter);
   if(epFilter===ABN_FILTER)eps=eps.filter(epErr);
   else if(epFilter!=='all')eps=eps.filter(e=>String(e.site_name||'').trim()===epFilter);
 
