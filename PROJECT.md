@@ -624,4 +624,4 @@ commit 后自动 checkpoint、`-wal` 归零。保留窗口实测最早记录 = 0
 **验证**：新增 `test/test_defer_group_isolation.py`（8 例：保护组与「自身即当前端点」组同场不再互相清零、释放回迁、活跃期滚动续期、手动切换作用域、序列化口径）；全量 398 例通过（`test_hermes_stream_error_e2e` 2 例为改动前既有失败——Hermes stub 缺 `_capture_nous_model_switch`，已用 pristine HEAD 复现确认）；ruff 128 错误与基线逐项一致、无新增；`py_compile` 通过；前端 `render_error_smoke.js` / `test_chain_group_ui.js` / `test_cooldown_hours_display.js` 全部通过。
 **部署**：后端 sha256 `8660a00e…`（md5 `83308efb…`）/ 前端 sha256 `0cd770d8…`；`api-pool2.service` active（启动 2026-09-20 00:20:14，NRestarts=0）；`/api/endpoints` 200 / 52 端点 / `defer_by_group` 就位；启动后 journal 0 ERROR/0 WARN；真实请求成功。就地回滚备份 `api_pool_server.py.bak-20260920_002008` + `static/index.html.bak-20260920_002008`（宿主机 `/vol1/1000/tool/api-pool2/`）。
 **未覆盖**：本次未产生新的冷却过期事件（唯一冷却端点 Cline-ds4.1f 剩余约 15h），行为验证由单测复现生产日志对覆盖；下一次真实冷却过期事件自然给出倒计时或立即回迁。
-**工作区**：`/opt/data/work/api-pool2` commit `905bcac`（本地，未推送）。
+**工作区**：`/opt/data/work/api-pool2` commit `905bcac`（修复）+ `3723fc1`（本台账）——已推送 `origin/main`（远端 HEAD `3723fc1`）。
