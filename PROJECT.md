@@ -615,3 +615,13 @@ commit 后自动 checkpoint、`-wal` 归零。保留窗口实测最早记录 = 0
 
 机制与判读 → `references/responses-probe-max-tokens-2026-09-13.md`、`references/log-retention-cleanup-2026-09-02.md` §2；运行事实 → skill `SKILL.md` 任务路由表「部署信息/探活/健康检测」「日志保留窗口/每日清理时刻」两行。
 
+## 2026-09-20 多组端点延迟回切按组隔离 + 冷却时长 dhms 展示 已部署生产
+**症状（用户报）**：端点 `[main]Cline2-ds4.1f` 冷却（4.8 分钟）结束后既没有回迁，也没有显示延迟回切计时。
+**根因**：`_defer_until` 是端点级单字段，写入方 `_background_probe` 的判定却是逐组循环 —— 该端点同属 `main` + `pool-ds`：`main` 迭代（当前端点 WorkBuddyGB 开启缓存保护）写 `now+300`，紧接着 `pool-ds` 迭代走 else 分支（该组当前端点就是 Cline2 自身，判据 `current_ep is not ep` 不成立）写 `0`，同一次探活内被清零。`_reconcile_deferred()` 开头 `if not (ep.in_pool and ep._defer_until > 0): continue` 直接跳过，唯一回迁路径（released → `_set_current`）永不执行 → 状态机停在「冷却已清、探活已过、defer=0、指针不动」的第三态，没有后续事件能自愈；缓存保护与主动回迁同时失效。
+**证据**：23:29:04 两条紧邻日志（`[main]…延迟回切 5 分钟` / `[pool-ds]…保留手动端点`）；`/api/endpoints` 该端点 `is_deferred=false`；全天 journal 无该端点「延迟回切解除」；服务自 22:53:30 未重启；对照组 `AgentRouterZ-ds4f`（三组全部走保护分支）defer 存活并在 15:51:18 正常解除。
+**契约（用户 2026-09-19 确立）**：① 池组退避单向——只有子组避让 main，main 侧任何决策（候选排序、defer 判定、回迁）都不读子组指针；② 冷却结束探活通过后，该组要么进入延迟回切（UI 可见倒计时），要么立即回迁，不存在第三种状态。
+**实现**：`_defer_until` → `_defer_until_by_group: dict[str, float]`（按 (端点, 组) 存储）。`_background_probe` 每组只写自己那一条；`_reconcile_deferred` 按 (端点, 组) 滚动/释放，判定只看本组当前端点；`_on_success` 与 `chat()` 的 `defer_at_request` 快照按组取；`switch_to_endpoint(id, group)` 只清目标组条目（`set_pool` 移回池 / `clear_error` 解冻 / 全局 `reset` 清该端点全部组）。序列化新增 `defer_by_group`（仅含仍在延迟中的组），聚合链按 `defer_by_group[当前组]` 渲染 ⏸ 倒计时，端点列表无组上下文保留聚合口径。冷却时长展示：`fmtCdMin` / `fmtCdSec` 统一走新增 `fmtDhms` —— dhms 格式、默认只取最高两个单位（`1d4h3m4s` → `1d4h`，`4m48s` → `4m48s`）。
+**验证**：新增 `test/test_defer_group_isolation.py`（8 例：保护组与「自身即当前端点」组同场不再互相清零、释放回迁、活跃期滚动续期、手动切换作用域、序列化口径）；全量 398 例通过（`test_hermes_stream_error_e2e` 2 例为改动前既有失败——Hermes stub 缺 `_capture_nous_model_switch`，已用 pristine HEAD 复现确认）；ruff 128 错误与基线逐项一致、无新增；`py_compile` 通过；前端 `render_error_smoke.js` / `test_chain_group_ui.js` / `test_cooldown_hours_display.js` 全部通过。
+**部署**：后端 sha256 `8660a00e…`（md5 `83308efb…`）/ 前端 sha256 `0cd770d8…`；`api-pool2.service` active（启动 2026-09-20 00:20:14，NRestarts=0）；`/api/endpoints` 200 / 52 端点 / `defer_by_group` 就位；启动后 journal 0 ERROR/0 WARN；真实请求成功。就地回滚备份 `api_pool_server.py.bak-20260920_002008` + `static/index.html.bak-20260920_002008`（宿主机 `/vol1/1000/tool/api-pool2/`）。
+**未覆盖**：本次未产生新的冷却过期事件（唯一冷却端点 Cline-ds4.1f 剩余约 15h），行为验证由单测复现生产日志对覆盖；下一次真实冷却过期事件自然给出倒计时或立即回迁。
+**工作区**：`/opt/data/work/api-pool2` commit `905bcac`（本地，未推送）。
