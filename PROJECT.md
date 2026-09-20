@@ -662,3 +662,14 @@ commit 后自动 checkpoint、`-wal` 归零。保留窗口实测最早记录 = 0
 **验证**：单测新增 4 例（可见文本不变 / `char`+`at` 与越界回退 / 空 `char` 报错 / 与替换型规则混用），`test_content_filter` 40 例通过，全量 404 例通过（2 例失败为改动前既存的 `test_hermes_stream_error_e2e` 即 HermesStub 属性缺失）。隔离实例 A/B（单端点 `AgentRouterZ-ds4f`、与生产隔离）：**A 规则开启** → 含命中词请求 HTTP 200 正常答复、端点 `health=ok` 且未冻结、日志 0 条敏感词；**B 规则关闭（对照）** → 同请求 HTTP 500 `sensitive_words_detected`，端点被冻结（`cooldown_reason=sensitive_words`）——证明差异来自该规则，且冻结契约仍是兜底。生产侧：`/api/content-filter/test` 实测 matched=1、结果含 U+200B；宿主机 `content_filter.json` 回读 4 条规则、文件内无不可见字符。前端内联脚本语法 0 错误；ruff 与改动前逐规则计数一致。
 **部署**：后端 md5 `3ed349f4…` / 前端 md5 `ef610085…`；`api-pool2.service` active、`/api/endpoints` 200。回滚备份 `api_pool_server.py.bak-pre-zwrule-20260920-023920`、`static/index.html.bak-pre-zwrule-20260920-023920`、`content_filter.json.bak-pre-zwrule-20260920-023920`（另有保存链自建 `content_filter.json.bak.20260920_023932`）。
 **边界（不修）**：零宽只覆盖文本字段；命中词若出现在 `tools[].function.name` 还会被拦，但该段上游不扫（实测），且标识符也插不进不可见字符（上游 400）。不可见字符会随模型输出流回下游（文件/grep/diff），排查需走 codepoint；上游若引入 Unicode 归一化则规则失效，届时删掉该规则即可（冻结契约仍在）。
+
+## 2026-09-20 端点级「限流优先重试」开关（retry_on_rate_limit） 已部署生产
+**需求（用户）**：`req=fee7e6fa` 在 `[pool-gpt6]AgentRouter-gpt6a` 命中「502 壳 + too_many_requests」限流后一次失败即冷却；用户判定重试即可，要求端点级开关「优先重试，跑完额外重试次数才冻结」。
+**根因（已核对宿主代码）**：`_try_endpoint` 有两处限流路径不经 `max_retries` 重试循环——流式首包 SSE 错误帧（`if stream_error: resp.close(); return None, f"HTTP 502: upstream stream error: …"`）与 `if e.code == 429: return …`。该端点 `max_retries=5` 对这两条路径无效，首次失败直接进 `_rotate` 冷却。4 天日志内 `pool-gpt6` 组的 502 共 7 次，全部是同一句限流文案。
+**实现（A 口径：仅限流类）**：
+- 新增 `Endpoint.retry_on_rate_limit`（默认 `False`＝现行为不变）；后端 3 处（数据类字段 / `_ep_to_dict` / `_sync_to_config` 持久化白名单），前端 4 处（表单选择框「限流优先重试」置于路由行为行第 4 格 + `openAddModal` 默认 + `editEndpoint` 回填 + `readFormDraft` 收集）。
+- 新增 `_is_rate_limit_error()`：**按报文文本判定**（`too_many_requests` / `rate limit` / `rate_limit` / `429` / `Retry-After`），不看状态码（上游用 502 壳包限流体）；命中仍以 `_classify_capacity_error` 为空为前提，故余额/配额/敏感词类不受影响。
+- 首包限流路径用「标记 + break → try/except 之后统一退避重试」实现（在 while 内直接 `continue` 会落回内层预读循环，而非 `for attempt`）；429 分支同开关、同预算。退避仍是 3s·2ⁿ，受 530s 请求预算与 `request_deadline` 截断。
+**验证**：单测 9 例（开关开/关 × 429 与首包限流、配额 429 不重试、非限流首包不重试、预算耗尽跳过、判定器 marker、字段默认与加载路径）；全量 413 例（2 例 `test_hermes_stream_error_e2e` 为改动前既存 stub 失败，`git worktree` HEAD 复核同样失败）。**隔离实例行为验证**（单端点指向 mock 上游、每次请求都回限流 SSE）：开关关 → 1 次客户端请求 = 1 次上游命中；开关开（`max_retries=2`）→ 1 次客户端请求 = 3 次上游命中，日志两条「首包限流，3/6 秒后进行第 1/2、2/2 次原端点重试（限流优先重试）」，预算跑完才「触发冷却机制」。字段 E2E：POST → GET 回读 → 落盘 → 重启后不回压 → 页面表单 4 处齐全。
+**部署**：后端 md5 `37070d16…` / 前端 md5 `b6cc494a…`；`api-pool2.service` 重启后 active、journal 0 ERROR；生产 59 端点全部带该字段，3 个 `[pool-gpt6]` AgentRouter 端点经 `PUT /api/endpoints` 置 `True`（`max_retries=5` → 限流时最多多等 93s 才轮转）。备份 `/opt/data/backups/api-pool2-host-2026-09-20_113235/`（宿主原件）与 `/opt/data/backups/api-pool2-2026-09-20_112403/`（改动前工作区）。commit `9053ee0` 已推送。
+**边界（不在范围）**：405 边缘拦截不适用（同 URL/同体积重放无增益）；开关开启的端点持续限流时，93s 内重试会持续消耗 RPM 且不轮转其它候选（端点自身优先）；前端选择框与卡片展示由用户实测。
