@@ -5701,19 +5701,19 @@ class APIPool:
                     if payload.get("stream"):
                         def vision_wrapper(tgt_ep, pld, t_out, a_eps, _grp=group):
                             import json
-                            yield f"data: {{'choices':[{{'delta':{{'content':'[API Pool: 检测到图片，当前目标不支持视觉，正在调用视觉模型进行解析...]\\n\\n'}}}}]}}\n\n".replace("'", '"')
+                            yield f"data: {{'choices':[{{'delta':{{'content':'[API Pool: 检测到图片，当前目标不支持视觉，正在调用视觉模型进行解析...]\\n\\n'}}}}]}}\n\n".replace("'", '"').encode("utf-8")
                             translated_msgs = self._translate_images_sync(
                                 pld["messages"], a_eps, _grp,
                                 request_id=request_id, request_deadline=request_deadline,
                             )
-                            yield f"data: {{'choices':[{{'delta':{{'content':'[图片解析完成，交由目标模型继续处理...]\\n\\n'}}}}]}}\n\n".replace("'", '"')
+                            yield f"data: {{'choices':[{{'delta':{{'content':'[图片解析完成，交由目标模型继续处理...]\\n\\n'}}}}]}}\n\n".replace("'", '"').encode("utf-8")
                             pld["messages"] = translated_msgs
                             gen, err = self._try_endpoint(
                                 tgt_ep, pld, t_out, pool_group=group,
                                 request_id=request_id, request_deadline=request_deadline,
                             )
                             if err:
-                                yield f"data: {{'choices':[{{'delta':{{'content':'\\n\\n[API Pool Error: 请求最终目标失败: {err}]'}}}}]}}\n\n".replace("'", '"')
+                                yield f"data: {{'choices':[{{'delta':{{'content':'\\n\\n[API Pool Error: 请求最终目标失败: {err}]'}}}}]}}\n\n".replace("'", '"').encode("utf-8")
                             else:
                                 # 实际请求成功后标记端点成功
                                 # clear_defer：仅当请求开始时端点已在 defer（兜底使用）才清除
