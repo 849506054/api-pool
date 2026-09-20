@@ -2734,6 +2734,9 @@ class Endpoint:
     is_vision: bool = False
     in_pool: bool = False  # 是否加入聚合池（默认不加入）
     check_fake_success: bool = False  # 是否检测假成功（200 OK 但内容含拒绝信息）
+    # 限流优先重试（2026-09-20）：开启后限流类错误（429 / too_many_requests / exceeded rate limit）
+    # 先在原端点按 max_retries 退避重试，耗尽才冷却并轮转；默认关闭 = 保持「限流即轮转」。
+    retry_on_rate_limit: bool = False
     tool_call_id_prefix: str = ""
     reasoning_policy: str = "auto"  # auto=DeepSeek保留+GLM保留+其余剥离 | keep=强制保留回传 | strip=强制剥离
     # DeepSeek 严格校验 400 的同端点重试上限（0=不重试只轮转 / 1=原样重试 1 次 / 2=原样 1 次 +
@@ -3962,6 +3965,7 @@ class APIPool:
             "is_vision": ep.is_vision,
             "in_pool": ep.in_pool,
             "check_fake_success": ep.check_fake_success,
+            "retry_on_rate_limit": getattr(ep, "retry_on_rate_limit", False),
             "tool_call_id_prefix": ep.tool_call_id_prefix,
             "strict400_retries": getattr(ep, "strict400_retries", 2),
             "reasoning_policy": getattr(ep, "reasoning_policy", "auto"),
@@ -4426,6 +4430,18 @@ class APIPool:
         """仅输出仍在延迟中的组，供前端按组视图渲染倒计时。"""
         now = now if now is not None else time.time()
         return {grp: max(0, int(u - now)) for grp, u in ep._defer_until_by_group.items() if u > now}
+
+    @staticmethod
+    def _is_rate_limit_error(error_msg):
+        """限流类判定（只看报文文本，不看状态码）。
+
+        上游常把限流包在 502 壳里返回（`HTTP 502: upstream stream error: too_many_requests: ...`），
+        因此不能按 429 状态码判定。仅用于 `retry_on_rate_limit` 开关的命中判断。
+        """
+        text = str(error_msg or "").lower()
+        return any(marker in text for marker in (
+            "too_many_requests", "rate limit", "rate_limit", "429", "retry-after",
+        ))
 
     @staticmethod
     def _classify_capacity_error(error_msg):
@@ -6427,6 +6443,7 @@ class APIPool:
                         _gate_stall_deadline = time.time() + _stall_budget if _stall_budget > 0 else None
                         _gate_max_deadline = time.time() + _max_budget if _max_budget > 0 else None
                         _gate_max_lines = 200
+                        _first_packet_rate_limit = ""
                         while True:
                             if _gate_stall_deadline is not None and time.time() > _gate_stall_deadline:
                                 _gate_elapsed_stall = True
@@ -6464,6 +6481,12 @@ class APIPool:
                             pending_error_event = False
                             if stream_error:
                                 resp.close()
+                                if (ep.retry_on_rate_limit and not force_no_retry and attempt < retries
+                                        and not self._classify_capacity_error(stream_error)
+                                        and self._is_rate_limit_error(stream_error)):
+                                    # 限流优先重试（2026-09-20）：首包限流不直接冷却，退避重试后再定夺
+                                    _first_packet_rate_limit = stream_error
+                                    break
                                 return None, f"HTTP 502: upstream stream error: {stream_error}"
                             if _is_business_chunk(chunk):
                                 break
@@ -6490,6 +6513,16 @@ class APIPool:
                         except Exception:
                             pass
                         return None, f"HTTP 502: upstream stream pre-read failed: {type(e).__name__}: {e}"
+
+                    if _first_packet_rate_limit:
+                        retry_delay = 3 * (2 ** attempt)
+                        if request_deadline is not None and time.time() + retry_delay >= request_deadline:
+                            return None, (f"HTTP 502: upstream stream error: {_first_packet_rate_limit}"
+                                          "; retry skipped: request budget exhausted")
+                        sys_log(f"{request_tag}端点 '{endpoint_log_label}' 首包限流，{retry_delay} 秒后进行第 "
+                                f"{attempt+1}/{retries} 次原端点重试（限流优先重试）: {_first_packet_rate_limit[:120]}", "INFO")
+                        time.sleep(retry_delay)
+                        continue
 
                     def stream_generator():
                         stream_id = f"chatcmpl-{int(time.time()*1000)}"
@@ -7215,7 +7248,17 @@ class APIPool:
                         request_id=request_id,
                         request_deadline=request_deadline,
                     )
-                if e.code == 429: return None, msg + " (429 rate-limited)"
+                if e.code == 429:
+                    if (ep.retry_on_rate_limit and not force_no_retry and attempt < retries
+                            and not self._classify_capacity_error(msg)):
+                        retry_delay = 3 * (2 ** attempt)
+                        if request_deadline is not None and time.time() + retry_delay >= request_deadline:
+                            return None, msg + " (429 rate-limited; retry skipped: request budget exhausted)"
+                        sys_log(f"{request_tag}端点 '{endpoint_log_label}' {retry_delay} 秒后进行第 "
+                                f"{attempt+1}/{retries} 次原端点重试（HTTP 429 限流优先重试）", "INFO")
+                        time.sleep(retry_delay)
+                        continue
+                    return None, msg + " (429 rate-limited)"
                 if e.code in (401, 403): return None, msg + " (auth error)"
                 if e.code >= 500:
                     if self._classify_capacity_error(msg) == "sensitive_words":
@@ -8567,7 +8610,7 @@ def _sync_to_config():
                 entry["idle_seconds"] = gd["idle_seconds"]
             defs_list.append(entry)
     save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "client_profile": ep.get("client_profile", ""), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
-            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "strict400_retries": ep.get("strict400_retries", 2), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles,
+            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "retry_on_rate_limit": ep.get("retry_on_rate_limit", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "strict400_retries": ep.get("strict400_retries", 2), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles,
         probe_client_profile=getattr(pool, "_probe_client_profile", ""),
         log_retention=load_log_retention())
 
