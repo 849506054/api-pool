@@ -667,7 +667,7 @@ commit 后自动 checkpoint、`-wal` 归零。保留窗口实测最早记录 = 0
 **需求（用户）**：`req=fee7e6fa` 在 `[pool-gpt6]AgentRouter-gpt6a` 命中「502 壳 + too_many_requests」限流后一次失败即冷却；用户判定重试即可，要求端点级开关「优先重试，跑完额外重试次数才冻结」。
 **根因（已核对宿主代码）**：`_try_endpoint` 有两处限流路径不经 `max_retries` 重试循环——流式首包 SSE 错误帧（`if stream_error: resp.close(); return None, f"HTTP 502: upstream stream error: …"`）与 `if e.code == 429: return …`。该端点 `max_retries=5` 对这两条路径无效，首次失败直接进 `_rotate` 冷却。4 天日志内 `pool-gpt6` 组的 502 共 7 次，全部是同一句限流文案。
 **实现（A 口径：仅限流类）**：
-- 新增 `Endpoint.retry_on_rate_limit`（默认 `False`＝现行为不变）；后端 3 处（数据类字段 / `_ep_to_dict` / `_sync_to_config` 持久化白名单），前端 4 处（表单选择框「限流优先重试」置于路由行为行第 4 格 + `openAddModal` 默认 + `editEndpoint` 回填 + `readFormDraft` 收集）。
+- 新增 `Endpoint.retry_on_rate_limit`（默认 `False`＝现行为不变）；后端 3 处（数据类字段 / `_ep_to_dict` / `_sync_to_config` 持久化白名单），前端 4 处（表单选择框「限流优先重试」置于能力行第 3 格「保留式思考」之后 + `openAddModal` 默认 + `editEndpoint` 回填 + `readFormDraft` 收集）。
 - 新增 `_is_rate_limit_error()`：**按报文文本判定**（`too_many_requests` / `rate limit` / `rate_limit` / `429` / `Retry-After`），不看状态码（上游用 502 壳包限流体）；命中仍以 `_classify_capacity_error` 为空为前提，故余额/配额/敏感词类不受影响。
 - 首包限流路径用「标记 + break → try/except 之后统一退避重试」实现（在 while 内直接 `continue` 会落回内层预读循环，而非 `for attempt`）；429 分支同开关、同预算。退避仍是 3s·2ⁿ，受 530s 请求预算与 `request_deadline` 截断。
 **验证**：单测 9 例（开关开/关 × 429 与首包限流、配额 429 不重试、非限流首包不重试、预算耗尽跳过、判定器 marker、字段默认与加载路径）；全量 413 例（2 例 `test_hermes_stream_error_e2e` 为改动前既存 stub 失败，`git worktree` HEAD 复核同样失败）。**隔离实例行为验证**（单端点指向 mock 上游、每次请求都回限流 SSE）：开关关 → 1 次客户端请求 = 1 次上游命中；开关开（`max_retries=2`）→ 1 次客户端请求 = 3 次上游命中，日志两条「首包限流，3/6 秒后进行第 1/2、2/2 次原端点重试（限流优先重试）」，预算跑完才「触发冷却机制」。字段 E2E：POST → GET 回读 → 落盘 → 重启后不回压 → 页面表单 4 处齐全。

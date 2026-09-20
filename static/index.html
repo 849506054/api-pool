@@ -158,7 +158,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .form-group input:focus,.form-group select:focus{border-color:var(--accent)}
 .form-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .form-row.form-row-routing,.form-row.form-row-capability{grid-template-columns:repeat(3,1fr)}
-.form-row.form-row-routing-4{grid-template-columns:repeat(4,1fr)}
 .form-row.form-row-request{grid-template-columns:1fr 1fr}
 .form-row.form-row-stream{grid-template-columns:repeat(3,1fr)}
 .form-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
@@ -275,7 +274,6 @@ select option { background: var(--bg); color: var(--text); }
   .modal>.form-row{margin-bottom:10px}
   .modal>.form-group{margin-bottom:10px}
   .form-row.form-row-routing,.form-row.form-row-capability{grid-template-columns:repeat(3,1fr)!important;gap:5px}
-  .form-row.form-row-routing-4{grid-template-columns:repeat(2,1fr)!important;gap:5px}
   .form-row.form-row-request{grid-template-columns:repeat(2,1fr)!important;gap:5px}
   .form-row.form-row-request{grid-template-columns:1fr 1fr}
   .form-row.form-row-stream{grid-template-columns:repeat(3,1fr)!important;gap:5px}
@@ -616,17 +614,17 @@ select option { background: var(--bg); color: var(--text); }
     <div class="form-row form-row-capability">
       <div class="form-group"><label title="reasoning_content 回传策略：auto=DeepSeek/GLM 自动保留，其余剥离；keep=强制保留（上游要求回传的中转）；strip=强制剥离（上游拒绝该字段）">推理回传策略</label><select id="fReasoningPolicy"><option value="auto">自动（DeepSeek/GLM 保留）</option><option value="keep">强制保留</option><option value="strip">强制剥离</option></select></div>
       <div class="form-group"><label title="GLM 保留式思考：请求注入 thinking.clear_thinking=false，要求历史 reasoning_content 完整回传（需上游支持，默认关）">保留式思考</label><select id="fPreservedThinking"><option value="false">关闭</option><option value="true">开启（GLM）</option></select></div>
+      <div class="form-group"><label title="开启后，限流类错误（429 / too_many_requests / exceeded rate limit）先在原端点退避重试，重试次数用「额外重试次数」，耗尽才冷却并轮转；关闭=限流即轮转">限流优先重试</label><select id="fRateRetry"><option value="false">关闭</option><option value="true">开启</option></select></div>
     </div>
     <div class="form-row form-row-capability">
       <div class="form-group"><label title="底层协议类型">协议类型</label><select id="fProtocol"><option value="openai">OpenAI 兼容</option><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic</option><option value="gemini">Gemini 兼容</option></select></div>
       <div class="form-group"><label title="标识该模型是否原生支持读图。若选“不支持”，收到图片时会自动触发图片解析。">多模态能力</label><select id="fVision"><option value="false" selected>🚫 不支持 (触发自动转译)</option><option value="true">👁️ 原生支持</option></select></div>
       <div class="form-group"><label title="是否使用系统代理 (如v2ray)。本地或直连接口请选择否。">代理设置</label><select id="fProxy"><option value="false">强制直连</option><option value="true">随系统</option></select></div>
     </div>
-    <div class="form-row form-row-routing form-row-routing-4">
+    <div class="form-row form-row-routing">
       <div class="form-group"><label title="检测上游返回内容是否含拒绝信息，从而触发自动轮转">假成功检测</label><select id="fFakeCheck"><option value="false">关闭</option><option value="true">开启</option></select></div>
       <div class="form-group"><label title="开启后，本端点工作时会保护其缓存：其他端点恢复后暂不切走；关闭后允许立即回切到恢复端点">缓存保护</label><select id="fDeferrable"><option value="true">开启（延迟切走）</option><option value="false">关闭（允许立即回切）</option></select></div>
       <div class="form-group"><label>后台探针</label><select id="fHealthMode"><option value="chat">Ping (/chat/completions)</option><option value="models">Models (/v1/models) 零成本</option><option value="none">关闭检测</option></select></div>
-      <div class="form-group"><label title="开启后，限流类错误（429 / too_many_requests / exceeded rate limit）先在原端点退避重试，重试次数用「额外重试次数」，耗尽才冷却并轮转；关闭=限流即轮转">限流优先重试</label><select id="fRateRetry"><option value="false">关闭</option><option value="true">开启</option></select></div>
     </div>
     <div class="form-row form-row-stream">
       <div class="form-group"><label title="收到响应头后等待第一条 SSE 数据的独立超时，0=不额外设置；仍受整体请求预算约束">首条数据 (秒)</label><input type="number" id="fStreamFirstPacket" value="120" min="0" placeholder="默认120"></div>
