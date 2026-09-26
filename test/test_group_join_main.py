@@ -495,6 +495,112 @@ class GroupJoinMainTests(unittest.TestCase):
             pool2._load_group_defs(defs)
             self.assertEqual(pool2._joined_subgroups(), {"bg": 4})
 
+    # ── 整组冻结后回落展示（2026-09-27）──
+    #
+    # 用户报：子组级端点整组冻结 fallback 到下个优先级端点时，UI 上当前使用
+    # 端点状态不显示。根因在 _main_pointer_target 返回 None（不是路由 bug，
+    # 路由一直正确回落），导致 chain/groups 的 current_endpoint 为空。
+
+    def test_main_pointer_falls_back_to_next_priority_when_subgroup_frozen(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            import time as _t
+            m1 = self.endpoint(module, "m1", 1, "glm-5.3")
+            b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
+            m9 = self.endpoint(module, "m9", 9, "ds-fallback")
+            pool = self.make_pool(module, [m1, b1, m9],
+                                  {"bg": {"type": "mixed", "model": "bg"}})
+            pool.set_main_priority("bg", 2)   # bg 占名次 2，m9 名次 9
+            self.assertTrue(pool.switch_main_to_subgroup("bg")[0])
+            # 子组可用：main 有效目标 = 子组名（下钻自动跟随）
+            self.assertEqual(pool._main_pointer_target(), "bg")
+            # 子组整组冻结：main 有效目标必须回落到下一个可用端点，而不是 None
+            b1._cooldown_until = _t.time() + 999
+            self.assertEqual(pool._main_pointer_target(), "m1")
+            # 名次 1 的 m1 也冻结 → 继续回落到 m9
+            m1._cooldown_until = _t.time() + 999
+            self.assertEqual(pool._main_pointer_target(), "m9")
+            # 全冻 → 无候选，才允许 None
+            m9._cooldown_until = _t.time() + 999
+            self.assertIsNone(pool._main_pointer_target())
+
+    def test_chain_marks_fallback_endpoint_current_for_main(self):
+        """整组冻结回落后，回落端点必须在 chain 里标成 main 当前（UI 显示「服务中」）。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            import time as _t
+            m1 = self.endpoint(module, "m1", 1, "glm-5.3")
+            b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
+            pool = self.make_pool(module, [m1, b1],
+                                  {"bg": {"type": "mixed", "model": "bg"}})
+            pool.set_main_priority("bg", 2)
+            self.assertTrue(pool.switch_main_to_subgroup("bg")[0])
+            b1._cooldown_until = _t.time() + 999
+            rows = {r["name"]: r for r in pool.get_active_chain()}
+            self.assertIn("main", rows["m1"]["current_groups"])
+            self.assertTrue(rows["m1"]["is_current"])
+            # 冻结的子组条目：不得再声称 main 指向它
+            self.assertNotIn("main", rows["bg"]["current_groups"])
+            self.assertFalse(rows["bg"]["is_current"])
+            self.assertTrue(rows["bg"]["in_cooldown"])
+
+    def test_chain_marks_subgroup_serving_when_available(self):
+        """子组可用且 main 指向它 → 子组条目显示「服务中」（回归：曾误用子组自身指针）。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            m1 = self.endpoint(module, "m1", 1, "glm-5.3")
+            b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
+            b2 = self.endpoint(module, "b2", 1, "ds2", groups=["bg2"])
+            pool = self.make_pool(module, [m1, b1, b2],
+                                  {"bg": {"type": "mixed", "model": "bg"},
+                                   "bg2": {"type": "mixed", "model": "bg2"}})
+            pool.set_main_priority("bg", 2)
+            pool.set_main_priority("bg2", 3)
+            self.assertTrue(pool.switch_main_to_subgroup("bg")[0])
+            rows = {r["name"]: r for r in pool.get_active_chain()}
+            # main 指向 bg → bg 服务中；bg2 虽在 main 轴上有名次但未被指向
+            self.assertTrue(rows["bg"]["is_current"])
+            self.assertEqual(rows["bg"]["current_groups"], ["main"])
+            self.assertFalse(rows["bg2"]["is_current"])
+            self.assertEqual(rows["bg2"]["current_groups"], [])
+
+    def test_chain_marks_subgroup_serving_when_main_uses_its_member(self):
+        """main 自动选中被加入子组的成员时，该子组条目也显示「服务中」。
+
+        main 指针存的是端点 id（不是子组名）——因为端点是被当作 main 候选
+        直接选中的。但该端点只可能进 main 候选是因为其所属子组已加入 main，
+        所以从用户视角该子组正在服务。
+        """
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
+            pool = self.make_pool(module, [b1],
+                                  {"bg": {"type": "mixed", "model": "bg"}})
+            pool.set_main_priority("bg", 1)
+            # 模拟 main 自动选中该成员（指针=端点 id，非子组名）
+            pool._set_current("main", "b1")
+            self.assertEqual(pool._main_pointer_target(), "b1")
+            rows = {r["name"]: r for r in pool.get_active_chain()}
+            self.assertTrue(rows["bg"]["is_current"])
+            self.assertEqual(rows["bg"]["current_groups"], ["main"])
+            # 池列表「● 当前」徽标/高亮框的唯一判据来源
+            self.assertEqual(pool._main_serving_subgroup(), "bg")
+
+    def test_serving_subgroup_none_when_native_endpoint(self):
+        """main 用原生端点服务时不得报任何子组服务中（否则池列表误标）。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            m1 = self.endpoint(module, "m1", 1, "glm-5.3")
+            b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
+            pool = self.make_pool(module, [m1, b1],
+                                  {"bg": {"type": "mixed", "model": "bg"}})
+            pool.set_main_priority("bg", 2)
+            pool._set_current("main", "m1")
+            self.assertIsNone(pool._main_serving_subgroup())
+            rows = {r["name"]: r for r in pool.get_active_chain()}
+            self.assertFalse(rows["bg"]["is_current"])
+            self.assertEqual(rows["bg"]["current_groups"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

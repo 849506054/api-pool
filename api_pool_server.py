@@ -3947,15 +3947,46 @@ class APIPool:
         """main 当前应指向的目标（端点 id / 子组名 / None）。
 
         手动切到子组整体时：子组有可用端点 → 保持子组名（下钻自动跟随）；
-        子组整体不可用（全冷却/挂）→ 视为手动意图已无法满足，清指针回落到
-        按优先级自动选择，避免卡在无效子组名上导致 chain 显示空当前端点。
+        子组整体不可用（全冷却/挂）→ 手动意图已无法满足，回落到 main 候选首位
+        （= 路由实际会用的下一个优先级可用端点）。
+
+        2026-09-27 修：原来这里返回 None，导致 chain/groups 的 current_endpoint
+        显示空——用户看不到整组冻结 fallback 后当前实际在用的端点。路由本身
+        （chat 里 current_id 解析）一直是正确回落的，只有展示口径漏了。
         """
         manual = self._get_manual(self.MAIN_GROUP)
         if manual in self._joined_subgroups():
             if self._resolve_subgroup_current(manual) is None:
-                return None
+                cands, _ = self._group_sticky_candidates(self.MAIN_GROUP)
+                return cands[0].id if cands else None
             return manual
         return manual or self._get_current(self.MAIN_GROUP)
+
+    def _main_serving_subgroup(self):
+        """main 当前实际正在服务的**子组名**（None = 正在用原生端点或空）。
+
+        main 指针有两种形态都算「该子组正在服务」：
+          1. 指针值是子组名（手动整组切入，下钻自动跟随）；
+          2. 指针值是**该子组的成员端点 id**（main 候选里子组名次靠前时直接
+             选中其成员，指针存端点 id 而非子组名）。
+
+        第 2 条是池列表「● 当前」徽标/高亮框的唯一判据来源——漏掉它会让
+        「main 正通过 workbuddy 的成员服务」在 UI 上完全没有当前标识。
+        """
+        target = self._main_pointer_target()
+        if not target:
+            return None
+        joined = self._joined_subgroups()
+        if target in joined:
+            return target
+        ep = next((e for e in self._endpoints if e.id == target), None)
+        if ep is None:
+            return None
+        groups = self._ep_groups(ep)
+        for sub in joined:
+            if sub in groups:
+                return sub
+        return None
 
     def _group_all_frozen_remaining(self, grp):
         """整组无可用端点时的最短剩余冻结秒数（2026-09-27）。
@@ -4275,6 +4306,10 @@ class APIPool:
         渲染），`model` 为该组当前端点模型（只读展示）。
         """
         out = []
+        # 「正在为 main 服务」的判据收在 _main_serving_subgroup 一处，与
+        # /api/chain 的 current_subgroup（池列表「● 当前」徽标/高亮框来源）
+        # 同源，避免两份判据漂移。
+        _serving_sub = self._main_serving_subgroup()
         for sub, mp in self._joined_subgroups().items():
             cands, _ = self._group_sticky_candidates(sub)
             cur = self._manual_override_by_group.get(sub) or self._current_endpoint_by_group.get(sub)
@@ -4302,10 +4337,8 @@ class APIPool:
                 "model": (cur_ep.model if cur_ep else (cands[0].model if cands else "—")),
                 "priority": mp,
                 "priority_by_group": {self.MAIN_GROUP: mp},
-                # 整组冻结时 main 不可能真正选中它（无候选），is_current 记 False，
-                # 否则前端显示「服务中」绿条与冷却态矛盾。
-                "is_current": bool(cur) and frozen_remaining <= 0,
-                "current_groups": [self.MAIN_GROUP] if (cur and frozen_remaining <= 0) else [],
+                "is_current": _serving_sub == sub,
+                "current_groups": [self.MAIN_GROUP] if _serving_sub == sub else [],
                 "pool_groups": [self.MAIN_GROUP, sub],
                 "fail_count": 0,
                 "in_cooldown": frozen_remaining > 0,
@@ -4344,6 +4377,20 @@ class APIPool:
                 for grp in self._all_group_names()
             }
             current_ids = set(current_by_group.values())
+            # main 的**有效**目标（2026-09-27）：手动指向的子组整组冻结时，
+            # _main_pointer_target 回落到路由实际会用的下一个优先级端点。原始指针
+            # 仍是子组名，_groups_pointing_at 判不出这个端点 → UI 不显示「当前使用」。
+            # 这里把回落端点补进 main 的指向集合。
+            main_target = self._main_pointer_target()
+            if main_target and main_target not in self._joined_subgroups():
+                current_ids.add(main_target)
+
+            def _groups_for(ep_id):
+                g = self._groups_pointing_at(ep_id)
+                if ep_id == main_target and self.MAIN_GROUP not in g:
+                    g.append(self.MAIN_GROUP)
+                return g
+
             # 已加入 main 的子组：整组作为 main 一个成员参与，链条目必须可见（2026-09-27）。
             subgroup_entries = self._joined_subgroup_chain_entries(now)
             rows = [
@@ -4353,7 +4400,7 @@ class APIPool:
                     "priority": ep.priority,
                     "priority_by_group": dict(getattr(ep, "priority_by_group", None) or {}),
                     "is_current": ep.id in current_ids,
-                    "current_groups": self._groups_pointing_at(ep.id),
+                    "current_groups": _groups_for(ep.id),
                     "pool_groups": list(self._ep_groups(ep)),
                     "fail_count": ep._fail_count,
                     "in_cooldown": ep._cooldown_until > now,
@@ -8604,8 +8651,10 @@ def api_handler(method, path, body):
             cur_sub = None
             if grp == pool.MAIN_GROUP:
                 cur = pool._main_pointer_target()
+                # 命中形态二（指针=子组成员端点 id）时也必须给出子组名，
+                # 否则池列表的「● 当前」徽标/高亮框不显示。
+                cur_sub = pool._main_serving_subgroup()
                 if cur in pool._joined_subgroups():
-                    cur_sub = cur
                     cur = pool._resolve_subgroup_current(cur_sub)
             cur_ep = next((e for e in pool._endpoints if e.id == cur), None)
             _fb_until = pool._group_fallback_lock_until.get(grp, 0)
