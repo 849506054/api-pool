@@ -101,12 +101,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .pool-model-select{max-width:240px;padding:2px 5px;cursor:pointer;font-size:11px;color:var(--text-dim)}
 
 .ep-list{display:flex;flex-direction:column;gap:6px;flex:1;overflow-y:auto;min-height:0;overscroll-behavior:contain;padding-right:2px}
+/* 聚合池管理列表（池组端点卡片容器）：原先无样式定义，卡片块级堆叠无间距 */
+#poolList{display:flex;flex-direction:column;gap:6px}
 .ep-item{background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:12px;padding:12px 14px;transition:all .2s cubic-bezier(0.2,0.8,0.2,1)}
 .ep-item:hover{border-color:rgba(255,255,255,.15);background:var(--card-hover);transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,.2)}
 .ep-item.disabled{opacity:.4}
 .ep-item.current{border-color:var(--green);background:var(--green-dim)}
 .ep-item.in-cooldown{border-color:var(--yellow);background:var(--yellow-dim)}
-.ep-item.in-pool{border-left:3px solid var(--accent);background:rgba(0,122,255,.08)}
+.ep-item.in-pool{background:rgba(0,122,255,.08)}
+/* 子组条目（2026-09-27）：整组作为 main 成员参与，紫色左边框与普通端点区分 */
+.ep-item.in-pool.subgroup-entry{border-left:3px solid var(--accent)}
 .ep-item.has-error{border-color:var(--red);background:var(--red-dim)}
 .ep-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;gap:6px;flex-wrap:wrap}
 .ep-name{font-weight:700;font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
@@ -129,6 +133,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 
 .chain-list{display:flex;flex-direction:column;gap:0}
 .chain-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border-left:2px solid var(--border);font-size:12px;position:relative;transition:all .12s}
+/* 聚合链子组级条目（2026-09-27）：紫色左边框与普通端点区分 */
+.chain-item.subgroup-entry{border-left:2px solid var(--accent)}
 .chain-item:last-child{border-left-color:transparent}
 .chain-item.active{border-left-color:var(--green);background:var(--green-dim);border-radius:0 8px 8px 0}
 .chain-item.cooldown{border-left-color:var(--yellow);background:var(--yellow-dim);border-radius:0 8px 8px 0}
@@ -897,7 +903,14 @@ function renderPoolList(eps){
     if(ep.in_pool)cls+=' in-pool';
     const prioOf=(e)=>((e.priority_by_group&&e.priority_by_group[displayGroup]!==undefined)?e.priority_by_group[displayGroup]:e.priority);
     const groupEps=poolEps.filter(e=>groupsOf(e).includes(displayGroup));
-    const maxP=Math.max(groupEps.length, Math.max(...groupEps.map(e=>prioOf(e))));
+    // 可选名次上限 = 统一优先级轴长度（main 视图含已加入子组，各占 1 个名次），
+    // 与子组条目下拉、后端 1..N 编号口径一致；非 main 视图维持纯端点口径。
+    let maxP=Math.max(groupEps.length, Math.max(...groupEps.map(e=>prioOf(e))));
+    if(displayGroup==='main'){
+      const joinedN=(window._groupDefs||[]).filter(g=>g.name&&g.name!=='main'&&g.name!=='vision'&&g.main_priority>0).length;
+      if(joinedN) maxP=Math.max(groupEps.length+joinedN, ...groupEps.map(e=>prioOf(e)),
+        ...(window._groupDefs||[]).filter(g=>g.main_priority>0).map(g=>g.main_priority));
+    }
     let options='';
     for(let p=1;p<=maxP;p++) options+=`<option value="${p}" ${p===prioOf(ep)?'selected':''}>#${p}</option>`;
     return `<div class="${cls}" style="display:flex;flex-direction:column;gap:6px;padding:10px 12px">
@@ -937,7 +950,11 @@ function renderPoolList(eps){
   const info=groupsInfo[poolGroupFilter]||{};
   const barHtml=groups.map(gr=>{
     const gi=groupsInfo[gr]||{};
-    const memN=poolEps.filter(e=>groupsOf(e).includes(gr)).length;
+    let memN=poolEps.filter(e=>groupsOf(e).includes(gr)).length;
+    // main 组：已加入子组各算 1 个成员（与后端统一优先级轴、聚合条目口径一致）
+    if(gr==='main'){
+      memN+=(window._groupDefs||[]).filter(g=>g.name&&g.name!=='main'&&g.name!=='vision'&&g.main_priority>0).length;
+    }
     const icon=groupIcon(gr);
     const gDef=(window._groupDefs||[]).find(x=>x.name===gr)||{};
     const selTip=gDef.model&&gDef.model!==gr?` · 选择器：${esc(gDef.model)}`:'';
@@ -955,7 +972,81 @@ function renderPoolList(eps){
     <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:10px" title="编辑分组属性（类型、选择器）" onclick="editPoolGroup('${esc(poolGroupFilter)}')">编辑分组</button>
     </div>
   </div>`;
-  el.innerHTML=`<div class="filter-bar" style="margin-bottom:8px">${barHtml}</div>`+statusHtml+members.map(cardOf).join('');
+  el.innerHTML=`<div class="filter-bar" style="margin-bottom:8px">${barHtml}</div>`+statusHtml+mergedMainRows(poolGroupFilter,members,cardOf,groupsInfo);
+}
+
+// main 视图：已加入子组条目与普通端点按同一条 main 优先级轴混排（子组占 1 个名次，
+// 与后端统一轴口径一致），不再无条件前置。非 main 视图只渲染端点。
+function mergedMainRows(displayGroup,members,cardOf,groupsInfo){
+  if(displayGroup!=='main')return members.map(cardOf).join('');
+  const joined=(window._groupDefs||[]).filter(g=>g.name&&g.name!=='main'&&g.name!=='vision'&&g.main_priority>0);
+  if(!joined.length)return members.map(cardOf).join('');
+  const pbgOf=(e)=>((e.priority_by_group&&e.priority_by_group.main!==undefined)?e.priority_by_group.main:e.priority);
+  // 统一轴名次上限：与端点下拉同一口径（原生端点数 + 已加入子组数，并兼顾现有最大名次）
+  const maxP=Math.max(members.length+joined.length,
+    ...members.map(e=>pbgOf(e)), ...joined.map(g=>g.main_priority));
+  const rows=members.map(e=>({prio:pbgOf(e),html:cardOf(e)}));
+  for(const g of joined) rows.push({prio:g.main_priority,html:joinedSubgroupCard(g,groupsInfo,maxP)});
+  rows.sort((a,b)=>a.prio-b.prio);
+  return rows.map(r=>r.html).join('');
+}
+
+// 已加入 main 的子组：在 main 列表里聚合为单条目。复用普通端点条目的完整结构与样式，
+// 仅去掉不适用的控件（模型选择/测试/暂停），用大写+紫色组名与普通端点区分（不加额外徽标）。
+// 保留：#N main 优先级下拉（改 main_priority）、⚡手动切到子组整体、✏️编辑（切子组视图）、📤移出 main。
+function joinedSubgroupCard(g,groupsInfo,maxP){
+  const mainInfo=groupsInfo['main']||{};
+  const gi=groupsInfo[g.name]||{};
+  const hit=mainInfo.current_subgroup===g.name;  // main 当前正命中该子组
+  // 整组冻结（2026-09-27）：组内无可用端点且全部冷却中 → 该子组条目在 main 中
+  // 等同冻结，不参与 main 轮转；冻结时长取组内最短剩余冻结端点。
+  const frozenSec=(gi.all_frozen_remaining||0)|0;
+  const frozen=frozenSec>0;
+  let cls='ep-item in-pool subgroup-entry';
+  if(hit)cls+=' current';
+  if(frozen)cls+=' in-cooldown';
+  const cur=gi.current_endpoint?esc(gi.current_endpoint):'—';
+  let options='';
+  for(let p=1;p<=maxP;p++) options+=`<option value="${p}" ${p===g.main_priority?'selected':''}>#${p}</option>`;
+  return `<div class="${cls}" style="display:flex;flex-direction:column;gap:6px;padding:10px 12px">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
+      <div style="display:flex;align-items:center;gap:6px;min-width:0">
+        <span class="badge badge-priority">#${g.main_priority}</span>
+        <span style="font-weight:700;font-size:13px;letter-spacing:.5px;color:#a5b4fc;text-transform:uppercase;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(g.name)}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
+        ${hit?`<span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="main 当前正使用该子组的端点：${cur}">● 当前</span>`:''}
+        ${frozen?`<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px" title="组内端点全部冻结，整组不参与 main 轮转；剩余时间取组内最早恢复的端点">⏳${fmtCdSec(frozenSec)}</span>`:''}
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
+      <span style="font-size:12px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0" title="${frozen?'组内端点全部冻结，main 轮转会跳过该子组；剩余时间取组内最早恢复的端点':'该子组当前端点（整组作为 main 成员参与，按子组自身优先级选端点）'}">当前端点：${frozen?'—（整组冻结）':cur}</span>
+      <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
+        <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setMainPriority('${esc(g.name)}', this.value);this.blur()" title="修改该子组在 main 优先级轴上的名次">${options}</select>
+        <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="编辑该子组（切到子组视图）" onclick="setPoolGroupFilter('${esc(g.name)}')">✏️</button>
+        ${(!hit&&!frozen)?`<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="手动切到该子组整体（main 按子组优先级选端点，子组当前端点变化自动跟随）" onclick="switchMainToSubgroup('${esc(g.name)}')">⚡</button>`:''}
+        <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="移出 main（该子组不再作为 main 成员参与）" onclick="leaveMain('${esc(g.name)}')">📤</button>
+      </div>
+    </div>
+  </div>`;
+}
+async function setMainPriority(name,newPrio){
+  newPrio=parseInt(newPrio);
+  if(!newPrio||newPrio<1)return;
+  const r=await api('POST',`/api/groups/${encodeURIComponent(name)}/join-main`,{main_priority:newPrio});
+  if(r.ok){toast('✅ main 优先级已更新','success');refresh();}
+  else{toast(r.error||'更新失败','error');}
+}
+async function switchMainToSubgroup(name){
+  const r=await api('POST',`/api/groups/${encodeURIComponent(name)}/switch-main`,{});
+  if(r.ok){toast(`已切到子组「${name.toUpperCase()}」`,'success');refresh();}
+  else{toast(r.error||'切换失败','error');}
+}
+async function leaveMain(name){
+  if(!confirm(`将子组「${name}」移出 main？移出后它不再作为 main 成员参与业务。`))return;
+  const r=await api('POST',`/api/groups/${encodeURIComponent(name)}/leave-main`,{});
+  if(r.ok){toast('已移出 main','success');refresh();}
+  else{toast(r.error||'移出失败','error');}
 }
 
 async function endpointModels(endpointId){
@@ -1053,6 +1144,11 @@ function openGroupModal(editName){
         <input type="number" id="gIdle" min="0" max="86400" value="${g.idle_seconds||''}" placeholder="0=关闭，如 600">
         <div style="font-size:11px;color:var(--text-dim)">${idleHint}</div>
       </div>`:''}
+      ${(editing&&!builtin)?`<div class="form-group"><label title="选「是」后本子组整组作为 main 的一个成员参与业务（相当于 apipool 内切 model）：在 main 优先级轴占一个名次（默认追加末位，之后在 main 列表用 #N 下拉调整，与端点一致），段内沿用子组自身优先级；整组内全部端点故障后才在 main 序列继续向后 fallback">加入 main 组</label>
+        <select id="gJoinMain">
+          <option value="false" ${g.main_priority>0?'':'selected'}>否</option>
+          <option value="true" ${g.main_priority>0?'selected':''}>是（整组作为 main 成员参与）</option>
+        </select></div>`:''}
       ${builtin?`<div style="font-size:11px;color:var(--text-dim)">${esc(g.name)} 为系统内置组：名称/类型/选择器均锁定</div>`:''}
       ${editing&&!builtin?`<button class="btn btn-ghost" style="color:var(--red);justify-content:flex-start" onclick="deletePoolGroup('${esc(g.name)}')">🗑 删除该分组（成员移出）</button>`:''}
     </div>
@@ -1095,7 +1191,24 @@ async function savePoolGroup(editName){
     }else{
       r=await api('POST','/api/groups',{name,type,model,context_tokens,idle_seconds});
     }
-    if(r.ok){toast(editName?'✅ 分组已更新':'✅ 分组已创建','success');closeGroupModal();refresh();}
+    if(r.ok){
+      // 加入/移出 main（2026-09-27）：仅编辑既有子组时处理（新建不含该控件）
+      if(editName&&!(document.getElementById('gName')&&document.getElementById('gName').disabled)){
+        const jm=document.getElementById('gJoinMain');
+        if(jm){
+          const finalName=(r.name&&typeof r.name==='string')?r.name:name; // 改名后用新名
+          if(jm.value==='true'){
+            // 加入默认追加末位（不传 main_priority）；名次在 main 列表用 #N 下拉调整（与端点一致）
+            await api('POST',`/api/groups/${encodeURIComponent(finalName)}/join-main`,{});
+          }else{
+            // 仅当原本已加入才调 leave（避免对未加入组报错 toast）
+            const wasJoined=(window._groupDefs||[]).find(x=>x.name===editName&&x.main_priority>0);
+            if(wasJoined) await api('POST',`/api/groups/${encodeURIComponent(finalName)}/leave-main`,{});
+          }
+        }
+      }
+      toast(editName?'✅ 分组已更新':'✅ 分组已创建','success');closeGroupModal();refresh();
+    }
     else{toast(r.error||'操作失败','error');if(btn){btn.disabled=false;btn.textContent=editName?'保存':'创建';}}
   }catch(e){
     toast('请求失败','error');
@@ -1154,15 +1267,25 @@ function renderChain(chain){
     // 分组隔离：仅本组当前端点高亮；其他组的当前端点显示组名 badge 不高亮
     const cg=it.current_groups||[];
     const isCurHere=it.is_current&&cg.includes(chainGroupFilter);
+    // 子组级条目（2026-09-27）：整组作为 main 一等成员，组名大写+紫色与普通端点区分
+    const isSub=!!it.is_subgroup_entry;
+    const vis = (it.is_vision !== false) ? '<span class="badge" style="background:rgba(0,122,255,.15);color:#0a84ff" title="支持原生视觉">👁️视觉</span>' : '';
+    const nameHtml=isSub
+      ?`<span style="color:#a5b4fc;font-weight:700;letter-spacing:.5px">${esc(String(it.name).toUpperCase())}</span> <span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:9px;padding:1px 5px" title="子组整体作为 main 成员参与（组内端点数 ${it.subgroup_member_count||0}，可用 ${it.subgroup_available_count||0}）">子组</span>`
+      :esc(it.name);
+    const modelLine=isSub
+      ?`<div class="model">当前端点模型：${esc(it.model)} ${vis}</div>`
+      :`<div class="model">${esc(it.model)} ${vis}</div>`;
     // 延迟回切倒计时按组取：main 与子组各自的缓存保护互不影响
     const _dsec=(it.defer_by_group||{})[chainGroupFilter]||0;
     let cls='chain-item';
+    if(isSub)cls+=' subgroup-entry';
     if(it.manual_unlock_required)cls+=' failed';
     else if(it.in_cooldown)cls+=' cooldown';
     else if(_dsec>0)cls+=' deferred';
     else if(isCurHere)cls+=' active';
     else if(epErr(it)||it.fail_count>0)cls+=' failed';
-    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">'+muInfo(it).badge+'</span>':(it.in_cooldown?'<span class="badge badge-warning">冷却中</span>':(_dsec>0?'<span class="badge badge-deferred">⏳延迟回切 '+fmtTime(_dsec)+'</span>':(isCurHere?'<span class="badge badge-success">服务中</span>':(it.is_current?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:9px;padding:1px 5px" title="本组未使用：它是其他组的当前端点">${esc(cg.filter(g=>g!==chainGroupFilter).join('·'))} 当前</span>`:''))));
+    const st=it.manual_unlock_required?'<span class="badge badge-h-bad">'+muInfo(it).badge+'</span>':(it.in_cooldown?(isSub?'<span class="badge badge-warning">整组冷却 '+fmtTime(it.cooldown_remaining)+'</span>':'<span class="badge badge-warning">冷却中</span>'):(_dsec>0?'<span class="badge badge-deferred">⏳延迟回切 '+fmtTime(_dsec)+'</span>':(isCurHere?'<span class="badge badge-success">服务中</span>':(it.is_current?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:9px;padding:1px 5px" title="本组未使用：它是其他组的当前端点">${esc(cg.filter(g=>g!==chainGroupFilter).join('·'))} 当前</span>`:''))));
     const h=it.health, lat=it.health_latency_ms;
     let rh='';
     if(h==='ok')rh=`<div class="chain-health" style="color:var(--green)">✓${lat>=0?' '+lat+'ms':''}</div>`;
@@ -1173,9 +1296,8 @@ function renderChain(chain){
     /* 错误详情：健康异常优先取 health_error，否则取真实请求的 last_error；全文换行显示，不做单行省略 */
     const cerr=it.health==='bad'?(it.health_error||it.last_error||''):(it.last_error||'');
     const conn=i<chain.length-1?'<div class="chain-connector"></div>':'';
-    const vis = (it.is_vision !== false) ? '<span class="badge" style="background:rgba(0,122,255,.15);color:#0a84ff" title="支持原生视觉">👁️视觉</span>' : '';
     const cp_=prioOf(it);
-    return`<div class="${cls}"><div class="chain-dot"></div><div class="chain-info"><div class="name"><span class="badge badge-priority">#${cp_}</span> ${esc(it.name)} ${st}</div><div class="model">${esc(it.model)} ${vis}</div>${cerr?`<div class="chain-err" title="${esc(cerr)}">⚠ ${esc(cerr)}</div>`:''}</div><div class="chain-right">${rh}</div></div>${conn}`;
+    return`<div class="${cls}"><div class="chain-dot"></div><div class="chain-info"><div class="name"><span class="badge badge-priority">#${cp_}</span> ${nameHtml} ${st}</div>${modelLine}${cerr?`<div class="chain-err" title="${esc(cerr)}">⚠ ${esc(cerr)}</div>`:''}</div><div class="chain-right">${rh}</div></div>${conn}`;
   }).join('');
 }
 
@@ -2296,6 +2418,27 @@ function updateChatScrollbar() {
   document.addEventListener('mouseup', () => { dragging = false; });
 })();
 let chatLogsReqSeq = 0;
+// 推理强度列（2026-09-27）：显示池实际发给上游的 reasoning_effort 档位（第1层出站真值），
+// 佐证响应侧是否检测到推理内容（第3层执行侧证据）——三态：
+//   ✓ = 采到了，确实推理了
+//   ✗ = 采到了，确实没推理
+//   — = 没采到（流中断/空响应/老数据），判不了，不作数
+function reasoningCell(log){
+  const eff=log.reasoning_effort;
+  const det=log.reasoning_detected; // 1/0/null（null=没抓到或老数据）
+  const mark=det===1?'<span style="color:var(--green)">✓</span>':(det===0?'<span style="color:var(--text-dim)">✗</span>':'<span style="color:var(--text-dim)">—</span>');
+  if(eff==null||eff===''){
+    // 未发推理配置：若仍检测到推理内容也如实标出
+    return det===1?'<span style="color:var(--green)">✓推理</span>':'—';
+  }
+  return `${esc(String(eff))} ${mark}`;
+}
+function reasoningTitle(log){
+  const eff=(log.reasoning_effort==null||log.reasoning_effort==='')?'（未发送推理配置）':log.reasoning_effort;
+  const det=log.reasoning_detected===1?'响应检测到推理内容':(log.reasoning_detected===0?'响应未检测到推理内容':'推理内容检测：未采集到有效响应（流中断/空响应），判不了');
+  const rt=log.reasoning_tokens!=null?`；上游 reasoning_tokens=${log.reasoning_tokens}`:'';
+  return `池实际发送 reasoning_effort=${eff}（经端点家族改写，非客户端原值、非上游内部实际强度）；${det}${rt}`;
+}
 async function loadChatLogs(page, opts = {}) {
   if (page < 0) return;
   const seq = ++chatLogsReqSeq; // 竞态守卫：轮询/翻页并发时只认最后一次请求
@@ -2329,7 +2472,7 @@ async function loadChatLogs(page, opts = {}) {
       <div class="cl-cell cl-model" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text-dim);" title="${log.model}">${log.model}</div>
       <div class="cl-cell cl-lat" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text-dim);">${log.latency_ms ? (log.latency_ms/1000).toFixed(1)+'s' : '—'}</div>
       <div class="cl-cell cl-cache" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--yellow);" title="${log.cached_tokens>0&&log.prompt_tokens>0 ? 'cached '+log.cached_tokens+' / prompt '+log.prompt_tokens : ''}">${(log.cached_tokens>0 && log.prompt_tokens>0) ? (log.cached_tokens/log.prompt_tokens*100).toFixed(1)+'%' : '—'}</div>
-      <div class="cl-cell cl-reasoning" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--accent-light);" title="上游 usage.completion_tokens_details.reasoning_tokens">${log.reasoning_tokens != null ? log.reasoning_tokens : '—'}</div>
+      <div class="cl-cell cl-reasoning" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--accent-light);" title="${reasoningTitle(log)}">${reasoningCell(log)}</div>
       <div class="cl-cell cl-tok" style="color:var(--green);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${log.total_tokens}</div>
     </div>
   `).join('');
@@ -2350,7 +2493,7 @@ async function viewChatLog(idx) {
   const full = (res && res.id) ? res : log;
   document.getElementById('clPrompt').textContent = full.prompt || '';
   document.getElementById('clCompletion').textContent = full.completion || '';
-  document.getElementById('clMeta').innerHTML = `<span style="color:var(--green)">${full.total_tokens} Tokens</span> <span style="margin-left:10px;color:var(--yellow)">${full.latency_ms}ms</span>${full.pool_group ? ` <span style="margin-left:10px;color:var(--accent-light)">组: ${esc(full.pool_group)}</span>` : ''}${full.reasoning_tokens != null ? ` <span style="margin-left:10px;color:var(--accent-light)">推理: ${full.reasoning_tokens}</span>` : ''}`;
+  document.getElementById('clMeta').innerHTML = `<span style="color:var(--green)">${full.total_tokens} Tokens</span> <span style="margin-left:10px;color:var(--yellow)">${full.latency_ms}ms</span>${full.pool_group ? ` <span style="margin-left:10px;color:var(--accent-light)">组: ${esc(full.pool_group)}</span>` : ''}${(full.reasoning_effort!=null&&full.reasoning_effort!=='') ? ` <span style="margin-left:10px;color:var(--accent-light)" title="池实际发送的 reasoning_effort（经端点家族改写）">推理强度: ${esc(String(full.reasoning_effort))}</span>` : ''}${full.reasoning_detected===1 ? ` <span style="margin-left:6px;color:var(--green)">✓已推理</span>` : (full.reasoning_detected===0 ? ` <span style="margin-left:6px;color:var(--text-dim)">✗未见推理</span>` : ` <span style="margin-left:6px;color:var(--text-dim)">—未采集到有效响应（流中断/空响应），判不了</span>`)}${full.reasoning_tokens != null ? ` <span style="margin-left:10px;color:var(--accent-light)">推理tokens: ${full.reasoning_tokens}</span>` : ''}`;
 }
 async function clearChatLogs() {
   if (!confirm('确定要清空所有对话日志记录吗？此操作不可逆。')) return;

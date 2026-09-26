@@ -127,8 +127,10 @@ class CacheAccountBoundaryTests(unittest.TestCase):
                 self.assertEqual(error, "")
                 self.assertEqual(result["usage"]["prompt_tokens_details"]["cached_tokens"], 99)
                 self.assertEqual(usage_calls[0][-1], 0)
-                self.assertEqual(log_calls[0][-2], 0)
-                self.assertIsNone(log_calls[0][-1])
+                # add_log 签名 2026-09-27 追加 reasoning_effort, reasoning_detected 两参：
+                # cached_tokens 现在是倒数第4，reasoning_tokens 倒数第3。
+                self.assertEqual(log_calls[0][-4], 0)      # cached_tokens
+                self.assertIsNone(log_calls[0][-3])        # reasoning_tokens（此上游 usage 无该字段）
             finally:
                 server.shutdown()
                 server.server_close()

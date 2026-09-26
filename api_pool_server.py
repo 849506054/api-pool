@@ -1079,9 +1079,13 @@ class ChatLogger:
                 pool_group TEXT,
                 prompt_tokens INTEGER,
                 cached_tokens INTEGER,
-                reasoning_tokens INTEGER
+                reasoning_tokens INTEGER,
+                reasoning_effort TEXT,
+                reasoning_detected INTEGER
             )''')
-            # 存量库迁移：老表缺列时补齐（pool_group 2026-08-30 分组调用区分；prompt/cached tokens 同日命中统计）
+            # 存量库迁移：老表缺列时补齐（pool_group 2026-08-30 分组调用区分；prompt/cached tokens 同日命中统计；
+            # reasoning_effort 2026-09-27 实际发给上游的推理强度档位（经池家族改写，第1层出站真值）；
+            # reasoning_detected 2026-09-27 响应侧是否检测到推理内容（0/1，第3层执行侧佐证））
             c.execute("PRAGMA table_info(chat_logs)")
             _cols = {row[1] for row in c.fetchall()}
             for _col, _ddl in (
@@ -1089,14 +1093,16 @@ class ChatLogger:
                 ("prompt_tokens", "INTEGER"),
                 ("cached_tokens", "INTEGER"),
                 ("reasoning_tokens", "INTEGER"),
+                ("reasoning_effort", "TEXT"),
+                ("reasoning_detected", "INTEGER"),
             ):
                 if _col not in _cols:
                     c.execute(f"ALTER TABLE chat_logs ADD COLUMN {_col} {_ddl}")
             conn.commit()
             conn.close()
 
-    def add_log(self, endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group=None, prompt_tokens=None, cached_tokens=None, reasoning_tokens=None):
-        row = (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens)
+    def add_log(self, endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group=None, prompt_tokens=None, cached_tokens=None, reasoning_tokens=None, reasoning_effort=None, reasoning_detected=None):
+        row = (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected)
         try:
             self._log_queue.put_nowait(row)
         except queue.Full:
@@ -1120,7 +1126,7 @@ class ChatLogger:
                 conn = self._connect()
                 c = conn.cursor()
                 c.executemany(
-                    "INSERT INTO chat_logs (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO chat_logs (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     batch,
                 )
                 conn.commit()
@@ -1136,12 +1142,12 @@ class ChatLogger:
             # detail=False：SQL 层不取 prompt/completion（避免从磁盘读 32MB 正文再丢弃）
             if detail:
                 c.execute(
-                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
+                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
                     (limit, offset)
                 )
             else:
                 c.execute(
-                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
+                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
                     (limit, offset)
                 )
                 rows = [r[:4] + (None, None) + r[4:] for r in c.fetchall()]
@@ -1155,7 +1161,8 @@ class ChatLogger:
                             "id": r[0], "timestamp": r[1], "endpoint_name": r[2], "model": r[3],
                             "prompt": None, "completion": None,
                             "total_tokens": r[6], "latency_ms": r[7], "pool_group": r[8],
-                            "prompt_tokens": r[9], "cached_tokens": r[10], "reasoning_tokens": r[11]
+                            "prompt_tokens": r[9], "cached_tokens": r[10], "reasoning_tokens": r[11],
+                            "reasoning_effort": r[12], "reasoning_detected": r[13]
                         } for r in rows
                     ]
                 }
@@ -1181,7 +1188,9 @@ class ChatLogger:
                         "pool_group": r[8],
                         "prompt_tokens": r[9],
                         "cached_tokens": r[10],
-                        "reasoning_tokens": r[11]
+                        "reasoning_tokens": r[11],
+                        "reasoning_effort": r[12],
+                        "reasoning_detected": r[13]
                     } for r in rows
                 ]
             }
@@ -1195,7 +1204,7 @@ class ChatLogger:
             conn = self._connect()
             c = conn.cursor()
             c.execute(
-                "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens FROM chat_logs WHERE id = ?",
+                "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected FROM chat_logs WHERE id = ?",
                 (int(log_id),)
             )
             r = c.fetchone()
@@ -1214,7 +1223,9 @@ class ChatLogger:
                 "pool_group": r[8],
                 "prompt_tokens": r[9],
                 "cached_tokens": r[10],
-                "reasoning_tokens": r[11]
+                "reasoning_tokens": r[11],
+                "reasoning_effort": r[12],
+                "reasoning_detected": r[13]
             }
         except Exception as e:
             return None
@@ -3209,21 +3220,48 @@ class APIPool:
 
         每组独立 1..N：跨组端点在不同组可有不同排序；main 组值镜像到全局
         priority 字段（兼容旧 config 格式与 prio99 兜底语义）。
+
+        main 组另含已加入子组（2026-09-27）：子组与原生端点共享同一条 main
+        优先级轴，作为正式条目一起重排 → 名次唯一且连续（子组占 1 个名次）。
         """
         for grp in self._all_group_names():
             group_eps = sorted(
                 (ep for ep in self._endpoints if ep.in_pool and grp in self._ep_groups(ep)),
                 key=lambda e: self._ep_priority(e, grp),
             )
+            if grp == self.MAIN_GROUP:
+                # 统一轴：原生端点 + 已加入子组按当前名次排序后整体重编号
+                slots = [("ep", ep, self._ep_priority(ep, self.MAIN_GROUP)) for ep in group_eps]
+                for sub_name, mp in self._joined_subgroups().items():
+                    slots.append(("sub", sub_name, mp))
+                slots.sort(key=lambda s: s[2])
+                for i, (kind, obj, _p) in enumerate(slots):
+                    if kind == "ep":
+                        self._set_ep_priority(obj, grp, i + 1)
+                    else:
+                        self._group_defs[obj]["main_priority"] = i + 1
+                continue
             for i, ep in enumerate(group_eps):
                 self._set_ep_priority(ep, grp, i + 1)
 
     def set_group_priority(self, ep_id, group, new_priority):
-        """组内优先级 insert-at-position（2026-08-29 分组隔离）：只影响该组。"""
+        """组内优先级 insert-at-position（2026-08-29 分组隔离）：只影响该组。
+
+        main 组另含已加入子组（2026-09-27）：子组与端点共享同一优先级轴，
+        insert-at-position 时一起参与位移（端点插到名次 N，名次 ≥N 的端点与
+        子组一起后移），保证名次唯一连续。
+        """
         with self._lock:
             for ep in self._endpoints:
                 if ep.id != ep_id or not ep.in_pool:
                     continue
+                if group == self.MAIN_GROUP and self._joined_subgroups():
+                    # 统一轴 insert 内部已整体重编号（唯一连续）；末尾的
+                    # _renumber_pool_priorities 会以当前名次为键重排，与刚插入的
+                    # 位置冲突（并列名次排序不稳定）→ 此处直接返回，跳过 renumber。
+                    self._set_main_axis_priority(ep, None, new_priority)
+                    self._endpoints.sort(key=lambda e: e.priority)
+                    return
                 members = sorted(
                     (e for e in self._endpoints if e.in_pool and group in self._ep_groups(e)),
                     key=lambda e: self._ep_priority(e, group),
@@ -3242,6 +3280,41 @@ class APIPool:
                 break
             self._renumber_pool_priorities()
             self._endpoints.sort(key=lambda e: e.priority)
+
+    def _main_axis_slots(self):
+        """main 优先级轴全部条目（原生端点 + 已加入子组），按当前名次排序。
+
+        返回 [(kind, obj, prio)]：kind='ep' → obj 为 Endpoint；'sub' → obj 为子组 def dict。
+        """
+        eps = [ep for ep in self._endpoints if ep.in_pool and self.MAIN_GROUP in self._ep_groups(ep)]
+        slots = [("ep", ep, self._ep_priority(ep, self.MAIN_GROUP)) for ep in eps]
+        for sub_name, mp in self._joined_subgroups().items():
+            slots.append(("sub", sub_name, mp))
+        slots.sort(key=lambda s: s[2])
+        return slots
+
+    def _set_main_axis_priority(self, ep, sub_name, new_priority):
+        """main 统一优先级轴 insert-at-position（2026-09-27）。
+
+        被移动对象（ep 或子组名二者其一）插到名次 new_priority，其余条目按序
+        位移后整体重编号 → 名次唯一连续。端点与子组互为邻居，挤开的是同一批对象。
+        """
+        slots = self._main_axis_slots()
+        moving_kind = "ep" if ep is not None else "sub"
+        # 用值相等而非 is：子组名是字符串（跨调用不保证驻留），Endpoint 用对象相等
+        if moving_kind == "ep":
+            moving_id = ep.id
+            rest = [s for s in slots if not (s[0] == "ep" and s[1].id == moving_id)]
+        else:
+            rest = [s for s in slots if not (s[0] == "sub" and s[1] == sub_name)]
+        new_priority = max(1, min(int(new_priority), len(slots)))
+        ordered = rest[:new_priority - 1] + [(moving_kind, ep if ep is not None else sub_name, 0)] + rest[new_priority - 1:]
+        for i, (kind, obj, _p) in enumerate(ordered):
+            if kind == "ep":
+                self._set_ep_priority(obj, self.MAIN_GROUP, i + 1)
+            else:
+                self._group_defs[obj]["main_priority"] = i + 1
+
 
     # ══════════════ 分组池路由基础设施（2026-08-29 spec）══════════════
 
@@ -3443,6 +3516,13 @@ class APIPool:
                 idle = self._loaded_group_idle_seconds(d)
                 if idle:
                     entry["idle_seconds"] = idle
+                # 加入 main 的名次（2026-09-27）：int>0 恢复，其余忽略
+                try:
+                    mp = int(d.get("main_priority") or 0)
+                except (TypeError, ValueError):
+                    mp = 0
+                if mp > 0:
+                    entry["main_priority"] = mp
                 self._group_defs[name] = entry
         return self._group_defs
 
@@ -3589,6 +3669,14 @@ class APIPool:
                 self._group_defs[new_name]["context_tokens"] = new_ck
             if new_idle:
                 self._group_defs[new_name]["idle_seconds"] = new_idle
+            # 加入 main 名次跟随改名（2026-09-27）；main 指针若指向旧子组名同步改名
+            if old.get("main_priority"):
+                self._group_defs[new_name]["main_priority"] = old["main_priority"]
+                if new_name != name:
+                    if self._get_manual(self.MAIN_GROUP) == name:
+                        self._set_manual(self.MAIN_GROUP, new_name)
+                    if self._get_current(self.MAIN_GROUP) == name:
+                        self._set_current(self.MAIN_GROUP, new_name)
             sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}，空闲借用 {('%s 秒' % new_idle) if new_idle else '关闭'}）", "INFO")
             return True, new_name
 
@@ -3611,6 +3699,11 @@ class APIPool:
                 state.pop(name, None)
             self._group_fallback_lock_until.pop(name, None)
             self._group_fallback_pending.pop(name, None)
+            # 删的是已加入 main 的子组：清 main 指向该子组名的指针（2026-09-27）
+            if self._get_manual(self.MAIN_GROUP) == name:
+                self._set_manual(self.MAIN_GROUP, None)
+            if self._get_current(self.MAIN_GROUP) == name:
+                self._set_current(self.MAIN_GROUP, None)
             sys_log(f"删除分组 '{name}'（成员已移出）", "INFO")
             return True, "deleted"
 
@@ -3802,20 +3895,193 @@ class APIPool:
             return False
         return (time.time() - max(ep._last_success_ts, ep._last_error_ts)) >= window
 
+    # ── 子组整组加入 main（2026-09-27）──
+    # 子组 def 的 main_priority（int>0）= 已作为 main 成员参与、占 main 优先级轴该名次；
+    # 无/0 = 未加入。子组整组作为 main 的一个成员参与业务（相当于 apipool 内切 model），
+    # 优先级/互斥/冷却等全部沿用子组自身，整组内全挂才在 main 序列继续向后 fallback。
+    def _joined_subgroups(self):
+        """已加入 main 的子组 → main_priority，按 (main_priority, 组名) 升序（确定性梯队顺序）。"""
+        out = {}
+        for name, gd in self._group_defs.items():
+            if name in (self.MAIN_GROUP, self.VISION_GROUP):
+                continue
+            mp = gd.get("main_priority")
+            if isinstance(mp, int) and mp > 0:
+                out[name] = mp
+        return dict(sorted(out.items(), key=lambda kv: (kv[1], kv[0])))
+
+    def _next_main_priority(self):
+        """加入 main 的默认名次 = 现有 main 优先级轴（原生端点 + 已加入子组）最大值 + 1（末位）。"""
+        used = [self._ep_priority(ep, self.MAIN_GROUP) for ep in self._endpoints
+                if self.MAIN_GROUP in self._ep_groups(ep) and ep.in_pool]
+        used += list(self._joined_subgroups().values())
+        return (max(used) + 1) if used else 1
+
+    def _main_candidate_sort_key(self, ep):
+        """main 候选统一优先级轴排序键：
+        - 原生 main 端点 → (该端点 main 优先级, 0, 0)
+        - 借来的子组成员 → (子组 main_priority, 1, 该端点在子组内优先级)
+        同名次时原生端点优先（次键 0<1）；跨多个已加入子组的端点取名次最靠前的一份。"""
+        if self.MAIN_GROUP in self._ep_groups(ep):
+            return (self._ep_priority(ep, self.MAIN_GROUP), 0, 0)
+        best = None
+        for sub, mp in self._joined_subgroups().items():
+            if sub in self._ep_groups(ep):
+                key = (mp, 1, self._ep_priority(ep, sub))
+                if best is None or key < best:
+                    best = key
+        return best if best is not None else (10 ** 9, 2, ep.priority)
+
+    def _resolve_subgroup_current(self, sub):
+        """手动切到子组整体时，下钻到该子组当前应使用的端点（子组当前端点变化自动跟随）。
+        优先沿用子组自身当前指针（若仍在候选内），否则按子组优先级取 top 可用端点；无可用→None。"""
+        cands, _ = self._group_sticky_candidates(sub)
+        if not cands:
+            return None
+        sub_cur = self._get_manual(sub) or self._get_current(sub)
+        if sub_cur and any(e.id == sub_cur for e in cands):
+            return sub_cur
+        return min(cands, key=lambda e: self._ep_priority(e, sub)).id
+
+    def _main_pointer_target(self):
+        """main 当前应指向的目标（端点 id / 子组名 / None）。
+
+        手动切到子组整体时：子组有可用端点 → 保持子组名（下钻自动跟随）；
+        子组整体不可用（全冷却/挂）→ 视为手动意图已无法满足，清指针回落到
+        按优先级自动选择，避免卡在无效子组名上导致 chain 显示空当前端点。
+        """
+        manual = self._get_manual(self.MAIN_GROUP)
+        if manual in self._joined_subgroups():
+            if self._resolve_subgroup_current(manual) is None:
+                return None
+            return manual
+        return manual or self._get_current(self.MAIN_GROUP)
+
+    def _group_all_frozen_remaining(self, grp):
+        """整组无可用端点时的最短剩余冻结秒数（2026-09-27）。
+
+        子组整组加入 main 后，main 列表里的子组条目必须与普通端点条目一样
+        反映冻结状态：组内端点全部冷却/冻结 → 该子组条目在 main 里等同冻结，
+        不参与 main 轮转，冻结时长取组内**最短**剩余冻结的端点（最早恢复者）。
+
+        有任一可用端点 → 0（未整组冻结）。无成员 → 0。
+        """
+        cands, _ = self._group_sticky_candidates(grp)
+        if cands:
+            return 0
+        members = [
+            ep for ep in self._endpoints
+            if ep.in_pool and grp in self._ep_groups(ep)
+        ]
+        if not members:
+            return 0
+        now = time.time()
+        remainings = [
+            ep._cooldown_until - now
+            for ep in members
+            if getattr(ep, "_cooldown_until", 0) and ep._cooldown_until > now
+        ]
+        if not remainings:
+            return 0
+        return max(0, int(min(remainings)))
+
+    def switch_main_to_subgroup(self, sub):
+        """手动把 main 切到一个已加入子组整体（口径A）：main 手动/当前指针指向子组名，
+        每次请求由子组按自身优先级+可用性选端点。返回 (ok, message)。
+
+        整组冻结（组内无可用端点且全部冷却中）时拒绝：与普通端点冻结后不可手动
+        切到它同语义，避免切过去后请求立刻落空。"""
+        with self._lock:
+            if sub not in self._joined_subgroups():
+                return False, f"子组 '{sub}' 未加入 main"
+            frozen_remaining = self._group_all_frozen_remaining(sub)
+            if frozen_remaining > 0:
+                return False, (f"子组 '{sub}' 组内端点全部冻结"
+                               f"（最短剩余 {frozen_remaining}s），暂不能切换")
+            self._set_manual(self.MAIN_GROUP, sub)
+            self._set_current(self.MAIN_GROUP, sub)
+            sys_log(f"手动切换 main → 子组 '{sub}'（整组作为 main 成员，按子组优先级选端点）", "INFO")
+            return True, sub
+
+    def set_main_priority(self, sub, priority):
+        """加入/调序：把子组作为 main 轴正式条目定位到名次（priority=None → 末位）。
+
+        走统一轴的 insert-at-position（_set_main_axis_priority）：其余端点与子组
+        一起位移后整体重编号 → 名次唯一连续，与端点改序完全同构。返回 (ok, message)。
+        """
+        with self._lock:
+            if sub in (self.MAIN_GROUP, self.VISION_GROUP):
+                return False, f"'{sub}' 为系统内置组，不可加入 main"
+            gd = self._group_defs.get(sub)
+            if gd is None:
+                return False, f"子组 '{sub}' 不存在"
+            joined = gd.get("main_priority")
+            if priority is None:
+                # 加入：先占末位（保证 _main_axis_slots 能拿到它），再走 insert 归位
+                gd["main_priority"] = self._next_main_priority()
+                sys_log(f"子组 '{sub}' 加入 main，占优先级 #{gd['main_priority']}", "INFO")
+                return True, sub
+            try:
+                priority = int(priority)
+            except (TypeError, ValueError):
+                return False, "main 优先级必须为正整数"
+            if priority <= 0:
+                return False, "main 优先级必须为正整数（移出请用 leave_main）"
+            if joined is None:
+                # 未加入却显式给了名次：视为加入并定位
+                gd["main_priority"] = self._next_main_priority()
+            # insert-at-position 内部已整体重编号（唯一连续），不再重复 renumber
+            # （renumber 会以当前名次为键重排，与刚插入的位置冲突导致错位）
+            self._set_main_axis_priority(None, sub, priority)
+            sys_log(f"子组 '{sub}' main 优先级调整为 #{self._group_defs[sub]['main_priority']}", "INFO")
+            return True, sub
+
+    def leave_main(self, sub):
+        """移出 main：清子组 main_priority；若 main 手动/当前指针正指向该子组则一并清除。"""
+        with self._lock:
+            gd = self._group_defs.get(sub)
+            if gd is None:
+                return False, f"子组 '{sub}' 不存在"
+            if gd.pop("main_priority", None) is None:
+                return False, f"子组 '{sub}' 未加入 main"
+            if self._get_manual(self.MAIN_GROUP) == sub:
+                self._set_manual(self.MAIN_GROUP, None)
+            if self._get_current(self.MAIN_GROUP) == sub:
+                self._set_current(self.MAIN_GROUP, None)
+            sys_log(f"子组 '{sub}' 已移出 main", "INFO")
+            return True, sub
+
     def _group_sticky_candidates(self, group):
         """组内可用端点：main 无跨组约束；子组避让 main 当前/手动工作端点与其在途占用。
 
         main 工作端点空闲满窗口时不再被剔除（2026-09-18 需求 1，见 _is_ep_sticky_elsewhere）。
+        main 组另含各已加入子组的成员（2026-09-27），统一按 main 优先级轴排序（整组占一个名次）。
         """
         base = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
                 and group in self._ep_groups(ep)
                 and not ep._manual_unlock_required
                 and not self._is_in_cooldown(ep)
 ]
+        if group == self.MAIN_GROUP:
+            joined = self._joined_subgroups()
+            if not joined:
+                # 零回归：无子组加入时逐字节等同旧行为（可能 base 为空）
+                return (base, False) if base else ([], False)
+            seen = {ep.id for ep in base}
+            for sub in joined:
+                for ep in self._endpoints:
+                    if (ep.id not in seen and ep.enabled and ep.in_pool
+                            and sub in self._ep_groups(ep)
+                            and not ep._manual_unlock_required
+                            and not self._is_in_cooldown(ep)):
+                        seen.add(ep.id)
+                        base.append(ep)
+            if not base:
+                return [], False
+            base.sort(key=self._main_candidate_sort_key)
+            return base, False
         if not base:
             return [], False
-        if group == self.MAIN_GROUP:
-            return base, False
         free = [ep for ep in base
                 if not self._is_ep_sticky_elsewhere(ep, group)
                 and not self._is_ep_inflight_elsewhere(ep, group)]
@@ -3997,6 +4263,72 @@ class APIPool:
             "health_error": ep._health_error,
         }
 
+    def _joined_subgroup_chain_entries(self, now):
+        """已加入 main 的子组 → 聚合链条目（2026-09-27）。
+
+        聚合链 main 视图此前只列原生端点，已加入的子组完全不可见——与
+        main 列表（子组作为 main 一等成员参与轮转）不一致。这里按 main
+        优先级轴把子组补成链条目，字段对齐端点形态，前端 renderChain 不必
+        为子组开特例分支。
+
+        子组条目用 `is_subgroup_entry` 标记，`name` 为子组名（大写由前端
+        渲染），`model` 为该组当前端点模型（只读展示）。
+        """
+        out = []
+        for sub, mp in self._joined_subgroups().items():
+            cands, _ = self._group_sticky_candidates(sub)
+            cur = self._manual_override_by_group.get(sub) or self._current_endpoint_by_group.get(sub)
+            cur_ep = next((e for e in self._endpoints if e.id == cur), None) if cur else None
+            frozen_remaining = self._group_all_frozen_remaining(sub)
+            members = [
+                ep for ep in self._endpoints
+                if ep.in_pool and sub in self._ep_groups(ep)
+            ]
+            worst_health = "ok"
+            for ep in members:
+                if ep._health == "bad":
+                    worst_health = "bad"
+                    break
+                if ep._health == "slow" and worst_health == "ok":
+                    worst_health = "slow"
+            # 整组冻结（2026-09-27）：无可用端点时健康必须反映为 bad——组内端点
+            # 多为 health=unknown（未跑过检查），只扫 _health 会把整组冷却的子组
+            # 显示成 ok，与「整组冷却」自相矛盾。
+            if frozen_remaining > 0:
+                worst_health = "bad"
+            out.append({
+                "is_subgroup_entry": True,
+                "name": sub,
+                "model": (cur_ep.model if cur_ep else (cands[0].model if cands else "—")),
+                "priority": mp,
+                "priority_by_group": {self.MAIN_GROUP: mp},
+                # 整组冻结时 main 不可能真正选中它（无候选），is_current 记 False，
+                # 否则前端显示「服务中」绿条与冷却态矛盾。
+                "is_current": bool(cur) and frozen_remaining <= 0,
+                "current_groups": [self.MAIN_GROUP] if (cur and frozen_remaining <= 0) else [],
+                "pool_groups": [self.MAIN_GROUP, sub],
+                "fail_count": 0,
+                "in_cooldown": frozen_remaining > 0,
+                "cooldown_remaining": frozen_remaining,
+                "cooldown_reason": "整组冻结" if frozen_remaining > 0 else "",
+                "manual_unlock_required": False,
+                "deferrable": False,
+                "is_deferred": False,
+                "defer_remaining": 0,
+                "defer_by_group": {},
+                "max_context_k": (cur_ep.max_context_k if cur_ep else 0),
+                "use_proxy": False,
+                "is_vision": bool(cands and cands[0].is_vision),
+                "in_pool": True,
+                "health": worst_health if members else "bad",
+                "health_latency_ms": (cur_ep._health_latency_ms if cur_ep else -1),
+                "health_error": "",
+                "last_error": "",
+                "subgroup_member_count": len(members),
+                "subgroup_available_count": len(cands),
+            })
+        return out
+
     def get_active_chain(self):
         self._cleanup_expired_cooldowns()
         now = time.time()
@@ -4012,7 +4344,9 @@ class APIPool:
                 for grp in self._all_group_names()
             }
             current_ids = set(current_by_group.values())
-            return [
+            # 已加入 main 的子组：整组作为 main 一个成员参与，链条目必须可见（2026-09-27）。
+            subgroup_entries = self._joined_subgroup_chain_entries(now)
+            rows = [
                 {
                     "name": ep.name,
                     "model": ep.model,
@@ -4041,6 +4375,12 @@ class APIPool:
                 }
                 for ep in active
             ]
+            # 同一优先级轴混排：原生端点与子组条目按 main 名次排序（与 main 列表一致）。
+            rows.extend(subgroup_entries)
+            rows.sort(key=lambda r: (r["priority_by_group"].get(self.MAIN_GROUP, r["priority"]),
+                                     0 if not r.get("is_subgroup_entry") else 1,
+                                     r["name"]))
+            return rows
 
     def reset(self):
         with self._lock:
@@ -5154,7 +5494,10 @@ class APIPool:
                 self._set_current(grp, candidates[0].id)
             else:
                 self._set_current(grp, None)
-            self._set_manual(grp, None)  # 当前路由决策内的失败才清除手动覆盖
+            # 手动切到子组整体时保留 manual 指针（2026-09-27）：子组内单端点失败
+            # 不该撤销用户「切到该子组」的意图，子组自身会按优先级轮转下一个端点。
+            if not (grp == self.MAIN_GROUP and self._get_manual(grp) in self._joined_subgroups()):
+                self._set_manual(grp, None)  # 当前路由决策内的失败才清除手动覆盖
             return self._get_route_epoch(grp)
 
     def _on_success(self, ep, result=None, clear_defer=True, group=None, expected_route_epoch=None):
@@ -5188,9 +5531,17 @@ class APIPool:
                 or self._get_route_epoch(grp) == expected_route_epoch
             )
             if route_is_current:
-                self._set_current(grp, ep.id)
-                if self._get_manual(grp) and self._get_manual(grp) != ep.id:
-                    self._set_manual(grp, None)
+                # 手动切到子组整体（2026-09-27 口径A）：main 的 manual/current 存的是子组名，
+                # 本次请求只是下钻解析出具体端点执行——不得把指针回写成端点 id，否则
+                # 下一次请求就丢失「切到子组」的意图、自动跳回 main 原生端点。
+                keep_subgroup_pointer = (
+                    grp == self.MAIN_GROUP
+                    and self._get_manual(grp) in self._joined_subgroups()
+                )
+                if not keep_subgroup_pointer:
+                    self._set_current(grp, ep.id)
+                    if self._get_manual(grp) and self._get_manual(grp) != ep.id:
+                        self._set_manual(grp, None)
     def _rewrite_tool_call_ids(self, messages, prefix):
         """确定性重写 tool_call id：原 id → 前缀+md5 后缀，保持 assistant/tool 配对。
 
@@ -5251,6 +5602,60 @@ class APIPool:
     def _is_glm_endpoint(ep):
         """GLM 系列端点：交错/保留式思考要求回传 reasoning_content。"""
         return "glm" in str(getattr(ep, "model", "") or "").lower()
+
+    @classmethod
+    def _chunk_reasoning_text(cls, delta):
+        """从 SSE delta / message 里取出推理文本（2026-09-27 统一口径）。
+
+        不同上游用不同字段名：reasoning_content（step/deepseek）、reasoning
+        （OpenRouter 系）、reasoning_details[]（{type:reasoning.text}）。
+        判定「是否业务增量」「是否检测到推理」必须共用本函数，避免漏判。
+        """
+        if not isinstance(delta, dict):
+            return ""
+        for key in ("reasoning_content", "reasoning"):
+            val = delta.get(key)
+            if val:
+                return val if isinstance(val, str) else ""
+        details = delta.get("reasoning_details")
+        if isinstance(details, list):
+            parts = [
+                (it.get("text") or "")
+                for it in details
+                if isinstance(it, dict) and it.get("type") == "reasoning.text"
+            ]
+            return "".join(parts)
+        return ""
+
+    @classmethod
+    def _reasoning_detected(cls, reasoning_text, reasoning_tokens, collected=None):
+        """响应侧推理佐证（2026-09-27）——三态，不是二态。
+
+        返回：
+          1  = 采集成功，确认推理了（文本证据或计数证据任一成立）
+          0  = 采集成功，确认没推理
+          None = 采集失败/未采集，判不了（流中断、超长请求被截断、
+                 分支未接线、usage 缺失且无内容）
+
+        - 文本证据：上游回了思考内容（reasoning_content / reasoning /
+          reasoning_details[]，视上游字段名而定）。
+        - 计数证据：usage.completion_tokens_details.reasoning_tokens > 0。
+
+        只认文本会漏判——mimo（Cline 中转）等上游只把推理量计入 usage、
+        不回思考正文，曾被误报为「未见推理」。
+
+        collected=False 表示调用方明确知道本次没采到有效响应（流被掐断、
+        客户端提前断开），此时绝不能记 0——那会把「没抓到」伪装成
+        「确实没推理」。默认 None 视为采集成功（老调用点不受影响）。
+        """
+        if collected is False:
+            return None
+        if reasoning_text and str(reasoning_text).strip():
+            return 1
+        try:
+            return 1 if int(reasoning_tokens or 0) > 0 else 0
+        except (TypeError, ValueError):
+            return 0
 
     @classmethod
     def _keep_reasoning_fields(cls, ep):
@@ -5350,6 +5755,23 @@ class APIPool:
             payload["reasoning_effort"] = cls._DEEPSEEK_V4_EFFORT_MAP.get(effort, "high")
 
     _REASONING_PLACEHOLDER = " "  # tool-call 轮次的空 reasoning 占位（上游要求非空回传）
+
+    @staticmethod
+    def _captured_reasoning_effort(payload, ep):
+        """本次实际发给上游的推理强度档位（第1层出站真值，2026-09-27）。
+
+        - openai/GLM/deepseek 等：payload 已过 _map_reasoning_effort 改写 → 取 reasoning_effort。
+        - anthropic：无 reasoning_effort，改看 thinking 是否启用（启用→'on'）。
+        - 未设置/被剔除 → None（UI 显示 —，真实反映未启用推理配置）。
+        """
+        if getattr(ep, "protocol", "openai") == "anthropic":
+            t = payload.get("thinking")
+            if isinstance(t, dict) and t.get("type") == "enabled":
+                return "on"
+            return None
+        eff = payload.get("reasoning_effort")
+        eff = str(eff).strip().lower() if eff not in (None, "") else ""
+        return eff or None
 
     @classmethod
     def _normalize_reasoning_shape(cls, messages):
@@ -5604,6 +6026,10 @@ class APIPool:
         # 最近成功或故障转移选中的端点，而不是每次回到最高优先级端点。
         # 分组池：粘性指针按组读取（fallback 到 main 后读 main 组指针）。
         current_id = self._get_manual(group) or self._get_current(group)
+        # 2026-09-27：main 手动/当前指针可能是「已加入子组名」（口径A 手动切到子组整体）。
+        # 命中子组名则下钻到该子组当前应用端点（子组当前端点变化自动跟随），无可用端点则忽略。
+        if group == self.MAIN_GROUP and current_id and current_id in self._joined_subgroups():
+            current_id = self._resolve_subgroup_current(current_id)
         if current_id:
             current_ep = next((ep for ep in active if ep.id == current_id), None)
             if current_ep is not None:
@@ -6178,6 +6604,10 @@ class APIPool:
         pool_group=None, reset_cached_stats=False, request_id=None, request_deadline=None,
     ):
         req_t0 = time.time()
+        # 推理强度（第1层出站真值，2026-09-27）：payload 已过 _map_reasoning_effort 家族改写，
+        # 此处取的是「池实际发给上游的档位」，非客户端原始值、非上游内部实际强度。
+        # anthropic 端点无 reasoning_effort 概念，改用 thinking 是否启用作为强度标记（thinking→'on'）。
+        log_reasoning_effort = self._captured_reasoning_effort(payload, ep)
         endpoint_log_label = self._endpoint_log_label(ep, pool_group)
         request_tag = f"[req={request_id}] " if request_id else ""
         prompt_text_to_log = extract_prompt_text(payload) if log_usage and not ep.name.startswith("test_") else ""
@@ -6429,7 +6859,7 @@ class APIPool:
                         if not choices:
                             return False
                         delta = choices[0].get("delta") or {}
-                        return bool(delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls"))
+                        return bool(delta.get("content") or self._chunk_reasoning_text(delta) or delta.get("tool_calls"))
 
                     try:
                         # 只读上游、逐行前进。bounded give-up：长时间只有心跳/空 delta
@@ -6664,7 +7094,7 @@ class APIPool:
                                     choices = chunk.get("choices") or []
                                     if choices:
                                         delta = choices[0].get("delta") or {}
-                                        if delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls"):
+                                        if delta.get("content") or self._chunk_reasoning_text(delta) or delta.get("tool_calls"):
                                             return True
                                         if choices[0].get("finish_reason"):
                                             return True
@@ -6967,6 +7397,13 @@ class APIPool:
                                                 delta = chunk["choices"][0].get("delta", {})
                                                 if "content" in delta:
                                                     final_completion_text += delta.get("content") or ""
+                                                # 推理内容累积（2026-09-27）：统一走
+                                                # _chunk_reasoning_text 识别三种上游字段形态
+                                                # （reasoning_content / reasoning /
+                                                # reasoning_details[]）；不累积则推理佐证恒 0。
+                                                _rtext = self._chunk_reasoning_text(delta)
+                                                if _rtext:
+                                                    final_reasoning_text += _rtext
                                             if "usage" in chunk and chunk["usage"]:
                                                 u = chunk["usage"]
                                                 final_prompt_tokens = u.get("prompt_tokens", 0)
@@ -7029,7 +7466,12 @@ class APIPool:
                             if has_usage and log_usage and not ep.name.startswith("test_"):
                                 stats_cached_tokens = 0 if reset_cached_stats else final_cached_tokens
                                 token_tracker.add_usage(ep.name, ep.model, final_prompt_tokens, final_completion_tokens, final_total_tokens, stats_cached_tokens)
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, final_completion_text.strip() or final_reasoning_text.strip(), final_total_tokens, int((time.time() - req_t0) * 1000), pool_group, final_prompt_tokens, stats_cached_tokens, final_reasoning_tokens)
+                                # 采集有效性判据（2026-09-27）：有 usage 不等于采到了有效响应——
+                                # 上游提前终止时 usage 齐全但 completion/reasoning 双空（实测 13/19 条
+                                # 空 completion 记录即此类）。此时判不了推理有无，记 None（界面 —），
+                                # 不能记 0 冒充「确实没推理」。
+                                _collected = bool(final_completion_text.strip()) or bool(final_reasoning_text.strip())
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, final_completion_text.strip() or final_reasoning_text.strip(), final_total_tokens, int((time.time() - req_t0) * 1000), pool_group, final_prompt_tokens, stats_cached_tokens, final_reasoning_tokens, log_reasoning_effort, self._reasoning_detected(final_reasoning_text, final_reasoning_tokens, _collected))
                                 self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
                             resp.close()
                     return stream_generator(), ""
@@ -7076,11 +7518,13 @@ class APIPool:
                             stats_cached = 0 if reset_cached_stats else g_usage["prompt_tokens_details"]["cached_tokens"]
                             token_tracker.add_usage(ep.name, ep.model, g_usage["prompt_tokens"],
                                                     g_usage["completion_tokens"], g_usage["total_tokens"], stats_cached)
+                            _g_collected = bool(g_text.strip()) or bool(g_reasoning.strip())
                             chat_logger.add_log(ep.name, ep.model, prompt_text_to_log,
                                                 g_text.strip() or g_reasoning.strip(),
                                                 g_usage["total_tokens"], int((time.time() - req_t0) * 1000),
                                                 pool_group, g_usage["prompt_tokens"], stats_cached,
-                                                g_usage["completion_tokens_details"]["reasoning_tokens"])
+                                                g_usage["completion_tokens_details"]["reasoning_tokens"],
+                                                log_reasoning_effort, self._reasoning_detected(g_reasoning, g_usage["completion_tokens_details"]["reasoning_tokens"], _g_collected))
                             self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
                         return {
                             "id": body.get("responseId") or f"chatcmpl-{int(time.time())}",
@@ -7108,7 +7552,8 @@ class APIPool:
                                                     response_usage.get("total_tokens", 0), stats_cached)
                             chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, (response_text or "").strip(),
                                                 response_usage.get("total_tokens", 0), int((time.time() - req_t0) * 1000),
-                                                pool_group, response_usage.get("prompt_tokens", 0), stats_cached, _reasoning)
+                                                pool_group, response_usage.get("prompt_tokens", 0), stats_cached, _reasoning,
+                                                log_reasoning_effort, 1 if (response_reasoning or "").strip() else 0)
                             self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
                         return {
                             "id": body.get("id", f"chatcmpl-{int(time.time())}"),
@@ -7145,7 +7590,7 @@ class APIPool:
                             if log_usage and not ep.name.startswith("test_"):
                                 stats_cached = 0 if reset_cached_stats else cached
                                 token_tracker.add_usage(ep.name, ep.model, prompt_t, u.get("output_tokens", 0), tot, stats_cached)
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, reply.strip() or reasoning.strip(), tot, int((time.time() - req_t0) * 1000), pool_group, prompt_t, stats_cached)
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, reply.strip() or reasoning.strip(), tot, int((time.time() - req_t0) * 1000), pool_group, prompt_t, stats_cached, None, log_reasoning_effort, self._reasoning_detected(reasoning, None, bool(reply.strip()) or bool(reasoning.strip())))
                                 self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
                         stop_reason = body.get("stop_reason")
                         finish_reason = {
@@ -7189,7 +7634,11 @@ class APIPool:
                     else:
                         u = body.get("usage", {})
                         content = body["choices"][0]["message"].get("content") or ""
-                        reasoning = body["choices"][0]["message"].get("reasoning_content") or ""
+                        # 推理文本字段名按上游而异（2026-09-27 统一口径）：
+                        # reasoning_content（step/deepseek）/ reasoning（OpenRouter 系）/
+                        # reasoning_details[]。
+                        _msg_obj = body["choices"][0]["message"]
+                        reasoning = self._chunk_reasoning_text(_msg_obj)
                         if u:
                             tot = u.get("total_tokens", 0)
                             cached = 0
@@ -7201,7 +7650,7 @@ class APIPool:
                                 stats_cached = 0 if reset_cached_stats else cached
                                 token_tracker.add_usage(ep.name, ep.model, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), tot, stats_cached)
                                 log_text = content.strip() or reasoning.strip()
-                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000), pool_group, u.get("prompt_tokens", 0), stats_cached, reasoning_tokens)
+                                chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, log_text, tot, int((time.time() - req_t0) * 1000), pool_group, u.get("prompt_tokens", 0), stats_cached, reasoning_tokens, log_reasoning_effort, self._reasoning_detected(reasoning, reasoning_tokens, bool(log_text)))
                                 self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
                         # 假成功检测（仅端点启用时）
                         if ep.check_fake_success:
@@ -7824,6 +8273,34 @@ if isinstance(restored_groups, dict):
     for grp, ep_id in restored_groups.items():
         if not isinstance(ep_id, str) or not ep_id:
             continue
+        # main 指针可能是「已加入子组名」（2026-09-27 口径A 手动切到子组整体）：直接恢复，
+        # 具体端点由路由时下钻决定；子组必须仍处于已加入状态，否则视为残留。
+        if grp == pool.MAIN_GROUP and ep_id in pool._joined_subgroups():
+            pool._set_current(grp, ep_id)
+            pool._set_manual(grp, ep_id)
+            pool._set_persisted(grp, ep_id)
+            continue
+        # main 指针还可能是「已加入子组的成员端点 id」（2026-09-27）：旧版本会在请求成功后
+        # 把下钻出的端点 id 落盘，或用户用 /api/switch-endpoint 指定了子组成员。
+        # 这类端点不属于 main 原生成员，通用校验会判「不存在」并 WARN 忽略 → 重启丢失
+        # 之前使用的子组端点。恢复为所属子组名：语义等同「main 切到该子组」，且该子组
+        # 自身的当前指针同样持久化，下钻后仍解析到同一个端点。
+        if grp == pool.MAIN_GROUP:
+            owner_sub = next(
+                (
+                    sub for sub in pool._joined_subgroups()
+                    if any(
+                        ep.id == ep_id and sub in pool._ep_groups(ep)
+                        for ep in pool._endpoints
+                    )
+                ),
+                None,
+            )
+            if owner_sub is not None:
+                pool._set_current(grp, owner_sub)
+                pool._set_manual(grp, owner_sub)
+                pool._set_persisted(grp, owner_sub)
+                continue
         restored_endpoint = next(
             (
                 ep for ep in pool._endpoints
@@ -8122,19 +8599,31 @@ def api_handler(method, path, body):
         group_summary = {}
         for grp in pool._all_group_names():
             cur = pool._get_manual(grp) or pool._get_current(grp)
+            # main 指针可能是已加入子组名（2026-09-27）：下钻解析出实际端点用于展示；
+            # 子组整体不可用时清指针回落自动选择（_main_pointer_target）
+            cur_sub = None
+            if grp == pool.MAIN_GROUP:
+                cur = pool._main_pointer_target()
+                if cur in pool._joined_subgroups():
+                    cur_sub = cur
+                    cur = pool._resolve_subgroup_current(cur_sub)
             cur_ep = next((e for e in pool._endpoints if e.id == cur), None)
             _fb_until = pool._group_fallback_lock_until.get(grp, 0)
             group_summary[grp] = {
                 "current_endpoint": cur_ep.name if cur_ep else None,
                 "current_endpoint_id": cur,
+                # main 当前命中的已加入子组名（None=命中原生端点或空）
+                "current_subgroup": cur_sub,
                 # 整组 fallback 锁剩余秒数（>0 = 该组正借道 main，UI 显示 ↩main）
                 "fallback_lock_remaining": max(0, int(_fb_until - time.time())) if _fb_until else 0,
                 # 待回切（锁已期满、尚无该组请求回组试探，UI 显示 ⏸待回切，点击立即切回）
                 "fallback_return_pending": bool(pool._group_fallback_pending.get(grp)),
-                "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)),
+                "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)) + (len(pool._joined_subgroups()) if grp == pool.MAIN_GROUP else 0),
                 "is_vision": grp == pool.VISION_GROUP,
                 # 图片解析池可用成员数（调度候选口径，与 _vision_pool_candidates 一致）
                 "available": len(pool._vision_pool_candidates()[0]) if grp == pool.VISION_GROUP else 0,
+                # 整组冻结最短剩余秒数（>0 = 组内无可用端点且全部冷却中；main 列表子组条目据此显示冻结）
+                "all_frozen_remaining": pool._group_all_frozen_remaining(grp),
             }
         return 200, {"chain": chain, "groups": group_summary}, False
     # ================= 组管理（2026-08-30）=================
@@ -8143,6 +8632,12 @@ def api_handler(method, path, body):
         for grp in pool._all_group_names():
             gd = pool._group_defs.get(grp, {})
             cur = pool._get_manual(grp) or pool._get_current(grp)
+            # main 指针可能是已加入子组名（2026-09-27）：下钻到实际端点展示；
+            # 子组整体不可用时回落自动选择（_main_pointer_target）
+            if grp == pool.MAIN_GROUP:
+                cur = pool._main_pointer_target()
+                if cur in pool._joined_subgroups():
+                    cur = pool._resolve_subgroup_current(cur)
             cur_ep = next((e for e in pool._endpoints if e.id == cur), None)
             groups.append({
                 "name": grp,
@@ -8151,9 +8646,13 @@ def api_handler(method, path, body):
                 "context_tokens": pool._group_context_tokens(grp) or 0,
                 "idle_seconds": pool._group_idle_seconds(grp),
                 "is_vision": grp == pool.VISION_GROUP,
-                "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)),
+                "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)) + (len(pool._joined_subgroups()) if grp == pool.MAIN_GROUP else 0),
                 "current_endpoint": cur_ep.name if cur_ep else None,
                 "is_main": grp == pool.MAIN_GROUP,
+                # 加入 main 状态（2026-09-27）：main_priority>0 = 已作为 main 成员参与
+                "main_priority": pool._group_defs.get(grp, {}).get("main_priority", 0) or 0,
+                # 整组冻结最短剩余秒数（>0 = 组内无可用端点且全部冷却中）
+                "all_frozen_remaining": pool._group_all_frozen_remaining(grp),
             })
         return 200, {"groups": groups}, False
     if method == "POST" and cp == "/api/groups":
@@ -8205,6 +8704,42 @@ def api_handler(method, path, body):
             return 400, {"error": msg}, False
         _sync_to_config()
         return 200, {"ok": True}, False
+    # 子组整组加入 main / 调序 / 移出 / 手动切到子组整体（2026-09-27）
+    if method == "POST" and cp.startswith("/api/groups/") and cp.endswith("/join-main"):
+        gname = unquote(cp[len("/api/groups/"):-len("/join-main")]).strip("/")
+        prio = body.get("main_priority")
+        ok, msg = pool.set_main_priority(gname, prio if prio not in ("", None) else None)
+        if not ok:
+            return 400, {"error": msg}, False
+        _sync_to_config()
+        return 200, {"ok": True, "name": msg}, False
+    if method == "POST" and cp.startswith("/api/groups/") and cp.endswith("/leave-main"):
+        gname = unquote(cp[len("/api/groups/"):-len("/leave-main")]).strip("/")
+        ok, msg = pool.leave_main(gname)
+        if not ok:
+            return 400, {"error": msg}, False
+        _sync_to_config()
+        # main 指针若曾指向该子组，leave_main 已清内存态 → 同步落盘（合并模式，仅覆盖 main 键）
+        cur_main = pool._get_current(pool.MAIN_GROUP)
+        if cur_main is None:
+            state = load_runtime_state() or {}
+            groups_state = dict(state.get("groups") or {})
+            groups_state.pop(pool.MAIN_GROUP, None)
+            save_runtime_state_groups(groups_state, replace_groups=True)
+        return 200, {"ok": True, "name": msg}, False
+    if method == "POST" and cp.startswith("/api/groups/") and cp.endswith("/switch-main"):
+        # 手动把 main 切到该已加入子组整体（口径A）
+        gname = unquote(cp[len("/api/groups/"):-len("/switch-main")]).strip("/")
+        ok, msg = pool.switch_main_to_subgroup(gname)
+        if not ok:
+            return 400, {"error": msg}, False
+        state = load_runtime_state() or {}
+        loaded = state.get("groups") if isinstance(state.get("groups"), dict) else None
+        groups_state: dict = dict(loaded) if loaded is not None else {}
+        groups_state[pool.MAIN_GROUP] = gname
+        if save_runtime_state_groups(groups_state, cooldowns=_collect_cooldown_state()):
+            pool._set_persisted(pool.MAIN_GROUP, gname)
+        return 200, {"ok": True, "name": msg}, False
     if method == "POST" and cp.startswith("/api/groups/") and cp.endswith("/clear-fallback"):
         # 手动「立即切回」（UI 点击 ↩main 锁定徽标 / ⏸待回切 徽标）：清回切锁 + 清该组
         # 端点的冷却/冻结/失败态 → 下一个请求真正落回本组。
@@ -8608,6 +9143,8 @@ def _sync_to_config():
                 entry["context_tokens"] = gd["context_tokens"]
             if gd.get("idle_seconds"):
                 entry["idle_seconds"] = gd["idle_seconds"]
+            if gd.get("main_priority"):
+                entry["main_priority"] = gd["main_priority"]
             defs_list.append(entry)
     save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "client_profile": ep.get("client_profile", ""), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
             "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "retry_on_rate_limit": ep.get("retry_on_rate_limit", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "strict400_retries": ep.get("strict400_retries", 2), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles,
