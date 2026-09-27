@@ -765,6 +765,80 @@ class GroupJoinMainTests(unittest.TestCase):
             self.assertGreater(remaining, 90)
             self.assertLessEqual(remaining, 100)
 
+    def test_frozen_false_positive_when_members_serving_main(self):
+        """Bug 1：子组成员正为 main 服务时，整组冻结判定不得误报。
+
+        main 粘在子组成员上（该成员是 main 当前端点）→ 子组自身 sticky 候选会剔除
+        「正为 main 服务的成员」而为空。整组冻结判定必须用真实可用口径，不受此影响。
+        """
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            b1 = self.endpoint(module, "b1", 2, "ds", groups=["cline"])
+            b1.priority_by_group = {"main": 2, "cline": 1}
+            b2 = self.endpoint(module, "b2", 2, "ds", groups=["cline"])
+            b2.priority_by_group = {"main": 2, "cline": 2}
+            pool = self.make_pool(module, [b1, b2],
+                                  {"cline": {"type": "mixed", "model": "cline"}})
+            pool.set_main_priority("cline", 1)
+            # main 当前端点 = b1（子组成员为 main 服务中）
+            pool._set_current("main", b1.id)
+            # 两成员都未冷却 → 绝不能报整组冻结
+            self.assertEqual(pool._group_all_frozen_remaining("cline"), 0)
+
+    def test_subgroup_current_endpoint_resolves_when_serving_main(self):
+        """Bug 2/3：main 借用子组成员时，子组「当前端点」必须解析出真实成员，非 None。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            b1 = self.endpoint(module, "b1", 2, "ds", groups=["cline"])
+            b1.priority_by_group = {"main": 2, "cline": 1}
+            b2 = self.endpoint(module, "b2", 2, "ds", groups=["cline"])
+            b2.priority_by_group = {"main": 2, "cline": 2}
+            pool = self.make_pool(module, [b1, b2],
+                                  {"cline": {"type": "mixed", "model": "cline"}})
+            pool.set_main_priority("cline", 1)
+            # 子组自身指针从未写过（历史缺陷）→ 仍应回退到 top 可用成员，不是 None
+            self.assertEqual(pool._resolve_subgroup_current("cline"), b1.id)
+            # 子组自身 sticky 指到 b2 → 保持粘性
+            pool._set_current("cline", b2.id)
+            self.assertEqual(pool._resolve_subgroup_current("cline"), b2.id)
+
+    def test_subgroup_chain_entry_only_in_main_axis(self):
+        """Bug 4：子组聚合链条目只属于 main 轴，不得泄漏进子组自身过滤视图。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            b1 = self.endpoint(module, "b1", 2, "ds", groups=["cline"])
+            b1.priority_by_group = {"main": 2, "cline": 1}
+            pool = self.make_pool(module, [b1],
+                                  {"cline": {"type": "mixed", "model": "cline"}})
+            pool.set_main_priority("cline", 1)
+            entries = pool._joined_subgroup_chain_entries(time.time())
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["pool_groups"], ["main"],
+                             "子组条目只该属于 main 轴，不带 sub（否则串进子组过滤）")
+
+    def test_subgroup_internal_sticky_no_flapping(self):
+        """Bug 5：main 借用子组成员成功后，指针粘在子组名次，成员保持粘性不横跳。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            b_hi = self.endpoint(module, "b-hi", 2, "ds", groups=["cline"])
+            b_hi.priority_by_group = {"main": 2, "cline": 1}
+            b_lo = self.endpoint(module, "b-lo", 2, "ds", groups=["cline"])
+            b_lo.priority_by_group = {"main": 2, "cline": 2}
+            pool = self.make_pool(module, [b_hi, b_lo],
+                                  {"cline": {"type": "mixed", "model": "cline"}})
+            pool.set_main_priority("cline", 1)
+            pool._try_endpoint = self.ok_try
+            # 第一次成功走 b-hi（子组 top）
+            pool._on_success(b_hi, group="main")
+            # main 指针粘在子组名，子组内部粘在 b-hi
+            self.assertEqual(pool._get_current("main"), "cline")
+            self.assertEqual(pool._get_current("cline"), b_hi.id)
+            # 后续解析稳定复用 b-hi，不横跳到 b-lo
+            self.assertEqual(pool._resolve_subgroup_current("cline"), b_hi.id)
+            self.assertEqual(pool._resolve_subgroup_current("cline"), b_hi.id)
+            # main 正服务子组 → _main_serving_subgroup 认得
+            self.assertEqual(pool._main_serving_subgroup(), "cline")
+
 
 if __name__ == "__main__":
     unittest.main()

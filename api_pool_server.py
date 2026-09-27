@@ -3910,6 +3910,25 @@ class APIPool:
                 out[name] = mp
         return dict(sorted(out.items(), key=lambda kv: (kv[1], kv[0])))
 
+    def _subgroup_raw_available(self, sub):
+        """子组内**真实可用**成员，按子组优先级升序（次键全局 priority）。
+
+        真实可用 = enabled + in_pool + 非冷却 + 非 manual_unlock。刻意**不**施加
+        sticky-elsewhere / inflight-elsewhere 排除：子组作为 main 的一个名次为 main
+        服务时，其成员正为 main 服务，不应被当成「被别处占用」而从子组视图消失——
+        否则会导致整组冻结误报（Bug 1）与当前端点漂移/横跳（Bug 5）。
+
+        这是「子组作为 main 名次」语境下的唯一候选口径：main 指针解析、整组冻结判定、
+        聚合链子组条目、面板当前端点显示全部收口到这里，保证四处同源不漂移。
+        """
+        members = [ep for ep in self._endpoints
+                   if ep.enabled and ep.in_pool
+                   and sub in self._ep_groups(ep)
+                   and not ep._manual_unlock_required
+                   and not self._is_in_cooldown(ep)]
+        members.sort(key=lambda e: (self._ep_priority(e, sub), e.priority))
+        return members
+
     def _next_main_priority(self):
         """加入 main 的默认名次 = 现有 main 优先级轴（原生端点 + 已加入子组）最大值 + 1（末位）。"""
         used = [self._ep_priority(ep, self.MAIN_GROUP) for ep in self._endpoints
@@ -3945,15 +3964,20 @@ class APIPool:
         return (self._ep_priority(ep, group), ep.priority)
 
     def _resolve_subgroup_current(self, sub):
-        """手动切到子组整体时，下钻到该子组当前应使用的端点（子组当前端点变化自动跟随）。
-        优先沿用子组自身当前指针（若仍在候选内），否则按子组优先级取 top 可用端点；无可用→None。"""
-        cands, _ = self._group_sticky_candidates(sub)
+        """子组作为 main 名次服务时，下钻到该子组当前应使用的成员端点。
+
+        口径（2026-09-27 Bug 2/5 修）：候选用 _subgroup_raw_available（真实可用，不受
+        「成员正为 main 服务」的 sticky/inflight-elsewhere 排除影响）——否则 main 借用
+        期间子组自身候选恒为空，当前端点显示不出、且每次解析漂移。
+        优先沿用子组自身 sticky 指针（仍可用则保持粘性），否则按子组优先级取 top；无可用→None。
+        """
+        cands = self._subgroup_raw_available(sub)
         if not cands:
             return None
         sub_cur = self._get_manual(sub) or self._get_current(sub)
         if sub_cur and any(e.id == sub_cur for e in cands):
             return sub_cur
-        return min(cands, key=lambda e: self._ep_priority(e, sub)).id
+        return cands[0].id
 
     def _main_pointer_target(self):
         """main 当前应指向的目标（端点 id / 子组名 / None）。
@@ -3965,14 +3989,18 @@ class APIPool:
         2026-09-27 修：原来这里返回 None，导致 chain/groups 的 current_endpoint
         显示空——用户看不到整组冻结 fallback 后当前实际在用的端点。路由本身
         （chat 里 current_id 解析）一直是正确回落的，只有展示口径漏了。
+
+        Bug 5 后（2026-09-27）：main 粘在子组名次时 current 指针也可能存子组名
+        （不止 manual）。两种指针统一处理：指向子组 → 组内可用则保持子组名，
+        全冻结则回落 main 候选首位。
         """
-        manual = self._get_manual(self.MAIN_GROUP)
-        if manual in self._joined_subgroups():
-            if self._resolve_subgroup_current(manual) is None:
+        pointer = self._get_manual(self.MAIN_GROUP) or self._get_current(self.MAIN_GROUP)
+        if pointer in self._joined_subgroups():
+            if self._resolve_subgroup_current(pointer) is None:
                 cands, _ = self._group_sticky_candidates(self.MAIN_GROUP)
                 return cands[0].id if cands else None
-            return manual
-        return manual or self._get_current(self.MAIN_GROUP)
+            return pointer
+        return pointer
 
     def _main_serving_subgroup(self):
         """main 当前实际正在服务的**子组名**（None = 正在用原生端点或空）。
@@ -4007,10 +4035,12 @@ class APIPool:
         反映冻结状态：组内端点全部冷却/冻结 → 该子组条目在 main 里等同冻结，
         不参与 main 轮转，冻结时长取组内**最短**剩余冻结的端点（最早恢复者）。
 
-        有任一可用端点 → 0（未整组冻结）。无成员 → 0。
+        判空口径（Bug 1 修）：用 _subgroup_raw_available（真实可用：非冷却/非锁定），
+        **不**受「成员正为 main 服务」的 sticky/inflight-elsewhere 排除影响——否则
+        main 借用期间子组自身候选恒空，会把「正在正常工作的子组」误报成整组冻结。
+        有任一真实可用端点 → 0。无成员 → 0。
         """
-        cands, _ = self._group_sticky_candidates(grp)
-        if cands:
+        if self._subgroup_raw_available(grp):
             return 0
         members = [
             ep for ep in self._endpoints
@@ -4323,8 +4353,10 @@ class APIPool:
         # 同源，避免两份判据漂移。
         _serving_sub = self._main_serving_subgroup()
         for sub, mp in self._joined_subgroups().items():
-            cands, _ = self._group_sticky_candidates(sub)
-            cur = self._manual_override_by_group.get(sub) or self._current_endpoint_by_group.get(sub)
+            cands = self._subgroup_raw_available(sub)
+            # 当前成员收口到 _resolve_subgroup_current（与 main 卡片/池面板同源）：
+            # 子组自身 sticky 指针（仍可用则保持）否则 top 可用；无可用→None（Bug 2/3 修）。
+            cur = self._resolve_subgroup_current(sub)
             cur_ep = next((e for e in self._endpoints if e.id == cur), None) if cur else None
             frozen_remaining = self._group_all_frozen_remaining(sub)
             members = [
@@ -4351,7 +4383,10 @@ class APIPool:
                 "priority_by_group": {self.MAIN_GROUP: mp},
                 "is_current": _serving_sub == sub,
                 "current_groups": [self.MAIN_GROUP] if _serving_sub == sub else [],
-                "pool_groups": [self.MAIN_GROUP, sub],
+                # 只属于 main 轴（Bug 4 修）：子组条目是「子组作为 main 名次」的代表，
+                # 只该在 main 过滤视图出现。若带上 sub，会泄漏进子组自身过滤视图，
+                # 且按 main_priority 错误排序（子组视图应只显示成员端点本身）。
+                "pool_groups": [self.MAIN_GROUP],
                 "fail_count": 0,
                 "in_cooldown": frozen_remaining > 0,
                 "cooldown_remaining": frozen_remaining,
@@ -5651,7 +5686,19 @@ class APIPool:
                     grp == self.MAIN_GROUP
                     and self._get_manual(grp) in self._joined_subgroups()
                 )
-                if not keep_subgroup_pointer:
+                # 子组作为 main 名次服务（2026-09-27 Bug 5）：main 粘在「子组」这一名次，
+                # 子组维护自身当前成员的粘性。否则 main 指针在子组成员 id 之间横跳
+                # （并发下互相覆盖），或成功后跳回原生端点、丢失子组归属。
+                axis_sub = self._main_axis_subgroup(ep) if grp == self.MAIN_GROUP else None
+                if axis_sub is not None:
+                    # 子组内部 sticky：记住这次成功的成员，下次下钻优先复用。
+                    self._set_current(axis_sub, ep.id)
+                    # main 粘在子组名（下钻由 _resolve_subgroup_current 复用上面的成员）。
+                    if not keep_subgroup_pointer:
+                        self._set_current(grp, axis_sub)
+                        if self._get_manual(grp) and self._get_manual(grp) != axis_sub:
+                            self._set_manual(grp, None)
+                elif not keep_subgroup_pointer:
                     self._set_current(grp, ep.id)
                     if self._get_manual(grp) and self._get_manual(grp) != ep.id:
                         self._set_manual(grp, None)
@@ -8722,6 +8769,11 @@ def api_handler(method, path, body):
                 cur_sub = pool._main_serving_subgroup()
                 if cur in pool._joined_subgroups():
                     cur = pool._resolve_subgroup_current(cur_sub)
+            elif grp in pool._joined_subgroups():
+                # 已加入 main 的子组：面板当前端点收口到 _resolve_subgroup_current
+                # （与 main 卡片、聚合链子组条目同源，Bug 2/3 修）——main 借用其成员时
+                # 子组自身指针可能未及回写，直接下钻到真实当前成员。
+                cur = pool._resolve_subgroup_current(grp)
             cur_ep = next((e for e in pool._endpoints if e.id == cur), None)
             _fb_until = pool._group_fallback_lock_until.get(grp, 0)
             group_summary[grp] = {
@@ -8753,6 +8805,9 @@ def api_handler(method, path, body):
                 cur = pool._main_pointer_target()
                 if cur in pool._joined_subgroups():
                     cur = pool._resolve_subgroup_current(cur)
+            elif grp in pool._joined_subgroups():
+                # 已加入 main 的子组：当前端点同源下钻（Bug 2/3 修）。
+                cur = pool._resolve_subgroup_current(grp)
             cur_ep = next((e for e in pool._endpoints if e.id == cur), None)
             groups.append({
                 "name": grp,
