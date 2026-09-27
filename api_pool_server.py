@@ -3932,6 +3932,18 @@ class APIPool:
                     best = key
         return best if best is not None else (10 ** 9, 2, ep.priority)
 
+    def _candidate_sort_key(self, ep, group):
+        """组内候选排序键的唯一出口。
+
+        main 组：子组作为整体钉在其 main_priority 名次上（_main_candidate_sort_key），
+        借来的子组成员绝不按各自 pbg['main'] 散落——否则同组兄弟会被别的原生
+        名次插队，故障后 fallback 跳出子组（2026-09-27 修）。
+        非 main 组：逐字节沿用旧口径 (组内优先级, 全局优先级)，零回归。
+        """
+        if group == self.MAIN_GROUP:
+            return self._main_candidate_sort_key(ep)
+        return (self._ep_priority(ep, group), ep.priority)
+
     def _resolve_subgroup_current(self, sub):
         """手动切到子组整体时，下钻到该子组当前应使用的端点（子组当前端点变化自动跟随）。
         优先沿用子组自身当前指针（若仍在候选内），否则按子组优先级取 top 可用端点；无可用→None。"""
@@ -5291,6 +5303,36 @@ class APIPool:
         fb = self._get_fallback_endpoint()
         return [fb] if fb else []
 
+    def _failover_active(self, group):
+        """故障后重建的候选 active 列表（组感知，与初始 _group_sticky_candidates 同口径）。
+
+        main 组：必须含借来的子组成员（_group_sticky_candidates 对 main 的专门逻辑），
+        否则子组兄弟被 `group in _ep_groups(e)` 窄过滤剔除 → 故障后 fallback 跳出子组
+        （2026-09-27 修）。非 main 组：沿用 _failover_endpoints 窄过滤，零回归。
+        返回已按 _candidate_sort_key 排序的列表。
+        """
+        if group == self.MAIN_GROUP:
+            active, _ = self._group_sticky_candidates(self.MAIN_GROUP)
+        else:
+            active = [e for e in self._failover_endpoints() if group in self._ep_groups(e)]
+        active.sort(key=lambda e: self._candidate_sort_key(e, group))
+        return active
+
+    def _main_axis_subgroup(self, ep):
+        """借入 main 的端点在 main 轴上归属的子组名（None=原生 main 端点或未借入）。
+
+        与 _main_candidate_sort_key 同口径：端点跨多个已加入子组时，取
+        main_priority 最小的那个（= 它在 main 轴上被排到的名次的归属）。
+        原生 main 端点（字面 groups 含 main）不属于任何借入子组，返回 None。
+        """
+        if self.MAIN_GROUP in self._ep_groups(ep):
+            return None
+        best_sub, best_mp = None, None
+        for sub, mp in self._joined_subgroups().items():
+            if sub in self._ep_groups(ep) and (best_mp is None or mp < best_mp):
+                best_sub, best_mp = sub, mp
+        return best_sub
+
     def _ordered_failover_candidates(self, failed_ep, active, exclude=None, group=None):
         """Return available endpoints in ring order.
 
@@ -5299,16 +5341,47 @@ class APIPool:
         cooldown when this function is called. 分组隔离：按该组优先级排 ring。
         模型优先分桶已移除（2026-09-06）：渠道命名差异下字符串相等既漏判又误判，
         同模型/同类型互备由人工把相关端点排成相邻优先级实现。
+
+        子组内 fallback 优先（2026-09-27）：main 组里失败端点若是借入的子组成员，
+        必须先在该子组内 ring 轮转耗尽（按子组优先级），组内全不可用才回到 main
+        主链后续名次。子组是 main 的一个整体名次，全局 ring 会在子组末位直接跨到
+        下一个原生名次，把同组排在前面的兄弟甩到环尾 → 违反「组内先耗尽」。
         """
         grp = group or self.MAIN_GROUP
         excluded_ids = {ep.id for ep in (exclude or ())}
         active_ids = {ep.id for ep in active}
+
+        def _avail(ep):
+            return (ep.id in active_ids
+                    and ep is not failed_ep
+                    and ep.id not in excluded_ids
+                    and not self._is_in_cooldown(ep)
+                    and not self._is_manually_locked(ep))
+
         pool = sorted(
             (ep for ep in self._endpoints if ep.enabled and ep.in_pool),
-            key=lambda ep: (self._ep_priority(ep, grp), ep.priority),
+            key=lambda ep: self._candidate_sort_key(ep, grp),
         )
         if not pool:
             return []
+
+        # main 组 + 失败端点属于某已加入子组 → 两级 ring：子组内先耗尽再回主链。
+        if grp == self.MAIN_GROUP:
+            sub = self._main_axis_subgroup(failed_ep)
+            if sub is not None:
+                # pool 已按 main 轴排序，同子组成员在 (main_priority, 1, 子组优先级)
+                # 段内天然按子组优先级升序连续排列。
+                members = [ep for ep in pool if self._main_axis_subgroup(ep) == sub]
+                rest = [ep for ep in pool if self._main_axis_subgroup(ep) != sub]
+                try:
+                    fi = next(i for i, ep in enumerate(members) if ep is failed_ep)
+                    sub_ring = members[fi + 1:] + members[:fi]
+                except StopIteration:
+                    sub_ring = members
+                ring = sub_ring + rest
+                return [ep for ep in ring if _avail(ep)]
+
+        # 全局 ring：非 main 组，或失败端点是原生 main 端点。
         try:
             failed_index = next(i for i, ep in enumerate(pool) if ep is failed_ep)
         except StopIteration:
@@ -5318,14 +5391,7 @@ class APIPool:
         else:
             ring = pool
 
-        return [
-            ep for ep in ring
-            if ep.id in active_ids
-            and ep is not failed_ep
-            and ep.id not in excluded_ids
-            and not self._is_in_cooldown(ep)
-            and not self._is_manually_locked(ep)
-        ]
+        return [ep for ep in ring if _avail(ep)]
 
     @staticmethod
     def _is_manually_locked(ep):
@@ -5530,7 +5596,7 @@ class APIPool:
             actual = max(0, (failed_ep._cooldown_until - time.time()) / 60)
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 触发冷却机制，下次可用时间在 {actual:.1f} 分钟后（连续第 {int(failed_ep._fail_count)} 次）", "WARN")
         # 分组池：轮转切换限定在失败请求所属组内（含 bg 组 fallback 逻辑见 chat()）。
-        active = [e for e in self._failover_endpoints() if grp in self._ep_groups(e)]
+        active = self._failover_active(grp)
         candidates = self._ordered_failover_candidates(failed_ep, active, group=grp)
         with self._lock:
             # 请求启动后若已有更新的路由决策，保留该决策；本请求仍可在局部
@@ -6041,7 +6107,9 @@ class APIPool:
         total = len(active)
         # 按优先级排序：每次从最高优先级端点开始尝试，故障自动降级，恢复后自动回迁
         # 分组隔离（2026-08-29）：按请求所属组的组内优先级排序
-        active.sort(key=lambda e: self._ep_priority(e, group))
+        # main 组用统一轴键（子组整体钉在 main_priority），否则借来的子组成员
+        # 会被这次 re-sort 按各自 pbg['main'] 打散，故障后跳出子组（2026-09-27）。
+        active.sort(key=lambda e: self._candidate_sort_key(e, group))
         # 修复消息顺序：tool 消息前缺少 tool_calls 时自动补 assistant 回复
         needs_fix = False
         tool_call_ids = set()
@@ -6406,8 +6474,7 @@ class APIPool:
                     # 单请求饿死不是 API Pool 的端点故障。不要探活或切换到
                     # 其他模型；交回 Hermes，由其现有请求重试机制善后。
                     break
-                active = [e for e in self._failover_endpoints() if group in self._ep_groups(e)]
-                active.sort(key=lambda e: self._ep_priority(e, group))
+                active = self._failover_active(group)
                 total = len(active)
                 if total == 0:
                     break
@@ -6506,8 +6573,7 @@ class APIPool:
                                 for e in remaining:
                                     if probe_results.get(e.id) == "bad" and not self._is_in_cooldown(e):
                                         self._rotate(e, "并发探活失败", probe_failed=True, group=group)
-                                active = [e for e in self._failover_endpoints() if group in self._ep_groups(e)]
-                                active.sort(key=lambda e: self._ep_priority(e, group))
+                                active = self._failover_active(group)
                                 total = len(active)
                                 if total == 0:
                                     break

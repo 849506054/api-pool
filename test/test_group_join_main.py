@@ -601,6 +601,170 @@ class GroupJoinMainTests(unittest.TestCase):
             self.assertFalse(rows["bg"]["is_current"])
             self.assertEqual(rows["bg"]["current_groups"], [])
 
+    # ── 故障后 fallback 必须先耗尽子组内兄弟（2026-09-27 生产 bug）──
+
+    def test_failover_stays_in_subgroup_before_leaving(self):
+        """子组成员故障 → 先切同组兄弟，不得跳出子组到后面的原生 main 端点。
+
+        复刻生产拓扑（pool-cline 占 main_priority=1，组内多成员，各成员
+        pbg['main'] 各异且大于 1；一个原生 main 端点排在更后）。
+        当前使用的子组成员失败时，_ordered_failover_candidates 必须返回同组
+        另一个成员，而不是原生端点。这是 Justwoker 越级 bug 的直接回归。
+        """
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            # 子组 cline 两个成员，pbg['main'] 故意设为 3/2（与子组 main_priority=1 不同，
+            # 复刻生产：Cline3-gemini main=3, Cline-ds4.1f main=2）
+            g_hi = self.endpoint(module, "cline-gemini", 3, "gemini", groups=["cline"])
+            g_hi.priority_by_group = {"main": 3, "cline": 7}
+            g_lo = self.endpoint(module, "cline-ds", 2, "ds", groups=["cline"])
+            g_lo.priority_by_group = {"main": 2, "cline": 1}
+            # 原生 main 端点，main 名次 4（复刻 Justwoker）
+            native = self.endpoint(module, "justwoker", 4, "opus", groups=["main"])
+            native.priority_by_group = {"main": 4}
+            pool = self.make_pool(module, [g_hi, g_lo, native],
+                                  {"cline": {"type": "mixed", "model": "cline"}})
+            pool.set_main_priority("cline", 1)  # 子组整体排 main 首位
+
+            # 初始候选：子组两成员钉在 main_priority=1 段（段内按 cline 优先级：ds#1 在 gemini#7 前），
+            # 原生 justwoker 排最后
+            init = [e.id for e in pool._group_sticky_candidates("main")[0]]
+            self.assertEqual(init, ["cline-ds", "cline-gemini", "justwoker"])
+
+            # 当前用 cline-gemini，它失败 → 重建候选 + 环序：下一个必须是同组 cline-ds，
+            # 绝不是 justwoker
+            active = pool._failover_active("main")
+            self.assertIn("cline-ds", [e.id for e in active])
+            self.assertIn("cline-gemini", [e.id for e in active])
+            cands = pool._ordered_failover_candidates(g_hi, active, group="main")
+            self.assertTrue(cands, "must have a failover candidate")
+            self.assertEqual(cands[0].id, "cline-ds",
+                             "failover must stay in subgroup (cline-ds), not jump to justwoker")
+
+    def test_failover_leaves_subgroup_only_after_all_members_down(self):
+        """子组成员全部冷却后，fallback 才轮到后面的原生 main 端点。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            import time as _t
+            g_hi = self.endpoint(module, "cline-gemini", 3, "gemini", groups=["cline"])
+            g_hi.priority_by_group = {"main": 3, "cline": 7}
+            g_lo = self.endpoint(module, "cline-ds", 2, "ds", groups=["cline"])
+            g_lo.priority_by_group = {"main": 2, "cline": 1}
+            native = self.endpoint(module, "justwoker", 4, "opus", groups=["main"])
+            native.priority_by_group = {"main": 4}
+            pool = self.make_pool(module, [g_hi, g_lo, native],
+                                  {"cline": {"type": "mixed", "model": "cline"}})
+            pool.set_main_priority("cline", 1)
+
+            # 两个子组成员都冷却 → 子组整段从候选消失，只剩原生 justwoker
+            g_hi._cooldown_until = _t.time() + 999
+            g_lo._cooldown_until = _t.time() + 999
+            active = pool._failover_active("main")
+            self.assertEqual([e.id for e in active], ["justwoker"])
+            cands = pool._ordered_failover_candidates(g_hi, active, group="main")
+            self.assertEqual([e.id for e in cands], ["justwoker"])
+
+    def test_failover_does_not_leak_into_sibling_subgroup(self):
+        """子组 A 成员失败 → 只在 A 内 fallback；不得串到另一个已加入子组 B。
+
+        A(main_priority=1) 两成员，B(main_priority=2) 一成员，原生 native(main#3)。
+        A 的成员失败 → 下一个候选是 A 的兄弟；A 全挂后才轮到 B / native，且顺序
+        按 main 轴（B 在 native 前）。
+        """
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            import time as _t
+            a_hi = self.endpoint(module, "a-hi", 3, "m", groups=["ga"])
+            a_hi.priority_by_group = {"main": 3, "ga": 2}
+            a_lo = self.endpoint(module, "a-lo", 2, "m", groups=["ga"])
+            a_lo.priority_by_group = {"main": 2, "ga": 1}
+            b1 = self.endpoint(module, "b1", 2, "m", groups=["gb"])
+            b1.priority_by_group = {"main": 2, "gb": 1}
+            native = self.endpoint(module, "native", 5, "m", groups=["main"])
+            native.priority_by_group = {"main": 5}
+            pool = self.make_pool(module, [a_hi, a_lo, b1, native],
+                                  {"ga": {"type": "mixed", "model": "ga"},
+                                   "gb": {"type": "mixed", "model": "gb"}})
+            pool.set_main_priority("ga", 1)
+            pool.set_main_priority("gb", 2)
+
+            # a-hi 失败：先在 ga 内 → a-lo，不得跳到 b1/native
+            active = pool._failover_active("main")
+            cands = pool._ordered_failover_candidates(a_hi, active, group="main")
+            self.assertEqual(cands[0].id, "a-lo",
+                             "must stay in subgroup ga, not leak to gb/native")
+
+            # ga 全挂 → 回主链，B 段(main#2) 在 native(main#3) 前
+            a_hi._cooldown_until = _t.time() + 999
+            a_lo._cooldown_until = _t.time() + 999
+            active2 = pool._failover_active("main")
+            cands2 = pool._ordered_failover_candidates(a_hi, active2, group="main")
+            self.assertEqual([e.id for e in cands2], ["b1", "native"])
+
+    def test_failover_spec_A_B123_C_D(self):
+        """验收规范（2026-09-27 用户四条）：main = A, B(b1,b2,b3), C, D。
+
+        1) A 故障 → fallback 到 B，B 内按子组优先级 b1→b2→b3
+        2) b1 故障 → 组内 fallback b2→b3
+        3) b1/b2/b3 全故障 → 跳出 B → 回 main（C、D）
+        4) B 的冻结时长 = b1/b2/b3 中冷却最短者
+        """
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            import time as _t
+            # A：原生 main 端点，main#1
+            a = self.endpoint(module, "A", 1, "m", groups=["main"])
+            a.priority_by_group = {"main": 1}
+            # B 子组三成员，子组内优先级 1/2/3；各自 pbg['main'] 故意打乱（不同于 B 名次）
+            b1 = self.endpoint(module, "b1", 9, "m", groups=["B"])
+            b1.priority_by_group = {"main": 9, "B": 1}
+            b2 = self.endpoint(module, "b2", 8, "m", groups=["B"])
+            b2.priority_by_group = {"main": 8, "B": 2}
+            b3 = self.endpoint(module, "b3", 7, "m", groups=["B"])
+            b3.priority_by_group = {"main": 7, "B": 3}
+            # C、D 原生 main 端点
+            c = self.endpoint(module, "C", 3, "m", groups=["main"])
+            c.priority_by_group = {"main": 3}
+            d = self.endpoint(module, "D", 4, "m", groups=["main"])
+            d.priority_by_group = {"main": 4}
+            pool = self.make_pool(module, [a, b1, b2, b3, c, d],
+                                  {"B": {"type": "mixed", "model": "B"}})
+            pool.set_main_priority("B", 2)  # 轴：A#1, B#2, C#3, D#4
+
+            # 1) A 故障 → 下一个是 B 段首（b1），且 B 内顺序 b1<b2<b3
+            active = pool._failover_active("main")
+            self.assertEqual([e.id for e in active], ["A", "b1", "b2", "b3", "C", "D"])
+            cands_A = pool._ordered_failover_candidates(a, active, group="main")
+            self.assertEqual([e.id for e in cands_A], ["b1", "b2", "b3", "C", "D"])
+
+            # A 已故障进入冷却（承接第 1 步），后续 fallback 不应再回到 A
+            import time as _t0
+            a._cooldown_until = _t0.time() + 999
+            active = pool._failover_active("main")
+            self.assertEqual([e.id for e in active], ["b1", "b2", "b3", "C", "D"])
+
+            # 2) b1 故障 → 组内 b2、b3（不跳出 B），组耗尽后回主链 C、D
+            cands_b1 = pool._ordered_failover_candidates(b1, active, group="main")
+            self.assertEqual([e.id for e in cands_b1], ["b2", "b3", "C", "D"])
+            # b2 故障 → 组内先给 b3
+            cands_b2 = pool._ordered_failover_candidates(b2, active, group="main")
+            self.assertEqual([e.id for e in cands_b2][:1], ["b3"])
+
+            # 3) b1/b2/b3 全部冷却 → B 整段从候选消失，跳出到 C、D
+            now = _t.time()
+            b1._cooldown_until = now + 100
+            b2._cooldown_until = now + 300
+            b3._cooldown_until = now + 200
+            active3 = pool._failover_active("main")
+            self.assertEqual([e.id for e in active3], ["C", "D"])
+            cands_all_down = pool._ordered_failover_candidates(b1, active3, group="main")
+            self.assertEqual([e.id for e in cands_all_down], ["C", "D"])
+
+            # 4) B 的整组冻结时长 = 组内最短剩余（b1 的 100s，非 b2/b3）
+            remaining = pool._group_all_frozen_remaining("B")
+            self.assertGreater(remaining, 90)
+            self.assertLessEqual(remaining, 100)
+
 
 if __name__ == "__main__":
     unittest.main()
