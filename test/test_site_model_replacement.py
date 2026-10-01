@@ -295,13 +295,14 @@ class SiteModelReplacementTests(unittest.TestCase):
         with open(index_path, encoding="utf-8") as handle:
             html = handle.read()
 
-        # 池内端点模型目录预取（2026-10-01 起走并发受限的 prefetchPoolModels：
-        # 原先 26 个上游 models 请求全并发会占满浏览器同源连接，令交互请求排队数秒）
+        # 池内端点模型目录预热（2026-10-01）：只在 renderPoolList 里为「当前可见分组」
+        # 预热（并发受限），禁止回到 refresh() 的全池每 5s 拉取
         self.assertIn(
-            "if (Array.isArray(eps)) prefetchPoolModels(eps.filter(e => e && e.in_pool).map(e => e.id));",
+            "prefetchPoolModels(poolEps.filter(e=>groupsOf(e).includes(displayGroup)).map(e=>e.id));",
             html,
         )
         self.assertIn("function prefetchPoolModels(ids){", html)
+        self.assertIn("const MODELS_PREFETCH_CONCURRENCY=2;", html)
         self.assertIn(
             "onmousedown=\"event.stopPropagation();loadPoolModelOptions(this,'${escAttr(ep.id)}')\"",
             html,

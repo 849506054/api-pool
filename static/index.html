@@ -677,7 +677,7 @@ const ABN_FILTER='__abnormal__'; /* 异常筛选哨兵值：与站点筛选共�
 let epFilter='all',epVendorFilter='all',modelPage=1,PP=50; /* epFilter=站点层（含异常哨兵），epVendorFilter=厂商层 */
 const endpointModelsCache=new Map();
 const endpointModelsInflight=new Map(); /* 在途请求复用：防同一端点并发重复拉取 */
-const ENDPOINT_MODELS_CACHE_MS=5*60*1000;
+const ENDPOINT_MODELS_CACHE_MS=60*60*1000; /* 上游模型目录近乎静态：客户端缓存 1 小时 */
 const ENDPOINT_MODELS_ERROR_CACHE_MS=60*1000; /* 失败短缓存：上游失败端点不再每 5s 重试 */
 let loadingPoolModelSelect=null;
 let refreshGeneration=0;
@@ -712,9 +712,6 @@ async function refresh(){
     lastRefreshSig = sig;
   }
   alignCards();
-  // 预取池内端点模型目录：iOS 原生 select 打开时选项必须已就绪（onfocus 懒加载 +
-  // iOS 快照问题：选项未加载完就弹出旧列表，看不到目标模型）。
-  if (Array.isArray(eps)) prefetchPoolModels(eps.filter(e => e && e.in_pool).map(e => e.id));
 }
 
 /* 端点列表卡片高度 = 右侧列（聚合池管理+聚合链）底部对齐，自适应 */
@@ -895,6 +892,10 @@ function renderPoolList(eps){
   sortGroups(groups);
   const multiGroup=groups.length>1||groups[0]!=='main';
   const displayGroup=multiGroup?poolGroupFilter:'main';
+  // 模型目录预热（2026-10-01）：只为「当前可见分组」的卡片预热，且只在渲染时跑一次
+  // （renderPoolList 由签名去重后的 refresh 或本地切组触发）。iOS 原生 select 打开时
+  // 选项必须已就绪（快照问题），故对真正会被点开的卡片保留预热。
+  prefetchPoolModels(poolEps.filter(e=>groupsOf(e).includes(displayGroup)).map(e=>e.id));
   const cardOf=(ep)=>{
     let cls='ep-item';
     if(!ep.enabled)cls+=' disabled';
@@ -1081,7 +1082,8 @@ async function endpointModels(endpointId){
 }
 /* 池内模型目录预取：并发上限 2。上游 models 请求单个 0.2~4 秒，全部并发会把浏览器
    同源连接（HTTP/1.1 6 条/host）占满，用户点击触发的请求要排队数秒——串行低并发
-   保证始终有空闲连接给交互请求。 */
+   保证始终有空闲连接给交互请求。调用点固定为 renderPoolList（当前可见分组），
+   禁止移回 refresh()（那样会退化成每 5s 全池拉上游）。 */
 const MODELS_PREFETCH_CONCURRENCY=2;
 let modelsPrefetchRunning=false;
 function prefetchPoolModels(ids){

@@ -37,6 +37,7 @@ const GROUP_ICONS={main:'M',vision:'V'};
 const groupIcon=g=>GROUP_ICONS[g]||'';
 const groupRank=g=>g==='main'?0:(GROUP_ICONS[g]?1:2);
 const sortGroups=list=>list.sort((a,b)=>groupRank(a)-groupRank(b));
+const prefetchPoolModels=()=>{}; // renderPoolList 内的模型目录预热（2026-10-01）不在本用例范围
 const VENDOR_SRC=js.match(/const VENDOR_RULES=\[[\s\S]*?\];\nfunction vendorOf\(model\)\{[\s\S]*?\n\}/)[0];
 const FNS=[VENDOR_SRC,js.match(/function epErr\(ep\)\{[^\n]*\}/)[0],grab('renderStats'),grab('renderEndpoints'),grab('renderPoolList'),grab('renderChain')].join('\n');
 eval(FNS);

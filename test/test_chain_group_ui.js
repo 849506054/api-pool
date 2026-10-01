@@ -20,14 +20,15 @@ const nodes = {};
 const document = {getElementById: id => nodes[id] ||= {innerHTML: '', textContent: ''}};
 const window = {};
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const ui = new Function('document', 'window', 'esc', 'escAttr', 'fmtTime', `
+// renderPoolList 内的模型目录预热（2026-10-01）不在本用例范围：注入空实现即可
+const ui = new Function('document', 'window', 'esc', 'escAttr', 'fmtTime', 'prefetchPoolModels', `
   let poolSnapshot;
   ${source}
   return {setPoolGroupFilter, setChainGroupFilter, renderChain,
     get pool(){return poolGroupFilter}, get chain(){return chainGroupFilter},
     load(data){poolSnapshot=data;window._groupDefs=data.groupDefs;window._poolGroups=data.groups;
       renderPoolList(data.endpoints);renderChain(data.chain);}};
-`)(document, window, esc, esc, s => `${s}s`);
+`)(document, window, esc, esc, s => `${s}s`, () => {});
 const badges = id => [...nodes[id].innerHTML.matchAll(/badge-priority">#(\d+)<\/span>/g)].map(m => Number(m[1]));
 const chainNames = () => [...nodes.chainList.innerHTML.matchAll(/badge-priority">#\d+<\/span> ([^<]+) /g)].map(m => m[1].trim());
 const ep = (name, priority, groupPriority, groups=['main','g']) => ({
