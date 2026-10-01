@@ -676,9 +676,12 @@ let allModels=[],selectedModels=new Set(),latencyResults={},visionResults={};
 const ABN_FILTER='__abnormal__'; /* 异常筛选哨兵值：与站点筛选共用 epFilter */
 let epFilter='all',epVendorFilter='all',modelPage=1,PP=50; /* epFilter=站点层（含异常哨兵），epVendorFilter=厂商层 */
 const endpointModelsCache=new Map();
+const endpointModelsInflight=new Map(); /* 在途请求复用：防同一端点并发重复拉取 */
 const ENDPOINT_MODELS_CACHE_MS=5*60*1000;
+const ENDPOINT_MODELS_ERROR_CACHE_MS=60*1000; /* 失败短缓存：上游失败端点不再每 5s 重试 */
 let loadingPoolModelSelect=null;
 let refreshGeneration=0;
+let lastRefreshSig=null; /* 三接口响应签名：未变化时跳过 5s 周期重绘 */
 let poolSnapshot={endpoints:[],chain:[],groups:{},groupDefs:[]};
 
 async function refresh(){
@@ -695,23 +698,23 @@ async function refresh(){
   window._poolGroups = groups;
   window._groupDefs = groupDefs; // 组实体（2026-08-30 组管理弹窗）
   window._allEps = eps; // 入池弹层读取端点当前组（回显勾选）
-  renderStats(eps);renderFilterBar(eps);renderEndpoints(eps);
   // 分组切换是本地视图操作；这里仅负责后台快照到达后的状态更新。
   // 优先级下拉框或模型选择器展开期间，避免自动刷新重建 DOM 导致控件收回。
   const active = document.activeElement;
-  if (!loadingPoolModelSelect && !(active && active.tagName === 'SELECT' && active.closest('#poolList'))) {
-    renderPoolList(eps);
+  const poolBlocked = !!loadingPoolModelSelect || !!(active && active.tagName === 'SELECT' && active.closest('#poolList'));
+  // 三个状态接口响应未变化时跳过重绘（消 5s 周期的 DOM 重建与交互打断）。
+  const sig = JSON.stringify([eps, chain, groups, groupDefs]);
+  const changed = sig !== lastRefreshSig;
+  if (changed) { renderStats(eps);renderFilterBar(eps);renderEndpoints(eps);renderChain(chain); }
+  // 控件交互期间跳过池重绘时不更新签名 → 下个周期自动补渲染，不会停在旧数据。
+  if (!poolBlocked) {
+    if (changed) renderPoolList(eps);
+    lastRefreshSig = sig;
   }
-  renderChain(chain);
   alignCards();
   // 预取池内端点模型目录：iOS 原生 select 打开时选项必须已就绪（onfocus 懒加载 +
-  // iOS 快照问题：选项未加载完就弹出旧列表，看不到目标模型）。endpointModels 有
-  // 5 分钟缓存，不会重复请求。
-  if (Array.isArray(eps)) {
-    for (const e of eps) {
-      if (e && e.in_pool) endpointModels(e.id).catch(() => {});
-    }
-  }
+  // iOS 快照问题：选项未加载完就弹出旧列表，看不到目标模型）。
+  if (Array.isArray(eps)) prefetchPoolModels(eps.filter(e => e && e.in_pool).map(e => e.id));
 }
 
 /* 端点列表卡片高度 = 右侧列（聚合池管理+聚合链）底部对齐，自适应 */
@@ -1050,13 +1053,48 @@ async function leaveMain(name){
 }
 
 async function endpointModels(endpointId){
-  const now=Date.now(),cached=endpointModelsCache.get(endpointId);
-  if(cached&&now-cached.at<ENDPOINT_MODELS_CACHE_MS)return cached.models;
-  const res=await api('GET',`/api/endpoints/${encodeURIComponent(endpointId)}/models`);
-  if(!res.ok)throw new Error(res.error||'获取模型失败');
-  const models=[...new Set((Array.isArray(res.models)?res.models:[]).map(item=>typeof item==='string'?item:item&&item.id).filter(Boolean).map(String))].sort((a,b)=>a.localeCompare(b));
-  endpointModelsCache.set(endpointId,{at:now,models});
-  return models;
+  const cached=endpointModelsCache.get(endpointId);
+  // 成功 5 分钟；失败 60 秒（失败端点不再每个刷新周期重试）
+  if(cached&&Date.now()-cached.at<(cached.models?ENDPOINT_MODELS_CACHE_MS:ENDPOINT_MODELS_ERROR_CACHE_MS)){
+    if(cached.models)return cached.models;
+    throw cached.error;
+  }
+  // 同一端点在途请求复用同一个 Promise：并发调用不会重复发上游请求
+  const inflight=endpointModelsInflight.get(endpointId);
+  if(inflight)return inflight;
+  const task=(async()=>{
+    try{
+      const res=await api('GET',`/api/endpoints/${encodeURIComponent(endpointId)}/models`);
+      if(!res.ok)throw new Error(res.error||'获取模型失败');
+      const models=[...new Set((Array.isArray(res.models)?res.models:[]).map(item=>typeof item==='string'?item:item&&item.id).filter(Boolean).map(String))].sort((a,b)=>a.localeCompare(b));
+      endpointModelsCache.set(endpointId,{at:Date.now(),models});
+      return models;
+    }catch(err){
+      endpointModelsCache.set(endpointId,{at:Date.now(),models:null,error:err});
+      throw err;
+    }finally{
+      endpointModelsInflight.delete(endpointId);
+    }
+  })();
+  endpointModelsInflight.set(endpointId,task);
+  return task;
+}
+/* 池内模型目录预取：并发上限 2。上游 models 请求单个 0.2~4 秒，全部并发会把浏览器
+   同源连接（HTTP/1.1 6 条/host）占满，用户点击触发的请求要排队数秒——串行低并发
+   保证始终有空闲连接给交互请求。 */
+const MODELS_PREFETCH_CONCURRENCY=2;
+let modelsPrefetchRunning=false;
+function prefetchPoolModels(ids){
+  if(modelsPrefetchRunning||!ids.length)return;
+  modelsPrefetchRunning=true;
+  const queue=ids.slice();
+  const worker=async()=>{
+    while(queue.length){
+      try{await endpointModels(queue.shift());}catch(_){}
+    }
+  };
+  Promise.all(Array.from({length:Math.min(MODELS_PREFETCH_CONCURRENCY,queue.length)},worker))
+    .catch(()=>{}).finally(()=>{modelsPrefetchRunning=false;});
 }
 async function loadPoolModelOptions(select,endpointId){
   if(select.dataset.loaded==='true'||loadingPoolModelSelect===select)return;

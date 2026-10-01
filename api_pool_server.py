@@ -2838,6 +2838,10 @@ class APIPool:
         self._identity_skip_log_ts: dict = {}   # 无身份跳过日志去重 {(ep_id, reason): ts}
         # 图片翻译短 TTL 缓存：图片集合签名 → (时间戳, 描述)，消除多轮重发历史含图的重译（2026-09-10 视觉池组）
         self._vision_cache: dict[str, tuple[float, str]] = {}
+        # 端点模型目录短 TTL 缓存：连接指纹 → (时间戳, 模型列表)。UI 展开聚合池/模型
+        # 下拉会按需拉取，逐个上游往返 0.2~4 秒；缓存后页面刷新不再重复打上游
+        # （2026-10-01）。键含连接指纹，端点配置变更自动换键。
+        self._models_cache: dict[str, tuple[float, list]] = {}
         # 后台探活基础设施：冷却过期端点在后台线程探活，不阻塞请求路径
         self._probe_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="apipool-probe")
         self._probe_inflight = set()  # 正在探活的端点 id 集合（后台/批量探活共享，防重复请求）
@@ -3091,7 +3095,7 @@ class APIPool:
         return name
 
     def fetch_endpoint_models(self, ep_id):
-        """使用指定端点自身的连接配置读取上游模型目录。"""
+        """使用指定端点自身的连接配置读取上游模型目录（带短 TTL 缓存）。"""
         with self._lock:
             ep = next((item for item in self._endpoints if item.id == ep_id), None)
             if ep is None:
@@ -3106,7 +3110,46 @@ class APIPool:
                 "extra_headers": dict(ep.extra_headers or {}),
                 "client_profile": ep.client_profile,
             }
-        return self.fetch_models(**connection)
+        cache_key = self._models_cache_key(ep_id, connection)
+        cached = self._models_cache_get(cache_key)
+        if cached is not None:
+            return cached
+        models = self.fetch_models(**connection)
+        self._models_cache_set(cache_key, models)
+        return models
+
+    @staticmethod
+    def _models_cache_key(ep_id, connection):
+        """目录缓存键：端点 id + 连接指纹。端点配置一改即换键，无需显式失效。"""
+        parts = [str(connection.get(k, "")) for k in
+                 ("base_url", "api_key", "protocol", "use_proxy", "client_profile")]
+        for name in ("default_headers", "extra_headers"):
+            parts.append(repr(sorted((connection.get(name) or {}).items())))
+        raw = "|".join([str(ep_id)] + parts)
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    def _models_cache_get(self, key):
+        item = self._models_cache.get(key)
+        if not item:
+            return None
+        ts, models = item
+        if time.time() - ts > self._MODELS_CACHE_TTL:
+            self._models_cache.pop(key, None)
+            return None
+        return models
+
+    def _models_cache_set(self, key, models):
+        if not models:
+            return
+        if len(self._models_cache) >= self._MODELS_CACHE_MAX:
+            now = time.time()
+            for k in [k for k, (ts, _) in list(self._models_cache.items())
+                      if now - ts > self._MODELS_CACHE_TTL]:
+                self._models_cache.pop(k, None)
+            if self._models_cache:
+                # 全部新鲜：按插入序丢最旧一条（近似 LRU，够用）
+                self._models_cache.pop(next(iter(self._models_cache)), None)
+        self._models_cache[key] = (time.time(), models)
 
     def replace_group_model(self, group, source_ep_id, model):
         """原子地把组内一个端点替换为同站点的另一模型端点。
@@ -4583,6 +4626,8 @@ class APIPool:
 
     _VISION_CACHE_TTL = 300  # 图片转译缓存有效期（秒）
     _VISION_CACHE_MAX = 256  # 缓存条目上限（超出按过期优先、最旧兜底淘汰）
+    _MODELS_CACHE_TTL = 300  # 端点模型目录缓存有效期（秒）：UI 5 分钟刷新周期内不再打上游
+    _MODELS_CACHE_MAX = 512  # 缓存条目上限（按连接指纹计，条数 ≈ 端点数的数倍）
 
     @staticmethod
     def _vision_cache_key(translation_msgs):
