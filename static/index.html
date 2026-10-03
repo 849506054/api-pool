@@ -760,8 +760,11 @@ function vendorOf(model){
   for(const [k,v] of VENDOR_RULES){ if(m.includes(k)) return v; }
   return '其他';
 }
-function setFilter(f){epFilter=f;refresh();}
-function setVendorFilter(v){epVendorFilter=v;refresh();}
+/* 筛选切换是本地视图操作（同 setPoolGroupFilter 快照口径）：直接用 poolSnapshot 重绘三块。
+   旧实现走 refresh()：①等 3 个接口往返才响应（迟钝）②签名去重后数据未变整个渲染被吞（无反应）。 */
+function applyEpFilter(){const eps=poolSnapshot.endpoints||[];renderStats(eps);renderFilterBar(eps);renderEndpoints(eps);}
+function setFilter(f){epFilter=f;applyEpFilter();}
+function setVendorFilter(v){epVendorFilter=v;applyEpFilter();}
 
 function renderFilterBar(eps){
   /* 厂商层与站点层同级、互相二级：本栏标签计数限定在对侧筛选结果内（0 计数的当前选中项仍保留在栏内） */

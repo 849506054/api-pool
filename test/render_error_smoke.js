@@ -39,7 +39,7 @@ const groupRank=g=>g==='main'?0:(GROUP_ICONS[g]?1:2);
 const sortGroups=list=>list.sort((a,b)=>groupRank(a)-groupRank(b));
 const prefetchPoolModels=()=>{}; // renderPoolList 内的模型目录预热（2026-10-01）不在本用例范围
 const VENDOR_SRC=js.match(/const VENDOR_RULES=\[[\s\S]*?\];\nfunction vendorOf\(model\)\{[\s\S]*?\n\}/)[0];
-const FNS=[VENDOR_SRC,js.match(/function epErr\(ep\)\{[^\n]*\}/)[0],grab('renderStats'),grab('renderEndpoints'),grab('renderPoolList'),grab('renderChain')].join('\n');
+const FNS=[VENDOR_SRC,js.match(/function epErr\(ep\)\{[^\n]*\}/)[0],js.match(/function applyEpFilter\(\)\{[^\n]*\}/)[0],js.match(/function setFilter\(f\)\{[^\n]*\}/)[0],js.match(/function setVendorFilter\(v\)\{[^\n]*\}/)[0],grab('renderStats'),grab('renderFilterBar'),grab('renderEndpoints'),grab('renderPoolList'),grab('renderChain')].join('\n');
 eval(FNS);
 
 const ERR='HTTP 402: {"error":{"message":"Budget pool quota has been exhausted. Please ask an administrator to raise it."}}';
@@ -97,7 +97,6 @@ epFilter='all';epVendorFilter='其他';renderEndpoints(fEps);
 chk(els['epList'].innerHTML.includes('BetaAuto')&&!els['epList'].innerHTML.includes('AlphaDs')&&els['filterCount'].textContent==='1 个','「其他」厂商：无关键词模型 1 条');
 epVendorFilter='all';
 /* 两栏渲染：厂商栏在上、计数随站点层收窄；站点栏计数随厂商层收窄 */
-eval(grab('renderFilterBar'));
 epFilter='Alpha';epVendorFilter='DeepSeek';renderFilterBar(fEps);
 chk(/>全部厂商 2<\/button>/.test(els['vendorBar'].innerHTML)&&/>DeepSeek 1<\/button>/.test(els['vendorBar'].innerHTML)
   &&els['vendorBar'].innerHTML.includes('>OpenAI 1<'),'厂商栏：计数限定在「Alpha」站点内（全部厂商 2 / DeepSeek 1 / OpenAI 1）');
@@ -105,6 +104,15 @@ chk(/>全部站点 2<\/button>/.test(els['filterBar'].innerHTML)&&/>Alpha 1<\/bu
   &&/>Beta 1<\/button>/.test(els['filterBar'].innerHTML),'站点栏：计数限定在「DeepSeek」厂商内（全部站点 2 / Alpha 1 / Beta 1）');
 chk(/class="filter-btn active" onclick="setVendorFilter\('DeepSeek'\)"/.test(els['vendorBar'].innerHTML)
   &&/class="filter-btn active" onclick="setFilter\('Alpha'\)"/.test(els['filterBar'].innerHTML),'两栏各自保留选中态');
+epFilter='all';epVendorFilter='all';
+/* 点击筛选项立即本地重绘（setFilter/setVendorFilter 不再走 refresh()：stub 无 refresh，误调即 ReferenceError） */
+poolSnapshot={endpoints:fEps};
+epFilter='all';epVendorFilter='all';setFilter('Beta');
+chk(epFilter==='Beta'&&els['epList'].innerHTML.includes('BetaDs')&&els['epList'].innerHTML.includes('BetaAuto')
+  &&!els['epList'].innerHTML.includes('AlphaDs')&&els['filterCount'].textContent==='2 个','setFilter 同步重绘：Beta 站点 2 条');
+setVendorFilter('DeepSeek');
+chk(els['epList'].innerHTML.includes('BetaDs')&&!els['epList'].innerHTML.includes('BetaAuto')&&els['filterCount'].textContent==='1 个','setVendorFilter 同步重绘：Beta×DeepSeek 1 条');
+chk(/onclick="setFilter\('/.test(els['filterBar'].innerHTML)&&/onclick="setVendorFilter\('/.test(els['vendorBar'].innerHTML),'两栏按钮 onclick 直连同步函数');
 epFilter='all';epVendorFilter='all';
 console.log(fail?'\n有断言失败':'\n全部断言通过');
 process.exit(fail);
