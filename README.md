@@ -8,7 +8,7 @@
 > Responses 两种协议），对内按 Endpoint 配置进行分组路由、协议转换、健康管理、故障转移
 > 和统计。Endpoint 可以使用不同的模型和协议，不要求整个池只服务于某一种模型。
 
-![Python](https://img.shields.io/badge/Python-3.13-blue)
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Zero Deps](https://img.shields.io/badge/Dependencies-None-brightgreen)
 ![SQLite](https://img.shields.io/badge/Database-SQLite-blue)
@@ -31,7 +31,7 @@
 - **入口敏感词过滤** — 请求进入路由前统一清洗已知字段，覆盖普通消息、多模态文本、reasoning、消息名称和工具调用参数；范围可配置，默认不扫描整个 payload；管理面板 `🛡 敏感词过滤` 可视化维护并热重载
 - **独立入口与内部路由** — Hermes 只需连接稳定的 `api-pool` 入口模型名，API Pool 2.0 使用目标 Endpoint 自己的 `model` 转发
 - **统计大盘** — Token 消耗、缓存命中、请求数趋势；「异常」统计卡可点击筛选异常端点
-- **零依赖** — 只需 Python 3.13，单文件即可运行
+- **零依赖** — 只用 Python 标准库（3.11+ 实测运行），单文件即可运行
 
 ## 快速开始
 
@@ -210,9 +210,12 @@ HTTP 层与并发模型的行为（决定容量与故障表现）：
 - **流式响应** — `Content-Type: text/event-stream`、`Cache-Control: no-cache`、`Connection: close`，写完后一连接一流式直接关闭，末帧 `data: [DONE]`。流时长受端点级 `stream_max_duration` 与 `stream_stall_timeout` 管控。
 - **请求体** — 只接受 `Content-Length` + JSON（不支持 chunked）；解析失败按空 body 处理，不会返回 400。客户端提前断开时 `ConnectionError` 静默吞掉。
 - **并发模型** — `ThreadingHTTPServer` 每连接一 daemon 线程，无线程上限、无限流；端点级在途占用按「组 → 计数」登记，main 与子组共享端点互不覆盖。SQLite `WAL` + 单写锁，读路径无锁。
-- **监听 backlog 128** — `_PoolServer.request_queue_size = 128`（Python `socketserver` 默认 5）。宿主机 `somaxconn=4096`，UI 5s 轮询 + 多客户端同时新建连接时不会再因 SYN 队列满触发 TCP 重传毛刺。
+- **实测容量（2026-10-04 宿主机生产）** — 空闲 3 线程（主线程 + 2 后台）；每连接恰一线程（150 个 held 连接 → 153 线程，全部关闭后回落 3，RSS 增量 ~2.3 MB / ~16 KB 每连接）。systemd 默认 `LimitNOFILE` 软上限 1024，因此并发连接的实际天花板约千级，远高于当前负载。
+- **当前负载与余量** — 生产真实流量（journal 第一方日志）：单日约 2000 请求、最大同时在途 4（组分布 main×3 + agnes×1），请求时长 p50 3s / p90 6s / max 98s；更长窗口（journal 实际保留约 1.5 天，2884 请求）最大在途同为 4。距复评阈值同时在途 ≥10 有 2.5 倍余量；过载保护全部在端点层（cooldown / rpm_limit / 402 冻结），池自身不排队、不限流，`self._lock`（RLock）为路由热路径共享锁。
+- **监听 backlog 128** — `_PoolServer.request_queue_size = 128`（Python `socketserver` 默认 5）。宿主机 `net.core.somaxconn=4096`、`ipv4.tcp_max_syn_backlog=512`、`tcp_abort_on_overflow=0`；现网 `ss -ltn` 实测 Send-Q=128，UI 5s 轮询 + 多客户端同时新建连接时 SYN 队列不再被内核静默丢弃。
 - **优雅停止** — SIGTERM 触发端点指针 / 冷却 / fallback 锁全量快照落盘（`api_runtime_state.json`）后立即退出，重启自动恢复。
 - **部署形态** — 单进程单监听（`0.0.0.0` + `API_POOL_PORT`），systemd `Restart=always`，无网关鉴权，需前置反向代理加固。
+- **运行时特征** — 宿主机 Python 3.11.2（`/usr/bin/python3`）、4 核 N5105 / 8 GB（非容器）、65 个已配置端点、空闲 RSS ~72-88 MB；SQLite `chat_logs.db` 文件已 2.6 GB，清理由启动守护线程按本地时刻执行。
 
 详见 [Wiki · 服务端运行特性](https://github.com/849506054/api-pool/wiki/服务端运行特性)。
 
