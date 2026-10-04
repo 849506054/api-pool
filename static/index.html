@@ -1227,6 +1227,12 @@ function openGroupModal(editName){
         </datalist>
         <div style="font-size:11px;color:var(--text-dim)">${ctxHint}</div>
       </div>
+      <div class="form-group"><label title="组内端点日志显示级别：全部=照常显示；错误=实时日志只显示报错行（对话日志均为成功记录，错误级下不显示）；静默=该组日志全部不显示。仅影响前端显示，后台照常记录">日志显示级别</label>
+        <select id="gLogLevel">
+          <option value="all" ${(g.log_level||'all')==='all'?'selected':''}>全部</option>
+          <option value="error" ${g.log_level==='error'?'selected':''}>错误（只显示报错）</option>
+          <option value="silent" ${g.log_level==='silent'?'selected':''}>静默（所有日志不显示）</option>
+        </select></div>
       ${g.is_main?`<div class="form-group"><label title="main 的当前/手动工作端点空闲满该时长后，子组不再避让它，按本组优先级正常使用；端点有在途（main 或子组）时仍避让，main 也可随时抢占。0=关闭（子组始终避让）">空闲时间 (秒)</label>
         <input type="number" id="gIdle" min="0" max="86400" value="${g.idle_seconds||''}" placeholder="0=关闭，如 600">
         <div style="font-size:11px;color:var(--text-dim)">${idleHint}</div>
@@ -1263,6 +1269,7 @@ async function savePoolGroup(editName){
   const type=document.getElementById('gType').value;
   const model=document.getElementById('gModel').value.trim();
   const context_tokens=parseCtxTokens(document.getElementById('gContext').value);
+  const log_level=document.getElementById('gLogLevel')?document.getElementById('gLogLevel').value:'all';
   const idleEl=document.getElementById('gIdle');  // 仅 main 组弹窗含该输入
   const idleRaw=idleEl?idleEl.value.trim():'';
   const idle_seconds=idleRaw===''?0:parseInt(idleRaw,10);
@@ -1274,9 +1281,9 @@ async function savePoolGroup(editName){
   try{
     let r;
     if(editName){
-      r=await api('PUT',`/api/groups/${encodeURIComponent(editName)}`,{name,type,model,context_tokens,idle_seconds});
+      r=await api('PUT',`/api/groups/${encodeURIComponent(editName)}`,{name,type,model,context_tokens,idle_seconds,log_level});
     }else{
-      r=await api('POST','/api/groups',{name,type,model,context_tokens,idle_seconds});
+      r=await api('POST','/api/groups',{name,type,model,context_tokens,idle_seconds,log_level});
     }
     if(r.ok){
       // 加入/移出 main（2026-09-27）：仅编辑既有子组时处理（新建不含该控件）
@@ -1294,7 +1301,7 @@ async function savePoolGroup(editName){
           }
         }
       }
-      toast(editName?'✅ 分组已更新':'✅ 分组已创建','success');closeGroupModal();refresh();
+      toast(editName?'✅ 分组已更新':'✅ 分组已创建','success');closeGroupModal();refresh();applyGroupLogFilter();
     }
     else{toast(r.error||'操作失败','error');if(btn){btn.disabled=false;btn.textContent=editName?'保存':'创建';}}
   }catch(e){
@@ -2388,14 +2395,47 @@ if (logContainer) {
 }
 function addLogLine(entry) {
     if (!logContainer) return;
+    if (!groupLogVisible(entry.msg, entry.level)) return;
     const d = document.createElement('div');
     d.className = 'log-line';
+    d.dataset.msg = entry.msg;
+    d.dataset.level = entry.level;
     d.innerHTML = `<span class="log-time">[${entry.time}]</span> <span class="log-${entry.level}">[${entry.level}]</span> <span class="log-msg">${esc(entry.msg)}</span>`;
     logContainer.appendChild(d);
     if (logContainer.children.length > 300) logContainer.removeChild(logContainer.firstChild);
     if (logAutoScroll) logContainer.scrollTop = logContainer.scrollHeight;
 }
 let _lastLogId = 0;
+// 组级日志显示级别（2026-10-05）：all=照常 / error=仅报错行 / silent=全隐藏。仅前端显示过滤，后台照常记录。
+// 组归属判定：端点日志行带 [组名] 前缀标签；无标签行（全局日志）不受影响。
+const _LOG_ERROR_LEVELS = new Set(['WARN', 'WARNING', 'ERROR']);
+function _groupLogLevels() {
+  const m = {};
+  for (const g of (window._groupDefs || [])) if (g.name && g.log_level && g.log_level !== 'all') m[g.name] = g.log_level;
+  return m;
+}
+function groupLogVisible(msg, level) {
+  const m = _groupLogLevels();
+  let shown = true;
+  for (const [grp, lv] of Object.entries(m)) {
+    if (msg && msg.includes(`[${grp}]`)) {
+      if (lv === 'silent') return false;
+      if (lv === 'error' && !_LOG_ERROR_LEVELS.has(level)) shown = false;
+    }
+  }
+  return shown;
+}
+function chatLogVisible(poolGroup) {
+  // 对话日志均为成功记录：非 all 级别（仅报错/静默）下该组无可显示内容
+  return !_groupLogLevels()[poolGroup || ''];
+}
+// 组级别变更后即时清理已渲染行（新行由 addLogLine/loadChatLogs 过滤）
+function applyGroupLogFilter() {
+  if (logContainer) for (const d of Array.from(logContainer.children)) {
+    if (!groupLogVisible(d.dataset.msg || '', d.dataset.level || '')) d.remove();
+  }
+  loadChatLogs(chatLogsPage);
+}
 async function pollLogs() {
     try {
         const logs = await api('GET', '/api/logs?since=' + _lastLogId);
@@ -2535,7 +2575,7 @@ async function loadChatLogs(page, opts = {}) {
   if (seq !== chatLogsReqSeq) return; // 过期响应丢弃
   if (!res.ok && res.error) { toast('加载失败', 'error'); return; }
   chatLogsPage = page;
-  currentChatLogs = res.logs || [];
+  currentChatLogs = (res.logs || []).filter(l => chatLogVisible(l.pool_group));
   
   const total = res.total || 0;
   const maxPage = Math.max(0, Math.ceil(total / limit) - 1);

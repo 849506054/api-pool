@@ -3460,6 +3460,32 @@ class APIPool:
         """配置读入：idle_seconds 归一化，非法值当未声明（不阻断启动）。"""
         return self._valid_group_idle_seconds(d.get("idle_seconds")) or 0
 
+    GROUP_LOG_LEVELS = ("all", "error", "silent")
+
+    def _valid_group_log_level(self, value):
+        """组级日志显示级别归一化：all=全部 / error=仅报错 / silent=静默；非法 → None（调用方拒绝）。"""
+        v = str(value if value is not None else "all").strip().lower()
+        return v if v in self.GROUP_LOG_LEVELS else None
+
+    def _loaded_group_log_level(self, d):
+        """配置读入：log_level 归一化，非法/缺省当 all（不阻断启动）。"""
+        return self._valid_group_log_level(d.get("log_level")) or "all"
+
+    def _set_group_log_level(self, group, level):
+        """写入/清除组的日志显示级别（all=默认态，不落键），返回是否有变更。"""
+        gd = self._group_defs.get(group)
+        if gd is None:
+            return False
+        if (gd.get("log_level") or "all") == level:
+            return False
+        if level == "all":
+            gd.pop("log_level", None)
+        else:
+            gd["log_level"] = level
+        names = {"all": "全部", "error": "仅报错", "silent": "静默"}
+        sys_log(f"组 '{group}' 日志显示级别设为 {names[level]}", "INFO")
+        return True
+
     def _set_group_idle_seconds(self, group, seconds):
         """写入/清除组的空闲借用窗口，返回是否有变更。"""
         gd = self._group_defs.get(group)
@@ -3538,6 +3564,9 @@ class APIPool:
                     idle = self._loaded_group_idle_seconds(d)
                     if idle:
                         self._group_defs[self.MAIN_GROUP]["idle_seconds"] = idle
+                    lvl = self._loaded_group_log_level(d)
+                    if lvl != "all":
+                        self._group_defs[self.MAIN_GROUP]["log_level"] = lvl
                     continue
                 if name == self.VISION_GROUP:
                     # 内置图片解析池：类型恒 mixed，选择器沿用配置（缺省 VISION_SELECTOR）
@@ -3548,6 +3577,9 @@ class APIPool:
                     idle = self._loaded_group_idle_seconds(d)
                     if idle:
                         entry["idle_seconds"] = idle
+                    lvl = self._loaded_group_log_level(d)
+                    if lvl != "all":
+                        entry["log_level"] = lvl
                     self._group_defs[name] = entry
                     continue
                 if str(d.get("role", "") or "").strip():
@@ -3559,6 +3591,9 @@ class APIPool:
                 idle = self._loaded_group_idle_seconds(d)
                 if idle:
                     entry["idle_seconds"] = idle
+                lvl = self._loaded_group_log_level(d)
+                if lvl != "all":
+                    entry["log_level"] = lvl
                 # 加入 main 的名次（2026-09-27）：int>0 恢复，其余忽略
                 try:
                     mp = int(d.get("main_priority") or 0)
@@ -3577,7 +3612,7 @@ class APIPool:
                 self._group_defs[grp] = {"type": "mixed", "model": grp}
         return self._group_defs
 
-    def create_group(self, name, gtype="mixed", model="", context_tokens=0, idle_seconds=0):
+    def create_group(self, name, gtype="mixed", model="", context_tokens=0, idle_seconds=0, log_level="all"):
         """新建分组。返回 (ok, message)。main / 图片解析池为系统内置组，不可由此创建。"""
         with self._lock:
             name = str(name or "").strip()
@@ -3597,6 +3632,9 @@ class APIPool:
             if idle is None:
                 return False, ("空闲时间非法（0=关闭，或 "
                                f"{self.GROUP_IDLE_MIN_SECONDS}–{self.GROUP_IDLE_MAX_SECONDS} 秒）")
+            lvl = self._valid_group_log_level(log_level)
+            if lvl is None:
+                return False, "日志级别非法（all=全部 / error=仅报错 / silent=静默）"
             model = str(model or "").strip()
             if gtype == "dedicated":
                 if not model:
@@ -3615,7 +3653,9 @@ class APIPool:
                 self._group_defs[name]["context_tokens"] = ck
             if idle:
                 self._group_defs[name]["idle_seconds"] = idle
-            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%s tokens' % format(ck, ',') if ck else '未声明'}，空闲借用 {('%s 秒' % idle) if idle else '关闭'}）", "INFO")
+            if lvl != "all":
+                self._group_defs[name]["log_level"] = lvl
+            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%s tokens' % format(ck, ',') if ck else '未声明'}，空闲借用 {('%s 秒' % idle) if idle else '关闭'}，日志 {lvl}）", "INFO")
             return True, name
 
     def update_group(self, name, updates):
@@ -3643,6 +3683,9 @@ class APIPool:
             if new_idle is None:
                 return False, ("空闲时间非法（0=关闭，或 "
                                f"{self.GROUP_IDLE_MIN_SECONDS}–{self.GROUP_IDLE_MAX_SECONDS} 秒）")
+            new_lvl = self._valid_group_log_level(updates.get("log_level", old.get("log_level", "all")))
+            if new_lvl is None:
+                return False, "日志级别非法（all=全部 / error=仅报错 / silent=静默）"
 
             if not self._valid_group_type(new_type):
                 return False, "分组类型必须为 mixed 或 dedicated"
@@ -3652,9 +3695,11 @@ class APIPool:
                 if new_model and new_model != "api-pool":
                     # main 选择器改名会让存量 Hermes 配置失配，禁止
                     return False, "main 组选择器固定为 api-pool（历史别名）"
-                # 上下文长度/空闲借用窗口不属于锁定项：main 是对外默认窗口，必须可改
+                # 上下文长度/空闲借用窗口/日志级别不属于锁定项：main 是对外默认窗口，必须可改
                 changed = self._set_group_context_tokens(name, new_ck)
                 if self._set_group_idle_seconds(name, new_idle):
+                    changed = True
+                if self._set_group_log_level(name, new_lvl):
                     changed = True
                 return True, (name if changed else "无变更")
 
@@ -3664,6 +3709,8 @@ class APIPool:
                     return False, "图片解析池为系统内置组：名称/类型/选择器均锁定"
                 changed = self._set_group_context_tokens(name, new_ck)
                 if self._set_group_idle_seconds(name, new_idle):
+                    changed = True
+                if self._set_group_log_level(name, new_lvl):
                     changed = True
                 return True, (name if changed else "无变更")
 
@@ -3712,6 +3759,8 @@ class APIPool:
                 self._group_defs[new_name]["context_tokens"] = new_ck
             if new_idle:
                 self._group_defs[new_name]["idle_seconds"] = new_idle
+            if new_lvl != "all":
+                self._group_defs[new_name]["log_level"] = new_lvl
             # 加入 main 名次跟随改名（2026-09-27）；main 指针若指向旧子组名同步改名
             if old.get("main_priority"):
                 self._group_defs[new_name]["main_priority"] = old["main_priority"]
@@ -3720,7 +3769,7 @@ class APIPool:
                         self._set_manual(self.MAIN_GROUP, new_name)
                     if self._get_current(self.MAIN_GROUP) == name:
                         self._set_current(self.MAIN_GROUP, new_name)
-            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}，空闲借用 {('%s 秒' % new_idle) if new_idle else '关闭'}）", "INFO")
+            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}，空闲借用 {('%s 秒' % new_idle) if new_idle else '关闭'}，日志 {new_lvl}）", "INFO")
             return True, new_name
 
     def delete_group(self, name):
@@ -8893,6 +8942,7 @@ def api_handler(method, path, body):
                 "model": gd.get("model", grp),
                 "context_tokens": pool._group_context_tokens(grp) or 0,
                 "idle_seconds": pool._group_idle_seconds(grp),
+                "log_level": pool._group_defs.get(grp, {}).get("log_level") or "all",
                 "is_vision": grp == pool.VISION_GROUP,
                 "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)) + (len(pool._joined_subgroups()) if grp == pool.MAIN_GROUP else 0),
                 "current_endpoint": cur_ep.name if cur_ep else None,
@@ -8908,7 +8958,7 @@ def api_handler(method, path, body):
         gtype = body.get("type", "mixed")
         model = str(body.get("model", "") or "").strip()
         ok, msg = pool.create_group(name, gtype, model, body.get("context_tokens", 0),
-                                    body.get("idle_seconds", 0))
+                                    body.get("idle_seconds", 0), body.get("log_level", "all"))
         if not ok:
             return 400, {"error": msg}, False
         _sync_to_config()
@@ -9391,6 +9441,8 @@ def _sync_to_config():
                 entry["context_tokens"] = gd["context_tokens"]
             if gd.get("idle_seconds"):
                 entry["idle_seconds"] = gd["idle_seconds"]
+            if gd.get("log_level"):
+                entry["log_level"] = gd["log_level"]
             if gd.get("main_priority"):
                 entry["main_priority"] = gd["main_priority"]
             defs_list.append(entry)
