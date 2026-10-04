@@ -9564,6 +9564,14 @@ def _handle_sigterm(signum, frame):
     os._exit(0)
 
 
+class _PoolServer(ThreadingHTTPServer):
+    # 宿主机 net.core.somaxconn=4096 / ipv4.tcp_max_syn_backlog=512，
+    # 而 socketserver.TCPServer.request_queue_size 写死 5（宿主机 ss -ltn 实测
+    # 5200 Send-Q=5）：UI 5s 轮询 + 多客户端并发新建连接时 SYN 队列易满，
+    # abort_on_overflow=0 下表现为 SYN 丢弃与重传毛刺。抬到 128。
+    request_queue_size = 128
+
+
 def main():
     import sys
     if sys.stdout.encoding.lower() != 'utf-8':
@@ -9579,7 +9587,7 @@ def main():
     signal.signal(signal.SIGTERM, _handle_sigterm)
     # 注：滚动清理由 ChatLogger.__init__ 的守护线程负责（启动即执行首次清理），
     #     不在 main() 同步执行——大表 DELETE 会阻塞 server 启动（2026-08-15 实测 63s）
-    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server = _PoolServer(("0.0.0.0", port), Handler)
     print(f"\n  ⚡ {instance_name} 管理面板已启动")
     print(f"  🌐 管理面板访问: http://localhost:{port}")
     print(f"  🔗 客户端 Base URL: http://localhost:{port}/v1")
