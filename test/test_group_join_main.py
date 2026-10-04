@@ -674,6 +674,55 @@ class GroupJoinMainTests(unittest.TestCase):
             self.assertEqual(eps["b1"]["current_groups"], ["bg"])
             self.assertEqual(eps["m1"]["current_groups"], ["main"])
 
+    def test_member_rows_fall_back_when_plain_group_pointer_unroutable(self):
+        """普通组的指针目标冷却时，成员卡报路由实际会用的下一个（不再标冷却中的那个）。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            import time as _t
+            d1 = self.endpoint(module, "d1", 1, "ds", groups=["ds"])
+            d2 = self.endpoint(module, "d2", 2, "ds", groups=["ds"])
+            pool = self.make_pool(module, [d1, d2], {"ds": {"type": "mixed", "model": "ds"}})
+            pool._set_manual("ds", "d1")
+            d1._cooldown_until = _t.time() + 999
+            eps = {e["name"]: e for e in pool.list_endpoints()}
+            self.assertTrue(eps["d2"]["is_current"])
+            self.assertEqual(eps["d2"]["current_groups"], ["ds"])
+            self.assertFalse(eps["d1"]["is_current"])
+            self.assertEqual(eps["d1"]["current_groups"], [])
+            rows = {r["name"]: r for r in pool.get_active_chain()}
+            self.assertTrue(rows["d2"]["is_current"])
+            self.assertFalse(rows["d1"]["is_current"])
+
+    def test_member_rows_fall_back_to_main_next_candidate(self):
+        """main 指针是冷却中的原生端点时，成员卡报 main 候选首位（借来的子组成员）。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            import time as _t
+            m1 = self.endpoint(module, "m1", 1, "glm-5.3")
+            c4 = self.endpoint(module, "c4", 1, "ds", groups=["cline"])
+            pool = self.make_pool(module, [m1, c4],
+                                  {"cline": {"type": "mixed", "model": "cline"}})
+            pool.set_main_priority("cline", 2)
+            pool._set_current("main", "m1")
+            m1._cooldown_until = _t.time() + 999
+            eps = {e["name"]: e for e in pool.list_endpoints()}
+            self.assertTrue(eps["c4"]["is_current"])
+            self.assertIn("main", eps["c4"]["current_groups"])
+            self.assertFalse(eps["m1"]["is_current"])
+
+    def test_member_rows_keep_pointer_when_group_has_no_usable_member(self):
+        """组内无任何可用成员时保持原指针（UI 靠冷却/整组冻结徽标表达，不静默清空）。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            import time as _t
+            d1 = self.endpoint(module, "d1", 1, "ds", groups=["ds"])
+            pool = self.make_pool(module, [d1], {"ds": {"type": "mixed", "model": "ds"}})
+            pool._set_manual("ds", "d1")
+            d1._cooldown_until = _t.time() + 999
+            eps = {e["name"]: e for e in pool.list_endpoints()}
+            self.assertTrue(eps["d1"]["is_current"])
+            self.assertEqual(eps["d1"]["current_groups"], ["ds"])
+
     # ── 故障后 fallback 必须先耗尽子组内兄弟（2026-09-27 生产 bug）──
 
     def test_failover_stays_in_subgroup_before_leaving(self):

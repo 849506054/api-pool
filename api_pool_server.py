@@ -4036,12 +4036,44 @@ class APIPool:
             ptr = self._main_pointer_target()
             if ptr and ptr in self._joined_subgroups():
                 return self._resolve_subgroup_current(ptr)
-            return ptr
+            return self._fallback_if_unroutable(grp, ptr)
         if grp in self._joined_subgroups():
             # 已加入 main 的子组：与组卡片/聚合链子组条目同源下钻——main 借用期间子组自身
             # 指针可能尚未回写，直接取真实当前成员；组内全不可用 → None（与组卡片一致）。
             return self._resolve_subgroup_current(grp)
-        return self._get_manual(grp) or self._get_current(grp)
+        return self._fallback_if_unroutable(grp, self._get_manual(grp) or self._get_current(grp))
+
+    def _ep_routable_in_group(self, ep, grp):
+        """该端点此刻是否仍可被该组路由：enabled + in_pool + 非冷却 + 非维护锁定 + 仍属该组。
+
+        main 组含已加入子组的成员（统一优先级轴），成员资格按「原生 main ∪ 已加入子组」判定。
+        """
+        if (not ep.enabled) or (not ep.in_pool) or ep._manual_unlock_required:
+            return False
+        if self._is_in_cooldown(ep):
+            return False
+        if grp == self.MAIN_GROUP:
+            return self.MAIN_GROUP in self._ep_groups(ep) or any(
+                sub in self._ep_groups(ep) for sub in self._joined_subgroups()
+            )
+        return grp in self._ep_groups(ep)
+
+    def _fallback_if_unroutable(self, grp, ptr):
+        """指针目标已不可路由（冷却/锁定/禁用/已移出该组）→ 回落该组真实可用首位。
+
+        即 chat() 会实际使用的下一个端点：候选口径 _group_sticky_candidates（与路由 active
+        同源），组内互斥过滤后为空时退回 _subgroup_raw_available（物理可用口径）。组内无任何
+        可用成员 → 保持原指针（UI 靠冷却/整组冻结徽标表达）。
+        """
+        if not ptr:
+            return ptr
+        ep = next((e for e in self._endpoints if e.id == ptr), None)
+        if ep is not None and self._ep_routable_in_group(ep, grp):
+            return ptr
+        cands, _ = self._group_sticky_candidates(grp)
+        if not cands:
+            cands = self._subgroup_raw_available(grp)
+        return cands[0].id if cands else ptr
 
     def _main_pointer_target(self):
         """main 当前应指向的目标（端点 id / 子组名 / None）。
