@@ -18,6 +18,6 @@ assert(ok(parse('0'))&&ok(parse('10'))&&ok(parse('86400')), '边界值合法');
 assert(!ok(parse('9'))&&!ok(parse('86401'))&&!ok(parse('abc')), '越界/非法被拒');
 
 // 请求体携带 idle_seconds（编辑 main 时）
-assert(/r=await api\('PUT',`\/api\/groups\/\$\{encodeURIComponent\(editName\)\}`,\{name,type,model,context_tokens,idle_seconds,log_level\}\)/.test(src), 'PUT 携带 idle_seconds');
-assert(/r=await api\('POST','\/api\/groups',\{name,type,model,context_tokens,idle_seconds,log_level\}\)/.test(src), 'POST 携带 idle_seconds');
+assert(/r=await api\('PUT',`\/api\/groups\/\$\{encodeURIComponent\(editName\)\}`,\{name,type,model,context_tokens,idle_seconds,log_level,rotate_minutes\}\)/.test(src), 'PUT 携带 idle_seconds');
+assert(/r=await api\('POST','\/api\/groups',\{name,type,model,context_tokens,idle_seconds,log_level,rotate_minutes\}\)/.test(src), 'POST 携带 idle_seconds');
 console.log('OK: 空闲时间输入自检通过');

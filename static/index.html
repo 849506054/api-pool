@@ -1233,6 +1233,9 @@ function openGroupModal(editName){
           <option value="error" ${g.log_level==='error'?'selected':''}>错误（只显示报错）</option>
           <option value="silent" ${g.log_level==='silent'?'selected':''}>静默（所有日志不显示）</option>
         </select></div>
+      <div class="form-group"><label title="组内端点轮换间隔（分钟）：>0 时每隔该时长把本组当前端点按组内优先级自动推进到下一名（循环）；0/留空=不轮换。手动固定端点或 main 整组指针期间暂停轮换">端点轮换间隔 (分钟)</label>
+        <input type="number" id="gRotate" min="0" max="1440" value="${g.rotate_minutes||''}" placeholder="0=不轮换，如 30">
+      </div>
       ${g.is_main?`<div class="form-group"><label title="main 的当前/手动工作端点空闲满该时长后，子组不再避让它，按本组优先级正常使用；端点有在途（main 或子组）时仍避让，main 也可随时抢占。0=关闭（子组始终避让）">空闲时间 (秒)</label>
         <input type="number" id="gIdle" min="0" max="86400" value="${g.idle_seconds||''}" placeholder="0=关闭，如 600">
         <div style="font-size:11px;color:var(--text-dim)">${idleHint}</div>
@@ -1270,20 +1273,23 @@ async function savePoolGroup(editName){
   const model=document.getElementById('gModel').value.trim();
   const context_tokens=parseCtxTokens(document.getElementById('gContext').value);
   const log_level=document.getElementById('gLogLevel')?document.getElementById('gLogLevel').value:'all';
+  const rotateRaw=(document.getElementById('gRotate')||{value:''}).value.trim();
+  const rotate_minutes=rotateRaw===''?0:parseInt(rotateRaw,10);
   const idleEl=document.getElementById('gIdle');  // 仅 main 组弹窗含该输入
   const idleRaw=idleEl?idleEl.value.trim():'';
   const idle_seconds=idleRaw===''?0:parseInt(idleRaw,10);
   if(!name){toast('填写分组名称','error');return;}
   if(Number.isNaN(context_tokens)||(context_tokens>0&&(context_tokens<2000||context_tokens>10000000))){toast('上下文长度需为 0（不声明）或 2000–10,000,000 tokens（支持 K/M 后缀，如 1048576、1M）','error');return;}
   if(Number.isNaN(idle_seconds)||(idle_seconds>0&&(idle_seconds<10||idle_seconds>86400))){toast('空闲时间需为 0（关闭）或 10–86400 秒','error');return;}
+  if(Number.isNaN(rotate_minutes)||(rotate_minutes>0&&(rotate_minutes<1||rotate_minutes>1440))){toast('端点轮换间隔需为 0（不轮换）或 1–1440 分钟','error');return;}
   const btn=document.getElementById('gSaveBtn');
   if(btn){btn.disabled=true;btn.textContent='保存中...';}
   try{
     let r;
     if(editName){
-      r=await api('PUT',`/api/groups/${encodeURIComponent(editName)}`,{name,type,model,context_tokens,idle_seconds,log_level});
+      r=await api('PUT',`/api/groups/${encodeURIComponent(editName)}`,{name,type,model,context_tokens,idle_seconds,log_level,rotate_minutes});
     }else{
-      r=await api('POST','/api/groups',{name,type,model,context_tokens,idle_seconds,log_level});
+      r=await api('POST','/api/groups',{name,type,model,context_tokens,idle_seconds,log_level,rotate_minutes});
     }
     if(r.ok){
       // 加入/移出 main（2026-09-27）：仅编辑既有子组时处理（新建不含该控件）
