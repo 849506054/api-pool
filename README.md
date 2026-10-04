@@ -202,6 +202,20 @@ systemctl daemon-reload
 systemctl enable --now api-pool2.service
 ```
 
+## 服务端运行特性
+
+HTTP 层与并发模型的行为（决定容量与故障表现）：
+
+- **HTTP/1.0，无 Keep-Alive** — 每个连接只处理一个请求后关闭；非流式响应带 `Content-Length`，客户端均能正确解析。
+- **流式响应** — `Content-Type: text/event-stream`、`Cache-Control: no-cache`、`Connection: close`，写完后一连接一流式直接关闭，末帧 `data: [DONE]`。流时长受端点级 `stream_max_duration` 与 `stream_stall_timeout` 管控。
+- **请求体** — 只接受 `Content-Length` + JSON（不支持 chunked）；解析失败按空 body 处理，不会返回 400。客户端提前断开时 `ConnectionError` 静默吞掉。
+- **并发模型** — `ThreadingHTTPServer` 每连接一 daemon 线程，无线程上限、无限流；端点级在途占用按「组 → 计数」登记，main 与子组共享端点互不覆盖。SQLite `WAL` + 单写锁，读路径无锁。
+- **监听 backlog 128** — `_PoolServer.request_queue_size = 128`（Python `socketserver` 默认 5）。宿主机 `somaxconn=4096`，UI 5s 轮询 + 多客户端同时新建连接时不会再因 SYN 队列满触发 TCP 重传毛刺。
+- **优雅停止** — SIGTERM 触发端点指针 / 冷却 / fallback 锁全量快照落盘（`api_runtime_state.json`）后立即退出，重启自动恢复。
+- **部署形态** — 单进程单监听（`0.0.0.0` + `API_POOL_PORT`），systemd `Restart=always`，无网关鉴权，需前置反向代理加固。
+
+详见 [Wiki · 服务端运行特性](https://github.com/849506054/api-pool/wiki/服务端运行特性)。
+
 ## Hermes 侧配置
 
 API Pool 2.0 对 Hermes 暴露 OpenAI-compatible 接口（Chat Completions 与 Responses 两种协议）。Hermes 只需要配置一个稳定的入口模型名（main 组固定为 `api-pool`，也可以指向某个分组的选择器）；真正发送给哪个上游模型、是否切换 Endpoint，由 API Pool 2.0 根据 Endpoint 配置和故障转移策略决定。
