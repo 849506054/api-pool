@@ -3753,7 +3753,7 @@ class APIPool:
                 self._group_defs[name]["log_level"] = lvl
             if rot:
                 self._group_defs[name]["rotate_minutes"] = rot
-            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%s tokens' % format(ck, ',') if ck else '未声明'}，空闲借用 {('%s 秒' % idle) if idle else '关闭'}，日志 {lvl}，轮换 {('%s 分钟' % rot) if rot else '不轮换'}）", "INFO")
+            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%s tokens' % format(ck, ',') if ck else '未声明'}{'，空闲借用 %s 秒' % idle if idle else ''}，日志 {lvl}，轮换 {('%s 分钟' % rot) if rot else '不轮换'}）", "INFO")
             return True, name
 
     def update_group(self, name, updates):
@@ -3877,7 +3877,9 @@ class APIPool:
                         self._set_manual(self.MAIN_GROUP, new_name)
                     if self._get_current(self.MAIN_GROUP) == name:
                         self._set_current(self.MAIN_GROUP, new_name)
-            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}，空闲借用 {('%s 秒' % new_idle) if new_idle else '关闭'}，日志 {new_lvl}）", "INFO")
+            # 空闲借用仅配置时显示（main 组更新走 _set_group_idle_seconds 专属日志，此处恒为子组路径）
+            idle_seg = f"，空闲借用 {new_idle} 秒" if new_idle else ""
+            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}{idle_seg}，日志 {new_lvl}，轮换 {('%s 分钟' % new_rot) if new_rot else '不轮换'}）", "INFO")
             return True, new_name
 
     def delete_group(self, name):
