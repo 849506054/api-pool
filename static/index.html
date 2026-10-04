@@ -766,13 +766,43 @@ function applyEpFilter(){const eps=poolSnapshot.endpoints||[];renderStats(eps);r
 function setFilter(f){epFilter=f;applyEpFilter();}
 function setVendorFilter(v){epVendorFilter=v;applyEpFilter();}
 
+/* 站点归一口径（2026-10-04）：筛选/分组按 base_url 的 host 收拢，不再按 site_name。
+   site_name 只是人工标签，同站常被拆成 Cline/Cline2/Cline3、AgentRouter/P/Z，
+   治理"收纳"时真正要的聚簇是同一个上游。host 相同即同站。 */
+function epHost(ep){
+  const b=String(ep.base_url||'').trim().toLowerCase();
+  if(!b)return '';
+  try{const u=new URL(b);return u.host;}
+  catch(e){
+    const m=b.match(/^[a-z]+:\/\/([^/]+)/);
+    return m?m[1]:b.split('/')[0];
+  }
+}
+function epSiteLabel(ep){ /* 标签展示名：host（同站唯一） */
+  return epHost(ep)||String(ep.site_name||'').trim();
+}
+/* 同站短名（2026-10-04）：host 下多个 site_name 取其公共前缀做展示名。
+   Cline/Cline2/Cline3/Cline4 → "Cline"；AgentRouter/P/Z → "AgentRouter"。
+   单个站点名原样返回；无公共前缀（完全不同的名字）回落 host。
+   注意：这只是**展示名**，筛选值仍用 host（setFilter 传 host）。 */
+function epSiteAlias(eps,host){
+  const names=[...new Set(eps.filter(e=>epHost(e)===host).map(e=>String(e.site_name||'').trim()).filter(Boolean))];
+  if(names.length<=1)return names[0]||host;
+  let pre=names[0];
+  for(const n of names){
+    while(pre&&!n.startsWith(pre))pre=pre.slice(0,-1);
+    if(!pre)break;
+  }
+  return pre||host;
+}
+
 function renderFilterBar(eps){
   /* 厂商层与站点层同级、互相二级：本栏标签计数限定在对侧筛选结果内（0 计数的当前选中项仍保留在栏内） */
   const vOk=ep=>epVendorFilter==='all'||vendorOf(ep.model)===epVendorFilter;
-  const sOk=ep=>epFilter==='all'||epFilter===ABN_FILTER||String(ep.site_name||'').trim()===epFilter;
+  const sOk=ep=>epFilter==='all'||epFilter===ABN_FILTER||epHost(ep)===epFilter;
   const allSites=new Set(),sites=new Map(),vendors=new Map();
   for(const ep of eps){
-    const site=String(ep.site_name||'').trim();
+    const site=epHost(ep);
     if(site){allSites.add(site);if(vOk(ep))sites.set(site,(sites.get(site)||0)+1);}
     if(sOk(ep)){const v=vendorOf(ep.model);vendors.set(v,(vendors.get(v)||0)+1);}
   }
@@ -784,12 +814,16 @@ function renderFilterBar(eps){
   siteNames.sort((a,b)=>a.localeCompare(b));
   const vendorNames=[...vendors.entries()].sort((a,b)=>(a[0]==='其他')-(b[0]==='其他')||b[1]-a[1]||a[0].localeCompare(b[0]));
   if(epVendorFilter!=='all'&&!vendors.has(epVendorFilter))vendorNames.push([epVendorFilter,0]);
+  /* 「全部」按钮的计数 = 维度条数（厂商数/站点数），不是端点计数：
+     端点总数已由右侧 filterCount 单独显示，两者语义不重叠。 */
+  const vendorCountAll=vendorNames.reduce((a,[,n])=>a+(n>0?1:0),0);
+  const siteCountAll=siteNames.length;
   document.getElementById('vendorBar').innerHTML=`
-    <button class="filter-btn ${epVendorFilter==='all'?'active':''}" onclick="setVendorFilter('all')">全部厂商 ${eps.filter(sOk).length}</button>
+    <button class="filter-btn ${epVendorFilter==='all'?'active':''}" onclick="setVendorFilter('all')">全部厂商 ${vendorCountAll}</button>
     ${vendorNames.map(([v,n])=>`<button class="filter-btn ${epVendorFilter===v?'active':''}" onclick="setVendorFilter('${escAttr(v)}')">${esc(v)} ${n}</button>`).join('')}`;
   document.getElementById('filterBar').innerHTML=`
-    <button class="filter-btn ${epFilter==='all'?'active':''}" onclick="setFilter('all')">全部站点 ${eps.filter(vOk).length}</button>
-    ${siteNames.map(site=>`<button class="filter-btn ${epFilter===site?'active':''}" onclick="setFilter('${escAttr(site)}')">${esc(site)} ${sites.get(site)||0}</button>`).join('')}
+    <button class="filter-btn ${epFilter==='all'?'active':''}" onclick="setFilter('all')">全部站点 ${siteCountAll}</button>
+    ${siteNames.map(site=>{const al=epSiteAlias(eps,site);return `<button class="filter-btn ${epFilter===site?'active':''}" onclick="setFilter('${escAttr(site)}')" title="${esc(site)}">${esc(al)} ${sites.get(site)||0}</button>`;}).join('')}
     <span class="filter-count" id="filterCount"></span>`;
 }
 
@@ -806,9 +840,19 @@ function hBadge(h,lat){
 function renderEndpoints(eps){
   if(epVendorFilter!=='all')eps=eps.filter(e=>vendorOf(e.model)===epVendorFilter);
   if(epFilter===ABN_FILTER)eps=eps.filter(epErr);
-  else if(epFilter!=='all')eps=eps.filter(e=>String(e.site_name||'').trim()===epFilter);
+  else if(epFilter!=='all')eps=eps.filter(e=>epHost(e)===epFilter);
 
   const c=document.getElementById('filterCount');if(c)c.textContent=`${eps.length} 个`;
+  /* 排序（2026-10-04）：先按 host 分组，host 内按端点名。
+     同站多 key 副本（Cline/Cline2/Cline3...）因此连续排列，而不是散在存储顺序里。
+     host 内名称相同则回落到 id 保证幂等（同 key 副本同名的极端情况）。 */
+  eps=[...eps].sort((a,b)=>{
+    const ha=epHost(a),hb=epHost(b);
+    if(ha!==hb)return ha.localeCompare(hb);
+    const na=String(a.name||''),nb=String(b.name||'');
+    if(na!==nb)return na.localeCompare(nb);
+    return String(a.id||'').localeCompare(String(b.id||''));
+  });
   const el=document.getElementById('epList');
   const st=el.scrollTop; /* 5s 自动刷新重渲染前保持滚动位置 */
   if(!eps.length){el.innerHTML='<div class="empty">暂无端点</div>';return;}
