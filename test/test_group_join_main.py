@@ -723,6 +723,31 @@ class GroupJoinMainTests(unittest.TestCase):
             self.assertTrue(eps["d1"]["is_current"])
             self.assertEqual(eps["d1"]["current_groups"], ["ds"])
 
+    def test_chain_and_groups_summary_agree_with_member_marks(self):
+        """/api/chain 汇总、/api/groups 与成员卡标记三面同源（普通组指针不可路由时回落一致）。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            import time as _t
+            d1 = self.endpoint(module, "d1", 1, "ds", groups=["ds"])
+            d2 = self.endpoint(module, "d2", 2, "ds", groups=["ds"])
+            pool = self.make_pool(module, [d1, d2], {"ds": {"type": "mixed", "model": "ds"}})
+            module.pool = pool
+            pool._set_manual("ds", "d1")
+            d1._cooldown_until = _t.time() + 999
+
+            status, body, _ = module.api_handler("GET", "/api/chain", None)
+            self.assertEqual(status, 200)
+            self.assertEqual(body["groups"]["ds"]["current_endpoint"], "d2")
+            rows = {r["name"]: r for r in body["chain"]}
+            self.assertTrue(rows["d2"]["is_current"])
+            self.assertEqual(rows["d2"]["current_groups"], ["ds"])
+            self.assertFalse(rows["d1"]["is_current"])
+
+            status, body2, _ = module.api_handler("GET", "/api/groups", None)
+            self.assertEqual(status, 200)
+            grp = next(g for g in body2["groups"] if g["name"] == "ds")
+            self.assertEqual(grp["current_endpoint"], "d2")
+
     # ── 故障后 fallback 必须先耗尽子组内兄弟（2026-09-27 生产 bug）──
 
     def test_failover_stays_in_subgroup_before_leaving(self):

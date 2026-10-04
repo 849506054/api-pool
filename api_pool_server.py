@@ -8854,22 +8854,11 @@ def api_handler(method, path, body):
         # 分组池：附加 per-group 汇总（各组当前指针 + fallback 锁实时状态），驱动 UI 组视图
         group_summary = {}
         for grp in pool._all_group_names():
-            cur = pool._get_manual(grp) or pool._get_current(grp)
-            # main 指针可能是已加入子组名（2026-09-27）：下钻解析出实际端点用于展示；
-            # 子组整体不可用时清指针回落自动选择（_main_pointer_target）
-            cur_sub = None
-            if grp == pool.MAIN_GROUP:
-                cur = pool._main_pointer_target()
-                # 命中形态二（指针=子组成员端点 id）时也必须给出子组名，
-                # 否则池列表的「● 当前」徽标/高亮框不显示。
-                cur_sub = pool._main_serving_subgroup()
-                if cur in pool._joined_subgroups():
-                    cur = pool._resolve_subgroup_current(cur_sub)
-            elif grp in pool._joined_subgroups():
-                # 已加入 main 的子组：面板当前端点收口到 _resolve_subgroup_current
-                # （与 main 卡片、聚合链子组条目同源，Bug 2/3 修）——main 借用其成员时
-                # 子组自身指针可能未及回写，直接下钻到真实当前成员。
-                cur = pool._resolve_subgroup_current(grp)
+            # 当前端点统一口径（2026-10-04）：与成员卡/聚合链同源——_display_pointer_id 含
+            # main 子组下钻、子组下钻与不可路由指针回落；命中形态二（指针=子组成员端点 id）
+            # 时也要给出子组名，否则池列表的「● 当前」徽标/高亮框不显示。
+            cur = pool._display_pointer_id(grp)
+            cur_sub = pool._main_serving_subgroup() if grp == pool.MAIN_GROUP else None
             cur_ep = next((e for e in pool._endpoints if e.id == cur), None)
             _fb_until = pool._group_fallback_lock_until.get(grp, 0)
             group_summary[grp] = {
@@ -8894,16 +8883,9 @@ def api_handler(method, path, body):
         groups = []
         for grp in pool._all_group_names():
             gd = pool._group_defs.get(grp, {})
-            cur = pool._get_manual(grp) or pool._get_current(grp)
-            # main 指针可能是已加入子组名（2026-09-27）：下钻到实际端点展示；
-            # 子组整体不可用时回落自动选择（_main_pointer_target）
-            if grp == pool.MAIN_GROUP:
-                cur = pool._main_pointer_target()
-                if cur in pool._joined_subgroups():
-                    cur = pool._resolve_subgroup_current(cur)
-            elif grp in pool._joined_subgroups():
-                # 已加入 main 的子组：当前端点同源下钻（Bug 2/3 修）。
-                cur = pool._resolve_subgroup_current(grp)
+            # 当前端点统一口径（2026-10-04）：与成员卡/聚合链同源（含 main 子组下钻、
+            # 子组下钻、不可路由指针回落）
+            cur = pool._display_pointer_id(grp)
             cur_ep = next((e for e in pool._endpoints if e.id == cur), None)
             groups.append({
                 "name": grp,
