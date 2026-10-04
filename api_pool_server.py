@@ -4022,6 +4022,27 @@ class APIPool:
             return sub_cur
         return cands[0].id
 
+    def _display_pointer_id(self, grp):
+        """展示口径「组当前端点 id」唯一来源（2026-10-04 收口）。
+
+        成员卡片（list_endpoints 的 is_current/current_groups、get_active_chain 成员行）
+        此前读裸指针 `manual or current`，而组卡片/聚合链子组条目走 _resolve_subgroup_current
+        下钻：同一个组出现两个「当前端点」答案——子组自身 manual 指针指向的成员进入冷却后
+        无人清理，面板显示 Cline-ds4.1f，实际在跑 Cline4-ds4.1f（2026-10-04 生产）。
+        口径与组卡片一致：已加入 main 的子组一律走 _resolve_subgroup_current（main 借用期间
+        也报真实当前成员），main 走 _main_pointer_target 下钻，其他组保持裸指针。
+        """
+        if grp == self.MAIN_GROUP:
+            ptr = self._main_pointer_target()
+            if ptr and ptr in self._joined_subgroups():
+                return self._resolve_subgroup_current(ptr)
+            return ptr
+        if grp in self._joined_subgroups():
+            # 已加入 main 的子组：与组卡片/聚合链子组条目同源下钻——main 借用期间子组自身
+            # 指针可能尚未回写，直接取真实当前成员；组内全不可用 → None（与组卡片一致）。
+            return self._resolve_subgroup_current(grp)
+        return self._get_manual(grp) or self._get_current(grp)
+
     def _main_pointer_target(self):
         """main 当前应指向的目标（端点 id / 子组名 / None）。
 
@@ -4286,13 +4307,18 @@ class APIPool:
         self._cleanup_expired_cooldowns()
         now = time.time()
         with self._lock:
+            # 当前端点统一口径（2026-10-04）：与组卡片/聚合链同源；子组只认 main 的有效指向
             current_by_group = {
-                grp: (self._manual_override_by_group.get(grp) or self._current_endpoint_by_group.get(grp))
-                for grp in self._all_group_names()
+                grp: self._display_pointer_id(grp) for grp in self._all_group_names()
             }
-            current_ids = set(current_by_group.values())
+            current_ids = {eid for eid in current_by_group.values() if eid}
+            groups_of: dict = {}
+            for grp, eid in current_by_group.items():
+                if eid:
+                    groups_of.setdefault(eid, []).append(grp)
             return [
-                self._ep_to_dict(ep, ep.id in current_ids, now, ep.id in current_ids)
+                self._ep_to_dict(ep, ep.id in current_ids, now, ep.id in current_ids,
+                                 current_groups=groups_of.get(ep.id, []))
                 for ep in self._endpoints
             ]
 
@@ -4321,7 +4347,7 @@ class APIPool:
                     groups.append(grp)
         return groups
 
-    def _ep_to_dict(self, ep, is_current, now, in_flight=False):
+    def _ep_to_dict(self, ep, is_current, now, in_flight=False, current_groups=None):
         return {
             "id": ep.id,
             "name": ep.name,
@@ -4356,7 +4382,7 @@ class APIPool:
             "stream_stall_timeout": ep.stream_stall_timeout,
             "stream_max_duration": ep.stream_max_duration,
             "pool_groups": list(self._ep_groups(ep)),
-            "current_groups": self._groups_pointing_at(ep.id),
+            "current_groups": list(current_groups) if current_groups is not None else self._groups_pointing_at(ep.id),
             "fail_count": ep._fail_count,
             "last_error": ep._last_error,
             "last_success": ep._last_success_ts,
@@ -4462,24 +4488,15 @@ class APIPool:
                 (ep for ep in self._endpoints if ep.enabled and ep.in_pool),
                 key=lambda ep: (self._ep_priority(ep, self.MAIN_GROUP), ep.priority),
             )
+            # 当前端点统一口径（2026-10-04）：与组卡片/聚合链子组条目同源
+            # （_display_pointer_id 已含 main 整组冻结回落与子组下钻），成员行不再读裸指针。
             current_by_group = {
-                grp: (self._manual_override_by_group.get(grp) or self._current_endpoint_by_group.get(grp))
-                for grp in self._all_group_names()
+                grp: self._display_pointer_id(grp) for grp in self._all_group_names()
             }
-            current_ids = set(current_by_group.values())
-            # main 的**有效**目标（2026-09-27）：手动指向的子组整组冻结时，
-            # _main_pointer_target 回落到路由实际会用的下一个优先级端点。原始指针
-            # 仍是子组名，_groups_pointing_at 判不出这个端点 → UI 不显示「当前使用」。
-            # 这里把回落端点补进 main 的指向集合。
-            main_target = self._main_pointer_target()
-            if main_target and main_target not in self._joined_subgroups():
-                current_ids.add(main_target)
+            current_ids = {eid for eid in current_by_group.values() if eid}
 
             def _groups_for(ep_id):
-                g = self._groups_pointing_at(ep_id)
-                if ep_id == main_target and self.MAIN_GROUP not in g:
-                    g.append(self.MAIN_GROUP)
-                return g
+                return [grp for grp, eid in current_by_group.items() if eid == ep_id]
 
             # 已加入 main 的子组：整组作为 main 一个成员参与，链条目必须可见（2026-09-27）。
             subgroup_entries = self._joined_subgroup_chain_entries(now)

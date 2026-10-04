@@ -601,6 +601,79 @@ class GroupJoinMainTests(unittest.TestCase):
             self.assertFalse(rows["bg"]["is_current"])
             self.assertEqual(rows["bg"]["current_groups"], [])
 
+    def test_member_rows_follow_main_pointer_not_stale_subgroup_manual(self):
+        """成员行必须报 main 实际在用的成员，而非子组自身陈旧的 manual 指针（2026-10-04 生产）。
+
+        复刻：子组 cline 的 manual 指向成员 c1（重启恢复写入手动覆盖），c1 被上游 429
+        冷却后无人清理；main 走子组下钻改用 c4。此前成员行（list_endpoints 的
+        is_current/current_groups、get_active_chain 成员行）读裸指针 `manual or current`
+        → 面板把冷却中的 c1 标成「当前」，与组卡片/聚合链的答案不一致。
+        """
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            import time as _t
+            c1 = self.endpoint(module, "c1", 1, "ds", groups=["cline"])
+            c4 = self.endpoint(module, "c4", 4, "ds", groups=["cline"])
+            pool = self.make_pool(module, [c1, c4],
+                                  {"cline": {"type": "mixed", "model": "cline"}})
+            pool.set_main_priority("cline", 1)
+            self.assertTrue(pool.switch_main_to_subgroup("cline")[0])
+            pool._set_manual("cline", "c1")    # 子组自身陈旧手动指针
+            pool._set_current("cline", "c4")   # main 借用成功后回写子组当前指针
+            c1._cooldown_until = _t.time() + 999
+            self.assertEqual(pool._resolve_subgroup_current("cline"), "c4")
+
+            rows = {r["name"]: r for r in pool.get_active_chain()}
+            self.assertTrue(rows["c4"]["is_current"])
+            self.assertIn("main", rows["c4"]["current_groups"])
+            self.assertIn("cline", rows["c4"]["current_groups"])
+            self.assertFalse(rows["c1"]["is_current"])
+            self.assertEqual(rows["c1"]["current_groups"], [])
+
+            eps = {e["name"]: e for e in pool.list_endpoints()}
+            self.assertTrue(eps["c4"]["is_current"])
+            self.assertEqual(eps["c4"]["current_groups"], ["main", "cline"])
+            self.assertFalse(eps["c1"]["is_current"])
+            self.assertEqual(eps["c1"]["current_groups"], [])
+
+    def test_member_rows_match_group_card_resolved_current(self):
+        """成员行与组卡片同源：每个组被标记的成员 = 该组解析出的当前端点（组内视图不再有第二个答案）。
+
+        覆盖子组未服务 main 的情形：子组自身当前端点仍须被标记（与组卡片「当前端点」一致），
+        而不是像聚合链「服务中」徽标那样只认 main 的命中。
+        """
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            import time as _t
+            m1 = self.endpoint(module, "m1", 1, "glm-5.3")
+            b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
+            c1 = self.endpoint(module, "c1", 1, "ds", groups=["cline"])
+            c4 = self.endpoint(module, "c4", 4, "ds", groups=["cline"])
+            pool = self.make_pool(module, [m1, b1, c1, c4],
+                                  {"bg": {"type": "mixed", "model": "bg"},
+                                   "cline": {"type": "mixed", "model": "cline"}})
+            pool.set_main_priority("cline", 1)
+            pool.set_main_priority("bg", 2)
+            pool._set_current("main", "m1")      # main 用原生端点
+            pool._set_manual("cline", "c1")      # 子组自身陈旧手动指针
+            pool._set_current("cline", "c4")
+            pool._set_current("bg", "b1")
+            c1._cooldown_until = _t.time() + 999
+
+            eps = {e["name"]: e for e in pool.list_endpoints()}
+            for grp in pool._all_group_names():
+                expected = pool._display_pointer_id(grp)
+                marked = {e["id"] for e in pool.list_endpoints()
+                          if grp in e["current_groups"]}
+                self.assertEqual(marked, {expected} if expected else set(),
+                                 f"组 {grp} 的成员标记与解析当前端点不一致")
+            self.assertTrue(eps["c4"]["is_current"])
+            self.assertIn("cline", eps["c4"]["current_groups"])
+            self.assertFalse(eps["c1"]["is_current"])
+            self.assertEqual(eps["c1"]["current_groups"], [])
+            self.assertEqual(eps["b1"]["current_groups"], ["bg"])
+            self.assertEqual(eps["m1"]["current_groups"], ["main"])
+
     # ── 故障后 fallback 必须先耗尽子组内兄弟（2026-09-27 生产 bug）──
 
     def test_failover_stays_in_subgroup_before_leaving(self):
