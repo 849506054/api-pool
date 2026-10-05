@@ -1,9 +1,8 @@
-"""组级端点轮换 rotate_minutes（2026-10-05）：按组内优先级定时推进当前端点。
+"""组级端点轮换 rotate_requests（2026-10-05）：按成功请求次数达标推进当前端点。
 
-覆盖：归一化校验 / 默认态不落键 / 轮换循环推进 / 手动指针跳过 / 冷却成员跳过 /
-tick 到期调度 / 持久化往返。
+口径：0=不轮换；>0 时每成功 N 次请求把本组当前端点按组内优先级推进到下一名（循环）。
+手动切换是那一刻的用户动作，组配了轮换就按配置继续推进（轮换不因 manual 暂停）。
 """
-
 import importlib.util
 import json
 import os
@@ -51,14 +50,14 @@ class GroupRotationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             m = load_module(tmp)
             pool = m.APIPool([])
-            self.assertEqual(pool._valid_group_rotate_minutes(0), 0)
-            self.assertEqual(pool._valid_group_rotate_minutes(None), 0)
-            self.assertEqual(pool._valid_group_rotate_minutes("30"), 30)
-            self.assertEqual(pool._valid_group_rotate_minutes(1), 1)
-            self.assertEqual(pool._valid_group_rotate_minutes(1440), 1440)
-            self.assertIsNone(pool._valid_group_rotate_minutes(-1))
-            self.assertIsNone(pool._valid_group_rotate_minutes(1441))
-            self.assertIsNone(pool._valid_group_rotate_minutes("abc"))
+            self.assertEqual(pool._valid_group_rotate_requests(0), 0)
+            self.assertEqual(pool._valid_group_rotate_requests(None), 0)
+            self.assertEqual(pool._valid_group_rotate_requests("20"), 20)
+            self.assertEqual(pool._valid_group_rotate_requests(1), 1)
+            self.assertEqual(pool._valid_group_rotate_requests(100000), 100000)
+            self.assertIsNone(pool._valid_group_rotate_requests(-1))
+            self.assertIsNone(pool._valid_group_rotate_requests(100001))
+            self.assertIsNone(pool._valid_group_rotate_requests("abc"))
 
     def test_default_zero_does_not_store_key(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -66,27 +65,27 @@ class GroupRotationTests(unittest.TestCase):
             pool = m.APIPool([])
             ok, msg = pool.create_group("bg", "mixed", "", 0, 0, "all", 0)
             self.assertTrue(ok, msg)
-            self.assertNotIn("rotate_minutes", pool._group_defs["bg"])
+            self.assertNotIn("rotate_requests", pool._group_defs["bg"])
 
-    def test_create_and_update_store_rotate_minutes(self):
+    def test_create_and_update_store_rotate_requests(self):
         with tempfile.TemporaryDirectory() as tmp:
             m = load_module(tmp)
             pool = m.APIPool([])
             ok, _ = pool.create_group("bg", "mixed", "", 0, 0, "all", 5)
             self.assertTrue(ok)
-            self.assertEqual(pool._group_defs["bg"]["rotate_minutes"], 5)
-            self.assertEqual(pool._group_rotate_minutes("bg"), 5)
+            self.assertEqual(pool._group_defs["bg"]["rotate_requests"], 5)
+            self.assertEqual(pool._group_rotate_requests("bg"), 5)
             # 非法拒绝
-            ok, msg = pool.create_group("bad", "mixed", "", 0, 0, "all", 9999)
+            ok, msg = pool.create_group("bad", "mixed", "", 0, 0, "all", 999999)
             self.assertFalse(ok)
             self.assertIn("轮换", msg)
             # 编辑更新与清零（0 → 不落键）
-            ok, _ = pool.update_group("bg", {"rotate_minutes": 10})
+            ok, _ = pool.update_group("bg", {"rotate_requests": 10})
             self.assertTrue(ok)
-            self.assertEqual(pool._group_defs["bg"]["rotate_minutes"], 10)
-            ok, _ = pool.update_group("bg", {"rotate_minutes": 0})
+            self.assertEqual(pool._group_defs["bg"]["rotate_requests"], 10)
+            ok, _ = pool.update_group("bg", {"rotate_requests": 0})
             self.assertTrue(ok)
-            self.assertNotIn("rotate_minutes", pool._group_defs["bg"])
+            self.assertNotIn("rotate_requests", pool._group_defs["bg"])
 
     def test_rotate_advances_by_priority_wraps(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -107,17 +106,15 @@ class GroupRotationTests(unittest.TestCase):
             pool._rotate_group_once("bg")  # 无指针 → 推进到第 1 名
             self.assertEqual(pool._get_current("bg"), "b1")
 
-    def test_rotate_respects_manual_override(self):
+    def test_rotate_continues_after_manual_switch(self):
+        """A 口径（2026-10-05）：手动切换后一样按配置轮换，manual 不挡轮换。"""
         with tempfile.TemporaryDirectory() as tmp:
             m = load_module(tmp)
             pool, _ = self.pool_with_bg(m)
             pool._set_current("bg", "b1")
-            pool._set_manual("bg", "b3")
-            pool._rotate_group_once("bg")  # 手动固定 = 用户意图，跳过
-            self.assertEqual(pool._get_current("bg"), "b1")
-            pool._set_manual("bg", None)
+            pool._set_manual("bg", "b3")           # 用户此刻手动切到 b3
             pool._rotate_group_once("bg")
-            self.assertEqual(pool._get_current("bg"), "b2")
+            self.assertEqual(pool._get_current("bg"), "b2")  # 到点照样推进
 
     def test_rotate_skips_cooldown_members(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,16 +133,31 @@ class GroupRotationTests(unittest.TestCase):
             pool._rotate_group_once("bg")
             self.assertEqual(pool._get_current("bg"), "b1")
 
-    def test_tick_only_fires_when_interval_elapsed(self):
+    def test_count_fires_at_threshold_and_resets(self):
         with tempfile.TemporaryDirectory() as tmp:
             m = load_module(tmp)
             pool, _ = self.pool_with_bg(m)
-            pool._set_group_rotate_minutes("bg", 30)
+            pool._set_group_rotate_requests("bg", 3)
             pool._set_current("bg", "b1")
-            pool._rotate_groups_tick()  # 刚设间隔 → 未到期，不动
+            pool._count_rotate_request("bg")
+            pool._count_rotate_request("bg")
+            self.assertEqual(pool._get_current("bg"), "b1")   # 未达阈值不动
+            pool._count_rotate_request("bg")
+            self.assertEqual(pool._get_current("bg"), "b2")   # 第 3 次 → 推进
+            self.assertEqual(pool._rotate_counts["bg"], 0)    # 计数重新累计
+            # 未配置轮换的组：不计数、不动
+            pool._count_rotate_request("main")
+            self.assertNotIn("main", pool._rotate_counts)
+
+    def test_on_success_counts_toward_rotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m = load_module(tmp)
+            pool, eps = self.pool_with_bg(m)
+            pool._set_group_rotate_requests("bg", 2)
+            pool._set_current("bg", "b1")
+            pool._on_success(eps[0], group="bg")
             self.assertEqual(pool._get_current("bg"), "b1")
-            pool._rotate_last_ts["bg"] -= 31 * 60
-            pool._rotate_groups_tick()  # 到期 → 推进一次
+            pool._on_success(eps[0], group="bg")
             self.assertEqual(pool._get_current("bg"), "b2")
 
     def test_persistence_roundtrip(self):
@@ -155,13 +167,29 @@ class GroupRotationTests(unittest.TestCase):
             m._sync_to_config()
             saved = json.load(open(m.CONFIG_FILE, encoding="utf-8"))
             entry = next(d for d in saved["pool_group_defs"] if d["name"] == "bg")
-            self.assertEqual(entry["rotate_minutes"], 15)
+            self.assertEqual(entry["rotate_requests"], 15)
             raw = m.load_group_defs_config()
             pool2 = m.APIPool([])
             pool2._load_group_defs(raw)
-            self.assertEqual(pool2._group_rotate_minutes("bg"), 15)
+            self.assertEqual(pool2._group_rotate_requests("bg"), 15)
             # all 默认态：0 不落键、读回 0
-            self.assertEqual(pool2._group_rotate_minutes("main"), 0)
+            self.assertEqual(pool2._group_rotate_requests("main"), 0)
+
+    def test_legacy_rotate_minutes_cleared_not_migrated(self):
+        """旧分钟制键（2026-10-05 前）不迁移：读入当未声明，落盘清除。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            m = load_module(tmp)
+            with open(m.CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump({"endpoints": [], "pool_group_defs": [
+                    {"name": "main", "type": "mixed", "model": "main"},
+                    {"name": "bg", "type": "mixed", "model": "bg", "rotate_minutes": 30},
+                ]}, f)
+            m.pool._load_group_defs(m.load_group_defs_config())
+            self.assertEqual(m.pool._group_rotate_requests("bg"), 0)
+            m._sync_to_config()
+            saved = json.load(open(m.CONFIG_FILE, encoding="utf-8"))
+            entry = next(d for d in saved["pool_group_defs"] if d["name"] == "bg")
+            self.assertNotIn("rotate_minutes", entry)
 
 
 if __name__ == "__main__":

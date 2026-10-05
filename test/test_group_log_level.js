@@ -9,7 +9,7 @@ assert(/<select id="gLogLevel">/.test(src), '组弹窗含日志级别下拉');
 assert(/g\.log_level==='error'/.test(src)&&/g\.log_level==='silent'/.test(src), '编辑回填非默认态');
 // 保存收集 + PUT/POST 携带
 assert(/const log_level=document\.getElementById\('gLogLevel'\)\?document\.getElementById\('gLogLevel'\)\.value:'all';/.test(src), '取值容忍缺失元素');
-assert(/context_tokens,idle_seconds,log_level,rotate_minutes\}\)/.test(src), 'PUT/POST 携带 log_level');
+assert(/context_tokens,idle_seconds,log_level,rotate_requests\}\)/.test(src), 'PUT/POST 携带 log_level');
 // 过滤逻辑存在且被两个显示面调用
 assert(/function groupLogVisible\(msg, level\)/.test(src), '实时日志过滤函数');
 assert(/if \(!groupLogVisible\(entry\.msg, entry\.level\)\) return;/.test(src), 'addLogLine 应用过滤');

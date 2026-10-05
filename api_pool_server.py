@@ -2806,7 +2806,7 @@ class APIPool:
         # 迟到的旧请求只更新自身健康状态，不得覆盖更新的路由决策。
         self._route_epoch_by_group: dict[str, int] = {}
         self._persisted_endpoint_by_group: dict[str, str | None] = {}
-        self._rotate_last_ts: dict[str, float] = {}  # 端点轮换：各组上次轮换时刻（分钟间隔到期判定）
+        self._rotate_counts: dict[str, int] = {}  # 端点轮换：各组累计成功请求数（达阈值推进下一名）
         self._fallback_lock_until_by_group: dict[str, float] = {}
         # 端点在途归属：ep.id → {组名: 在途请求数}。main 可抢占子组共享端点，
         # 因此必须按组计数，避免并发请求覆盖 owner 或提前释放仍在途的占用。
@@ -3461,72 +3461,67 @@ class APIPool:
         """配置读入：idle_seconds 归一化，非法值当未声明（不阻断启动）。"""
         return self._valid_group_idle_seconds(d.get("idle_seconds")) or 0
 
-    # 端点轮换间隔（分钟，2026-10-05）：0=不轮换；>0 每隔该时长把当前端点按组内优先级推进到下一名
-    GROUP_ROTATE_MIN_MINUTES = 1
-    GROUP_ROTATE_MAX_MINUTES = 1440
-    ROTATION_TICK_SECONDS = 15
+    # 端点轮换阈值（成功请求次数，2026-10-05）：0=不轮换；>0 时每成功 N 次请求把当前端点按组内优先级推进到下一名
+    GROUP_ROTATE_MIN_REQUESTS = 1
+    GROUP_ROTATE_MAX_REQUESTS = 100000
 
-    def _valid_group_rotate_minutes(self, value):
-        """组级端点轮换间隔（分钟）归一化：0=不轮换；非法/越界 → None（调用方拒绝）。"""
+    def _valid_group_rotate_requests(self, value):
+        """组级端点轮换阈值（成功请求次数）归一化：0=不轮换；非法/越界 → None（调用方拒绝）。"""
         try:
             n = int(value or 0)
         except (TypeError, ValueError):
             return None
         if n == 0:
             return 0
-        if self.GROUP_ROTATE_MIN_MINUTES <= n <= self.GROUP_ROTATE_MAX_MINUTES:
+        if self.GROUP_ROTATE_MIN_REQUESTS <= n <= self.GROUP_ROTATE_MAX_REQUESTS:
             return n
         return None
 
-    def _group_rotate_minutes(self, group):
-        """该组声明的端点轮换间隔（分钟）；未声明/存值非法 → 0（不轮换）。"""
-        return self._valid_group_rotate_minutes(self._group_defs.get(group, {}).get("rotate_minutes")) or 0
+    def _group_rotate_requests(self, group):
+        """该组声明的轮换阈值（成功请求次数）；未声明/存值非法 → 0（不轮换）。"""
+        return self._valid_group_rotate_requests(self._group_defs.get(group, {}).get("rotate_requests")) or 0
 
-    def _loaded_group_rotate_minutes(self, d):
-        """配置读入：rotate_minutes 归一化，非法值当未声明（不阻断启动）。"""
-        return self._valid_group_rotate_minutes(d.get("rotate_minutes")) or 0
+    def _loaded_group_rotate_requests(self, d):
+        """配置读入：rotate_requests 归一化，非法值当未声明（不阻断启动）；旧 rotate_minutes 不迁移。"""
+        return self._valid_group_rotate_requests(d.get("rotate_requests")) or 0
 
-    def _set_group_rotate_minutes(self, group, minutes):
-        """写入/清除组的端点轮换间隔（0=默认态，不落键），返回是否有变更。"""
+    def _set_group_rotate_requests(self, group, requests):
+        """写入/清除组的轮换阈值（0=默认态，不落键），返回是否有变更。"""
         gd = self._group_defs.get(group)
         if gd is None:
             return False
-        if minutes:
-            if gd.get("rotate_minutes") == minutes:
+        if requests:
+            if gd.get("rotate_requests") == requests:
                 return False
-            gd["rotate_minutes"] = minutes
-        elif gd.pop("rotate_minutes", None) is None:
+            gd["rotate_requests"] = requests
+        elif gd.pop("rotate_requests", None) is None:
             return False
-        self._rotate_last_ts[group] = time.time()  # 新间隔从当下重新计时
-        sys_log(f"组 '{group}' 端点轮换间隔设为 {('%s 分钟' % minutes) if minutes else '不轮换'}", "INFO")
+        self._rotate_counts[group] = 0  # 新阈值从零开始计数
+        sys_log(f"组 '{group}' 端点轮换设为 {('每 %s 次请求' % requests) if requests else '不轮换'}", "INFO")
         return True
 
-    def _rotation_loop(self):
-        """端点轮换守护线程：固定 tick 间隔，仅在组配置了轮换时才检查到点与否。"""
-        while True:
-            time.sleep(self.ROTATION_TICK_SECONDS)
-            try:
-                self._rotate_groups_tick()
-            except Exception as e:
-                sys_log(f"端点轮换 tick 异常: {e}", "WARN")
+    def _count_rotate_request(self, group):
+        """成功请求计数：达到组声明的阈值就把该组当前端点推进到下一名。
 
-    def _rotate_groups_tick(self):
-        now = time.time()
-        for grp in list(self._group_defs):
-            mins = self._group_rotate_minutes(grp)
-            if not mins:
-                continue
-            last = self._rotate_last_ts.setdefault(grp, now)
-            if now - last < mins * 60:
-                continue
-            self._rotate_last_ts[grp] = now
-            self._rotate_group_once(grp)
+        只计成功请求；失败尝试走既有故障轮转，不重复计数（2026-10-05 口径）。
+        """
+        limit = self._group_rotate_requests(group)
+        if not limit:
+            return
+        with self._lock:
+            n = self._rotate_counts.get(group, 0) + 1
+            self._rotate_counts[group] = 0 if n >= limit else n
+            if n < limit:
+                return
+        self._rotate_group_once(group)
 
     def _rotate_group_once(self, group):
-        """把组当前端点按组内优先级推进到下一名（循环）；成员不足 2 不轮换。"""
+        """把组当前端点按组内优先级推进到下一名（循环）；成员不足 2 不轮换。
+
+        手动切换是那一刻的用户动作：组配了轮换就按配置继续推进，两者不冲突
+        （2026-10-05 口径——轮换不因 manual 暂停）。
+        """
         with self._lock:
-            if self._get_manual(group):
-                return  # 手动固定端点=用户意图，轮换待手动清除后恢复
             cur = self._get_current(group)
             if group == self.MAIN_GROUP and cur and cur in self._joined_subgroups():
                 return  # 「整组」指针优先于轮换（2026-09-27 手动切子组整体语义）
@@ -3650,9 +3645,9 @@ class APIPool:
                     lvl = self._loaded_group_log_level(d)
                     if lvl != "all":
                         self._group_defs[self.MAIN_GROUP]["log_level"] = lvl
-                    rot = self._loaded_group_rotate_minutes(d)
-                    if rot:
-                        self._group_defs[self.MAIN_GROUP]["rotate_minutes"] = rot
+                    req = self._loaded_group_rotate_requests(d)
+                    if req:
+                        self._group_defs[self.MAIN_GROUP]["rotate_requests"] = req
                     continue
                 if name == self.VISION_GROUP:
                     # 内置图片解析池：类型恒 mixed，选择器沿用配置（缺省 VISION_SELECTOR）
@@ -3666,9 +3661,9 @@ class APIPool:
                     lvl = self._loaded_group_log_level(d)
                     if lvl != "all":
                         entry["log_level"] = lvl
-                    rot = self._loaded_group_rotate_minutes(d)
-                    if rot:
-                        entry["rotate_minutes"] = rot
+                    req = self._loaded_group_rotate_requests(d)
+                    if req:
+                        entry["rotate_requests"] = req
                     self._group_defs[name] = entry
                     continue
                 if str(d.get("role", "") or "").strip():
@@ -3683,9 +3678,9 @@ class APIPool:
                 lvl = self._loaded_group_log_level(d)
                 if lvl != "all":
                     entry["log_level"] = lvl
-                rot = self._loaded_group_rotate_minutes(d)
-                if rot:
-                    entry["rotate_minutes"] = rot
+                req = self._loaded_group_rotate_requests(d)
+                if req:
+                    entry["rotate_requests"] = req
                 # 加入 main 的名次（2026-09-27）：int>0 恢复，其余忽略
                 try:
                     mp = int(d.get("main_priority") or 0)
@@ -3704,7 +3699,7 @@ class APIPool:
                 self._group_defs[grp] = {"type": "mixed", "model": grp}
         return self._group_defs
 
-    def create_group(self, name, gtype="mixed", model="", context_tokens=0, idle_seconds=0, log_level="all", rotate_minutes=0):
+    def create_group(self, name, gtype="mixed", model="", context_tokens=0, idle_seconds=0, log_level="all", rotate_requests=0):
         """新建分组。返回 (ok, message)。main / 图片解析池为系统内置组，不可由此创建。"""
         with self._lock:
             name = str(name or "").strip()
@@ -3727,10 +3722,10 @@ class APIPool:
             lvl = self._valid_group_log_level(log_level)
             if lvl is None:
                 return False, "日志级别非法（all=全部 / error=仅报错 / silent=静默）"
-            rot = self._valid_group_rotate_minutes(rotate_minutes)
-            if rot is None:
-                return False, ("端点轮换间隔非法（0=不轮换，或 "
-                               f"{self.GROUP_ROTATE_MIN_MINUTES}–{self.GROUP_ROTATE_MAX_MINUTES} 分钟）")
+            req = self._valid_group_rotate_requests(rotate_requests)
+            if req is None:
+                return False, ("端点轮换次数非法（0=不轮换，或 "
+                               f"{self.GROUP_ROTATE_MIN_REQUESTS}–{self.GROUP_ROTATE_MAX_REQUESTS} 次）")
             model = str(model or "").strip()
             if gtype == "dedicated":
                 if not model:
@@ -3751,9 +3746,9 @@ class APIPool:
                 self._group_defs[name]["idle_seconds"] = idle
             if lvl != "all":
                 self._group_defs[name]["log_level"] = lvl
-            if rot:
-                self._group_defs[name]["rotate_minutes"] = rot
-            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%s tokens' % format(ck, ',') if ck else '未声明'}{'，空闲借用 %s 秒' % idle if idle else ''}，日志 {lvl}，轮换 {('%s 分钟' % rot) if rot else '不轮换'}）", "INFO")
+            if req:
+                self._group_defs[name]["rotate_requests"] = req
+            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%s tokens' % format(ck, ',') if ck else '未声明'}{'，空闲借用 %s 秒' % idle if idle else ''}，日志 {lvl}，轮换 {('每 %s 次请求' % req) if req else '不轮换'}）", "INFO")
             return True, name
 
     def update_group(self, name, updates):
@@ -3784,10 +3779,10 @@ class APIPool:
             new_lvl = self._valid_group_log_level(updates.get("log_level", old.get("log_level", "all")))
             if new_lvl is None:
                 return False, "日志级别非法（all=全部 / error=仅报错 / silent=静默）"
-            new_rot = self._valid_group_rotate_minutes(updates.get("rotate_minutes", old.get("rotate_minutes", 0)))
-            if new_rot is None:
-                return False, ("端点轮换间隔非法（0=不轮换，或 "
-                               f"{self.GROUP_ROTATE_MIN_MINUTES}–{self.GROUP_ROTATE_MAX_MINUTES} 分钟）")
+            new_req = self._valid_group_rotate_requests(updates.get("rotate_requests", old.get("rotate_requests", 0)))
+            if new_req is None:
+                return False, ("端点轮换次数非法（0=不轮换，或 "
+                               f"{self.GROUP_ROTATE_MIN_REQUESTS}–{self.GROUP_ROTATE_MAX_REQUESTS} 次）")
 
             if not self._valid_group_type(new_type):
                 return False, "分组类型必须为 mixed 或 dedicated"
@@ -3803,7 +3798,7 @@ class APIPool:
                     changed = True
                 if self._set_group_log_level(name, new_lvl):
                     changed = True
-                if self._set_group_rotate_minutes(name, new_rot):
+                if self._set_group_rotate_requests(name, new_req):
                     changed = True
                 return True, (name if changed else "无变更")
 
@@ -3816,7 +3811,7 @@ class APIPool:
                     changed = True
                 if self._set_group_log_level(name, new_lvl):
                     changed = True
-                if self._set_group_rotate_minutes(name, new_rot):
+                if self._set_group_rotate_requests(name, new_req):
                     changed = True
                 return True, (name if changed else "无变更")
 
@@ -3867,8 +3862,8 @@ class APIPool:
                 self._group_defs[new_name]["idle_seconds"] = new_idle
             if new_lvl != "all":
                 self._group_defs[new_name]["log_level"] = new_lvl
-            if new_rot:
-                self._group_defs[new_name]["rotate_minutes"] = new_rot
+            if new_req:
+                self._group_defs[new_name]["rotate_requests"] = new_req
             # 加入 main 名次跟随改名（2026-09-27）；main 指针若指向旧子组名同步改名
             if old.get("main_priority"):
                 self._group_defs[new_name]["main_priority"] = old["main_priority"]
@@ -3879,7 +3874,7 @@ class APIPool:
                         self._set_current(self.MAIN_GROUP, new_name)
             # 空闲借用仅配置时显示（main 组更新走 _set_group_idle_seconds 专属日志，此处恒为子组路径）
             idle_seg = f"，空闲借用 {new_idle} 秒" if new_idle else ""
-            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}{idle_seg}，日志 {new_lvl}，轮换 {('%s 分钟' % new_rot) if new_rot else '不轮换'}）", "INFO")
+            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}{idle_seg}，日志 {new_lvl}，轮换 {('每 %s 次请求' % new_req) if new_req else '不轮换'}）", "INFO")
             return True, new_name
 
     def delete_group(self, name):
@@ -5957,6 +5952,8 @@ class APIPool:
                     self._set_current(grp, ep.id)
                     if self._get_manual(grp) and self._get_manual(grp) != ep.id:
                         self._set_manual(grp, None)
+        self._count_rotate_request(grp)  # 成功请求计一次，达阈值推进组内下一名
+
     def _rewrite_tool_call_ids(self, messages, prefix):
         """确定性重写 tool_call id：原 id → 前缀+md5 后缀，保持 assistant/tool 配对。
 
@@ -9053,7 +9050,7 @@ def api_handler(method, path, body):
                 "context_tokens": pool._group_context_tokens(grp) or 0,
                 "idle_seconds": pool._group_idle_seconds(grp),
                 "log_level": pool._group_defs.get(grp, {}).get("log_level") or "all",
-                "rotate_minutes": pool._group_defs.get(grp, {}).get("rotate_minutes") or 0,
+                "rotate_requests": pool._group_defs.get(grp, {}).get("rotate_requests") or 0,
                 "is_vision": grp == pool.VISION_GROUP,
                 "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)) + (len(pool._joined_subgroups()) if grp == pool.MAIN_GROUP else 0),
                 "current_endpoint": cur_ep.name if cur_ep else None,
@@ -9070,7 +9067,7 @@ def api_handler(method, path, body):
         model = str(body.get("model", "") or "").strip()
         ok, msg = pool.create_group(name, gtype, model, body.get("context_tokens", 0),
                                     body.get("idle_seconds", 0), body.get("log_level", "all"),
-                                    body.get("rotate_minutes", 0))
+                                    body.get("rotate_requests", 0))
         if not ok:
             return 400, {"error": msg}, False
         _sync_to_config()
@@ -9555,11 +9552,13 @@ def _sync_to_config():
                 entry["idle_seconds"] = gd["idle_seconds"]
             if gd.get("log_level"):
                 entry["log_level"] = gd["log_level"]
-            if gd.get("rotate_minutes"):
-                entry["rotate_minutes"] = gd["rotate_minutes"]
+            if gd.get("rotate_requests"):
+                entry["rotate_requests"] = gd["rotate_requests"]
             if gd.get("main_priority"):
                 entry["main_priority"] = gd["main_priority"]
             defs_list.append(entry)
+    for entry in defs_list:
+        entry.pop("rotate_minutes", None)  # 旧分钟制键（2026-10-05 起按请求次数）：清空不迁移
     save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "client_profile": ep.get("client_profile", ""), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
             "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "retry_on_rate_limit": ep.get("retry_on_rate_limit", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "strict400_retries": ep.get("strict400_retries", 2), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles,
         probe_client_profile=getattr(pool, "_probe_client_profile", ""),
@@ -9751,8 +9750,7 @@ def main():
     if not 1 <= port <= 65535:
         raise SystemExit("API_POOL_PORT must be between 1 and 65535")
     signal.signal(signal.SIGTERM, _handle_sigterm)
-    # 端点轮换守护线程（2026-10-05）：组 rotate_minutes>0 时按组内优先级定时推进当前端点
-    threading.Thread(target=pool._rotation_loop, daemon=True).start()
+    # 端点轮换（2026-10-05）：无守护线程——组配了 rotate_requests 时，成功请求在 _on_success 计数达阈值即推进
     # 注：滚动清理由 ChatLogger.__init__ 的守护线程负责（启动即执行首次清理），
     #     不在 main() 同步执行——大表 DELETE 会阻塞 server 启动（2026-08-15 实测 63s）
     server = _PoolServer(("0.0.0.0", port), Handler)
