@@ -4720,12 +4720,12 @@ class APIPool:
             "credit": self._credit_view(ep),
         }
 
-    def _credit_probe(self, base_origin: str, path: str) -> object:
+    def _credit_probe(self, base_origin: str, path: str, method: str = "GET") -> object:
         """打 wkm 管理面（剥掉 /v1 的 origin + Bearer 令牌）。失败抛异常，由调用方吞掉。"""
         req = urllib.request.Request(base_origin + path, headers={
             "Authorization": "Bearer " + WKM_TOKEN,
             "Accept": "application/json",
-        })
+        }, method=method)
         # 内网直连（同池内 use_proxy=False 形态）：wkm 是局域网 http，绕开系统代理，
         # 也避免 ProxyHandler 对 CIDR 形态 no_proxy 的兼容性问题。
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -4759,10 +4759,20 @@ class APIPool:
                 sys_log(f"wkm 积分拉取失败 {root}: {type(exc).__name__}（保留上次读数）", "WARN")
                 continue
             acct = accounts.get("accounts") if isinstance(accounts, dict) else None
+            realm_of = {str(a.get("uid") or ""): (a.get("realm") or "cn") for a in (acct or []) if isinstance(a, dict)}
+            # /api/accounts 的 credits 是上游调度快照（可滞后数小时甚至为 0，wkm issue #56
+            # 同源问题）；面板显示的是实时查询值。取 refresh-credits?force=false（只读
+            # 令牌可用的实时通道，wkm 侧自带 60s TTL 缓存），失败回退快照值。
+            live: dict | None = None
+            try:
+                rc = self._credit_probe(root, "/api/accounts/refresh-credits?force=false", method="POST")
+                if isinstance(rc, dict) and isinstance(rc.get("credits"), dict):
+                    live = rc["credits"]
+            except Exception:
+                pass  # 回退快照，不打积分线程的 WARN（属口径降级非链路故障）
             realm_sum: dict[str, float] = {}
-            for a in acct or []:
-                if isinstance(a, dict):
-                    realm_sum[a.get("realm") or "cn"] = realm_sum.get(a.get("realm") or "cn", 0.0) + float(a.get("credits") or 0)
+            for uid, v in (live if live is not None else {str(a.get("uid") or ""): a.get("credits") for a in (acct or []) if isinstance(a, dict)}).items():
+                realm_sum[realm_of.get(uid, "cn")] = realm_sum.get(realm_of.get(uid, "cn"), 0.0) + float(v or 0)
             now = time.time()
             for k in keys if isinstance(keys, list) else []:
                 prefix = str(k.get("prefix") or "")
