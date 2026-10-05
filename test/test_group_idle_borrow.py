@@ -159,5 +159,78 @@ class IdleBorrowTests(unittest.TestCase):
             self.assertNotIn("idle_seconds", pool._group_defs["main"])
 
 
+    def test_avoided_endpoint_defers_then_returns_when_main_idle(self):
+        """main 占用时剔除并挂延迟回迁；main 空闲窗口满足后释放 → 回切到该端点（空闲借用回切）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module(tmp)
+            pool, shared = self.make_pool(module)
+            pool._set_group_idle_seconds("main", 600)
+            pool._set_current("bg", "b1")
+            b1 = next(e for e in pool._endpoints if e.id == "b1")
+            b1.deferrable = False  # 隔离缓存保护因子，只考察 main 占用
+            shared._last_success_ts = time.time() - 60  # main 正在用
+
+            candidates, _ = pool._group_sticky_candidates("bg")
+            self.assertNotIn("shared", [ep.id for ep in candidates])
+            self.assertIn("bg", shared._defer_until_by_group)  # 已挂延迟回迁
+
+            pool._reconcile_deferred()  # main 仍忙 → 延期，不回切
+            self.assertEqual(pool._get_current("bg"), "b1")
+            self.assertIn("bg", shared._defer_until_by_group)
+
+            shared._last_success_ts = time.time() - 700  # main 空闲满窗口
+            pool._reconcile_deferred()  # 释放 → 回切
+            self.assertEqual(pool._get_current("bg"), "shared")
+            self.assertNotIn("bg", shared._defer_until_by_group)
+
+    def test_return_waits_for_cache_protection_of_current_endpoint(self):
+        """当前端点保护缓存且池活跃：main 空闲也先不回切（与既有延迟回迁同一口径）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module(tmp)
+            pool, shared = self.make_pool(module)
+            pool._set_group_idle_seconds("main", 600)
+            pool._set_current("bg", "b1")  # b1.deferrable 默认 True
+            pool._last_pool_activity = time.time()
+            shared._last_success_ts = time.time() - 60
+            pool._group_sticky_candidates("bg")  # 触发挂 defer
+            self.assertIn("bg", shared._defer_until_by_group)
+
+            shared._last_success_ts = time.time() - 700  # main 已空闲
+            pool._reconcile_deferred()
+            self.assertEqual(pool._get_current("bg"), "b1")  # 缓存保护未解除 → 不回切
+
+            pool._last_pool_activity = time.time() - 4000  # 池空闲
+            pool._reconcile_deferred()
+            self.assertEqual(pool._get_current("bg"), "shared")  # 释放并回切
+
+    def test_disabled_window_creates_no_defer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module(tmp)
+            pool, shared = self.make_pool(module)
+            pool._set_current("bg", "b1")
+            shared._last_success_ts = time.time() - 700  # 窗口=0=关闭
+
+            candidates, _ = pool._group_sticky_candidates("bg")
+            self.assertNotIn("shared", [ep.id for ep in candidates])
+            self.assertEqual(shared._defer_until_by_group, {})  # 不挂 defer（行为同现状）
+            pool._reconcile_deferred()
+            self.assertEqual(pool._get_current("bg"), "b1")
+
+    def test_manual_pin_creates_no_defer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module(tmp)
+            pool, shared = self.make_pool(module)
+            pool._set_group_idle_seconds("main", 600)
+            pool._set_current("bg", "b1")
+            pool._set_manual("bg", "b2")  # 用户手动钉住本组
+            shared._last_success_ts = time.time() - 60
+
+            pool._group_sticky_candidates("bg")
+            self.assertEqual(shared._defer_until_by_group, {})  # 用户意图优先，不挂
+            pool._set_manual("bg", None)
+            pool._reconcile_deferred()
+            self.assertEqual(pool._get_current("bg"), "b1")
+
+
 if __name__ == "__main__":
     unittest.main()

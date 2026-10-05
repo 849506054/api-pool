@@ -4494,9 +4494,18 @@ class APIPool:
             return base, False
         if not base:
             return [], False
-        free = [ep for ep in base
-                if not self._is_ep_sticky_elsewhere(ep, group)
-                and not self._is_ep_inflight_elsewhere(ep, group)]
+        free = []
+        for ep in base:
+            if self._is_ep_sticky_elsewhere(ep, group):
+                # main 占用中：本次剔除；同时按「延迟回迁」机制挂 defer（滚动续期见
+                # _reconcile_deferred）——main 空闲窗口满足后由它释放，统一走那条
+                # 「释放即回切到组内最优端点」的尾巴。窗口未启用 / 本组被手动钉住时不挂。
+                if self._group_idle_seconds(self.MAIN_GROUP) and not self._get_manual(group):
+                    ep._defer_until_by_group[group] = time.time() + 300
+                continue
+            if self._is_ep_inflight_elsewhere(ep, group):
+                continue
+            free.append(ep)
         if free:
             return free, False
         return [], False
@@ -5638,12 +5647,24 @@ class APIPool:
                     # 分组池：只按本组当前端点判断——main 不受子组指针影响，子组也不替 main 决定。
                     cur = current_eps.get(grp)
                     protected = cur is not None and cur is not ep and cur.deferrable
-                    if protected and pool_active:
+                    # 空闲借用等待（2026-10-05）：端点仍被 main 占用 → 本组还不能回切。
+                    # 与缓存保护同为「暂时不回迁」，各自独立地滚动延期。
+                    borrow_blocked = self._is_ep_sticky_elsewhere(ep, grp)
+                    if borrow_blocked or (protected and pool_active):
                         ep._defer_until_by_group[grp] = now + defer_window  # 滚动延长，保持 cache
                     else:
                         ep._defer_until_by_group.pop(grp, None)
                         released.append((ep, grp))
-                        reason = "池空闲" if not pool_active else "当前端点未开启缓存保护"
+                        borrow_release = (
+                            grp != self.MAIN_GROUP
+                            and ep.id in (self._get_current(self.MAIN_GROUP), self._get_manual(self.MAIN_GROUP))
+                        )
+                        if borrow_release:
+                            reason = "main 空闲窗口已满（空闲借用回切）"
+                        elif not pool_active:
+                            reason = "池空闲"
+                        else:
+                            reason = "当前端点未开启缓存保护"
                         sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 延迟回切解除（{reason}）", "INFO")
             if released:
                 for grp in self._all_group_names():
