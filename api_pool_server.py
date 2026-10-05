@@ -2846,10 +2846,10 @@ class Endpoint:
     # 依据：该类 400 为上游实例级随机（zdsub2api 2026-09-12 外部实证：同 body 背靠背重放失败率 15–25%）。
     strict400_retries: int = 2
     preserved_thinking: bool = False  # GLM 保留式思考：注入 thinking.clear_thinking=False
-    # 端点级思考映射（2026-10-05）：等级改写 + 关闭思考的落地形态，全部走配置。
-    #   {"map": {"medium": "high", "*": "high"}, "disable": "low"}
-    # 不配 = 完全不干预（既有行为）。
-    reasoning_effort_map: dict | None = None
+    # 端点级思考配置（2026-10-05）：档位就是一张单词替换表（类似敏感词替换）；
+    # 「关闭思考」是一个开关，关闭形态由池按端点自动决定（关不掉的模型折叠成最低档）。
+    reasoning_effort_map: dict | None = None  # {"medium": "high"}：客户端档位 → 本端点发出的档位
+    thinking_disabled: bool = False           # 关闭思考（透传=False / 关闭=True）
     stream_first_packet_timeout: int = 120
     stream_stall_timeout: int = 60
     stream_max_duration: int = 0  # 流总时长上限（秒），0=禁用；正常持续输出默认不截断
@@ -4677,6 +4677,7 @@ class APIPool:
             "reasoning_policy": getattr(ep, "reasoning_policy", "auto"),
             "preserved_thinking": getattr(ep, "preserved_thinking", False),
             "reasoning_effort_map": getattr(ep, "reasoning_effort_map", None),
+            "thinking_disabled": getattr(ep, "thinking_disabled", False),
             "stream_first_packet_timeout": ep.stream_first_packet_timeout,
             "stream_stall_timeout": ep.stream_stall_timeout,
             "stream_max_duration": ep.stream_max_duration,
@@ -6225,82 +6226,111 @@ class APIPool:
         # Kimi/Moonshot、Xiaomi MiMo：与 Hermes 相同的回传校验家族
         return any(k in model or k in base_url for k in ("kimi", "moonshot", "mimo"))
 
-    # 端点级思考映射（2026-10-05 用户定稿）：把「等级改写」与「关闭思考」从按 vendor
-    # 嗅探的硬编码表改为端点配置 `reasoning_effort_map`。
-    # 语义参照 Hermes agent/reasoning_effort.py：档位是字符串、`none` 是「关闭思考」在
-    # 阶梯里的表达、未命中不猜（透传）、映射表按端点声明。
-    #   {"map": {"medium": "high", "*": "high"}, "disable": "low"}
-    # - map：精确命中优先，`*` 兜底，都没有 → 原样透传。
-    # - disable：关闭意图的落地形态
-    #     passthrough=不动 / low=折叠成 enabled+low（GLM 类，思考关不掉）/
-    #     thinking=写 thinking.type=disabled（DeepSeek 类）/ none=用 none 档表达 /
-    #     strip=剥掉（上游会对该字段反向生效，如 agnes 的顶层 thinking）。
-    # 不配 = 完全不干预（既有行为）。
-    _REASONING_OFF_VALUES = frozenset({"disabled", "none", "off"})
-
-    @staticmethod
-    def _mapped_effort(mapping, effort):
-        """按端点映射表求目标档位；无命中且无 `*` 兜底 → None（不改写）。"""
-        if not effort:
-            return None
-        if effort in mapping:
-            return mapping[effort]
-        if "*" in mapping:
-            return mapping["*"]
-        return None
+    # GLM 官方 reasoning_effort 映射（docs.bigmodel.cn 深度思考页，2026-09-08）：
+    # GLM-5.3/5.3-FLASH 标准 API 仅接受 max/high/low，其余报错；GLM-5.2 服务端自动
+    # 映射 medium→high、xhigh→max，透传即可。Coding Plan 语义：low→low，
+    # medium/high→high，xhigh/max→max。
+    _GLM_EFFORT_MAP = {
+        "none": "low", "minimal": "low", "low": "low",
+        "medium": "high", "high": "high",
+        "xhigh": "max", "max": "max",
+    }
+    # GLM-5.3 官方契约：thinking.type 仅支持 enabled —— 思考不可关闭，传 disabled
+    # 直接 400「该模型始终思考，不支持关闭思考；请使用 low、high 或 max」。
+    # 官方迁移建议：原发 {"type":"disabled"} 的调用方改为 {"type":"enabled"} +
+    # reasoning_effort "low"。直连实测（ps.air-outer glm-5.3，2026-09-11）：
+    # disabled / reasoning_effort none / medium 命中同一 400；low 正常。
+    _GLM_DISABLE_THINKING_TYPES = frozenset({"disabled", "none", "off"})
 
     @classmethod
-    def _apply_reasoning_effort_map(cls, payload, ep) -> bool:
-        """端点级思考映射。返回 True = 本次改写由端点配置接管。"""
-        cfg = getattr(ep, "reasoning_effort_map", None)
-        if not isinstance(cfg, dict):
-            return False
-        mapping = cfg.get("map") if isinstance(cfg.get("map"), dict) else {}
-        disable = str(cfg.get("disable") or "").strip().lower() or "passthrough"
+    def _normalize_glm_thinking(cls, payload, ep):
+        """把 GLM-5.3 端点上「关闭思考」的表达折叠成官方允许的形态。
+
+        数据式映射（与 Hermes agent/reasoning_effort.py 的 GLM53/OX_ALPHA 声明
+        同型），不在调用点按 vendor 名散写分支。仅处理显式关闭意图。
+        """
+        model = str(getattr(ep, "model", "") or "").lower()
+        if "glm-5.3" not in model:
+            return
         thinking = payload.get("thinking")
-        effort = str(payload.get("reasoning_effort") or "").strip().lower()
-        target = cls._mapped_effort(mapping, effort)
-        # 「关闭意图」两种来源：客户端用 thinking 表达，或 map 把档位映射成 disabled
-        off_by_thinking = (
-            isinstance(thinking, dict)
-            and str(thinking.get("type") or "").strip().lower() in cls._REASONING_OFF_VALUES
-        ) or payload.get("enable_thinking") is False
-        if not (off_by_thinking or target == "disabled"):
-            if target:
-                payload["reasoning_effort"] = target
-            return True
-        # 关闭意图落地：显式有效档位仍按 map 归一，不降级
-        eff = cls._mapped_effort(mapping, effort) if effort else None
-        if eff == "disabled":
-            eff = None
-        if disable == "low":
-            # 端点关不掉思考（如 GLM）：折叠成 enabled + 最低档
+        if not isinstance(thinking, dict):
+            return
+        if str(thinking.get("type", "") or "").lower() not in cls._GLM_DISABLE_THINKING_TYPES:
+            return
+        payload["thinking"] = {"type": "enabled"}
+        payload.setdefault("reasoning_effort", "low")
+
+    # 思考关不掉的上游（传 disabled 直接 400）：GLM-5.3 官方契约 thinking.type 仅支持
+    # enabled，官方迁移建议 = enabled + reasoning_effort low。
+    _THINKING_UNDISABLABLE = ("glm-5.3",)
+
+    @classmethod
+    def _apply_thinking_config(cls, payload, ep):
+        """端点级思考配置（2026-10-05）：档位单词替换 + 关闭思考。
+
+        - reasoning_effort_map：一张替换表，命中即换（未命中不动）。
+        - thinking_disabled：关闭思考。落地形态由池按端点决定 —— 关不掉的上游
+          折叠成 enabled + 最低档，其余写 thinking.type=disabled 并清掉档位。
+        """
+        mapping = getattr(ep, "reasoning_effort_map", None)
+        if isinstance(mapping, dict) and mapping:
+            effort = str(payload.get("reasoning_effort") or "").strip().lower()
+            if effort and effort in mapping:
+                payload["reasoning_effort"] = mapping[effort]
+        if not getattr(ep, "thinking_disabled", False):
+            return
+        model = str(getattr(ep, "model", "") or "").lower()
+        if any(k in model for k in cls._THINKING_UNDISABLABLE):
             payload["thinking"] = {"type": "enabled"}
-            payload["reasoning_effort"] = eff or "low"
-        elif disable == "thinking":
-            payload["thinking"] = {"type": "disabled"}
-            payload.pop("enable_thinking", None)
-            if eff:
-                payload["reasoning_effort"] = eff
-            elif target == "disabled":
-                payload.pop("reasoning_effort", None)
-        elif disable == "none":
-            payload.pop("thinking", None)
-            payload.pop("enable_thinking", None)
-            payload["reasoning_effort"] = "none"
-        elif disable == "strip":
-            # 上游对该字段反向生效（如 agnes 的顶层 thinking）→ 剥掉
-            payload.pop("thinking", None)
-            payload.pop("enable_thinking", None)
-            if eff:
-                payload["reasoning_effort"] = eff
-            elif target == "disabled":
-                payload.pop("reasoning_effort", None)
+            payload["reasoning_effort"] = "low"
         else:
-            # passthrough：thinking 原样保留（端点自己认得），档位仍按 map 归一
-            if eff:
-                payload["reasoning_effort"] = eff
-        return True
+            payload.pop("reasoning_effort", None)
+            payload["thinking"] = {"type": "disabled"}
+
+    _KIMI_K3_EFFORT_MAP = {
+        "none": "low", "minimal": "low", "low": "low",
+        "medium": "high", "high": "high",
+        "xhigh": "max", "max": "max",
+    }
+    _KIMI_K2_EFFORT_MAP = {
+        "none": "low", "minimal": "low", "low": "low",
+        "medium": "medium", "high": "high",
+        "xhigh": "high", "max": "high",
+    }
+    _DEEPSEEK_V4_EFFORT_MAP = {
+        "none": "low", "minimal": "low", "low": "low",
+        "medium": "medium", "high": "high",
+        "xhigh": "max", "max": "max",
+    }
+
+    @staticmethod
+    def _is_kimi_endpoint(ep):
+        model = str(getattr(ep, "model", "") or "").lower()
+        base_url = str(getattr(ep, "base_url", "") or "").lower()
+        return any(k in model or k in base_url for k in ("kimi", "moonshot"))
+
+    @staticmethod
+    def _is_kimi_k3_model(model):
+        """匹配 k3、k3-*、kimi-k3*，但不误判 kimi-k2.6。"""
+        return re.search(r"(?:^|[^a-z0-9])k3(?:[^a-z0-9]|$)", model) is not None
+
+    @classmethod
+    def _map_reasoning_effort(cls, payload, ep):
+        """按端点模型/家族改写或剔除顶层 reasoning_effort。仅处理显式值。"""
+        if "reasoning_effort" not in payload:
+            return
+        effort = str(payload.get("reasoning_effort") or "").strip().lower()
+        model = str(getattr(ep, "model", "") or "").lower()
+        if "glm-5.3" in model:
+            payload["reasoning_effort"] = cls._GLM_EFFORT_MAP.get(effort, "high")
+        elif "glm" in model and "glm-5.2" not in model:
+            # glm-4.x 等不支持该参数的 GLM 模型：剔除，交服务端默认
+            payload.pop("reasoning_effort", None)
+        elif cls._is_kimi_endpoint(ep):
+            mapping = cls._KIMI_K3_EFFORT_MAP if cls._is_kimi_k3_model(model) else cls._KIMI_K2_EFFORT_MAP
+            payload["reasoning_effort"] = mapping.get(effort, "high")
+        elif cls._is_deepseek_endpoint(ep) and "deepseek-v3" not in model:
+            payload["reasoning_effort"] = cls._DEEPSEEK_V4_EFFORT_MAP.get(effort, "high")
 
     _REASONING_PLACEHOLDER = " "  # tool-call 轮次的空 reasoning 占位（上游要求非空回传）
 
@@ -6308,7 +6338,7 @@ class APIPool:
     def _captured_reasoning_effort(payload, ep):
         """本次实际发给上游的推理强度档位（第1层出站真值，2026-09-27）。
 
-        - openai/GLM/deepseek 等：payload 已过 _apply_reasoning_effort_map 改写 → 取 reasoning_effort。
+        - openai/GLM/deepseek 等：payload 已过 _map_reasoning_effort 改写 → 取 reasoning_effort。
         - anthropic：无 reasoning_effort，改看 thinking 是否启用（启用→'on'）。
         - 未设置/被剔除 → None（UI 显示 —，真实反映未启用推理配置）。
         """
@@ -6652,17 +6682,21 @@ class APIPool:
                 "model": ep_model, "messages": loop_messages,
                 **(extra_payload or {}),
             }
-            # 端点级思考映射（2026-10-05）：等级改写与「关闭思考」由端点配置
-            # `reasoning_effort_map` 决定；未配置 = 原样透传（不再按 vendor 嗅探）。
+            # GLM 系列推理强度适配：reasoning_effort 按官方映射改写/剔除；
             # preserved_thinking 开关：注入 clear_thinking=False 开启保留式思考
             if not is_anthropic:
-                self._apply_reasoning_effort_map(payload, ep)
+                self._map_reasoning_effort(payload, ep)
                 if getattr(ep, "preserved_thinking", False):
                     t = payload.get("thinking")
                     if isinstance(t, dict):
                         t["clear_thinking"] = False
                     else:
                         payload["thinking"] = {"type": "enabled", "clear_thinking": False}
+                # GLM-5.3 思考不可关闭：客户端/nightly LLM 下发的 disabled 在这里
+                # 折叠为官方形态（enabled + effort low），避免上游 400。
+                self._normalize_glm_thinking(payload, ep)
+                # 端点级思考配置（2026-10-05）：档位替换 + 关闭思考，覆盖在上面之上
+                self._apply_thinking_config(payload, ep)
             
             # [VISION TRANSLATION INTERCEPT]
             if self._has_images(payload["messages"]) and getattr(ep, "is_vision", True) is False:
@@ -7151,7 +7185,7 @@ class APIPool:
         pool_group=None, reset_cached_stats=False, request_id=None, request_deadline=None,
     ):
         req_t0 = time.time()
-        # 推理强度（第1层出站真值，2026-09-27）：payload 已过 _apply_reasoning_effort_map 家族改写，
+        # 推理强度（第1层出站真值，2026-09-27）：payload 已过 _map_reasoning_effort 家族改写，
         # 此处取的是「池实际发给上游的档位」，非客户端原始值、非上游内部实际强度。
         # anthropic 端点无 reasoning_effort 概念，改用 thinking 是否启用作为强度标记（thinking→'on'）。
         log_reasoning_effort = self._captured_reasoning_effort(payload, ep)
