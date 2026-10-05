@@ -20,6 +20,14 @@
 
 ## 🎯 里程碑
 
+- 2026-10-06 wkm 积分徽标（纯展示层）：端点 api_key=wbk_* 自动识别 workbuddy manager，
+  WKM_TOKEN（readonly wbt_ 令牌，存 /opt/data/.env，经 systemd EnvironmentFile 注入）
+  轮询 /api/keys+/api/accounts，5 分钟 TTL，直连不走代理。限额 key=quota_credit-used_credit
+  (kind=key)；不限额=该 realm 账号池积分和 (kind=pool)。聚合池成员卡替换原 🔗N组 徽标、
+  main 子组聚合条目显示当前端点读数（/api/chain groups.current_credit）；不进路由/不触冷却/
+  拉取失败保留旧读数。坑：生产是 APIPool() 无参构造+模块级补加端点，线程须延后首刷
+  （_credit_loop 先 sleep 15），否则首刷池空、白等一个 TTL。测试 522 例=基线（2 既有 openai 导入 error）。
+
 ### 已完成
 
 - [x] **聚合链组内排序与分组联动（2026-09-12）** — 聚合链顺序及优先级徽标统一读取当前组 `priority_by_group`；聚合池切组同步聚合链，后者保留独立选择。组实体提供空组/全禁用组标签。本地快照热更新，前端 hash `bb2f2c06`；`node test/test_chain_group_ui.js` 及生产七组快照对照通过。

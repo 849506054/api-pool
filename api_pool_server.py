@@ -67,6 +67,12 @@ _POOL_INITIATED_CTX = threading.local()   # 池自身发起的请求标记（伤
 # 该类 400 是上游实例级随机故障，隔开一点再打命中率更高；测试可置 0 免等待。
 _STRICT400_BACKOFF_MS = (300, 800)
 
+# wkm 积分展示（2026-10-06）：workbuddy manager 管理面只读令牌（设置页「访问令牌」签发，
+# scope=readonly）。仅当 WKM_TOKEN 存在时启用积分线程；端点按 base_url 自动识别 wkm
+# （api_key 以 wbk_ 开头）。纯展示层：不进路由、不触冷却、拉取失败不标端点异常。
+WKM_TOKEN = os.environ.get("WKM_TOKEN", "").strip()
+WKM_CREDIT_TTL = 300.0   # 积分刷新周期（秒）；wkm 侧账号积分本身有缓存口径，无需更快
+
 
 class PoolIdentityUnavailable(RuntimeError):
     """池自身出站解析不到可用客户端身份 → 调用方必须跳过本次出站（不改任何端点状态）。"""
@@ -2944,12 +2950,20 @@ class APIPool:
         self._probe_inflight = set()  # 正在探活的端点 id 集合（后台/批量探活共享，防重复请求）
         self._health_check_lock = threading.Lock()  # 防止多个全量探活批次重叠
         self._health_probe_max_workers = 2  # chat/models 探针会消耗上游并发与额度
+        # wkm 积分展示（2026-10-06）：端点 api_key 以 wbk_ 开头 → 自动从 workbuddy manager
+        # 拉该密钥的积分余额（限额 key 现剩 = quota_credit-used_credit；不限额 key 显示其
+        # realm 账号池积分总和，语义为池级）。令牌走 WKM_TOKEN env，无令牌则整层静默关闭。
+        # 纯展示层：不进路由、不触冷却、失败不影响端点健康。
+        self._credit_cache: dict[str, dict] = {}
         if endpoints:
             for ep in endpoints:
                 # 批量加载：逐次 add 不做组内重排（增量重排以加载顺序为 tiebreak，
                 # 会覆盖 config 已保存的组内优先级——2026-09-07 修复），循环后统一一次。
                 self.add_endpoint(ep, renumber=False)
             self._renumber_pool_priorities()
+        # 积分线程在端点加载完成后启动（否则首刷时池为空，白等一个 TTL）
+        if WKM_TOKEN:
+            threading.Thread(target=self._credit_loop, daemon=True).start()
 
     def add_endpoint(self, ep, renumber=True):
         if isinstance(ep, dict):
@@ -4703,7 +4717,84 @@ class APIPool:
             "health_latency_ms": ep._health_latency_ms,
             "health_last_check": ep._health_last_check,
             "health_error": ep._health_error,
+            "credit": self._credit_view(ep),
         }
+
+    def _credit_probe(self, base_origin: str, path: str) -> object:
+        """打 wkm 管理面（剥掉 /v1 的 origin + Bearer 令牌）。失败抛异常，由调用方吞掉。"""
+        req = urllib.request.Request(base_origin + path, headers={
+            "Authorization": "Bearer " + WKM_TOKEN,
+            "Accept": "application/json",
+        })
+        # 内网直连（同池内 use_proxy=False 形态）：wkm 是局域网 http，绕开系统代理，
+        # 也避免 ProxyHandler 对 CIDR 形态 no_proxy 的兼容性问题。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=8) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    def _refresh_wkm_credits(self):
+        """刷新所有 wkm 端点的积分读数。按 manager origin 分组，各拉一次 keys+accounts。
+
+        读数语义：
+        - 限额 key（quota_credit>0）：现剩 = quota_credit - used_credit（key 级，精确）
+        - 不限额 key（quota_credit=0）：显示该 key realm 的账号池积分总和（池级，
+          是「还能不能放心跑」的真实约束；账号积分由 wkm 侧刷新，有缓存口径）
+        """
+        origins: set[str] = set()
+        for ep in self._endpoints:
+            if not (ep.api_key or "").startswith("wbk_"):
+                continue
+            root = (ep.base_url or "").rstrip("/")
+            if root.lower().endswith("/v1"):
+                root = root[:-3]
+            if root.startswith(("http://", "https://")):
+                origins.add(root)
+        if not origins:
+            return
+        for root in origins:
+            try:
+                keys = self._credit_probe(root, "/api/keys")
+                accounts = self._credit_probe(root, "/api/accounts")
+            except Exception as exc:
+                sys_log(f"wkm 积分拉取失败 {root}: {type(exc).__name__}（保留上次读数）", "WARN")
+                continue
+            acct = accounts.get("accounts") if isinstance(accounts, dict) else None
+            realm_sum: dict[str, float] = {}
+            for a in acct or []:
+                if isinstance(a, dict):
+                    realm_sum[a.get("realm") or "cn"] = realm_sum.get(a.get("realm") or "cn", 0.0) + float(a.get("credits") or 0)
+            now = time.time()
+            for k in keys if isinstance(keys, list) else []:
+                prefix = str(k.get("prefix") or "")
+                if len(prefix) < 8:
+                    continue
+                quota_c = float(k.get("quota_credit") or 0)
+                used_c = float(k.get("used_credit") or 0)
+                realm = k.get("realm") or "both"
+                if quota_c > 0:
+                    entry = {"kind": "key", "remaining": round(quota_c - used_c, 1)}
+                else:
+                    total = sum(realm_sum.values()) if realm == "both" else realm_sum.get(realm, 0.0)
+                    entry = {"kind": "pool", "realm": realm, "remaining": round(total, 1)}
+                self._credit_cache[prefix] = dict(entry, ts=now)
+
+    def _credit_view(self, ep) -> dict | None:
+        """端点卡徽标读数：wbk_ 密钥命中的积分；无数据返回 None（不显示徽标）。"""
+        if not (ep.api_key or "").startswith("wbk_"):
+            return None
+        hit = self._credit_cache.get(ep.api_key[:12])
+        return dict(hit) if hit else None
+
+    def _credit_loop(self):
+        # 生产是 APIPool() 无参构造、端点在模块级稍后补加：等引导完成再首刷，
+        # 否则第一刷池为空、白等一个 TTL。
+        time.sleep(15)
+        while True:
+            try:
+                self._refresh_wkm_credits()
+            except Exception as exc:  # 展示层永不冒泡
+                sys_log(f"wkm 积分线程异常: {type(exc).__name__}", "WARN")
+            time.sleep(WKM_CREDIT_TTL)
 
     def _joined_subgroup_chain_entries(self, now):
         """已加入 main 的子组 → 聚合链条目（2026-09-27）。
@@ -9199,6 +9290,9 @@ def api_handler(method, path, body):
             group_summary[grp] = {
                 "current_endpoint": cur_ep.name if cur_ep else None,
                 "current_endpoint_id": cur,
+                # wkm 积分（2026-10-06）：该组当前端点的 key 读数，main 列表的子组聚合
+                # 条目据此显示「当前使用端点」的积分。非 wkm 端点/无数据 = None。
+                "current_credit": pool._credit_view(cur_ep) if cur_ep else None,
                 # main 当前命中的已加入子组名（None=命中原生端点或空）
                 "current_subgroup": cur_sub,
                 # 整组 fallback 锁剩余秒数（>0 = 该组正借道 main，UI 显示 ↩main）

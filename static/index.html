@@ -937,6 +937,15 @@ function setPoolGroupFilter(g){
   if(Array.isArray(poolSnapshot.endpoints))renderPoolList(poolSnapshot.endpoints);
   setChainGroupFilter(poolGroupFilter);
 }
+// wkm 积分徽标（2026-10-06）：图标沿用 wkm 积分页的 lucide coins 内联 SVG。
+// kind=key=限额密钥现剩；kind=pool=不限额密钥对应 realm 账号池积分总和。
+const WKM_COINS_SVG='<svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px"><path d="M13.744 17.736a6 6 0 1 1-7.48-7.48"/><path d="M15 6h1v4"/><path d="m6.134 14.768.866-.5 2 3.464"/><circle cx="16" cy="8" r="6"/></svg>';
+function wkmCreditBadge(c){
+  if(!c||!c.remaining&&c.remaining!==0)return '';
+  const v=c.remaining>=1000?(c.remaining/1000).toFixed(1)+'k':Math.round(c.remaining);
+  const title=c.kind==='pool'?`不限额密钥·${esc(c.realm||'')}${c.realm==='global'?'（国际版）':(c.realm==='cn'?'（国内版）':'')}账号池积分合计 ${c.remaining}`:`密钥剩余积分 ${c.remaining}`;
+  return `<span class="badge" style="background:rgba(255,204,0,.12);color:#ffd60a;font-size:10px;padding:1px 5px" title="${title}">${WKM_COINS_SVG}${v}</span>`;
+}
 
 function renderPoolList(eps){
   const poolEps=eps.filter(e=>e.in_pool).sort((a,b)=>a.priority-b.priority);
@@ -985,7 +994,7 @@ function renderPoolList(eps){
         <div style="display:flex;align-items:center;gap:6px;min-width:0">
           <span class="badge badge-priority">#${prioOf(ep)}</span>
           <span style="font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(ep.name)}</span>
-          ${(ep.pool_groups&&ep.pool_groups.length>1)?`<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;font-size:9px;padding:1px 5px" title="跨组共享：${esc(ep.pool_groups.join(', '))}">🔗${ep.pool_groups.length}组</span>`:''}
+          ${wkmCreditBadge(ep.credit)}
           ${ep.billing_mode==='pay_per_use'?`<span class="badge" style="background:rgba(255,159,10,.15);color:#ff9f0a;font-size:10px;padding:1px 5px" title="按次计费">💰按次</span>`:''}
         </div>
         <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
@@ -1080,6 +1089,7 @@ function joinedSubgroupCard(g,groupsInfo,maxP){
       <div style="display:flex;align-items:center;gap:6px;min-width:0">
         <span class="badge badge-priority">#${g.main_priority}</span>
         <span style="font-weight:700;font-size:13px;letter-spacing:.5px;color:#a5b4fc;text-transform:uppercase;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(g.name)}</span>
+        ${wkmCreditBadge((window._poolGroups||{})[g.name]&&window._poolGroups[g.name].current_credit)}
       </div>
       <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
         ${hit?`<span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="main 当前正使用该子组的端点：${cur}">● 当前</span>`:''}
