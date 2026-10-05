@@ -303,7 +303,7 @@ class GroupManagementTests(unittest.TestCase):
             self.assertEqual(restarted.pool._group_defs["bg"], {"type": "mixed", "model": "api-pool-bg"})
             self.assertEqual(endpoint.priority_by_group["bg"], 1)
             self.assertEqual(restarted.pool._get_current("bg"), "b1")
-            self.assertEqual(restarted.pool._get_manual("bg"), "b1")
+            self.assertIsNone(restarted.pool._get_manual("bg"))  # 重启=还原状态，非手动指定
             self.assertEqual(restarted.pool._get_persisted("bg"), "b1")
 
     def test_zero_member_group_is_visible_in_group_apis(self):

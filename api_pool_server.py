@@ -4499,8 +4499,11 @@ class APIPool:
             if self._is_ep_sticky_elsewhere(ep, group):
                 # main 占用中：本次剔除；同时按「延迟回迁」机制挂 defer（滚动续期见
                 # _reconcile_deferred）——main 空闲窗口满足后由它释放，统一走那条
-                # 「释放即回切到组内最优端点」的尾巴。窗口未启用 / 本组被手动钉住时不挂。
-                if self._group_idle_seconds(self.MAIN_GROUP) and not self._get_manual(group):
+                # 「释放即回切到组内最优端点」的尾巴。
+                # 手动钉住不阻止挂（2026-10-05 A 口径，与轮换一致：手动是那一刻的动作，
+                # 组配了空闲借用就按配置推进；回切时清除该组锁定）。配了轮换的组不挂——
+                # 轮换本就是组内循环意图，回切会与它互相拉锯。
+                if self._group_idle_seconds(self.MAIN_GROUP) and not self._group_rotate_requests(group):
                     ep._defer_until_by_group[group] = time.time() + 300
                 continue
             if self._is_ep_inflight_elsewhere(ep, group):
@@ -5633,6 +5636,7 @@ class APIPool:
                 for grp, eid in current_by_group.items() if eid
             }
             released = []  # [(ep, grp)]
+            borrow_released = set()  # 空闲借用回切：该组的锁定允许被清除（A 口径，同轮换）
             for ep in self._endpoints:
                 if not ep.in_pool or not ep._defer_until_by_group:
                     continue
@@ -5661,6 +5665,7 @@ class APIPool:
                         )
                         if borrow_release:
                             reason = "main 空闲窗口已满（空闲借用回切）"
+                            borrow_released.add(grp)
                         elif not pool_active:
                             reason = "池空闲"
                         else:
@@ -5668,11 +5673,16 @@ class APIPool:
                         sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 延迟回切解除（{reason}）", "INFO")
             if released:
                 for grp in self._all_group_names():
-                    if self._get_manual(grp):
+                    if self._get_manual(grp) and grp not in borrow_released:
                         continue
                     group_eps = [e for e, g in released if g == grp]
                     if group_eps:
                         best = min(group_eps, key=lambda e: self._ep_priority(e, grp))
+                        if grp in borrow_released and self._get_manual(grp):
+                            # 空闲借用回切按配置推进（2026-10-05 A 口径，与轮换一致）：
+                            # 手动的锁定由本次回切清除（_set_manual 推进 route epoch，
+                            # 在途旧请求的成功回调不会覆盖）
+                            self._set_manual(grp, None)
                         self._set_current(grp, best.id)
 
     def _failover_endpoints(self):
@@ -8834,10 +8844,10 @@ if isinstance(restored_groups, dict):
             None,
         )
         if restored_endpoint is not None:
-            # 重启恢复的是"当前端点"而非一次性首请求偏好。复用手动覆盖路径，
-            # 直到该端点失败/进入冷却或用户主动切换，才允许离开该端点。
+            # 重启恢复的是「当前端点」这个状态：只还原指针，**不写 manual** ——
+            # 重启是还原重启前的状态，不是用户手动指定（manual 只记用户显式动作）。
+            # 此前用 manual 承载恢复态，会让轮换/空闲借用回切被静默挡住。
             pool._set_current(grp, restored_endpoint.id)
-            pool._set_manual(grp, restored_endpoint.id)
             pool._set_persisted(grp, restored_endpoint.id)
         else:
             sys_log(f"组 '{grp}' 的恢复端点 {ep_id} 不存在或不可用，忽略", "WARN", group=grp)

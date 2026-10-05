@@ -216,20 +216,40 @@ class IdleBorrowTests(unittest.TestCase):
             pool._reconcile_deferred()
             self.assertEqual(pool._get_current("bg"), "b1")
 
-    def test_manual_pin_creates_no_defer(self):
+    def test_manual_pin_does_not_block_defer_and_is_cleared_on_return(self):
+        """A 口径（同轮换）：手动钉住不阻止挂 defer；回切时清除该组锁定并落指针到被借端点。"""
         with tempfile.TemporaryDirectory() as tmp:
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
             pool._set_group_idle_seconds("main", 600)
             pool._set_current("bg", "b1")
-            pool._set_manual("bg", "b2")  # 用户手动钉住本组
+            b1 = next(e for e in pool._endpoints if e.id == "b1")
+            b1.deferrable = False
+            pool._set_manual("bg", "b2")  # 开机恢复/用户手动：本组被钉在 b2
             shared._last_success_ts = time.time() - 60
 
             pool._group_sticky_candidates("bg")
-            self.assertEqual(shared._defer_until_by_group, {})  # 用户意图优先，不挂
-            pool._set_manual("bg", None)
+            self.assertIn("bg", shared._defer_until_by_group)  # 锁定不阻止挂
+
+            shared._last_success_ts = time.time() - 700  # main 空闲窗口满足
             pool._reconcile_deferred()
-            self.assertEqual(pool._get_current("bg"), "b1")
+            self.assertEqual(pool._get_current("bg"), "shared")  # 回切
+            self.assertIsNone(pool._get_manual("bg"))  # 锁定被回切清除（同轮换 A 口径）
+
+    def test_rotate_enabled_group_does_not_mount_defer(self):
+        """配了轮换的组不挂 defer：轮换本就是组内循环意图，回切会与之拉锯。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module(tmp)
+            pool, shared = self.make_pool(module)
+            pool._group_defs["bg"] = {"type": "mixed", "model": "bg"}  # 组实体（否则组级字段无处落）
+            pool._set_group_idle_seconds("main", 600)
+            pool._set_group_rotate_requests("bg", 5)
+            self.assertEqual(pool._group_rotate_requests("bg"), 5)  # 前置条件自检
+            pool._set_current("bg", "b1")
+            shared._last_success_ts = time.time() - 60
+
+            pool._group_sticky_candidates("bg")
+            self.assertEqual(shared._defer_until_by_group, {})
 
 
 if __name__ == "__main__":
