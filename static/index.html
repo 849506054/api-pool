@@ -168,11 +168,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .form-row.form-row-stream{grid-template-columns:repeat(3,1fr)}
 /* 端点级思考映射编辑器（2026-10-05） */
 .rmap{margin-top:2px}
+.rmap-hint{font-size:11px;color:var(--text-dim);margin-bottom:6px;line-height:1.5}
 .rmap-rows{display:flex;flex-direction:column;gap:5px;margin-bottom:6px}
 .rmap-row{display:flex;align-items:center;gap:7px}
 .rmap-row select{flex:1 1 auto;min-width:0}
+.rmap-tag{font-size:10px;color:var(--text-dim);flex:0 0 auto;white-space:nowrap}
 .rmap-arrow{color:var(--text-dim);font-size:12px;flex:0 0 auto}
+.rmap-empty{font-size:11px;color:var(--text-dim);padding:2px 0 6px}
 .rmap-del{flex:0 0 auto;padding:3px 8px}
+.rmap-add{margin-bottom:8px}
 .rmap-foot{display:flex;gap:14px;flex-wrap:wrap;align-items:center}
 .rmap-inline{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:500;color:var(--text-dim);text-transform:none;letter-spacing:0;margin:0}
 .rmap-inline select{font-size:11px}
@@ -633,7 +637,7 @@ select option { background: var(--bg); color: var(--text); }
       <div class="form-group"><label title="开启后，限流类错误（429 / too_many_requests / exceeded rate limit）先在原端点退避重试，重试次数用「额外重试次数」，耗尽才冷却并轮转；关闭=限流即轮转">限流优先重试</label><select id="fRateRetry"><option value="false">关闭</option><option value="true">开启</option></select></div>
     </div>
     <div class="form-row form-row-capability">
-      <div class="form-group" style="grid-column:1/-1"><label title="把客户端发来的思考档位改成上游认得的档位（如 GLM 不认 medium → 改成 high）；右侧设置客户端要关闭思考时怎么办。留空 = 不做任何改写">思考映射</label><div class="rmap"><div class="rmap-rows" id="rmapRows"></div><div class="rmap-foot"><button type="button" class="btn-ghost btn-sm" onclick="rmapRowsAdd('medium','high')">+ 添加映射</button><label class="rmap-inline">客户端要关闭思考时<select id="rmapDisable"><option value="">不处理</option><option value="thinking">改成 thinking.type=disabled</option><option value="low">折叠成最低档（上游关不掉）</option><option value="none">改成 none 档</option><option value="strip">剥掉该字段</option></select></label></div></div></div>
+      <div class="form-group" style="grid-column:1/-1"><label title="客户端发给池的思考档位 → 本端点实际发给上游的档位。表里没列出的档位按「其它档位」处理；「关闭思考」单独设置。全部留默认 = 不做任何改写（原样透传）">思考映射</label><div class="rmap"><div class="rmap-hint">客户端发来的档位 → 本端点实际发给上游的档位；没列的走「其它档位」。全部留默认 = 不做任何改写。</div><div class="rmap-empty" id="rmapEmpty">当前未配置：思考参数原样透传给上游。</div><div class="rmap-rows" id="rmapRows"></div><button type="button" class="btn-ghost btn-sm rmap-add" onclick="rmapRowsAdd('medium','high')">+ 添加档位映射</button><div class="rmap-foot"><label class="rmap-inline">其它档位<select id="rmapFallback" onchange="rmapEmptySync()"><option value="">原样透传</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="max">max</option></select></label><label class="rmap-inline">客户端要关闭思考时<select id="rmapDisable" onchange="rmapEmptySync()"><option value="passthrough">原样传给上游</option><option value="low">折叠成最低档（上游关不掉，如 GLM）</option><option value="thinking">改写成 thinking.type=disabled</option><option value="none">改用 none 档</option><option value="strip">剥掉该字段</option></select></label></div></div></div>
     </div>
     <div class="form-row form-row-capability">
       <div class="form-group"><label title="底层协议类型">协议类型</label><select id="fProtocol"><option value="openai">OpenAI 兼容</option><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic</option><option value="gemini">Gemini 兼容</option></select></div>
@@ -1719,7 +1723,7 @@ async function testSelectedVision(){
 function openAddModal(){
     document.getElementById('editName').value='';document.getElementById('modalTitle').textContent='添加端点';
     ['fName','fSiteName','fUrl','fKey','fModel','fUserAgent'].forEach(id=>document.getElementById(id).value='');document.getElementById('fClientProfile').value='';syncProfileUAField();
-    document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fDeferrable').value='true';document.getElementById('fMaxContext').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='false';document.getElementById('fFakeCheck').value='false';document.getElementById('fToolCallPrefix').value='';document.getElementById('fReasoningPolicy').value='auto';rmapSet({},'');document.getElementById('fPreservedThinking').value='false';document.getElementById('fStreamFirstPacket').value=120;document.getElementById('fStreamStall').value=60;document.getElementById('fStreamMaxDuration').value=0;document.getElementById('fRateRetry').value='false';
+    document.getElementById('fTimeout').value=60;document.getElementById('fRetries').value=0;document.getElementById('fCooldown').value=5;document.getElementById('fDeferrable').value='true';document.getElementById('fMaxContext').value=0;document.getElementById('fProxy').value='false';document.getElementById('fProtocol').value='openai';document.getElementById('fHealthMode').value='chat';document.getElementById('fBillingMode').value='subscription';document.getElementById('fVision').value='false';document.getElementById('fFakeCheck').value='false';document.getElementById('fToolCallPrefix').value='';document.getElementById('fReasoningPolicy').value='auto';rmapSet({},'','passthrough');document.getElementById('fPreservedThinking').value='false';document.getElementById('fStreamFirstPacket').value=120;document.getElementById('fStreamStall').value=60;document.getElementById('fStreamMaxDuration').value=0;document.getElementById('fRateRetry').value='false';
     document.getElementById('modelBrowser').style.display='none';document.getElementById('batchBar').style.display='none';
     document.getElementById('fetchModelsBtn').disabled=true;document.getElementById('batchAddBtn').style.display='none';document.getElementById('singleAddBtn').style.display='inline-flex';
     allModels=[];selectedModels=new Set();latencyResults={};visionResults={};_origDraft=null;
@@ -2026,29 +2030,45 @@ const RMAP_EFFORTS=['none','minimal','low','medium','high','xhigh','max'];
 function rmapOpts(sel,val){RMAP_EFFORTS.forEach(e=>{const o=document.createElement('option');o.value=e;o.textContent=e;sel.appendChild(o);});if(val)sel.value=val;return sel;}
 function rmapRowsAdd(k,v){
   const wrap=document.getElementById('rmapRows');const row=document.createElement('div');row.className='rmap-row';
+  const t1=document.createElement('span');t1.className='rmap-tag';t1.textContent='客户端';row.appendChild(t1);
   const s=rmapOpts(document.createElement('select'),k||'medium');s.dataset.role='src';row.appendChild(s);
   const a=document.createElement('span');a.className='rmap-arrow';a.textContent='→';row.appendChild(a);
+  const t2=document.createElement('span');t2.className='rmap-tag';t2.textContent='本端点发';row.appendChild(t2);
   const d=rmapOpts(document.createElement('select'),v||'high');d.dataset.role='dst';row.appendChild(d);
-  const del=document.createElement('button');del.type='button';del.className='btn-ghost btn-sm rmap-del';del.textContent='✕';del.title='删除这条映射';
-  del.onclick=()=>row.remove();row.appendChild(del);
+  const del=document.createElement('button');del.type='button';del.className='btn-ghost btn-sm rmap-del';del.textContent='✕';del.title='删除这行映射';
+  del.onclick=()=>{row.remove();rmapEmptySync();};row.appendChild(del);
   wrap.appendChild(row);
+  rmapEmptySync();
 }
-function rmapSet(map,disable){
+function rmapEmptySync(){
+  const wrap=document.getElementById('rmapRows'),el=document.getElementById('rmapEmpty');
+  const fb=document.getElementById('rmapFallback').value,dis=document.getElementById('rmapDisable').value;
+  const idle=!wrap.children.length && !fb && (!dis||dis==='passthrough');
+  if(el)el.style.display=idle?'block':'none';
+}
+function rmapSet(map,fallback,disable){
   document.getElementById('rmapRows').innerHTML='';
   Object.entries(map||{}).forEach(([k,v])=>{if(k!=='*')rmapRowsAdd(k,v);});
-  document.getElementById('rmapDisable').value=disable||'';
+  document.getElementById('rmapFallback').value=fallback||'';
+  document.getElementById('rmapDisable').value=disable||'passthrough';
+  rmapEmptySync();
 }
-function rmapLoad(cfg){const c=(cfg&&typeof cfg==='object')?cfg:{};rmapSet(c.map,c.disable);}
+function rmapLoad(cfg){
+  if(!cfg||typeof cfg!=='object'){rmapSet({},'','passthrough');return;}
+  const m=cfg.map&&typeof cfg.map==='object'?cfg.map:{};
+  rmapSet(m,m['*']||'',cfg.disable||'passthrough');
+}
 function rmapCollect(){
   const map={};
   document.querySelectorAll('#rmapRows .rmap-row').forEach(r=>{
     const k=r.querySelector('[data-role=src]').value,d=r.querySelector('[data-role=dst]').value;
     if(k&&d)map[k]=d;
   });
-  const dis=document.getElementById('rmapDisable').value;
+  const fb=document.getElementById('rmapFallback').value;if(fb)map['*']=fb;
+  const dis=document.getElementById('rmapDisable').value||'passthrough';
   const out={};
   if(Object.keys(map).length)out.map=map;
-  if(dis)out.disable=dis;
+  if(dis!=='passthrough')out.disable=dis;
   return Object.keys(out).length?out:null;   // 什么都没配 = 不干预
 }
 let _origDraft=null; // 编辑模式打开时的表单快照；仅提交与之不同的字段，未改字段不更新
