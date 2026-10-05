@@ -815,8 +815,11 @@ function renderFilterBar(eps){
   if(epVendorFilter!=='all'&&!eps.some(e=>vendorOf(e.model)===epVendorFilter))epVendorFilter='all';
   const siteNames=[...sites.keys()];
   if(epFilter!=='all'&&epFilter!==ABN_FILTER&&!siteNames.includes(epFilter))siteNames.push(epFilter);
-  siteNames.sort((a,b)=>a.localeCompare(b));
-  const vendorNames=[...vendors.entries()].sort((a,b)=>(a[0]==='其他')-(b[0]==='其他')||b[1]-a[1]||a[0].localeCompare(b[0]));
+  /* 2026-10-05：筛选按钮按显示文本首字母排序（原按 host 排，而标签显示的是别名，视觉错位） */
+  const siteLabel=s=>String(epSiteAlias(eps,s)||s);
+  siteNames.sort((a,b)=>siteLabel(a).localeCompare(siteLabel(b),undefined,{numeric:true})||a.localeCompare(b));
+  /* 2026-10-05：按名称首字母排序（原按数量降序） */
+  const vendorNames=[...vendors.entries()].sort((a,b)=>a[0].localeCompare(b[0],undefined,{numeric:true})||b[1]-a[1]);
   if(epVendorFilter!=='all'&&!vendors.has(epVendorFilter))vendorNames.push([epVendorFilter,0]);
   /* 「全部」按钮的计数 = 维度条数（厂商数/站点数），不是端点计数：
      端点总数已由右侧 filterCount 单独显示，两者语义不重叠。 */
