@@ -162,4 +162,16 @@ pool2.add_endpoint({"name": "t2", "base_url": "https://x/v1", "api_key": "k", "m
 d2 = [x for x in pool2.list_endpoints() if x["name"] == "t2"][0]
 assert d2["thinking_disabled"] is True and d2["reasoning_effort_map"] == {"medium": "high"}, d2
 
+# 10) 配置优先：端点配了替换表 → 家族写死逻辑跳过，由端点配置接管（漏网之鱼）
+p = {"reasoning_effort": "medium"}
+e_cfg = ep("glm-5.3", reasoning_effort_map={"medium": "high"})
+APIPool._map_reasoning_effort(p, e_cfg)
+assert p["reasoning_effort"] == "medium", p      # 家族逻辑已跳过（否则这里会是 high）
+APIPool._apply_thinking_config(p, e_cfg)
+assert p["reasoning_effort"] == "high", p         # 由端点配置改写
+# 未配置的端点：仍走原家族兜底
+p = {"reasoning_effort": "medium"}
+APIPool._map_reasoning_effort(p, ep("glm-5.3"))
+assert p["reasoning_effort"] == "high", p
+
 print("ALL ASSERTS PASSED")

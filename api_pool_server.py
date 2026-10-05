@@ -6316,7 +6316,13 @@ class APIPool:
 
     @classmethod
     def _map_reasoning_effort(cls, payload, ep):
-        """按端点模型/家族改写或剔除顶层 reasoning_effort。仅处理显式值。"""
+        """按端点模型/家族改写或剔除顶层 reasoning_effort。仅处理显式值。
+
+        端点配了 reasoning_effort_map 时由端点配置接管（见 _apply_thinking_config），
+        这里跳过家族写死逻辑；未配置的端点仍按原家族表兜底。
+        """
+        if getattr(ep, "reasoning_effort_map", None):
+            return
         if "reasoning_effort" not in payload:
             return
         effort = str(payload.get("reasoning_effort") or "").strip().lower()
