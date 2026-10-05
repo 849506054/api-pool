@@ -2857,6 +2857,7 @@ class Endpoint:
     _cooldown_reason: str = field(default="", repr=False)
     _manual_unlock_required: bool = field(default=False, repr=False)
     _defer_until_by_group: dict[str, float] = field(default_factory=dict, repr=False)  # 延迟回迁到期时间（按组）；该组在此期间不主动回迁到此端点
+    _defer_borrow_by_group: set[str] = field(default_factory=set, repr=False)  # 其中因「借用避让」而挂的组：释放判据看接手端点自身空闲
     
     health_mode: str = field(default="models")
     billing_mode: str = field(default="subscription")
@@ -4504,6 +4505,7 @@ class APIPool:
                 # 轮换的组不挂（轮换是组内循环意图，回切会与之互相拉锯）。
                 if self._group_idle_seconds(self.MAIN_GROUP) and not self._group_rotate_requests(group):
                     ep._defer_until_by_group[group] = time.time() + 300
+                    ep._defer_borrow_by_group.add(group)  # 借用避让型：判据=接手端点自身空闲
                 continue
             if self._is_ep_inflight_elsewhere(ep, group):
                 continue
@@ -5200,9 +5202,11 @@ class APIPool:
         """清除延迟回切：groups=None 清全部组；否则只清指定组。"""
         if groups is None:
             ep._defer_until_by_group.clear()
+            ep._defer_borrow_by_group.clear()
         else:
             for grp in groups:
                 ep._defer_until_by_group.pop(grp, None)
+                ep._defer_borrow_by_group.discard(grp)
 
     @staticmethod
     def _defer_remaining_max(ep, now=None):
@@ -5625,11 +5629,11 @@ class APIPool:
         if now is None:
             now = time.time()
         with self._lock:
-            pool_active = self._last_pool_activity > now - defer_window
             current_by_group = {
                 grp: (self._manual_override_by_group.get(grp) or self._current_endpoint_by_group.get(grp))
                 for grp in self._all_group_names()
             }
+            released = []  # [(ep, grp)]
             current_eps = {
                 grp: next((e for e in self._endpoints if e.id == eid), None)
                 for grp, eid in current_by_group.items() if eid
@@ -5643,6 +5647,7 @@ class APIPool:
                     until = ep._defer_until_by_group.get(grp, 0)
                     if until <= 0:
                         ep._defer_until_by_group.pop(grp, None)
+                        ep._defer_borrow_by_group.discard(grp)
                         continue
                     # 兜底使用的 defer 清除已由 _on_success(clear_defer=True) 处理；
                     # 这里若用实时 current 判断会误清「defer 前进入的并发请求」产生的 defer
@@ -5650,15 +5655,22 @@ class APIPool:
                     # 分组池：只按本组当前端点判断——main 不受子组指针影响，子组也不替 main 决定。
                     cur = current_eps.get(grp)
                     protected = cur is not None and cur is not ep and cur.deferrable
-                    # 释放条件（2026-10-05 用户定稿）：只看「接手端点执行完了没」——
-                    # 组内无池活动满回迁窗口即释放，**不要求 main 空闲**。
-                    # 回迁后 main 若再抢占，后续请求重新避让、本组再交给组内其他端点接手。
-                    if protected and pool_active:
+                    pool_active = self._last_pool_activity > now - defer_window
+                    # 释放条件（2026-10-05 用户定稿）：
+                    # - 借用避让型：只看**接手端点**执行完了没——该端点自身无新成功请求
+                    #   满窗口即释放，不看其他组/其他端点的流量，也不要求 main 空闲。
+                    #   回迁后 main 若再抢占，后续请求重新避让、本组再交给组内其他端点接手。
+                    # - 缓存保护型：沿用全池活跃判据（池还在忙就不切走当前端点）。
+                    is_borrow = grp in ep._defer_borrow_by_group
+                    takeover_idle = (cur is not None and cur._last_success_ts > 0
+                                     and (now - cur._last_success_ts) >= defer_window)
+                    if protected and (not takeover_idle if is_borrow else pool_active):
                         ep._defer_until_by_group[grp] = now + defer_window  # 滚动延长，保持 cache
                     else:
                         ep._defer_until_by_group.pop(grp, None)
+                        ep._defer_borrow_by_group.discard(grp)
                         released.append((ep, grp))
-                        if not pool_active:
+                        if is_borrow and takeover_idle:
                             reason = "接手端点已无新请求（回迁窗口满足）"
                         else:
                             reason = "当前端点未开启缓存保护"

@@ -160,33 +160,30 @@ class IdleBorrowTests(unittest.TestCase):
 
 
     def test_avoided_endpoint_defers_then_returns_after_takeover_finishes(self):
-        """借用回切（2026-10-05 定稿）：只看「接手端点执行完没」——组内池活动停满
-        300s 即释放并回切，**不要求 main 空闲**；回迁后 main 若再抢占，后续请求重新避让。"""
+        """借用回切（2026-10-05 定稿）：只看**接手端点**执行完没——该端点自身
+        300s 无新请求即释放并回切，**不要求 main 空闲**，也不看其他组/其他端点流量。"""
         with tempfile.TemporaryDirectory() as tmp:
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
             pool._set_group_idle_seconds("main", 600)
             pool._set_current("bg", "b1")
             b1 = next(e for e in pool._endpoints if e.id == "b1")
-            b1.deferrable = False  # 隔离缓存保护因子，只考察 main 占用
             shared._last_success_ts = time.time() - 60  # main 正在用
 
             candidates, _ = pool._group_sticky_candidates("bg")
             self.assertNotIn("shared", [ep.id for ep in candidates])
             self.assertIn("bg", shared._defer_until_by_group)  # 已挂延迟回迁
 
-            # 新建组实体前的候选计算：bg1 未配 deferrable=False 时，这里 pool_active=True
-            # 但 b1.deferrable=False → 缓存保护判定为「不保护」→ 立即回迁（既有语义）。
-            # 隔离缓存保护因子用 b1.deferrable=True + pool_active：
-            b1.deferrable = True
-            pool._last_pool_activity = time.time()
+            # 接手端点 b1 最近还有成功请求 → 仍在执行，不回迁
+            # （borrow 型判据只看接手端点自身，与缓存保护的 deferrable 无关）
+            b1._last_success_ts = time.time()
             pool._reconcile_deferred()
-            self.assertEqual(pool._get_current("bg"), "b1")  # 保护缓存 → 不回迁
+            self.assertEqual(pool._get_current("bg"), "b1")  # 仍在执行 → 不回迁
             self.assertIn("bg", shared._defer_until_by_group)  # 继续等接手端点跑完
 
-            # 池活动停满窗口（接手端点执行完）→ 释放并回切，
+            # 接手端点自身 300s 无新成功请求（执行完）→ 释放并回切，
             # **即使 main 仍在使用该端点**（回迁后 main 若再抢占，后续请求重新避让）
-            pool._last_pool_activity = time.time() - 400
+            b1._last_success_ts = time.time() - 400
             pool._reconcile_deferred()
             self.assertEqual(pool._get_current("bg"), "shared")
             self.assertNotIn("bg", shared._defer_until_by_group)
@@ -196,26 +193,27 @@ class IdleBorrowTests(unittest.TestCase):
             cands2, _ = pool._group_sticky_candidates("bg")
             self.assertNotIn("shared", [ep.id for ep in cands2])
             self.assertIn("bg", shared._defer_until_by_group)
-            pool._reconcile_deferred()  # 池活动仍停着 → 再次回迁
+            pool._reconcile_deferred()  # 接手端点仍空闲 → 再次回迁
             self.assertEqual(pool._get_current("bg"), "shared")
 
     def test_return_waits_for_cache_protection_of_current_endpoint(self):
-        """当前端点保护缓存且池活跃：main 空闲也先不回切（与既有延迟回迁同一口径）。"""
+        """接手端点在执行中：不释放。释放判据只看接手端点自身空闲（2026-10-05 定稿）。"""
         with tempfile.TemporaryDirectory() as tmp:
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
             pool._set_group_idle_seconds("main", 600)
-            pool._set_current("bg", "b1")  # b1.deferrable 默认 True
-            pool._last_pool_activity = time.time()
+            pool._set_current("bg", "b1")
+            b1 = next(e for e in pool._endpoints if e.id == "b1")
             shared._last_success_ts = time.time() - 60
             pool._group_sticky_candidates("bg")  # 触发挂 defer
             self.assertIn("bg", shared._defer_until_by_group)
 
             shared._last_success_ts = time.time() - 700  # main 已空闲
+            b1._last_success_ts = time.time()  # 接手端点刚执行过
             pool._reconcile_deferred()
-            self.assertEqual(pool._get_current("bg"), "b1")  # 缓存保护未解除 → 不回切
+            self.assertEqual(pool._get_current("bg"), "b1")  # 仍在执行 → 不回切
 
-            pool._last_pool_activity = time.time() - 4000  # 池空闲
+            b1._last_success_ts = time.time() - 400  # 接手端点 300s 无新请求
             pool._reconcile_deferred()
             self.assertEqual(pool._get_current("bg"), "shared")  # 释放并回切
 
@@ -240,7 +238,6 @@ class IdleBorrowTests(unittest.TestCase):
             pool._set_group_idle_seconds("main", 600)
             pool._set_current("bg", "b1")
             b1 = next(e for e in pool._endpoints if e.id == "b1")
-            b1.deferrable = False
             pool._set_manual("bg", "b2")  # 开机恢复/用户手动：本组被钉在 b2
             shared._last_success_ts = time.time() - 60
 
@@ -248,6 +245,9 @@ class IdleBorrowTests(unittest.TestCase):
             self.assertIn("bg", shared._defer_until_by_group)  # 锁定不阻止挂
 
             shared._last_success_ts = time.time() - 700  # main 空闲窗口满足
+            b1._last_success_ts = time.time() - 400  # 接手端点 300s 无新请求
+            b2 = next(e for e in pool._endpoints if e.id == "b2")
+            b2._last_success_ts = time.time() - 400  # 手动锁定的 b2 同样已空闲
             pool._reconcile_deferred()
             self.assertEqual(pool._get_current("bg"), "shared")  # 回切
             self.assertIsNone(pool._get_manual("bg"))  # 锁定被回切清除（同轮换 A 口径）
