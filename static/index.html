@@ -815,11 +815,15 @@ function renderFilterBar(eps){
   if(epVendorFilter!=='all'&&!eps.some(e=>vendorOf(e.model)===epVendorFilter))epVendorFilter='all';
   const siteNames=[...sites.keys()];
   if(epFilter!=='all'&&epFilter!==ABN_FILTER&&!siteNames.includes(epFilter))siteNames.push(epFilter);
-  /* 2026-10-05：筛选按钮按显示文本首字母排序（原按 host 排，而标签显示的是别名，视觉错位） */
+  /* 2026-10-05：筛选按钮按名称排序（原按 host / 按数量）。口径：英文数字在前、中文在后，
+     同段内 localeCompare —— 纯 localeCompare 结果随运行环境 locale 变化（实测中文会被排到最前），
+     故这个前后关系显式定义。 */
   const siteLabel=s=>String(epSiteAlias(eps,s)||s);
-  siteNames.sort((a,b)=>siteLabel(a).localeCompare(siteLabel(b),undefined,{numeric:true})||a.localeCompare(b));
-  /* 2026-10-05：按名称首字母排序（原按数量降序） */
-  const vendorNames=[...vendors.entries()].sort((a,b)=>a[0].localeCompare(b[0],undefined,{numeric:true})||b[1]-a[1]);
+  const rankName=s=>/^[\x00-\x7f]/.test(String(s).trim())?0:1;
+  siteNames.sort((a,b)=>rankName(siteLabel(a))-rankName(siteLabel(b))
+    ||siteLabel(a).localeCompare(siteLabel(b))||a.localeCompare(b));
+  /* 2026-10-05：按名称排序（原按数量降序），与站点同口径 */
+  const vendorNames=[...vendors.entries()].sort((a,b)=>rankName(a[0])-rankName(b[0])||String(a[0]).localeCompare(String(b[0]))||b[1]-a[1]);
   if(epVendorFilter!=='all'&&!vendors.has(epVendorFilter))vendorNames.push([epVendorFilter,0]);
   /* 「全部」按钮的计数 = 维度条数（厂商数/站点数），不是端点计数：
      端点总数已由右侧 filterCount 单独显示，两者语义不重叠。 */
