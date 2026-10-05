@@ -1,6 +1,5 @@
-"""GLM 适配自检：reasoning_policy / reasoning_effort 映射 / preserved_thinking。可直接 python3 运行。"""
+"""GLM 适配自检：reasoning_policy / 端点级思考映射（reasoning_effort_map）/ preserved_thinking。可直接 python3 运行。"""
 import importlib.util
-import sys
 
 spec = importlib.util.spec_from_file_location("aps", "/opt/data/work/api-pool2/api_pool_server.py")
 aps = importlib.util.module_from_spec(spec)
@@ -37,45 +36,71 @@ assert APIPool._messages_for_endpoint(msgs, ep("k", base_url="https://api.moonsh
 assert APIPool._messages_for_endpoint(msgs, ep("mimo-7b"))[1].get("reasoning_content") == "R1"
 assert "reasoning_content" not in APIPool._messages_for_endpoint(msgs, ep("gpt-5.6-sol"))[1]
 
-# 3) reasoning_effort 映射：GLM/Kimi/DeepSeek；MiMo 官方未定义该参数，保持透传
-p = {"reasoning_effort": "medium"}
-APIPool._map_reasoning_effort(p, ep("glm-5.3"))
-assert p["reasoning_effort"] == "high", p
-p = {"reasoning_effort": "medium"}
-APIPool._map_reasoning_effort(p, ep("glm-5.3-flash"))
-assert p["reasoning_effort"] == "high"
-p = {"reasoning_effort": "medium"}
-APIPool._map_reasoning_effort(p, ep("glm-5.2"))  # 服务端自映射，透传
-assert p["reasoning_effort"] == "medium"
-p = {"reasoning_effort": "medium"}
-APIPool._map_reasoning_effort(p, ep("glm-4.6"))
-assert "reasoning_effort" not in p
-p = {"reasoning_effort": "medium"}
-APIPool._map_reasoning_effort(p, ep("deepseek-v4-flash"))
-assert p["reasoning_effort"] == "medium"
-p = {"reasoning_effort": "xhigh"}
-APIPool._map_reasoning_effort(p, ep("deepseek-v4-flash"))
-assert p["reasoning_effort"] == "max"
-p = {"reasoning_effort": "medium"}
-APIPool._map_reasoning_effort(p, ep("kimi-k3"))
-assert p["reasoning_effort"] == "high"
-p = {"reasoning_effort": "xhigh"}
-APIPool._map_reasoning_effort(p, ep("kimi-k3"))
-assert p["reasoning_effort"] == "max"
-p = {"reasoning_effort": "max"}
-APIPool._map_reasoning_effort(p, ep("kimi-k2.6"))
-assert p["reasoning_effort"] == "high"
-p = {"reasoning_effort": "medium"}
-APIPool._map_reasoning_effort(p, ep("mimo-v2.5-pro"))
-assert p["reasoning_effort"] == "medium"  # 官方未定义参数词汇，不猜映射
-p = {}  # 未显式设置：不动
-APIPool._map_reasoning_effort(p, ep("glm-5.3"))
-assert p == {}
+# 3) 端点级思考映射（2026-10-05）：配置驱动；不配 = 完全不干预
+GLM_CFG = {"map": {"none": "low", "minimal": "low", "low": "low", "medium": "high",
+                   "high": "high", "xhigh": "max", "max": "max", "*": "high"}, "disable": "low"}
+DS_CFG = {"map": {"none": "low", "minimal": "low", "low": "low", "medium": "medium",
+                  "high": "high", "xhigh": "max", "max": "max", "*": "high"}, "disable": "passthrough"}
 
-# 4) preserved_thinking 注入语义（模拟轮转处 payload 构造）
-e = ep("glm-5.3", preserved_thinking=True)
+
+def cfg_ep(model, cfg, **kw):
+    return ep(model, reasoning_effort_map=cfg, **kw)
+
+
+p = {"reasoning_effort": "medium"}
+assert APIPool._apply_reasoning_effort_map(p, ep("glm-5.3")) is False, "不配则不接管"
+assert p == {"reasoning_effort": "medium"}
+
+p = {"reasoning_effort": "medium"}
+assert APIPool._apply_reasoning_effort_map(p, cfg_ep("glm-5.3", GLM_CFG)) is True
+assert p["reasoning_effort"] == "high", p          # 客户端 medium → 端点 high
+p = {"reasoning_effort": "weird"}
+APIPool._apply_reasoning_effort_map(p, cfg_ep("glm-5.3", GLM_CFG))
+assert p["reasoning_effort"] == "high", p          # `*` 兜底
+p = {"reasoning_effort": "xhigh"}
+APIPool._apply_reasoning_effort_map(p, cfg_ep("deepseek-v4-flash", DS_CFG))
+assert p["reasoning_effort"] == "max", p
+p = {"reasoning_effort": "medium"}
+APIPool._apply_reasoning_effort_map(p, cfg_ep("x", {"map": {}}))
+assert p["reasoning_effort"] == "medium", "无 map 无 `*` → 未命中不猜（透传）"
+
+# 4) 「关闭思考」的落地形态
+# disable=low：端点关不掉（GLM）→ thinking 折叠成 enabled，档位落 low
+p = {"thinking": {"type": "disabled"}}
+APIPool._apply_reasoning_effort_map(p, cfg_ep("glm-5.3", GLM_CFG))
+assert p == {"thinking": {"type": "enabled"}, "reasoning_effort": "low"}, p
+# 客户端同时给了有效档位 → 保留并按 map 归一（medium → high），不降级
+p = {"thinking": {"type": "disabled"}, "reasoning_effort": "medium"}
+APIPool._apply_reasoning_effort_map(p, cfg_ep("glm-5.3", GLM_CFG))
+assert p == {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}, p
+# reasoning_effort=none（无 thinking）→ 按 map 归一，不注入 thinking
+p = {"reasoning_effort": "none"}
+APIPool._apply_reasoning_effort_map(p, cfg_ep("glm-5.3", GLM_CFG))
+assert p == {"reasoning_effort": "low"}, p
+# disable=passthrough（DeepSeek 真关闭）：thinking 原样，档位仍归一
+p = {"thinking": {"type": "disabled"}}
+APIPool._apply_reasoning_effort_map(p, cfg_ep("deepseek-v4-flash", DS_CFG))
+assert p == {"thinking": {"type": "disabled"}}, p
+p = {"thinking": {"type": "disabled"}, "reasoning_effort": "xhigh"}
+APIPool._apply_reasoning_effort_map(p, cfg_ep("deepseek-v4-flash", DS_CFG))
+assert p == {"thinking": {"type": "disabled"}, "reasoning_effort": "max"}, p
+# map 目标写成 disabled = 「该档位改为关闭」，由 disable 决定写法
+p = {"reasoning_effort": "medium"}
+APIPool._apply_reasoning_effort_map(p, cfg_ep("deepseek-v4-flash", {"map": {"medium": "disabled", "*": "high"}, "disable": "thinking"}))
+assert p == {"thinking": {"type": "disabled"}}, p
+# disable=strip：上游对该字段反向生效（如 agnes）→ 剥掉
+p = {"thinking": {"type": "disabled"}, "reasoning_effort": "high"}
+APIPool._apply_reasoning_effort_map(p, cfg_ep("agnes-3.0-flash", {"map": {}, "disable": "strip"}))
+assert p == {"reasoning_effort": "high"}, p
+# disable=none：用 none 档表达关闭
+p = {"thinking": {"type": "disabled"}}
+APIPool._apply_reasoning_effort_map(p, cfg_ep("x", {"map": {}, "disable": "none"}))
+assert p == {"reasoning_effort": "none"}, p
+
+# 5) preserved_thinking 注入语义（模拟轮转处 payload 构造）
+e = cfg_ep("glm-5.3", GLM_CFG, preserved_thinking=True)
 payload = {"model": "glm-5.3", "messages": []}
-APIPool._map_reasoning_effort(payload, e)
+APIPool._apply_reasoning_effort_map(payload, e)
 t = payload.get("thinking")
 if isinstance(t, dict):
     t["clear_thinking"] = False
@@ -83,41 +108,27 @@ else:
     payload["thinking"] = {"type": "enabled", "clear_thinking": False}
 assert payload["thinking"] == {"type": "enabled", "clear_thinking": False}
 
-# 5) 序列化往返：新字段进 _ep_to_dict
+# 6) 序列化往返：新字段进 _ep_to_dict / list_endpoints
 pool = APIPool()
 pool.add_endpoint({"name": "g", "base_url": "https://x/v1", "api_key": "k", "model": "glm-5.3",
-                   "reasoning_policy": "keep", "preserved_thinking": True})
+                   "reasoning_policy": "keep", "preserved_thinking": True,
+                   "reasoning_effort_map": GLM_CFG})
 d = pool.list_endpoints()[0]
 assert d["reasoning_policy"] == "keep" and d["preserved_thinking"] is True
-
-# 6) 关闭思考的 GLM 折叠（2026-09-11）：disabled/none → enabled + effort low
-p = {"thinking": {"type": "disabled"}}
-APIPool._normalize_glm_thinking(p, ep("glm-5.3"))
-assert p["thinking"] == {"type": "enabled"} and p["reasoning_effort"] == "low", p
-p = {"thinking": {"type": "none"}}
-APIPool._normalize_glm_thinking(p, ep("glm-5.3-flash"))
-assert p["thinking"] == {"type": "enabled"} and p["reasoning_effort"] == "low", p
-# 客户端已显式给档位：只折叠 thinking，不覆盖更高档
-p = {"thinking": {"type": "disabled"}, "reasoning_effort": "high"}
-APIPool._normalize_glm_thinking(p, ep("glm-5.3"))
-assert p["reasoning_effort"] == "high" and p["thinking"] == {"type": "enabled"}, p
-# preserved_thinking 的注入体（enabled + clear_thinking）不动
-p = {"thinking": {"type": "enabled", "clear_thinking": False}}
-APIPool._normalize_glm_thinking(p, ep("glm-5.3"))
-assert p["thinking"] == {"type": "enabled", "clear_thinking": False}, p
-# glm-5.2 支持关闭思考；非 GLM 端点：不干预
-p = {"thinking": {"type": "disabled"}}
-APIPool._normalize_glm_thinking(p, ep("glm-5.2"))
-assert p["thinking"] == {"type": "disabled"} and "reasoning_effort" not in p, p
+assert d["reasoning_effort_map"] == GLM_CFG, d.get("reasoning_effort_map")
 
 # 7) 回归护栏：不再有「关闭 thinking」注入（结构性无效 + 会污染轮转后的异构端点）。
 #    严格校验 400 重试为**二级口径**（2026-09-12，外部实证 zdsub2api 后定案）：端点级上限
 #    strict400_retries（0/1/2，默认 2）；第 1 级同端点原样重试 + 抖动退避，第 2 级
 #    「原始 tool_call id」变体仅在本次确实应用过前缀重写时发；且只在**首包前**失败分支上重试。
+#    2026-10-05：家族硬编码映射已迁到端点配置 reasoning_effort_map，关闭形态只允许由
+#    端点配置驱动（无配置 = 不干预），仍禁止无条件注入。
 src = open("/opt/data/work/api-pool2/api_pool_server.py", encoding="utf-8").read()
 assert "disable_thinking_forced" not in src
 assert "disable_thinking_eps" not in src
-assert 'payload["thinking"] = {"type": "disabled"}' not in src
+assert "_apply_reasoning_effort_map" in src, "关闭/等级映射由端点配置驱动"
+assert "_GLM_EFFORT_MAP" not in src and "_DEEPSEEK_V4_EFFORT_MAP" not in src, "家族硬编码映射已删除"
+assert src.count('payload["thinking"] = {"type": "disabled"}') == 1, "关闭形态只在配置分支里出现"
 assert "strict_validation_retries = 0" in src
 assert "strict_validation_retries < 1 and budget >= 1" in src, "第 1 级：同端点原样重试"
 assert "strict_validation_retries = 1" in src
