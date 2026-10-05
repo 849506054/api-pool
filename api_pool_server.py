@@ -4497,12 +4497,11 @@ class APIPool:
         free = []
         for ep in base:
             if self._is_ep_sticky_elsewhere(ep, group):
-                # main 占用中：本次剔除；同时按「延迟回迁」机制挂 defer（滚动续期见
-                # _reconcile_deferred）——main 空闲窗口满足后由它释放，统一走那条
-                # 「释放即回切到组内最优端点」的尾巴。
-                # 手动钉住不阻止挂（2026-10-05 A 口径，与轮换一致：手动是那一刻的动作，
-                # 组配了空闲借用就按配置推进；回切时清除该组锁定）。配了轮换的组不挂——
-                # 轮换本就是组内循环意图，回切会与它互相拉锯。
+                # main 占用中：本次剔除，并按「延迟回迁」机制挂 defer —— 组内 300s
+                # 无新请求（=接手端点执行完）即由 _reconcile_deferred 释放，回切到该
+                # 端点。回迁后 main 若再抢占，后续请求重新避让、本组再交给组内其他
+                # 端点接手。前提：main 配了空闲窗口（否则=始终避让的旧行为）；配了
+                # 轮换的组不挂（轮换是组内循环意图，回切会与之互相拉锯）。
                 if self._group_idle_seconds(self.MAIN_GROUP) and not self._group_rotate_requests(group):
                     ep._defer_until_by_group[group] = time.time() + 300
                 continue
@@ -5636,7 +5635,7 @@ class APIPool:
                 for grp, eid in current_by_group.items() if eid
             }
             released = []  # [(ep, grp)]
-            borrow_released = set()  # 空闲借用回切：该组的锁定允许被清除（A 口径，同轮换）
+            borrow_released = set()  # 因「main 占用/借用」而释放的回切组：其锁定允许被清除
             for ep in self._endpoints:
                 if not ep.in_pool or not ep._defer_until_by_group:
                     continue
@@ -5651,25 +5650,21 @@ class APIPool:
                     # 分组池：只按本组当前端点判断——main 不受子组指针影响，子组也不替 main 决定。
                     cur = current_eps.get(grp)
                     protected = cur is not None and cur is not ep and cur.deferrable
-                    # 空闲借用等待（2026-10-05）：端点仍被 main 占用 → 本组还不能回切。
-                    # 与缓存保护同为「暂时不回迁」，各自独立地滚动延期。
-                    borrow_blocked = self._is_ep_sticky_elsewhere(ep, grp)
-                    if borrow_blocked or (protected and pool_active):
+                    # 释放条件（2026-10-05 用户定稿）：只看「接手端点执行完了没」——
+                    # 组内无池活动满回迁窗口即释放，**不要求 main 空闲**。
+                    # 回迁后 main 若再抢占，后续请求重新避让、本组再交给组内其他端点接手。
+                    if protected and pool_active:
                         ep._defer_until_by_group[grp] = now + defer_window  # 滚动延长，保持 cache
                     else:
                         ep._defer_until_by_group.pop(grp, None)
                         released.append((ep, grp))
-                        borrow_release = (
-                            grp != self.MAIN_GROUP
-                            and ep.id in (self._get_current(self.MAIN_GROUP), self._get_manual(self.MAIN_GROUP))
-                        )
-                        if borrow_release:
-                            reason = "main 空闲窗口已满（空闲借用回切）"
-                            borrow_released.add(grp)
-                        elif not pool_active:
-                            reason = "池空闲"
+                        if not pool_active:
+                            reason = "接手端点已无新请求（回迁窗口满足）"
                         else:
                             reason = "当前端点未开启缓存保护"
+                        if grp != self.MAIN_GROUP and ep.id in (self._get_current(self.MAIN_GROUP), self._get_manual(self.MAIN_GROUP)):
+                            reason = "接手端点已无新请求（借用回切）"
+                            borrow_released.add(grp)
                         sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 延迟回切解除（{reason}）", "INFO")
             if released:
                 for grp in self._all_group_names():
@@ -5684,7 +5679,6 @@ class APIPool:
                             # 在途旧请求的成功回调不会覆盖）
                             self._set_manual(grp, None)
                         self._set_current(grp, best.id)
-
     def _failover_endpoints(self):
         """Return failover-eligible endpoints, including deferred recoveries.
 

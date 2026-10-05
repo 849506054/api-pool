@@ -159,8 +159,9 @@ class IdleBorrowTests(unittest.TestCase):
             self.assertNotIn("idle_seconds", pool._group_defs["main"])
 
 
-    def test_avoided_endpoint_defers_then_returns_when_main_idle(self):
-        """main 占用时剔除并挂延迟回迁；main 空闲窗口满足后释放 → 回切到该端点（空闲借用回切）。"""
+    def test_avoided_endpoint_defers_then_returns_after_takeover_finishes(self):
+        """借用回切（2026-10-05 定稿）：只看「接手端点执行完没」——组内池活动停满
+        300s 即释放并回切，**不要求 main 空闲**；回迁后 main 若再抢占，后续请求重新避让。"""
         with tempfile.TemporaryDirectory() as tmp:
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
@@ -174,14 +175,29 @@ class IdleBorrowTests(unittest.TestCase):
             self.assertNotIn("shared", [ep.id for ep in candidates])
             self.assertIn("bg", shared._defer_until_by_group)  # 已挂延迟回迁
 
-            pool._reconcile_deferred()  # main 仍忙 → 延期，不回切
-            self.assertEqual(pool._get_current("bg"), "b1")
-            self.assertIn("bg", shared._defer_until_by_group)
+            # 新建组实体前的候选计算：bg1 未配 deferrable=False 时，这里 pool_active=True
+            # 但 b1.deferrable=False → 缓存保护判定为「不保护」→ 立即回迁（既有语义）。
+            # 隔离缓存保护因子用 b1.deferrable=True + pool_active：
+            b1.deferrable = True
+            pool._last_pool_activity = time.time()
+            pool._reconcile_deferred()
+            self.assertEqual(pool._get_current("bg"), "b1")  # 保护缓存 → 不回迁
+            self.assertIn("bg", shared._defer_until_by_group)  # 继续等接手端点跑完
 
-            shared._last_success_ts = time.time() - 700  # main 空闲满窗口
-            pool._reconcile_deferred()  # 释放 → 回切
+            # 池活动停满窗口（接手端点执行完）→ 释放并回切，
+            # **即使 main 仍在使用该端点**（回迁后 main 若再抢占，后续请求重新避让）
+            pool._last_pool_activity = time.time() - 400
+            pool._reconcile_deferred()
             self.assertEqual(pool._get_current("bg"), "shared")
             self.assertNotIn("bg", shared._defer_until_by_group)
+
+            # 回迁后 main 仍占用该端点 → 下一条 bg 请求重新避让、defer 重新挂上，
+            # 组内由其他端点接手（状态机：回迁 → 再避让 → 接手，循环自洽）
+            cands2, _ = pool._group_sticky_candidates("bg")
+            self.assertNotIn("shared", [ep.id for ep in cands2])
+            self.assertIn("bg", shared._defer_until_by_group)
+            pool._reconcile_deferred()  # 池活动仍停着 → 再次回迁
+            self.assertEqual(pool._get_current("bg"), "shared")
 
     def test_return_waits_for_cache_protection_of_current_endpoint(self):
         """当前端点保护缓存且池活跃：main 空闲也先不回切（与既有延迟回迁同一口径）。"""
