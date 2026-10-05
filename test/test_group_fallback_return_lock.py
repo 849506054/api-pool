@@ -151,7 +151,7 @@ class GroupFallbackReturnLockTests(unittest.TestCase):
         self.pool._group_fallback_lock_until["api-pool-gpt"] = time.time() + 120
         logs = []
         original_sys_log = self.module.sys_log
-        self.module.sys_log = lambda msg, level="INFO": logs.append(msg)
+        self.module.sys_log = lambda msg, level="INFO", group=None: logs.append(msg)
 
         def fake_try(ep, payload, timeout, **kwargs):
             return {"choices": [{"message": {"content": "ok"}}]}, ""

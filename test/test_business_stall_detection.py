@@ -204,7 +204,7 @@ class BusinessStallDetectionTests(unittest.TestCase):
             logs = []
             with mock.patch.object(module.urllib.request, "urlopen", return_value=response), \
                     mock.patch.object(module, "_get_resp_socket", return_value=response.socket), \
-                    mock.patch.object(module, "sys_log", side_effect=lambda msg, level="INFO": logs.append((msg, level))):
+                    mock.patch.object(module, "sys_log", side_effect=lambda msg, level="INFO", group=None: logs.append((msg, level))):
                 result, error = module.APIPool()._try_endpoint(
                     self.make_endpoint(module, stall=1), payload, 60, log_usage=False,
                     request_id="b2req01",

@@ -107,14 +107,26 @@ class GroupRotationTests(unittest.TestCase):
             self.assertEqual(pool._get_current("bg"), "b1")
 
     def test_rotate_continues_after_manual_switch(self):
-        """A 口径（2026-10-05）：手动切换后一样按配置轮换，manual 不挡轮换。"""
+        """A 口径（2026-10-05）：手动切换后一样按配置轮换；轮换同时清除组内锁定，让新指针真的生效。"""
         with tempfile.TemporaryDirectory() as tmp:
             m = load_module(tmp)
             pool, _ = self.pool_with_bg(m)
             pool._set_current("bg", "b1")
-            pool._set_manual("bg", "b3")           # 用户此刻手动切到 b3
+            pool._set_manual("bg", "b3")           # 用户此刻手动切到 b3（或开机恢复钉住）
             pool._rotate_group_once("bg")
             self.assertEqual(pool._get_current("bg"), "b2")  # 到点照样推进
+            self.assertIsNone(pool._get_manual("bg"), "轮换后不残留组内锁定，否则路由仍走锁定端点")
+
+    def test_rotate_clears_boot_restore_pin(self):
+        """开机恢复把组钉在端点 A；轮换后路由必须落到新指针（不被恢复到的手动锁定回钉）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            m = load_module(tmp)
+            pool, _ = self.pool_with_bg(m)
+            pool._set_current("bg", "b1")
+            pool._set_manual("bg", "b1")           # 恢复态：manual == current == b1
+            pool._rotate_group_once("bg")
+            # 下一次请求的指针取值顺序：manual 优先，其次 current
+            self.assertEqual(pool._get_manual("bg") or pool._get_current("bg"), "b2")
 
     def test_rotate_skips_cooldown_members(self):
         with tempfile.TemporaryDirectory() as tmp:

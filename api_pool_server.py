@@ -198,6 +198,24 @@ def clear_client_headers():
     _client_ctx.headers = {}
 
 
+# 当前线程的日志组归属（2026-10-05）：请求路径在组解析后设置，组级事件行显式传 group。
+# 用途：sys_log 写 ring 前按该组日志级别决定记不记，前端不再拿到应隐藏的数据。
+_log_ctx = threading.local()
+
+
+def set_log_group(group):
+    """设置当前线程的日志组归属（请求路径用）；None = 清除。"""
+    _log_ctx.group = group or None
+
+
+def clear_log_group():
+    _log_ctx.group = None
+
+
+def _current_log_group():
+    return getattr(_log_ctx, "group", None)
+
+
 def _current_client_headers():
     """当前线程的客户端头；无（探活/测试/管理线程）→ 客户端基线；都无 → {}。"""
     hdrs = getattr(_client_ctx, "headers", None)
@@ -215,12 +233,12 @@ class LogManager:
         self.max_history = max_history
         self._counter = 0
 
-    def log(self, level, msg):
+    def log(self, level, msg, group=None):
         ts = time.time()
         time_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
         with self.lock:
             self._counter += 1
-            entry = {"id": self._counter, "time": time_str, "level": level, "msg": msg, "timestamp": ts}
+            entry = {"id": self._counter, "time": time_str, "level": level, "msg": msg, "timestamp": ts, "group": group}
             self.history.append(entry)
             if len(self.history) > self.max_history:
                 self.history.pop(0)
@@ -234,8 +252,65 @@ class LogManager:
             self.history.clear()
 
 sys_logger = LogManager()
-def sys_log(msg, level="INFO"):
-    sys_logger.log(level, msg)
+# 组级 error 档放行的报错级别
+_LOG_ERROR_LEVELS = ("WARN", "WARNING", "ERROR")
+# 组级日志级别的展示名（管理日志行用）
+_GROUP_LOG_LEVEL_NAMES = {"all": "全部", "error": "仅报错", "live": "仅实时", "silent": "静默"}
+# 组归属兜底解析：label 与 `组 'X'` 两种形态
+_LOG_GROUP_LABEL_RE = re.compile(r"\[([^\]]{1,32})\]")
+_LOG_GROUP_QUOTED_RE = re.compile(r"组 '([^']{1,32})'")
+
+
+def group_log_level(group):
+    """该组当前的日志显示级别；未声明/未知组 → all。"""
+    p = globals().get("pool")
+    if p is None:
+        return "all"
+    return p._group_defs.get(group, {}).get("log_level") or "all"
+
+
+def chat_log_hidden(group):
+    """对话日志是否对该组隐藏：级别 ≠ all（error/live/silent）时隐藏。"""
+    return bool(group) and group_log_level(group) != "all"
+
+
+def _group_log_records(group, level):
+    """这条日志是否进 UI ring（journal 照常打印）。
+
+    silent=不进；error=只进报错；all/live=照进。无组归属（全局/系统行）一律进。
+    ring 只有 300 条：被隐藏组的行不占位，避免把别组的行挤出去。
+    """
+    if not group:
+        return True
+    lv = group_log_level(group)
+    if lv == "silent":
+        return False
+    if lv == "error":
+        return level in _LOG_ERROR_LEVELS
+    return True
+
+
+def _group_from_message(msg):
+    """从消息文本兜底推断组归属：`[组名]` 标签（_endpoint_log_label 形态）或 `组 'X'`。
+
+    仅当调用方没给 group、也不在请求线程上下文里时使用——背景线程（探活/对账）靠它兜底，
+    保证被隐藏组的行不漏到面板。命中已登记的组名才算。
+    """
+    p = globals().get("pool")
+    if p is None or not msg:
+        return None
+    defs = p._group_defs
+    for m in _LOG_GROUP_LABEL_RE.finditer(msg):
+        if m.group(1) in defs:
+            return m.group(1)
+    m = _LOG_GROUP_QUOTED_RE.search(msg)
+    return m.group(1) if m and m.group(1) in defs else None
+
+
+def sys_log(msg, level="INFO", group=None):
+    grp = group or _current_log_group() or _group_from_message(msg)
+    if _group_log_records(grp, level):
+        sys_logger.log(level, msg, grp)
     # flush=True: systemd 下 stdout 是块缓冲（8KB），不加 flush 日志会积攒 6-12 分钟
     # 才落盘 journal，排障时严重误导（2026-08-15 实测：23:53 的日志 23:52:53 才批量落盘）
     print(f"[{time.strftime('%H:%M:%S')}] [{level}] {msg}", flush=True)
@@ -1098,6 +1173,9 @@ class ChatLogger:
             ):
                 if _col not in _cols:
                     c.execute(f"ALTER TABLE chat_logs ADD COLUMN {_col} {_ddl}")
+            # 组级日志级别过滤（2026-10-05）：/api/chat-logs 按 pool_group 排除隐藏组，
+            # 无索引时 COUNT 会全表扫（2.8GB 实测 9.7s）→ 建覆盖索引后走索引扫描
+            c.execute("CREATE INDEX IF NOT EXISTS idx_chat_logs_pool_group ON chat_logs(pool_group)")
             conn.commit()
             conn.close()
 
@@ -1134,24 +1212,31 @@ class ChatLogger:
             except Exception as e:
                 sys_log(f"记录对话日志失败: {e}", "ERROR")
 
-    def get_logs(self, limit=50, offset=0, detail=True):
+    def get_logs(self, limit=50, offset=0, detail=True, exclude_groups=None):
         # 读路径无锁：WAL 下多读者并发安全，不被日志写入/滚动清理阻塞
+        # exclude_groups：级别非 all 的组（其对话日志不下发）；列表与 total 同步排除，翻页一致
+        ex = [g for g in (exclude_groups or []) if g]
+        where = ""
+        wargs = ()
+        if ex:
+            where = f" WHERE (pool_group IS NULL OR pool_group NOT IN ({','.join('?' * len(ex))}))"
+            wargs = tuple(ex)
         try:
             conn = self._connect()
             c = conn.cursor()
             # detail=False：SQL 层不取 prompt/completion（避免从磁盘读 32MB 正文再丢弃）
             if detail:
                 c.execute(
-                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
-                    (limit, offset)
+                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected FROM chat_logs" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+                    wargs + (limit, offset)
                 )
             else:
                 c.execute(
-                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected FROM chat_logs ORDER BY id DESC LIMIT ? OFFSET ?",
-                    (limit, offset)
+                    "SELECT id, datetime(timestamp, 'localtime'), endpoint_name, model, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected FROM chat_logs" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+                    wargs + (limit, offset)
                 )
                 rows = [r[:4] + (None, None) + r[4:] for r in c.fetchall()]
-                c.execute("SELECT COUNT(*) FROM chat_logs")
+                c.execute("SELECT COUNT(*) FROM chat_logs" + where, wargs)
                 total = c.fetchone()[0]
                 conn.close()
                 return {
@@ -1168,7 +1253,7 @@ class ChatLogger:
                 }
             rows = c.fetchall()
             
-            c.execute("SELECT COUNT(*) FROM chat_logs")
+            c.execute("SELECT COUNT(*) FROM chat_logs" + where, wargs)
             total = c.fetchone()[0]
             conn.close()
             
@@ -2966,13 +3051,13 @@ class APIPool:
                         self._set_current(group, None)
                     if self._manual_override_by_group.get(group) == ep_id:
                         self._set_manual(group, None)
-                    sys_log(f"端点 '{ep.name}' 已从组 '{group}' 移除（仍属其他组）", "INFO")
+                    sys_log(f"端点 '{ep.name}' 已从组 '{group}' 移除（仍属其他组）", "INFO", group=group)
                 else:
                     # 最后一组 → 整体出池
                     ep.in_pool = False
                     ep.pool_groups = []
                     self._clear_pointers_for(ep_id)
-                    sys_log(f"端点 '{ep.name}' 从组 '{group}' 移除后无剩余组，已整体移出聚合池", "INFO")
+                    sys_log(f"端点 '{ep.name}' 从组 '{group}' 移除后无剩余组，已整体移出聚合池", "INFO", group=group)
                 break
             self._renumber_pool_priorities()
 
@@ -3497,7 +3582,7 @@ class APIPool:
         elif gd.pop("rotate_requests", None) is None:
             return False
         self._rotate_counts[group] = 0  # 新阈值从零开始计数
-        sys_log(f"组 '{group}' 端点轮换设为 {('每 %s 次请求' % requests) if requests else '不轮换'}", "INFO")
+        sys_log(f"组 '{group}' 端点轮换设为 {('每 %s 次请求' % requests) if requests else '不轮换'}", "INFO", group=group)
         return True
 
     def _count_rotate_request(self, group):
@@ -3535,13 +3620,17 @@ class APIPool:
             if nxt.id == cur:
                 return
             prev_name = next((e.name for e in cands if e.id == cur), "-")
+            # 轮换要落到实处：开机恢复/手动切换留下的组内锁定会盖住新指针
+            # （_set_manual 会推进 route epoch，在途旧请求的成功回调不会覆盖本次决策）
+            had_manual = bool(self._get_manual(group))
+            self._set_manual(group, None)
             self._set_current(group, nxt.id)
-            sys_log(f"组 '{group}' 端点轮换 '{prev_name}' → '{nxt.name}'", "INFO")
+            sys_log(f"组 '{group}' 端点轮换 '{prev_name}' → '{nxt.name}'" + ("（清除组内手动锁定）" if had_manual else ""), "INFO", group=group)
 
-    GROUP_LOG_LEVELS = ("all", "error", "silent")
+    GROUP_LOG_LEVELS = ("all", "error", "live", "silent")
 
     def _valid_group_log_level(self, value):
-        """组级日志显示级别归一化：all=全部 / error=仅报错 / silent=静默；非法 → None（调用方拒绝）。"""
+        """组级日志显示级别归一化：all=全部 / error=仅报错 / live=仅实时（不显示对话日志）/ silent=静默；非法 → None（调用方拒绝）。"""
         v = str(value if value is not None else "all").strip().lower()
         return v if v in self.GROUP_LOG_LEVELS else None
 
@@ -3560,8 +3649,8 @@ class APIPool:
             gd.pop("log_level", None)
         else:
             gd["log_level"] = level
-        names = {"all": "全部", "error": "仅报错", "silent": "静默"}
-        sys_log(f"组 '{group}' 日志显示级别设为 {names[level]}", "INFO")
+        names = _GROUP_LOG_LEVEL_NAMES
+        sys_log(f"组 '{group}' 日志显示级别设为 {names[level]}", "INFO", group=group)
         return True
 
     def _set_group_idle_seconds(self, group, seconds):
@@ -3575,7 +3664,7 @@ class APIPool:
             gd["idle_seconds"] = seconds
         elif gd.pop("idle_seconds", None) is None:
             return False
-        sys_log(f"组 '{group}' 空闲借用窗口设为 {('%s 秒' % seconds) if seconds else '关闭'}", "INFO")
+        sys_log(f"组 '{group}' 空闲借用窗口设为 {('%s 秒' % seconds) if seconds else '关闭'}", "INFO", group=group)
         return True
 
     def _loaded_group_context_tokens(self, d):
@@ -3600,7 +3689,7 @@ class APIPool:
         else:
             if gd.pop("context_tokens", None) is None:
                 return False
-        sys_log(f"组 '{group}' 上下文长度声明为 {'%s tokens' % format(tokens, ',') if tokens else '取消声明'}", "INFO")
+        sys_log(f"组 '{group}' 上下文长度声明为 {'%s tokens' % format(tokens, ',') if tokens else '取消声明'}", "INFO", group=group)
         return True
 
     def _group_selector(self, name):
@@ -3667,7 +3756,7 @@ class APIPool:
                     self._group_defs[name] = entry
                     continue
                 if str(d.get("role", "") or "").strip():
-                    sys_log(f"忽略组 '{name}' 的 role 键（图片解析池固定为 '{self.VISION_GROUP}'）", "WARNING")
+                    sys_log(f"忽略组 '{name}' 的 role 键（图片解析池固定为 '{self.VISION_GROUP}'）", "WARNING", group=name)
                 entry = {"type": gtype, "model": model or name}
                 ck = self._loaded_group_context_tokens(d)
                 if ck:
@@ -3748,7 +3837,7 @@ class APIPool:
                 self._group_defs[name]["log_level"] = lvl
             if req:
                 self._group_defs[name]["rotate_requests"] = req
-            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%s tokens' % format(ck, ',') if ck else '未声明'}{'，空闲借用 %s 秒' % idle if idle else ''}，日志 {lvl}，轮换 {('每 %s 次请求' % req) if req else '不轮换'}）", "INFO")
+            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%s tokens' % format(ck, ',') if ck else '未声明'}{'，空闲借用 %s 秒' % idle if idle else ''}，日志 {lvl}，轮换 {('每 %s 次请求' % req) if req else '不轮换'}）", "INFO", group=name)
             return True, name
 
     def update_group(self, name, updates):
@@ -3874,7 +3963,7 @@ class APIPool:
                         self._set_current(self.MAIN_GROUP, new_name)
             # 空闲借用仅配置时显示（main 组更新走 _set_group_idle_seconds 专属日志，此处恒为子组路径）
             idle_seg = f"，空闲借用 {new_idle} 秒" if new_idle else ""
-            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}{idle_seg}，日志 {new_lvl}，轮换 {('每 %s 次请求' % new_req) if new_req else '不轮换'}）", "INFO")
+            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}{idle_seg}，日志 {new_lvl}，轮换 {('每 %s 次请求' % new_req) if new_req else '不轮换'}）", "INFO", group=name)
             return True, new_name
 
     def delete_group(self, name):
@@ -3901,7 +3990,7 @@ class APIPool:
                 self._set_manual(self.MAIN_GROUP, None)
             if self._get_current(self.MAIN_GROUP) == name:
                 self._set_current(self.MAIN_GROUP, None)
-            sys_log(f"删除分组 '{name}'（成员已移出）", "INFO")
+            sys_log(f"删除分组 '{name}'（成员已移出）", "INFO", group=name)
             return True, "deleted"
 
     # ── per-group 优先级访问器（2026-08-29 分组隔离）──
@@ -4323,7 +4412,7 @@ class APIPool:
                                f"（最短剩余 {frozen_remaining}s），暂不能切换")
             self._set_manual(self.MAIN_GROUP, sub)
             self._set_current(self.MAIN_GROUP, sub)
-            sys_log(f"手动切换 main → 子组 '{sub}'（整组作为 main 成员，按子组优先级选端点）", "INFO")
+            sys_log(f"手动切换 main → 子组 '{sub}'（整组作为 main 成员，按子组优先级选端点）", "INFO", group=sub)
             return True, sub
 
     def set_main_priority(self, sub, priority):
@@ -4342,7 +4431,7 @@ class APIPool:
             if priority is None:
                 # 加入：先占末位（保证 _main_axis_slots 能拿到它），再走 insert 归位
                 gd["main_priority"] = self._next_main_priority()
-                sys_log(f"子组 '{sub}' 加入 main，占优先级 #{gd['main_priority']}", "INFO")
+                sys_log(f"子组 '{sub}' 加入 main，占优先级 #{gd['main_priority']}", "INFO", group=sub)
                 return True, sub
             try:
                 priority = int(priority)
@@ -4356,7 +4445,7 @@ class APIPool:
             # insert-at-position 内部已整体重编号（唯一连续），不再重复 renumber
             # （renumber 会以当前名次为键重排，与刚插入的位置冲突导致错位）
             self._set_main_axis_priority(None, sub, priority)
-            sys_log(f"子组 '{sub}' main 优先级调整为 #{self._group_defs[sub]['main_priority']}", "INFO")
+            sys_log(f"子组 '{sub}' main 优先级调整为 #{self._group_defs[sub]['main_priority']}", "INFO", group=sub)
             return True, sub
 
     def leave_main(self, sub):
@@ -4371,7 +4460,7 @@ class APIPool:
                 self._set_manual(self.MAIN_GROUP, None)
             if self._get_current(self.MAIN_GROUP) == sub:
                 self._set_current(self.MAIN_GROUP, None)
-            sys_log(f"子组 '{sub}' 已移出 main", "INFO")
+            sys_log(f"子组 '{sub}' 已移出 main", "INFO", group=sub)
             return True, sub
 
     def _group_sticky_candidates(self, group):
@@ -6362,11 +6451,12 @@ class APIPool:
                     self._group_fallback_pending.pop(group, None)
         request_route_epoch = self._get_route_epoch(group)
         group_fallback_used = False  # bg 组入口/耗尽 fallback 到 main 的标记
+        set_log_group(group)  # 本请求的日志组归属：其行是否进 UI ring 由该组日志级别决定
         # 终极兜底锁定：锁定期间该组请求直连 prio99（per-group 滑动窗口，prio99 仅 main 组语义生效）
         if self._is_fallback_locked_group(group):
             fb = self._get_fallback_endpoint()
             if fb is not None:
-                sys_log(f"终极兜底锁定中（组 '{group}'），直连端点 '{fb.name}'", "INFO")
+                sys_log(f"终极兜底锁定中（组 '{group}'），直连端点 '{fb.name}'", "INFO", group=group)
                 active = [fb]
                 starved = False
             else:
@@ -6376,13 +6466,13 @@ class APIPool:
         else:
             active, starved = self._group_sticky_candidates(group)
         if starved:
-            sys_log(f"组 '{group}' 互斥过滤后无可用端点，main 保底特权忽略互斥", "WARN")
+            sys_log(f"组 '{group}' 互斥过滤后无可用端点，main 保底特权忽略互斥", "WARN", group=group)
         # bg → main 入口兜底（触发点 1）：bg 组无可用端点 → 整请求改走 main 组正常路由
         if not active and group != self.MAIN_GROUP:
             active, starved2 = self._group_sticky_candidates(self.MAIN_GROUP)
             if active:
                 group_fallback_used = True
-                sys_log(f"组 '{group}' 无可用端点，入口 fallback 到 main 组", "WARN")
+                sys_log(f"组 '{group}' 无可用端点，入口 fallback 到 main 组", "WARN", group=group)
                 # A0：建立组级延迟回切锁（滑动空闲窗口，无请求 N 秒后回组）+ 标记待回切
                 with self._lock:
                     self._group_fallback_lock_until[group] = time.time() + self._GROUP_FALLBACK_RETURN_SECONDS
@@ -6893,7 +6983,7 @@ class APIPool:
         # 再失败才报 AllEndpointsFailed 交 Hermes。530s 预算跨组共享不翻倍（剩余预算内执行）。
         # 仅当请求原生属于非 main 组且尚未 fallback 过（入口触发点 1 会改写 group）。
         if group != self.MAIN_GROUP and not group_fallback_used and errors:
-            sys_log(f"组 '{group}' 轮转耗尽仍失败，fallback 到 main 组追加一轮", "WARN")
+            sys_log(f"组 '{group}' 轮转耗尽仍失败，fallback 到 main 组追加一轮", "WARN", group=group)
             # A0：耗尽 fallback 同样建立组级延迟回切锁（+ 标记待回切）
             with self._lock:
                 self._group_fallback_lock_until[group] = time.time() + self._GROUP_FALLBACK_RETURN_SECONDS
@@ -8729,7 +8819,7 @@ if isinstance(restored_groups, dict):
             pool._set_manual(grp, restored_endpoint.id)
             pool._set_persisted(grp, restored_endpoint.id)
         else:
-            sys_log(f"组 '{grp}' 的恢复端点 {ep_id} 不存在或不可用，忽略", "WARN")
+            sys_log(f"组 '{grp}' 的恢复端点 {ep_id} 不存在或不可用，忽略", "WARN", group=grp)
             # 残留自愈（2026-09-01 方案 A）：组改名/删除、端点删除遗留的键
             # （组名已不在当前配置 或 端点 id 已不存在）从 runtime_state 删除，
             # 避免每次重启重复 WARN。端点存在但暂不属于该组则保留（防误删合法指针）。
@@ -8960,14 +9050,16 @@ def api_handler(method, path, body):
         offset = int(qs.get("offset", 0))
         # 列表页 detail=false 不拉正文（33MB→KB 级）；详情面板按 id 单独取
         detail = qs.get("detail", "true").lower() != "false"
-        return 200, chat_logger.get_logs(limit=limit, offset=offset, detail=detail), False
+        # 级别 ≠ all 的组：对话日志不下发（列表与 total 同步排除）
+        hidden = [g for g, gd in pool._group_defs.items() if (gd.get("log_level") or "all") != "all"]
+        return 200, chat_logger.get_logs(limit=limit, offset=offset, detail=detail, exclude_groups=hidden), False
     if method == "GET" and cp == "/api/chat-log":
         qs = dict(q.split("=") for q in parsed.query.split("&") if "=" in q) if parsed.query else {}
         log_id = qs.get("id", "")
         if not log_id:
             return 400, {"error": "缺少 id 参数"}, False
         one = chat_logger.get_log_by_id(log_id)
-        if one is None:
+        if one is None or chat_log_hidden(one.get("pool_group")):
             return 404, {"error": "记录不存在"}, False
         return 200, one, False
 
@@ -9214,7 +9306,7 @@ def api_handler(method, path, body):
                 groups_state[group] = replacement.id
                 if not save_runtime_state_groups(groups_state):
                     return 500, {"error": "运行态指针持久化失败"}, False
-            sys_log(f"模型切换成功: 组 '{group}' 源端点 {source_ep_id} → 模型 '{model}' → 端点 '{replacement.name}'（{'克隆' if created else '复用'}）", "INFO")
+            sys_log(f"模型切换成功: 组 '{group}' 源端点 {source_ep_id} → 模型 '{model}' → 端点 '{replacement.name}'（{'克隆' if created else '复用'}）", "INFO", group=group)
             return 200, {
                 "ok": True,
                 "action": "cloned" if created else "reused",
@@ -9222,10 +9314,10 @@ def api_handler(method, path, body):
                 "endpoint_name": replacement.name,
             }, False
         except KeyError as exc:
-            sys_log(f"模型切换失败(404): 组 '{group}' 源端点 {source_ep_id} 模型 '{model}': {exc}", "ERROR")
+            sys_log(f"模型切换失败(404): 组 '{group}' 源端点 {source_ep_id} 模型 '{model}': {exc}", "ERROR", group=group)
             return 404, {"error": str(exc.args[0])}, False
         except ValueError as exc:
-            sys_log(f"模型切换失败(400): 组 '{group}' 源端点 {source_ep_id} 模型 '{model}': {exc}", "ERROR")
+            sys_log(f"模型切换失败(400): 组 '{group}' 源端点 {source_ep_id} 模型 '{model}': {exc}", "ERROR", group=group)
             return 400, {"error": str(exc)}, False
     if method == "POST" and cp.startswith("/api/pool/"):
         ep_id = unquote(cp.split("/")[-1])
@@ -9709,6 +9801,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send_json(res[0], res[1])
         finally:
+            clear_log_group()  # 每请求重置日志组归属：keep-alive 复用线程，避免串组
             if proxy_request:
                 clear_client_headers()
 

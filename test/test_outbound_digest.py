@@ -70,7 +70,7 @@ class OutboundDigestTests(unittest.TestCase):
             )
             pool = module.APIPool([ep])
             logs = []
-            module.sys_log = lambda msg, level="INFO": logs.append((msg, level))
+            module.sys_log = lambda msg, level="INFO", group=None: logs.append((msg, level))
             payload = {"model": "gpt-6-astra", "messages": [{"role": "user", "content": "ping"}], "stream": True}
             with mock.patch.object(module.urllib.request, "urlopen",
                                    side_effect=module_level_urlerror("https://up.example/v1/responses", 405, b"<html>405</html>")):
@@ -96,7 +96,7 @@ class OutboundDigestTests(unittest.TestCase):
             )
             pool = module.APIPool([ep])
             logs = []
-            module.sys_log = lambda msg, level="INFO": logs.append((msg, level))
+            module.sys_log = lambda msg, level="INFO", group=None: logs.append((msg, level))
             resp = mock.MagicMock()
             resp.read.return_value = module.json.dumps(
                 {"choices": [{"message": {"role": "assistant", "content": "hi"}}], "usage": {}}

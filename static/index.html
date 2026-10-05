@@ -1231,6 +1231,7 @@ function openGroupModal(editName){
         <select id="gLogLevel">
           <option value="all" ${(g.log_level||'all')==='all'?'selected':''}>全部</option>
           <option value="error" ${g.log_level==='error'?'selected':''}>错误（只显示报错）</option>
+          <option value="live" ${g.log_level==='live'?'selected':''}>仅实时（只显示实时日志，不显示对话日志）</option>
           <option value="silent" ${g.log_level==='silent'?'selected':''}>静默（所有日志不显示）</option>
         </select></div>
       <div class="form-group"><label title="组内端点轮换（成功请求次数）：>0 时每成功 N 次请求把本组当前端点按组内优先级自动推进到下一名（循环）；0/留空=不轮换。手动切换是那一刻的动作，组配了轮换就按配置继续推进，两者不冲突">端点轮换 (每 N 次请求)</label>
@@ -1307,7 +1308,7 @@ async function savePoolGroup(editName){
           }
         }
       }
-      toast(editName?'✅ 分组已更新':'✅ 分组已创建','success');closeGroupModal();refresh();applyGroupLogFilter();
+      toast(editName?'✅ 分组已更新':'✅ 分组已创建','success');closeGroupModal();refresh();refreshLogViews();
     }
     else{toast(r.error||'操作失败','error');if(btn){btn.disabled=false;btn.textContent=editName?'保存':'创建';}}
   }catch(e){
@@ -2401,45 +2402,20 @@ if (logContainer) {
 }
 function addLogLine(entry) {
     if (!logContainer) return;
-    if (!groupLogVisible(entry.msg, entry.level)) return;
     const d = document.createElement('div');
     d.className = 'log-line';
-    d.dataset.msg = entry.msg;
-    d.dataset.level = entry.level;
     d.innerHTML = `<span class="log-time">[${entry.time}]</span> <span class="log-${entry.level}">[${entry.level}]</span> <span class="log-msg">${esc(entry.msg)}</span>`;
     logContainer.appendChild(d);
     if (logContainer.children.length > 300) logContainer.removeChild(logContainer.firstChild);
     if (logAutoScroll) logContainer.scrollTop = logContainer.scrollHeight;
 }
 let _lastLogId = 0;
-// 组级日志显示级别（2026-10-05）：all=照常 / error=仅报错行 / silent=全隐藏。仅前端显示过滤，后台照常记录。
-// 组归属判定：端点日志行带 [组名] 前缀标签；无标签行（全局日志）不受影响。
-const _LOG_ERROR_LEVELS = new Set(['WARN', 'WARNING', 'ERROR']);
-function _groupLogLevels() {
-  const m = {};
-  for (const g of (window._groupDefs || [])) if (g.name && g.log_level && g.log_level !== 'all') m[g.name] = g.log_level;
-  return m;
-}
-function groupLogVisible(msg, level) {
-  const m = _groupLogLevels();
-  let shown = true;
-  for (const [grp, lv] of Object.entries(m)) {
-    if (msg && msg.includes(`[${grp}]`)) {
-      if (lv === 'silent') return false;
-      if (lv === 'error' && !_LOG_ERROR_LEVELS.has(level)) shown = false;
-    }
-  }
-  return shown;
-}
-function chatLogVisible(poolGroup) {
-  // 对话日志均为成功记录：非 all 级别（仅报错/静默）下该组无可显示内容
-  return !_groupLogLevels()[poolGroup || ''];
-}
-// 组级别变更后即时清理已渲染行（新行由 addLogLine/loadChatLogs 过滤）
-function applyGroupLogFilter() {
-  if (logContainer) for (const d of Array.from(logContainer.children)) {
-    if (!groupLogVisible(d.dataset.msg || '', d.dataset.level || '')) d.remove();
-  }
+// 组级日志显示级别（2026-10-05）：all/error/live/silent 一律由服务端过滤——应隐藏的行不下发。
+// 前端不再自行判定（旧前端过滤在首屏 _groupDefs 未就绪时会漏放积压行，方案已废弃）。
+function refreshLogViews() {
+  // 组级别变更后：清空面板 + 从头拉实时日志 + 重载对话日志，由服务端按新级别重新过滤
+  if (logContainer) logContainer.innerHTML = '';
+  _lastLogId = 0;
   loadChatLogs(chatLogsPage);
 }
 async function pollLogs() {
@@ -2581,7 +2557,7 @@ async function loadChatLogs(page, opts = {}) {
   if (seq !== chatLogsReqSeq) return; // 过期响应丢弃
   if (!res.ok && res.error) { toast('加载失败', 'error'); return; }
   chatLogsPage = page;
-  currentChatLogs = (res.logs || []).filter(l => chatLogVisible(l.pool_group));
+  currentChatLogs = (res.logs || []);
   
   const total = res.total || 0;
   const maxPage = Math.max(0, Math.ceil(total / limit) - 1);

@@ -247,7 +247,7 @@ class SiteModelReplacementTests(unittest.TestCase):
         logs = []
 
         with mock.patch.object(
-            self.module, "sys_log", side_effect=lambda message, level="INFO": logs.append((message, level))
+            self.module, "sys_log", side_effect=lambda message, level="INFO", group=None: logs.append((message, level))
         ):
             status, response, _ = self.module.api_handler(
                 "POST", "/api/pool/source/select-model",

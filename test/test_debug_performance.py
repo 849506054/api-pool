@@ -76,7 +76,7 @@ class DebugPerformanceTests(unittest.TestCase):
             )
             pool = module.APIPool([first, second])
             logs = []
-            module.sys_log = lambda msg, level="INFO": logs.append((msg, level))
+            module.sys_log = lambda msg, level="INFO", group=None: logs.append((msg, level))
 
             def fake_try(ep, payload, timeout, **kwargs):
                 if ep is first:
@@ -128,7 +128,7 @@ class DebugPerformanceTests(unittest.TestCase):
                 "http://example/v1/chat/completions", 502, "bad gateway", {}, None,
             )
             logs = []
-            module.sys_log = lambda msg, level="INFO": logs.append((msg, level))
+            module.sys_log = lambda msg, level="INFO", group=None: logs.append((msg, level))
             with mock.patch.object(module.urllib.request, "urlopen", side_effect=[http_error, response]), \
                     mock.patch.object(module.time, "sleep") as sleep:
                 result, error = module.APIPool()._try_endpoint(
@@ -187,7 +187,7 @@ class DebugPerformanceTests(unittest.TestCase):
             )
             pool = module.APIPool([ep])
             logs = []
-            module.sys_log = lambda msg, level="INFO": logs.append((msg, level))
+            module.sys_log = lambda msg, level="INFO", group=None: logs.append((msg, level))
             pool._try_endpoint = lambda ep, payload, timeout, **kwargs: (
                 {"choices": [{"message": {"content": "ok"}}]}, ""
             )

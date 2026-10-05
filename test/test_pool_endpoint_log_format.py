@@ -49,7 +49,7 @@ class PoolEndpointLogFormatTests(unittest.TestCase):
             pool._try_endpoint = lambda *args, **kwargs: ({"choices": [{"message": {"content": "ok"}}]}, "")
             logs = []
             original = module.sys_log
-            setattr(module, "sys_log", lambda msg, level="INFO": logs.append((msg, level)))
+            setattr(module, "sys_log", lambda msg, level="INFO", group=None: logs.append((msg, level)))
             try:
                 pool.chat([{"role": "user", "content": "hi"}], model="api-pool-bg", request_id="reqtest")
             finally:
