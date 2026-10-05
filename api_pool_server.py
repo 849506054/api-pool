@@ -8008,6 +8008,8 @@ class APIPool:
                             else:
                                 sys_log(f"{request_tag}端点 '{endpoint_log_label}' 流式响应异常: {type(e).__name__}: {e}", "ERROR")
                         finally:
+                            # 流式收尾标记：与「请求成功」（＝流已建立）配对，说明流何时真正结束。
+                            sys_log(f"{request_tag}端点 '{endpoint_log_label}' 流式响应结束", "INFO")
                             if has_usage and log_usage and not ep.name.startswith("test_"):
                                 stats_cached_tokens = 0 if reset_cached_stats else final_cached_tokens
                                 token_tracker.add_usage(ep.name, ep.model, final_prompt_tokens, final_completion_tokens, final_total_tokens, stats_cached_tokens)
