@@ -116,18 +116,18 @@ class GroupLogLevelTests(unittest.TestCase):
             self.assertEqual(ring(), ["T-all"])
             m.pool.update_group("bg", {"log_level": "silent"})
             m.sys_log("T-silent", group="bg")
-            self.assertEqual(ring(), ["T-all"])  # 不记
+            self.assertEqual(ring(), [])  # 不记；已入 ring 的旧行同时停发
             m.pool.update_group("bg", {"log_level": "error"})
             m.sys_log("T-info", group="bg")
-            self.assertEqual(ring(), ["T-all"])  # 非报错不记
+            self.assertEqual(ring(), [])  # 非报错不记
             m.sys_log("T-warn", "WARN", group="bg")
-            self.assertEqual(ring(), ["T-all", "T-warn"])
+            self.assertEqual(ring(), ["T-warn"])
             m.pool.update_group("bg", {"log_level": "live"})
             m.sys_log("T-live", group="bg")
-            self.assertEqual(ring(), ["T-all", "T-warn", "T-live"])
+            self.assertEqual(ring(), ["T-all", "T-warn", "T-live"])  # 级别回升，旧行同步恢复
             m.pool.update_group("bg", {"log_level": "silent"})
             m.sys_log("T-global")
-            self.assertEqual(ring(), ["T-all", "T-warn", "T-live", "T-global"])  # 无归属照记
+            self.assertEqual(ring(), ["T-global"])  # 无归属照记，bg 行全部停发
 
     def test_thread_local_group_attribution(self):
         """请求路径的组归属：线程级上下文生效，显式 group 优先，清除后回无归属。"""
@@ -159,9 +159,9 @@ class GroupLogLevelTests(unittest.TestCase):
             m.pool.update_group("bg", {"log_level": "silent"})
             m.sys_log("F3 端点 '[bg]ep1' 后台探活异常")
             m.sys_log("F4 组 'bg' 轮转耗尽")
-            self.assertEqual(ring(), ["F1 端点 '[bg]ep1' 后台探活异常", "F2 组 'bg' 轮转耗尽"])  # silent 组不落 ring
+            self.assertEqual(ring(), [])  # silent：新行不落 ring，旧行也停发
             m.sys_log("F5 端点 '[unknown-grp]ep1' 探活异常")  # 未登记组名 → 不归属 → 照记
-            self.assertEqual(len(ring()), 3)
+            self.assertEqual(ring(), ["F5 端点 '[unknown-grp]ep1' 探活异常"])
 
     def test_chat_log_hidden_by_level(self):
         """对话日志隐藏判定：非 all 级别（error/live/silent）隐藏；未知组/空组名可见。"""
@@ -195,6 +195,26 @@ class GroupLogLevelTests(unittest.TestCase):
                 self.assertEqual({r["pool_group"] for r in got["logs"]}, {"main", None})
             # 空排除列表 = 不排除
             self.assertEqual(logger.get_logs(limit=10, offset=0, detail=False, exclude_groups=[])["total"], 3)
+
+    def test_ring_read_refilters_after_level_change(self):
+        """已入 ring 的旧行随级别变化即时改变可见性（读取侧按当前级别重判，不做一次性删除）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            m = load_module(tmp)
+            m.pool.create_group("bg", "mixed", "")
+
+            def ring():
+                return [e["msg"] for e in m.sys_logger.get_logs_since(0) if e["msg"].startswith("R")]
+
+            m.sys_log("R-info", group="bg")
+            m.sys_log("R-err", "ERROR", group="bg")
+            m.sys_log("R-global")
+            self.assertEqual(ring(), ["R-info", "R-err", "R-global"])
+            m.pool.update_group("bg", {"log_level": "silent"})
+            self.assertEqual(ring(), ["R-global"])  # 旧行立刻停发
+            m.pool.update_group("bg", {"log_level": "error"})
+            self.assertEqual(ring(), ["R-err", "R-global"])  # 只放报错
+            m.pool.update_group("bg", {"log_level": "all"})
+            self.assertEqual(ring(), ["R-info", "R-err", "R-global"])  # 复位即恢复
 
 
 if __name__ == "__main__":

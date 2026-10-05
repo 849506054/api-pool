@@ -244,8 +244,14 @@ class LogManager:
                 self.history.pop(0)
 
     def get_logs_since(self, last_id):
+        """下发可见行：按**当前**级别过滤。
+
+        写入侧过滤（sys_log）只负责不让隐藏行占 ring 的 300 格；级别是随时可改的，
+        所以读取必须重判一次——否则改级别后缓冲里的旧行会继续下发到面板。
+        """
         with self.lock:
-            return [log for log in self.history if log["id"] > last_id]
+            return [log for log in self.history
+                    if log["id"] > last_id and _group_log_records(log.get("group"), log["level"])]
 
     def clear_logs(self):
         with self.lock:
