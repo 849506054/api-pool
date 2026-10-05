@@ -944,7 +944,9 @@ const WKM_COINS_SVG='<svg xmlns="http://www.w3.org/2000/svg" width="11" height="
 function wkmCreditBadge(c){
   if(!c||!c.remaining&&c.remaining!==0)return '';
   const v=c.remaining>=1000?(c.remaining/1000).toFixed(1)+'k':Math.round(c.remaining);
-  const title=c.kind==='pool'?`不限额密钥·${esc(c.realm||'')}${c.realm==='global'?'（国际版）':(c.realm==='cn'?'（国内版）':'')}账号池积分合计 ${c.remaining}`:`密钥剩余积分 ${c.remaining}`;
+  const rl=c.realm==='global'?'国际版':(c.realm==='intl'?'国际版':(c.realm==='cn'?'国内版':c.realm||''));
+  const src=c.src==='qoder'?'qoder 网关巡检登记':'wkm 面板查询落盘';
+  const title=c.kind==='pool'?`不限额密钥·${rl}账号池已登记积分 ${c.remaining}（${src}，池只读登记值不触发刷新）`:`密钥剩余积分 ${c.remaining}`;
   return `<span class="badge" style="background:rgba(255,204,0,.12);color:#ffd60a;font-size:10px;padding:1px 5px" title="${title}">${WKM_COINS_SVG}${v}</span>`;
 }
 

@@ -67,11 +67,19 @@ _POOL_INITIATED_CTX = threading.local()   # 池自身发起的请求标记（伤
 # 该类 400 是上游实例级随机故障，隔开一点再打命中率更高；测试可置 0 免等待。
 _STRICT400_BACKOFF_MS = (300, 800)
 
-# wkm 积分展示（2026-10-06）：workbuddy manager 管理面只读令牌（设置页「访问令牌」签发，
-# scope=readonly）。仅当 WKM_TOKEN 存在时启用积分线程；端点按 base_url 自动识别 wkm
-# （api_key 以 wbk_ 开头）。纯展示层：不进路由、不触冷却、拉取失败不标端点异常。
-WKM_TOKEN = os.environ.get("WKM_TOKEN", "").strip()
-WKM_CREDIT_TTL = 300.0   # 积分刷新周期（秒）；wkm 侧账号积分本身有缓存口径，无需更快
+# 积分展示（2026-10-06）：**只读上游已在本地登记好的积分值，绝不触发任何刷新/查询行为**
+# （池→wkm refresh-credits 会驱动 wkm 逐号查腾讯，已被否决；网关 /status 快照对 global
+# 号结构性无值，intl 无签到链路）。两个数据源都是上游自己的巡检/面板动作落盘的登记值：
+#  · workbuddy manager：manager.db `settings.credits_snapshot`（uid→余额，面板 live 查询
+#    时顺手写）+ `api_keys` 表（key 级额度上限/已用/realm）；uid→realm 用 auths/*.json。
+#  · qoder2api-hub：accounts/<uid>.json `credits.remain`（网关巡检/消耗回写）+
+#    settings.json 的 key→realm 绑定（'' = 跟随 active_realm）。
+# 读取时机 = serve-time（面板读状态接口时距上次 ≥ CREDIT_READ_SEC 才重读；纯本地 IO，
+# 毫秒级，无常驻线程）。纯展示层：不进路由、不触冷却、读取失败不标端点异常。
+CREDIT_READ_SEC = 60.0
+WKM_MANAGER_DB = os.environ.get("WKM_MANAGER_DB", "/vol1/1000/tool/wb-manager/data/manager.db")
+WKM_AUTHS_DIR = os.environ.get("WKM_AUTHS_DIR", "/vol1/1000/tool/wb2api/auths")
+QODER_ACCOUNTS_DIR = os.environ.get("QODER_ACCOUNTS_DIR", "/vol1/1000/tool/qoder2api/accounts")
 
 
 class PoolIdentityUnavailable(RuntimeError):
@@ -2950,20 +2958,15 @@ class APIPool:
         self._probe_inflight = set()  # 正在探活的端点 id 集合（后台/批量探活共享，防重复请求）
         self._health_check_lock = threading.Lock()  # 防止多个全量探活批次重叠
         self._health_probe_max_workers = 2  # chat/models 探针会消耗上游并发与额度
-        # wkm 积分展示（2026-10-06）：端点 api_key 以 wbk_ 开头 → 自动从 workbuddy manager
-        # 拉该密钥的积分余额（限额 key 现剩 = quota_credit-used_credit；不限额 key 显示其
-        # realm 账号池积分总和，语义为池级）。令牌走 WKM_TOKEN env，无令牌则整层静默关闭。
-        # 纯展示层：不进路由、不触冷却、失败不影响端点健康。
+        # 积分读数缓存（serve-time 读本地登记值；见模块头「积分展示」注释）
         self._credit_cache: dict[str, dict] = {}
+        self._credit_last_read = 0.0
         if endpoints:
             for ep in endpoints:
                 # 批量加载：逐次 add 不做组内重排（增量重排以加载顺序为 tiebreak，
                 # 会覆盖 config 已保存的组内优先级——2026-09-07 修复），循环后统一一次。
                 self.add_endpoint(ep, renumber=False)
             self._renumber_pool_priorities()
-        # 积分线程在端点加载完成后启动（否则首刷时池为空，白等一个 TTL）
-        if WKM_TOKEN:
-            threading.Thread(target=self._credit_loop, daemon=True).start()
 
     def add_endpoint(self, ep, renumber=True):
         if isinstance(ep, dict):
@@ -4720,91 +4723,134 @@ class APIPool:
             "credit": self._credit_view(ep),
         }
 
-    def _credit_probe(self, base_origin: str, path: str, method: str = "GET") -> object:
-        """打 wkm 管理面（剥掉 /v1 的 origin + Bearer 令牌）。失败抛异常，由调用方吞掉。"""
-        req = urllib.request.Request(base_origin + path, headers={
-            "Authorization": "Bearer " + WKM_TOKEN,
-            "Accept": "application/json",
-        }, method=method)
-        # 内网直连（同池内 use_proxy=False 形态）：wkm 是局域网 http，绕开系统代理，
-        # 也避免 ProxyHandler 对 CIDR 形态 no_proxy 的兼容性问题。
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(req, timeout=8) as resp:
-            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    def _read_credit_sources(self) -> dict:
+        """读两个上游**已在本地登记的**积分值，返回 {api_key[:12]: entry}。
+        铁律：只读登记值，绝不触发任何刷新/查询行为（不发 HTTP、不打 /status）。
+        单个源失败只影响自己的读数，另一源照常。"""
+        out: dict[str, dict] = {}
+        try:
+            out.update(self._read_wkm_credits())
+        except Exception as exc:
+            sys_log(f"wkm 积分登记值读取失败: {type(exc).__name__}", "WARN")
+        try:
+            out.update(self._read_qoder_credits())
+        except Exception as exc:
+            sys_log(f"qoder 积分登记值读取失败: {type(exc).__name__}", "WARN")
+        return out
 
-    def _refresh_wkm_credits(self):
-        """刷新所有 wkm 端点的积分读数。按 manager origin 分组，各拉一次 keys+accounts。
-
-        读数语义：
-        - 限额 key（quota_credit>0）：现剩 = quota_credit - used_credit（key 级，精确）
-        - 不限额 key（quota_credit=0）：显示该 key realm 的账号池积分总和（池级，
-          是「还能不能放心跑」的真实约束；账号积分由 wkm 侧刷新，有缓存口径）
-        """
-        origins: set[str] = set()
-        for ep in self._endpoints:
-            if not (ep.api_key or "").startswith("wbk_"):
+    def _read_wkm_credits(self) -> dict:
+        """wkm：manager.db 的 credits_snapshot（uid→余额；面板 live 查询时落盘的登记值）
+        + api_keys 表（限额 key 现剩）。uid→realm 用 auths/*.json。只读连接，零写入。"""
+        if not os.path.isfile(WKM_MANAGER_DB):
+            return {}
+        con = sqlite3.connect("file:" + WKM_MANAGER_DB + "?mode=ro", uri=True, timeout=1)
+        try:
+            row = con.execute("SELECT value FROM settings WHERE key='credits_snapshot'").fetchone()
+            key_rows = con.execute(
+                "SELECT prefix, quota_credit, used_credit, realm FROM api_keys WHERE enabled=1").fetchall()
+        finally:
+            con.close()
+        if not row or not row[0]:
+            return {}
+        snap = json.loads(row[0])
+        if isinstance(snap, str):
+            snap = json.loads(snap)  # settings 表双层 JSON 编码（credits.py set_setting 口径）
+        realm_of: dict[str, str] = {}
+        try:
+            names = os.listdir(WKM_AUTHS_DIR)
+        except OSError:
+            names = []
+        for fn in names:
+            if not (fn.startswith("workbuddy-") and fn.endswith(".json")):
                 continue
-            root = (ep.base_url or "").rstrip("/")
-            if root.lower().endswith("/v1"):
-                root = root[:-3]
-            if root.startswith(("http://", "https://")):
-                origins.add(root)
-        if not origins:
-            return
-        for root in origins:
             try:
-                keys = self._credit_probe(root, "/api/keys")
-                accounts = self._credit_probe(root, "/api/accounts")
-            except Exception as exc:
-                sys_log(f"wkm 积分拉取失败 {root}: {type(exc).__name__}（保留上次读数）", "WARN")
-                continue
-            acct = accounts.get("accounts") if isinstance(accounts, dict) else None
-            realm_of = {str(a.get("uid") or ""): (a.get("realm") or "cn") for a in (acct or []) if isinstance(a, dict)}
-            # /api/accounts 的 credits 是上游调度快照（可滞后数小时甚至为 0，wkm issue #56
-            # 同源问题）；面板显示的是实时查询值。取 refresh-credits?force=false（只读
-            # 令牌可用的实时通道，wkm 侧自带 60s TTL 缓存），失败回退快照值。
-            live: dict | None = None
-            try:
-                rc = self._credit_probe(root, "/api/accounts/refresh-credits?force=false", method="POST")
-                if isinstance(rc, dict) and isinstance(rc.get("credits"), dict):
-                    live = rc["credits"]
+                with open(os.path.join(WKM_AUTHS_DIR, fn), encoding="utf-8") as fh:
+                    d = json.load(fh)
             except Exception:
-                pass  # 回退快照，不打积分线程的 WARN（属口径降级非链路故障）
-            realm_sum: dict[str, float] = {}
-            for uid, v in (live if live is not None else {str(a.get("uid") or ""): a.get("credits") for a in (acct or []) if isinstance(a, dict)}).items():
-                realm_sum[realm_of.get(uid, "cn")] = realm_sum.get(realm_of.get(uid, "cn"), 0.0) + float(v or 0)
-            now = time.time()
-            for k in keys if isinstance(keys, list) else []:
-                prefix = str(k.get("prefix") or "")
-                if len(prefix) < 8:
-                    continue
-                quota_c = float(k.get("quota_credit") or 0)
-                used_c = float(k.get("used_credit") or 0)
-                realm = k.get("realm") or "both"
-                if quota_c > 0:
-                    entry = {"kind": "key", "remaining": round(quota_c - used_c, 1)}
-                else:
-                    total = sum(realm_sum.values()) if realm == "both" else realm_sum.get(realm, 0.0)
-                    entry = {"kind": "pool", "realm": realm, "remaining": round(total, 1)}
-                self._credit_cache[prefix] = dict(entry, ts=now)
+                continue
+            uid = str(d.get("uid") or (d.get("account") or {}).get("uid") or "")
+            r = (d.get("auth") or {}).get("realm")
+            if uid and r:
+                realm_of[uid] = r
+        realm_sum: dict[str, float] = {}
+        for uid, v in (snap or {}).items():
+            r = realm_of.get(str(uid), "cn")
+            realm_sum[r] = realm_sum.get(r, 0.0) + float(v or 0)
+        now = time.time()
+        out: dict[str, dict] = {}
+        for prefix, quota_c, used_c, realm in key_rows:
+            prefix = str(prefix or "")
+            if len(prefix) < 8:
+                continue
+            quota_c = float(quota_c or 0)
+            used_c = float(used_c or 0)
+            if quota_c > 0:
+                out[prefix] = {"kind": "key", "remaining": round(quota_c - used_c, 1),
+                               "src": "wkm", "ts": now}
+            else:
+                realm = realm or "both"
+                total = sum(realm_sum.values()) if realm == "both" else realm_sum.get(realm, 0.0)
+                out[prefix] = {"kind": "pool", "realm": realm, "remaining": round(total, 1),
+                               "src": "wkm", "ts": now}
+        return out
+
+    def _read_qoder_credits(self) -> dict:
+        """qoder2api：accounts/<uid>.json 的 credits.remain（网关巡检/消耗回写的登记值）
+        按 realm 汇总；settings.json 的 key→realm 绑定（'' = 跟随 active_realm）。"""
+        if not os.path.isdir(QODER_ACCOUNTS_DIR):
+            return {}
+        special = {"settings.json", "active_realm.json", "machine_identity.json"}
+        realm_sum: dict[str, float] = {}
+        try:
+            names = os.listdir(QODER_ACCOUNTS_DIR)
+        except OSError:
+            return {}
+        for fn in names:
+            if not fn.endswith(".json") or fn in special:
+                continue
+            try:
+                with open(os.path.join(QODER_ACCOUNTS_DIR, fn), encoding="utf-8") as fh:
+                    d = json.load(fh)
+            except Exception:
+                continue
+            if not isinstance(d, dict) or "uid" not in d:
+                continue
+            r = d.get("realm") or "cn"
+            rem = (d.get("credits") or {}).get("remain") or 0
+            realm_sum[r] = realm_sum.get(r, 0.0) + float(rem or 0)
+        try:
+            with open(os.path.join(QODER_ACCOUNTS_DIR, "settings.json"), encoding="utf-8") as fh:
+                st = json.load(fh)
+        except Exception:
+            return {}
+        active = "cn"
+        try:
+            with open(os.path.join(QODER_ACCOUNTS_DIR, "active_realm.json"), encoding="utf-8") as fh:
+                active = (json.load(fh) or {}).get("realm") or "cn"
+        except Exception:
+            pass
+        now = time.time()
+        out: dict[str, dict] = {}
+        for k in st.get("api_keys") or []:
+            if not k.get("enabled") or not k.get("key"):
+                continue
+            realm = k.get("realm") or active
+            out[str(k["key"])[:12]] = {"kind": "pool", "realm": realm,
+                                       "remaining": round(realm_sum.get(realm, 0.0), 1),
+                                       "src": "qoder", "ts": now}
+        return out
 
     def _credit_view(self, ep) -> dict | None:
-        """端点卡徽标读数：wbk_ 密钥命中的积分；无数据返回 None（不显示徽标）。"""
-        if not (ep.api_key or "").startswith("wbk_"):
+        """端点积分徽标读数。serve-time 重读：距上次 ≥ CREDIT_READ_SEC 才重扫两个登记源
+        （纯本地 IO，毫秒级，无常驻线程）。失败时间戳已先置位 → 坏源不会每帧重试。"""
+        if not (ep.api_key or ""):
             return None
+        now = time.time()
+        if now - self._credit_last_read >= CREDIT_READ_SEC:
+            self._credit_last_read = now
+            self._credit_cache = self._read_credit_sources()
         hit = self._credit_cache.get(ep.api_key[:12])
         return dict(hit) if hit else None
-
-    def _credit_loop(self):
-        # 生产是 APIPool() 无参构造、端点在模块级稍后补加：等引导完成再首刷，
-        # 否则第一刷池为空、白等一个 TTL。
-        time.sleep(15)
-        while True:
-            try:
-                self._refresh_wkm_credits()
-            except Exception as exc:  # 展示层永不冒泡
-                sys_log(f"wkm 积分线程异常: {type(exc).__name__}", "WARN")
-            time.sleep(WKM_CREDIT_TTL)
 
     def _joined_subgroup_chain_entries(self, now):
         """已加入 main 的子组 → 聚合链条目（2026-09-27）。

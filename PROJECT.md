@@ -20,13 +20,13 @@
 
 ## 🎯 里程碑
 
-- 2026-10-06 wkm 积分徽标（纯展示层）：端点 api_key=wbk_* 自动识别 workbuddy manager，
-  WKM_TOKEN（readonly wbt_ 令牌，存 /opt/data/.env，经 systemd EnvironmentFile 注入）
-  轮询 /api/keys+/api/accounts，5 分钟 TTL，直连不走代理。限额 key=quota_credit-used_credit
-  (kind=key)；不限额=该 realm 账号池积分和 (kind=pool)。聚合池成员卡替换原 🔗N组 徽标、
-  main 子组聚合条目显示当前端点读数（/api/chain groups.current_credit）；不进路由/不触冷却/
-  拉取失败保留旧读数。坑：生产是 APIPool() 无参构造+模块级补加端点，线程须延后首刷
-  （_credit_loop 先 sleep 15），否则首刷池空、白等一个 TTL。测试 522 例=基线（2 既有 openai 导入 error）。
+- 2026-10-06 上游积分徽标（纯展示层，**只读登记值零触发**）：端点 api_key 前 12 位匹配
+  wkm `manager.db`（credits_snapshot + api_keys 表，只读 sqlite）与 qoder `accounts/*.json`
+  的 `credits.remain`，按 realm 汇总（kind=pool）或 key 级现剩（kind=key）。serve-time 触发
+  （距上次 ≥60s 重扫，本地 IO；时间戳读前置位防坏源每帧重试），无常驻线程、无令牌、无 HTTP
+  探针。展示三处：端点列表、聚合池成员卡（取代 🔗N组）、main 子组聚合条目（chain 的
+  current_credit）；图标 = wkm lucide coins 内联 SVG。口径铁律与数据源细节见
+  api-pool-management skill 的 references/credit-badge-read-only.md。测试 522 例=基线（2 既有 openai 导入 error）。
 
 ### 已完成
 
