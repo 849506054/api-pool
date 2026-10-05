@@ -623,7 +623,7 @@ select option { background: var(--bg); color: var(--text); }
       <div class="form-group"><label title="开启后，限流类错误（429 / too_many_requests / exceeded rate limit）先在原端点退避重试，重试次数用「额外重试次数」，耗尽才冷却并轮转；关闭=限流即轮转">限流优先重试</label><select id="fRateRetry"><option value="false">关闭</option><option value="true">开启</option></select></div>
     </div>
     <div class="form-row">
-      <div class="form-group"><label title="档位单词替换，每行一条「原词=新词」。客户端发出的档位命中即替换（如上游不认 medium 就写 medium=high）；留空=不替换">思考档位替换</label><input type="text" id="fEffortMap" placeholder="留空=不替换，如 medium=high"></div>
+      <div class="form-group"><label title="档位单词替换：客户端发出的档位命中即替换（如上游不认 medium 就写 medium=high）。多个配对组用逗号隔开，如 medium=high,xhigh=max；留空=不替换">思考档位替换</label><input type="text" id="fEffortMap" placeholder="留空=不替换；多个用逗号隔开，如 medium=high,xhigh=max"></div>
       <div class="form-group"><label title="关闭思考：池按该端点的上游兼容性自动落地（思考关不掉的模型折叠成最低档，其余写 thinking.type=disabled）">关闭思考</label><select id="fThinkingDisabled"><option value="false">透传</option><option value="true">关闭</option></select></div>
     </div>
     <div class="form-row form-row-capability">
@@ -2020,7 +2020,7 @@ function effortMapParse(t){
   });
   return Object.keys(o).length?o:null;
 }
-function effortMapFormat(m){return (m&&typeof m==='object')?Object.entries(m).map(([k,v])=>k+'='+v).join('\n'):'';}
+function effortMapFormat(m){return (m&&typeof m==='object')?Object.entries(m).map(([k,v])=>k+'='+v).join(','):'';}
 let _origDraft=null; // 编辑模式打开时的表单快照；仅提交与之不同的字段，未改字段不更新
 function readFormDraft(){
     const clientProfile=document.getElementById('fClientProfile').value;const ua=clientProfile?'':document.getElementById('fUserAgent').value.trim();
