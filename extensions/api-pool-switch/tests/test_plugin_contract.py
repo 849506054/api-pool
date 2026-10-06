@@ -21,7 +21,7 @@ class ContractTests(unittest.TestCase):
         with open(os.path.join(PLUGIN_DIR, "plugin.yaml"), encoding="utf-8") as fh:
             manifest = yaml.safe_load(fh)
         self.assertEqual(manifest["name"], "api-pool-switch")
-        self.assertTrue(manifest["version"].startswith("1.3"))
+        self.assertRegex(str(manifest["version"]), r"^\d+\.\d+\.\d+$")
         self.assertTrue(any(c["name"] == "endpoint" for c in manifest["commands"]))
 
     def test_register_exports(self):
