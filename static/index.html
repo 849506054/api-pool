@@ -140,6 +140,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .chain-item.cooldown{border-left-color:var(--yellow);background:var(--yellow-dim);border-radius:0 8px 8px 0}
 .chain-item.deferred{border-left-color:var(--blue);background:var(--blue-dim);border-radius:0 8px 8px 0}
 .chain-item.failed{border-left-color:var(--red);background:var(--red-dim);border-radius:0 8px 8px 0}
+.chain-item.disabled{opacity:.45;border-left-color:var(--border);background:transparent}
+.chain-item.disabled .chain-dot{background:var(--border);box-shadow:none}
 .chain-dot{width:8px;height:8px;border-radius:50%;background:var(--border);flex-shrink:0;position:absolute;left:-5px}
 .chain-item.active .chain-dot{background:var(--green);box-shadow:0 0 6px var(--green)}
 .chain-item.cooldown .chain-dot{background:var(--yellow)}
@@ -469,15 +471,17 @@ select option { background: var(--bg); color: var(--text); }
 <div class="log-card" style="margin-top:20px;">
   <div class="card-title">
     <span class="icon">📝</span> 实时日志
-    <button class="btn btn-ghost btn-sm" onclick="clearSysLogs()" style="color:var(--red); float:right; margin-top:-2px; padding:2px 8px;">🗑 清空</button>
+    <button class="btn btn-ghost btn-sm" id="logPauseBtn" onclick="toggleLogPause()" title="暂停后日志不再刷新，可自由滚动/选中文本复制；恢复时自动补齐暂停期间的日志" style="padding:2px 8px;">⏸ 暂停</button>
+    <button class="btn btn-ghost btn-sm" onclick="clearSysLogs()" style="color:var(--red); margin-left:auto; padding:2px 8px;">🗑 清空</button>
   </div>
   <div class="log-container" id="logContainer"></div>
 </div>
 
 <div class="log-card" style="margin-top:20px; display:flex; flex-direction:column; padding-bottom:15px;">
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
-      <div class="card-title" style="margin-bottom:0;"><span class="icon">💬</span> 对话日志 (Audit Logs)</div>
-      <button class="btn btn-ghost btn-sm" onclick="clearChatLogs()" style="color:var(--red); padding:2px 8px;">🗑 清空记录</button>
+    <div style="display:flex; align-items:center; gap:10px; margin-bottom:15px;">
+      <div class="card-title" style="margin-bottom:0;"><span class="icon">💬</span> 对话日志</div>
+      <button class="btn btn-ghost btn-sm" id="clPauseBtn" onclick="toggleChatLogsPause()" title="暂停后表格不再自动刷新，可自由滚动/选中文本复制；恢复时保持当前页" style="padding:2px 8px;">⏸ 暂停</button>
+      <button class="btn btn-ghost btn-sm" onclick="clearChatLogs()" style="color:var(--red); margin-left:auto; padding:2px 8px;">🗑 清空</button>
     </div>
     <div class="chatlog-layout" style="display:flex; gap:15px; height:450px; min-height:300px;">
       <!-- List View -->
@@ -973,7 +977,8 @@ function renderPoolList(eps){
   prefetchPoolModels(poolEps.filter(e=>groupsOf(e).includes(displayGroup)).map(e=>e.id));
   const cardOf=(ep)=>{
     let cls='ep-item';
-    if(!ep.enabled)cls+=' disabled';
+    const gDis=(ep.disabled_groups||[]).includes(displayGroup);  // 组级停用：仅本组不参与轮转
+    if(!ep.enabled||gDis)cls+=' disabled';
     // 高亮边框仅本组当前端点；其他组的当前端点只显示紫色组名 badge（无高亮）
     if(ep.is_current&&(ep.current_groups||[]).includes(displayGroup))cls+=' current';
     if(ep.in_cooldown)cls+=' in-cooldown';
@@ -1003,6 +1008,7 @@ function renderPoolList(eps){
         <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
           ${(()=>{const cg=ep.current_groups||[];if(!ep.is_current||!cg.length)return '';if(cg.includes(displayGroup))return `<span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="当前服务组：${esc(cg.join(', '))}">● 当前</span>`;const others=cg.filter(g=>g!==displayGroup);return `<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:10px;padding:1px 6px" title="本组未使用：它是其他组的当前端点">● ${esc(others.join('·'))}</span>`;})()}
           ${ep.in_cooldown?`<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px">⏳${fmtCdSec(ep.cooldown_remaining)}</span>`:''}
+          ${gDis?`<span class="badge badge-disabled" style="font-size:10px;padding:1px 6px" title="已在本组停用：不参与 ${esc(displayGroup)} 组轮转（其他组与全局不受影响）">⏸本组停用</span>`:''}
           ${(ep.in_cooldown||ep.manual_unlock_required)?`<button class="btn btn-yellow btn-sm" style="padding:2px 5px;font-size:11px" title="${ep.manual_unlock_required?muInfo(ep).btn:'解除冷却'}" onclick="clearCooldown('${ep.id}')">⏰</button>`:''}
         </div>
       </div>
@@ -1011,7 +1017,7 @@ function renderPoolList(eps){
         <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
           <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setPriority('${ep.id}', this.value, '${esc(displayGroup)}');this.blur()" title="修改组内优先级">${options}</select>
           <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="测试端点" onclick="openTestDrawer('${ep.id}', '${esc(ep.name)} (${esc(ep.model)})', '${esc(displayGroup)}')">🧪</button>
-          <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="${ep.enabled?'暂停端点':'恢复端点'}" onclick="toggleEndpoint('${ep.id}')">${ep.enabled?'⏸':'▶'}</button>
+          <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="${gDis?`启用本组（恢复参与 ${esc(displayGroup)} 组轮转）`:`停用本组（仅不参与 ${esc(displayGroup)} 组轮转，其他组与全局不受影响）`}" onclick="toggleGroupDisabled('${ep.id}','${esc(displayGroup)}')">${gDis?'▶':'⏸'}</button>
           <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="编辑端点" onclick="editEndpoint('${ep.id}')">✏️</button>
           ${!((ep.current_groups||[]).includes(displayGroup)&&ep.is_current)?`<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="${(ep.in_cooldown||ep.manual_unlock_required)?`切换为当前端点（组 ${esc(displayGroup)}）并解除其冻结，按真实请求结果重新判定`:`切换为当前端点（组 ${esc(displayGroup)}）`}" onclick="switchEndpoint('${ep.id}','${esc(displayGroup)}')">⚡</button>`:''}
           <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="从当前组移除（其他组不受影响；最后一组移除时整体出池）" onclick="removeFromPool('${ep.id}','${esc(displayGroup)}')">📤</button>
@@ -1410,6 +1416,8 @@ function renderChain(chain){
     const _dsec=(it.defer_by_group||{})[chainGroupFilter]||0;
     let cls='chain-item';
     if(isSub)cls+=' subgroup-entry';
+    const gDis=(it.disabled_groups||[]).includes(chainGroupFilter);  // 组级停用 → 置灰，不参与本组轮转
+    if(gDis)cls+=' disabled';
     if(it.manual_unlock_required)cls+=' failed';
     else if(it.in_cooldown)cls+=' cooldown';
     else if(_dsec>0)cls+=' deferred';
@@ -1427,12 +1435,14 @@ function renderChain(chain){
     const cerr=it.health==='bad'?(it.health_error||it.last_error||''):(it.last_error||'');
     const conn=i<chain.length-1?'<div class="chain-connector"></div>':'';
     const cp_=prioOf(it);
-    return`<div class="${cls}"><div class="chain-dot"></div><div class="chain-info"><div class="name"><span class="badge badge-priority">#${cp_}</span> ${nameHtml} ${st}</div>${modelLine}${cerr?`<div class="chain-err" title="${esc(cerr)}">⚠ ${esc(cerr)}</div>`:''}</div><div class="chain-right">${rh}</div></div>${conn}`;
+    return`<div class="${cls}"><div class="chain-dot"></div><div class="chain-info"><div class="name"><span class="badge badge-priority">#${cp_}</span> ${nameHtml} ${gDis?'<span class="badge badge-disabled">本组停用</span> ':''}${st}</div>${modelLine}${cerr?`<div class="chain-err" title="${esc(cerr)}">⚠ ${esc(cerr)}</div>`:''}</div><div class="chain-right">${rh}</div></div>${conn}`;
   }).join('');
 }
 
 async function runHealthCheck(){toast('正在检测...','info');const r=await api('POST','/api/health-check');if(r.ok){const o=r.results.filter(x=>x.health==='ok').length,s=r.results.filter(x=>x.health==='slow').length,b=r.results.filter(x=>x.health==='bad').length;toast(`✅${o} 🐢${s} ❌${b}`,'success');}refresh();}
 async function toggleEndpoint(id){await api('POST',`/api/endpoints/${encodeURIComponent(id)}/toggle`);refresh();}
+// 池卡 ⏸ = 组级停用/启用：只切该端点是否参与「该组」业务（全局 enabled 由左侧端点列表 ⏸ 管）
+async function toggleGroupDisabled(id,group){const r=await api('POST',`/api/endpoints/${encodeURIComponent(id)}/toggle`,{group});if(r&&r.error){toast(r.error,'error');}refresh();}
 // ── 分组池：入池组点选弹层（点击组即加入该组，一次一组；要再加组重复操作）──
 function openJoinPoolModal(id,name){
   const gs=window._poolGroups||{};
@@ -2448,6 +2458,11 @@ function addLogLine(entry) {
     if (logAutoScroll) logContainer.scrollTop = logContainer.scrollHeight;
 }
 let _lastLogId = 0;
+let logPaused = false;
+function toggleLogPause(){
+  logPaused = !logPaused;
+  document.getElementById('logPauseBtn').textContent = logPaused ? '▶ 恢复' : '⏸ 暂停';
+}
 // 组级日志显示级别（2026-10-05）：all/error/live/silent 一律由服务端过滤——应隐藏的行不下发。
 // 前端不再自行判定（旧前端过滤在首屏 _groupDefs 未就绪时会漏放积压行，方案已废弃）。
 function refreshLogViews() {
@@ -2457,6 +2472,8 @@ function refreshLogViews() {
   loadChatLogs(chatLogsPage);
 }
 async function pollLogs() {
+    // 暂停期间不发请求（恢复后 since=_lastLogId 自动补齐积压行；300 行上限内）
+    if (!logPaused) {
     try {
         const logs = await api('GET', '/api/logs?since=' + _lastLogId);
         if (logs && logs.length > 0) {
@@ -2466,6 +2483,7 @@ async function pollLogs() {
             }
         }
     } catch(err){}
+    }
     setTimeout(pollLogs, 2000);
 }
 pollLogs();
@@ -2474,8 +2492,13 @@ refresh();
 // 每5秒自动刷新状态（端点、聚合池、切换链），日志单独轮询
 setInterval(refresh, 5000);
 // 日志保持单独轮询
+let chatLogsPaused = false;
+function toggleChatLogsPause(){
+  chatLogsPaused = !chatLogsPaused;
+  document.getElementById('clPauseBtn').textContent = chatLogsPaused ? '▶ 恢复' : '⏸ 暂停';
+}
 setInterval(() => {
-    loadChatLogs(chatLogsPage);
+    if (!chatLogsPaused) loadChatLogs(chatLogsPage);
 }, 3000);
 let chatLogsPage = 0;
 let currentChatLogs = []

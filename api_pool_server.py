@@ -2838,6 +2838,9 @@ class Endpoint:
     model: str = "gpt-4o-mini"
     priority: int = 999
     priority_by_group: dict = field(default_factory=dict)  # per-group 优先级（2026-08-29 分组隔离；main 组值同时镜像到 priority 字段保持旧格式兼容）
+    # 组级停用（2026-10-06 池卡 ⏸）：列出的组里该端点不参与轮转；成员资格与组内优先级保留，
+    # 与全局 enabled（端点自身开关，池卡不再触碰）是两条独立轴。
+    disabled_groups: list = field(default_factory=list)
     timeout: int = 60
     max_retries: int = 1
     enabled: bool = True
@@ -2986,6 +2989,11 @@ class APIPool:
                     if gs and gs not in seen:
                         seen.append(gs)
                 ep_dict["pool_groups"] = seen
+            # 组级停用（2026-10-06）：必须是字符串列表，其余归一为空
+            raw_dg = ep_dict.get("disabled_groups")
+            ep_dict["disabled_groups"] = (
+                [str(g) for g in raw_dg if isinstance(g, str)] if isinstance(raw_dg, list) else []
+            )
             # 新增时按组别自动设置健康检测模式（未显式指定时生效）
             if "health_mode" not in ep_dict:
                 ep_dict["health_mode"] = "models" if ep_dict.get("billing_mode", "subscription") == "pay_per_use" else ("chat" if ep_dict.get("in_pool", False) else "models")
@@ -3054,9 +3062,13 @@ class APIPool:
                         ep.pool_groups = sanitized or [self.MAIN_GROUP]
                     elif in_pool and not ep.pool_groups:
                         ep.pool_groups = [self.MAIN_GROUP]
+                    if in_pool:
+                        # 组级停用只对仍属的组有效（2026-10-06）
+                        ep.disabled_groups = [g for g in (ep.disabled_groups or []) if g in ep.pool_groups]
                     # 出池清组绑定，避免残留（全量出池路径；单组移除走 remove_from_group）
                     if not in_pool:
                         ep.pool_groups = []
+                        ep.disabled_groups = []
                         self._clear_pointers_for(ep_id)
                     # 手动移出池再移回 = 显式信任该端点 → 清除延迟回迁状态，恢复最高优先级
                     if in_pool:
@@ -3074,6 +3086,7 @@ class APIPool:
                 remaining = [g for g in self._ep_groups(ep) if g != group]
                 if remaining:
                     ep.pool_groups = remaining
+                    ep.disabled_groups = [g for g in (ep.disabled_groups or []) if g in remaining]
                     # 该组粘性指针若指向本端点 → 清除（其他组指针不动）
                     if self._current_endpoint_by_group.get(group) == ep_id:
                         self._set_current(group, None)
@@ -3084,10 +3097,44 @@ class APIPool:
                     # 最后一组 → 整体出池
                     ep.in_pool = False
                     ep.pool_groups = []
+                    ep.disabled_groups = []
                     self._clear_pointers_for(ep_id)
                     sys_log(f"端点 '{ep.name}' 从组 '{group}' 移除后无剩余组，已整体移出聚合池", "INFO", group=group)
                 break
             self._renumber_pool_priorities()
+
+    def toggle_group_disabled(self, ep_id, group):
+        """组级停用/启用（池卡 ⏸，2026-10-06）：只切该端点是否参与**该组**业务。
+
+        成员资格（pool_groups）与组内优先级保留，全局 enabled（端点自身开关）不动；
+        停用本组当前/手动指针指向的端点时清该组指针（下个请求重新解析，与 remove_from_group 同构）。
+        返回停用后的状态（True=已在本组停用）；端点不存在或不在该组 → None。
+        """
+        with self._lock:
+            for ep in self._endpoints:
+                if ep.id != ep_id:
+                    continue
+                if not ep.in_pool or group not in self._ep_groups(ep):
+                    return None
+                dg = list(ep.disabled_groups or [])
+                if group in dg:
+                    dg.remove(group)
+                else:
+                    dg.append(group)
+                ep.disabled_groups = dg
+                disabled = group in dg
+                if disabled:
+                    if self._current_endpoint_by_group.get(group) == ep_id:
+                        self._set_current(group, None)
+                    if self._manual_override_by_group.get(group) == ep_id:
+                        self._set_manual(group, None)
+                sys_log(
+                    f"端点 '{self._endpoint_log_label(ep, group)}' 在本组"
+                    + ("停用（不参与该组轮转，其他组不受影响）" if disabled else "启用（恢复参与该组轮转）"),
+                    "INFO", group=group,
+                )
+                return disabled
+        return None
 
     def _clear_pointers_for(self, ep_id):
         """端点整体出池/删除时清理所有组的指针与在途登记。"""
@@ -3119,6 +3166,11 @@ class APIPool:
                     if updates.get("pool_groups") is not None:
                         sanitized = self._sanitize_groups(ep.pool_groups)
                         ep.pool_groups = sanitized or [self.MAIN_GROUP]
+                    # 组级停用（2026-10-06）：接受列表入参，且只保留仍属的组
+                    if updates.get("disabled_groups") is not None:
+                        raw_dg = updates.get("disabled_groups")
+                        ep.disabled_groups = [str(g) for g in raw_dg if isinstance(g, str)] if isinstance(raw_dg, list) else []
+                    ep.disabled_groups = [g for g in (ep.disabled_groups or []) if g in ep.pool_groups]
                     if updates.get("max_retries") is not None:
                         ep.max_retries = self._normalize_max_retries(updates["max_retries"])
                     if updates.get("strict400_retries") is not None:
@@ -3960,6 +4012,8 @@ class APIPool:
                 for ep in self._endpoints:
                     if name in self._ep_groups(ep):
                         ep.pool_groups = [new_name if g == name else g for g in self._ep_groups(ep)]
+                    if name in (ep.disabled_groups or []):
+                        ep.disabled_groups = [new_name if g == name else g for g in ep.disabled_groups]
                 for state in (self._current_endpoint_by_group, self._manual_override_by_group,
                               self._persisted_endpoint_by_group):
                     if name in state:
@@ -4026,6 +4080,10 @@ class APIPool:
         """端点在指定组的优先级：优先 priority_by_group，缺失时回退全局 priority。"""
         pbg = getattr(ep, "priority_by_group", None) or {}
         return pbg.get(group, ep.priority)
+
+    def _ep_disabled_in(self, ep, group):
+        """该端点在指定组是否被组级停用（池卡 ⏸）：只影响该组轮转，与全局 enabled 独立。"""
+        return group in (getattr(ep, "disabled_groups", None) or ())
 
     def _set_ep_priority(self, ep, group, value):
         if not hasattr(ep, "priority_by_group") or ep.priority_by_group is None:
@@ -4238,6 +4296,7 @@ class APIPool:
         members = [ep for ep in self._endpoints
                    if ep.enabled and ep.in_pool
                    and sub in self._ep_groups(ep)
+                   and not self._ep_disabled_in(ep, sub)
                    and not ep._manual_unlock_required
                    and not self._is_in_cooldown(ep)]
         members.sort(key=lambda e: (self._ep_priority(e, sub), e.priority))
@@ -4321,11 +4380,13 @@ class APIPool:
         """
         if (not ep.enabled) or (not ep.in_pool) or ep._manual_unlock_required:
             return False
-        if self._is_in_cooldown(ep):
+        if self._is_in_cooldown(ep) or self._ep_disabled_in(ep, grp):
             return False
         if grp == self.MAIN_GROUP:
+            # 整组加入 main 的名次沿用子组自身状态：子组内停用的成员不算 main 可用成员
             return self.MAIN_GROUP in self._ep_groups(ep) or any(
-                sub in self._ep_groups(ep) for sub in self._joined_subgroups()
+                sub in self._ep_groups(ep) and not self._ep_disabled_in(ep, sub)
+                for sub in self._joined_subgroups()
             )
         return grp in self._ep_groups(ep)
 
@@ -4499,6 +4560,7 @@ class APIPool:
         """
         base = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
                 and group in self._ep_groups(ep)
+                and not self._ep_disabled_in(ep, group)
                 and not ep._manual_unlock_required
                 and not self._is_in_cooldown(ep)
 ]
@@ -4512,6 +4574,8 @@ class APIPool:
                 for ep in self._endpoints:
                     if (ep.id not in seen and ep.enabled and ep.in_pool
                             and sub in self._ep_groups(ep)
+                            # 整组加入 main 时沿用子组自身状态：子组内停用的成员不进 main 该名次
+                            and not self._ep_disabled_in(ep, sub)
                             and not ep._manual_unlock_required
                             and not self._is_in_cooldown(ep)):
                         seen.add(ep.id)
@@ -4582,6 +4646,9 @@ class APIPool:
                         return False
                     if group is not None and grp not in self._ep_groups(ep):
                         return False
+                    if self._ep_disabled_in(ep, grp):
+                        # 手动切换 = 用户断言该端点在本组工作 → 自动解除本组停用（2026-10-06）
+                        ep.disabled_groups = [g for g in (ep.disabled_groups or []) if g != grp]
                     self._reset_endpoint_assertion_state(ep, defer_group=grp)
                     grp = group or self.MAIN_GROUP
                     self._set_manual(grp, ep_id)
@@ -4699,6 +4766,7 @@ class APIPool:
             "stream_stall_timeout": ep.stream_stall_timeout,
             "stream_max_duration": ep.stream_max_duration,
             "pool_groups": list(self._ep_groups(ep)),
+            "disabled_groups": list(getattr(ep, "disabled_groups", None) or []),
             "current_groups": list(current_groups) if current_groups is not None else self._groups_pointing_at(ep.id),
             "fail_count": ep._fail_count,
             "last_error": ep._last_error,
@@ -4956,6 +5024,7 @@ class APIPool:
                     "is_current": ep.id in current_ids,
                     "current_groups": _groups_for(ep.id),
                     "pool_groups": list(self._ep_groups(ep)),
+                    "disabled_groups": list(getattr(ep, "disabled_groups", None) or []),
                     "fail_count": ep._fail_count,
                     "in_cooldown": ep._cooldown_until > now,
                     "cooldown_remaining": max(0, int(ep._cooldown_until - now)),
@@ -5342,6 +5411,7 @@ class APIPool:
         """返回优先级 99 的终极兜底端点（启用、在池、未冷却）。"""
         for ep in self._endpoints:
             if (ep.enabled and ep.in_pool and not ep._manual_unlock_required and ep.priority == 99
+                    and not self._ep_disabled_in(ep, self.MAIN_GROUP)
                     and not self._is_in_cooldown(ep)):
                 return ep
         return None
@@ -5748,10 +5818,12 @@ class APIPool:
                             or not current_ep.enabled
                             or not current_ep.in_pool
                             or self._is_in_cooldown(current_ep)
+                            or self._ep_disabled_in(current_ep, grp)
                         )
                         if not self._get_manual(grp) and current_unavailable:
                             group_eps = [e for e in self._endpoints if e.enabled and e.in_pool
                                          and grp in self._ep_groups(e)
+                                         and not self._ep_disabled_in(e, grp)
                                          and not self._is_in_cooldown(e)
 ]
                             if group_eps:
@@ -5884,7 +5956,8 @@ class APIPool:
         if group == self.MAIN_GROUP:
             active, _ = self._group_sticky_candidates(self.MAIN_GROUP)
         else:
-            active = [e for e in self._failover_endpoints() if group in self._ep_groups(e)]
+            active = [e for e in self._failover_endpoints() if group in self._ep_groups(e)
+                      and not self._ep_disabled_in(e, group)]
         active.sort(key=lambda e: self._candidate_sort_key(e, group))
         return active
 
@@ -9043,6 +9116,7 @@ if isinstance(restored_groups, dict):
                 if ep.id == ep_id and ep.enabled and ep.in_pool
                 and not ep._manual_unlock_required
                 and grp in pool._ep_groups(ep)
+                and not pool._ep_disabled_in(ep, grp)
             ),
             None,
         )
@@ -9722,6 +9796,13 @@ def api_handler(method, path, body):
         ep_id = unquote(cp.split("/")[-1]); pool.remove_endpoint(ep_id); _sync_to_config(); return 200, {"ok": True}, False
     if method == "POST" and cp.endswith("/toggle"):
         ep_id = unquote(cp.split("/")[3])
+        grp = str((body or {}).get("group") or "").strip() if isinstance(body, dict) else ""
+        if grp:
+            # 带 group = 组级停用/启用（池卡 ⏸）；不带 = 全局启用/禁用（端点列表 ⏸）
+            res = pool.toggle_group_disabled(ep_id, grp)
+            if res is None:
+                return 404, {"error": f"端点不存在或不在组 '{grp}'"}, False
+            _sync_to_config(); return 200, {"ok": True, "disabled": res}, False
         for ep in pool.list_endpoints():
             if ep["id"] == ep_id: pool.set_enabled(ep_id, not ep["enabled"]); break
         _sync_to_config(); return 200, {"ok": True}, False
@@ -9889,7 +9970,7 @@ def _sync_to_config():
     for entry in defs_list:
         entry.pop("rotate_minutes", None)  # 旧分钟制键（2026-10-05 起按请求次数）：清空不迁移
     save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "client_profile": ep.get("client_profile", ""), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
-            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "retry_on_rate_limit": ep.get("retry_on_rate_limit", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "strict400_retries": ep.get("strict400_retries", 2), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles,
+            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "retry_on_rate_limit": ep.get("retry_on_rate_limit", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "strict400_retries": ep.get("strict400_retries", 2), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"]), "disabled_groups": ep.get("disabled_groups", [])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles,
         probe_client_profile=getattr(pool, "_probe_client_profile", ""),
         log_retention=load_log_retention())
 
