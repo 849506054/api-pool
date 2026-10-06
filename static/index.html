@@ -196,9 +196,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .free-tag{font-size:9px;background:var(--green-dim);color:var(--green);padding:1px 5px;border-radius:8px}
 .mb-row.selected .free-tag{background:rgba(255,255,255,.2);color:#fff}
 .mb-row .lat-cell{font-size:10px;white-space:nowrap}
-/* 组内轮换成员选择（2026-10-06）：复选框列表，与模型选择器 .mb-row 同构 */
-.gm-list{max-height:104px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;background:rgba(255,255,255,.02)}
-.gm-row{display:grid;grid-template-columns:20px 1fr;gap:6px;padding:4px 8px;align-items:center;font-size:12px;cursor:pointer}
+/* 组内轮换成员选择（2026-10-06）：复选框列表，与模型选择器 .mb-row 同构（紧凑尺寸，不撑高弹窗） */
+.gm-list{max-height:66px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;background:rgba(255,255,255,.02)}
+.gm-row{display:grid;grid-template-columns:16px 1fr;gap:4px;padding:1px 8px;align-items:center;font-size:11px;cursor:pointer}
 .gm-row:hover{background:var(--card-hover)}
 .gm-row input[type=checkbox]{accent-color:var(--accent);cursor:pointer}
 .gm-row .name-cell{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
@@ -1004,6 +1004,9 @@ function renderPoolList(eps){
     }
     let options='';
     for(let p=1;p<=maxP;p++) options+=`<option value="${p}" ${p===prioOf(ep)?'selected':''}>#${p}</option>`;
+    // 选择性轮换（2026-10-06）：本组 rotate_members 选中的端点在卡片上打标
+    const gRotSel=(window._groupDefs||[]).find(x=>x.name===displayGroup)||{};
+    const rotating=(gRotSel.rotate_requests>0)&&(gRotSel.rotate_members||[]).includes(ep.id);
     return `<div class="${cls}" style="display:flex;flex-direction:column;gap:6px;padding:10px 12px">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
         <div style="display:flex;align-items:center;gap:6px;min-width:0">
@@ -1011,6 +1014,7 @@ function renderPoolList(eps){
           <span style="font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(ep.name)}</span>
           ${wkmCreditBadge(ep.credit)}
           ${ep.billing_mode==='pay_per_use'?`<span class="badge" style="background:rgba(255,159,10,.15);color:#ff9f0a;font-size:10px;padding:1px 5px" title="按次计费">💰按次</span>`:''}
+          ${rotating?`<span class="badge" style="background:rgba(94,92,230,.15);color:#a5b4fc;border:1px solid rgba(94,92,230,.35);font-size:10px;padding:1px 5px" title="参与 ${esc(displayGroup)} 组轮换（选择性轮换选中成员）">🔄 轮换</span>`:''}
         </div>
         <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
           ${(()=>{const cg=ep.current_groups||[];if(!ep.is_current||!cg.length)return '';if(cg.includes(displayGroup))return `<span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="当前服务组：${esc(cg.join(', '))}">● 当前</span>`;const others=cg.filter(g=>g!==displayGroup);return `<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:10px;padding:1px 6px" title="本组未使用：它是其他组的当前端点">● ${esc(others.join('·'))}</span>`;})()}

@@ -21,6 +21,10 @@ assert(/<label class="gm-row">/.test(src), '复选框行用原生 label 包裹')
 assert(/const rotate_members=rmEl\?Array\.from\(rmEl\.querySelectorAll\('input\[type=checkbox\]:checked'\)\)\.map\(c=>c\.value\):\[\];/.test(src), '保存收集勾选的端点 id');
 assert(/log_level,rotate_requests,rotate_members\}\)/.test(src), 'PUT/POST 携带 rotate_members');
 // 6) 样式复用模型选择器同构写法，不引入自定义浮层
-assert(/\.gm-row\{display:grid;grid-template-columns:20px 1fr;/.test(src), '成员行与 .mb-row 同构的网格行');
+assert(/\.gm-row\{display:grid;grid-template-columns:16px 1fr;/.test(src), '成员行与 .mb-row 同构的网格行');
 assert(!/gm-popover|gm-dropdown|createPortal/.test(src), '不使用自定义浮层');
+// 7) 选择框紧凑（不撑高弹窗）+ 选中成员在池卡打标
+assert(/\.gm-list\{max-height:66px/.test(src), '选择框高度紧凑');
+assert(/const rotating=\(gRotSel\.rotate_requests>0\)&&\(gRotSel\.rotate_members\|\|\[\]\)\.includes\(ep\.id\);/.test(src), '池卡按本组 rotate_members 判定');
+assert(/🔄 轮换<\/span>/.test(src), '选中成员卡片带轮换徽标');
 console.log('OK: 组内选择性轮换前端自检通过');
