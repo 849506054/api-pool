@@ -36,6 +36,7 @@ assert(/参与轮换的成员：\$\{sel\?\`已选 \$\{sel\} 个\`:'全部'\}/.te
 assert(/\.gm-row input\[type=checkbox\]\{flex:none;width:13px;height:13px;min-width:0;padding:0;margin:0;border:none/.test(src), '复选框显式尺寸，不继承表单输入框样式');
 assert(/\.gm-row,\.form-group \.gm-row\{display:flex;align-items:center;gap:5px;padding:2px 6px;margin-bottom:0;font-size:11px;font-weight:400;/.test(src), '成员行用 flex 且覆盖 .form-group label 样式');
 assert(/\.gm-dd\{flex:0 1 auto;min-width:0\}/.test(src), '折叠态按钮宽度=文字宽度');
+assert(!/\.gm-dd\[open\]\{flex/.test(src), '展开面板与按钮同宽（同一元素，不另设宽度）');
 assert(/\.gm-list\{margin-top:4px;max-height:132px/.test(src), '展开面板限高滚动');
 assert(!/gm-popover|gm-dropdown|createPortal/.test(src), '不使用自定义浮层');
 // 8) 选中成员在池卡打标
