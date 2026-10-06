@@ -196,8 +196,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .free-tag{font-size:9px;background:var(--green-dim);color:var(--green);padding:1px 5px;border-radius:8px}
 .mb-row.selected .free-tag{background:rgba(255,255,255,.2);color:#fff}
 .mb-row .lat-cell{font-size:10px;white-space:nowrap}
-/* 组内轮换成员选择（2026-10-06）：与轮换次数同行，紧凑复选框列表（显式尺寸，避免继承 .form-group input 的框体样式） */
-.gm-list{flex:1;min-width:0;max-height:58px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;background:rgba(255,255,255,.02)}
+/* 组内轮换成员选择（2026-10-06）：折叠摘要（默认不展开，点击弹出）+ 紧凑复选框列表 */
+.gm-dd{flex:1;min-width:0}
+.gm-dd>summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:6px;height:34px;padding:0 11px;background:rgba(0,0,0,.2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;box-shadow:inset 0 1px 2px rgba(0,0,0,.1)}
+.gm-dd>summary::-webkit-details-marker{display:none}
+.gm-dd>summary::after{content:'▾';font-size:10px;color:var(--text-dim);transition:transform .12s}
+.gm-dd[open]>summary{border-color:var(--accent)}
+.gm-dd[open]>summary::after{transform:rotate(180deg)}
+.gm-list{margin-top:4px;max-height:132px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;background:rgba(255,255,255,.02)}
 /* 行内 .form-group .gm-row 一档提高特异性，覆盖 .form-group label 的块级/大写/字重/下边距 */
 .gm-row,.form-group .gm-row{display:flex;align-items:center;gap:5px;padding:2px 6px;margin-bottom:0;font-size:11px;font-weight:400;color:var(--text);text-transform:none;letter-spacing:0;line-height:1.4;cursor:pointer}
 .gm-row input[type=checkbox]{flex:none;width:13px;height:13px;min-width:0;padding:0;margin:0;border:none;border-radius:3px;background:none;box-shadow:none;accent-color:var(--accent);cursor:pointer}
@@ -1248,14 +1254,9 @@ function openGroupModal(editName){
   const idleHint=g.idle_seconds
     ?`main 工作端点空闲满 ${g.idle_seconds} 秒后，子组不再避让它（main 在途时仍避让）`
     :'未启用：子组始终避让 main 的当前/手动端点';
-  // 参与轮换的成员（2026-10-06）：列本组直接成员，按组内优先级排序；不选=全体成员参与
-  const gmGroups=(e)=>((e.pool_groups&&e.pool_groups.length)?e.pool_groups:['main']);
-  const gmPrio=(e)=>((e.priority_by_group&&e.priority_by_group[g.name]!==undefined)?e.priority_by_group[g.name]:e.priority);
+  // 参与轮换的成员（2026-10-06）：默认折叠；点摘要才向后端查询组内成员并列出勾选（不勾 = 全体参与）
   const gmSel=new Set(Array.isArray(g.rotate_members)?g.rotate_members:[]);
-  const gmEps=(poolSnapshot.endpoints||[]).filter(e=>e.in_pool&&gmGroups(e).includes(g.name)).sort((a,b)=>gmPrio(a)-gmPrio(b));
-  const gmList=gmEps.length
-    ?gmEps.map(e=>`<label class="gm-row"><input type="checkbox" value="${esc(e.id)}" ${gmSel.has(e.id)?'checked':''}><span class="name-cell">${esc(e.name)}${e.model?' · '+esc(e.model):''}</span></label>`).join('')
-    :'<div class="gm-empty">组内暂无成员</div>';
+  const gmSummary=`参与轮换的成员：${gmSel.size?`已选 ${gmSel.size} 个`:'全部'}`;
   const overlay=document.createElement('div');
   overlay.className='modal-overlay show';
   overlay.id='groupEditOverlay';
@@ -1291,9 +1292,11 @@ function openGroupModal(editName){
       <div class="form-group"><label title="组内端点轮换（成功请求次数）：>0 时每成功 N 次请求把本组当前端点按组内优先级自动推进到下一名（循环）；0/留空=不轮换。手动切换是那一刻的动作，组配了轮换就按配置继续推进，两者不冲突">端点轮换 (每 N 次请求)</label>
         <div style="display:flex;gap:8px;align-items:flex-start">
           <input type="number" id="gRotate" min="0" max="100000" value="${g.rotate_requests||''}" placeholder="0=不轮换" style="flex:0 0 78px;min-width:0">
-          <div class="gm-list" id="gRotateMembers" title="参与轮换的成员（不选 = 全部成员参与）">${gmList}</div>
+          <details class="gm-dd" id="gRotateMembersBox" ontoggle="gmLoadMembers(this)">
+            <summary id="gRotateMembersSum" title="点击查询组内成员并勾选；不勾选 = 全部成员参与">${gmSummary}</summary>
+            <div class="gm-list" id="gRotateMembers" onchange="gmUpdateSummary()"></div>
+          </details>
         </div>
-        <div style="font-size:11px;color:var(--text-dim);margin-top:4px">参与轮换的成员（不选 = 全部成员参与）</div>
       </div>
       ${g.is_main?`<div class="form-group"><label title="main 的当前/手动工作端点空闲满该时长后，子组不再避让它，按本组优先级正常使用；端点有在途（main 或子组）时仍避让，main 也可随时抢占。0=关闭（子组始终避让）">空闲时间 (秒)</label>
         <input type="number" id="gIdle" min="0" max="86400" value="${g.idle_seconds||''}" placeholder="0=关闭，如 600">
@@ -1318,6 +1321,42 @@ function closeGroupModal(){
   const o=document.getElementById('groupEditOverlay');
   if(o)o.remove();
 }
+// 轮换成员折叠摘要（2026-10-06）：勾选变化时刷新摘要文本（默认折叠，点击 summary 才展开）
+function gmUpdateSummary(){
+  const box=document.getElementById('gRotateMembersBox');
+  const sum=document.getElementById('gRotateMembersSum');
+  if(!box||!sum)return;
+  const boxes=box.querySelectorAll('.gm-list input[type=checkbox]');
+  const sel=box.querySelectorAll('.gm-list input[type=checkbox]:checked').length;
+  sum.textContent=boxes.length?`参与轮换的成员：${sel?`已选 ${sel} 个`:'全部'}`:'参与轮换的成员：组内暂无成员';
+}
+// 组内成员口径（2026-10-06）：组归属缺省 main；组内优先级优先 priority_by_group
+function gmGroupsOf(e){return (e.pool_groups&&e.pool_groups.length)?e.pool_groups:['main'];}
+function gmPrioOf(e,g){return (e.priority_by_group&&e.priority_by_group[g]!==undefined)?e.priority_by_group[g]:e.priority;}
+// 查询组内成员（2026-10-06）：点摘要展开时向后端拉取最新端点/组定义，列出本组成员供勾选
+async function gmLoadMembers(box){
+  box=box||document.getElementById('gRotateMembersBox');
+  if(!box||!box.open||box.dataset.loaded==='1')return;
+  const list=box.querySelector('.gm-list');
+  const gname=(document.getElementById('gName')||{value:''}).value.trim();
+  if(!gname){list.innerHTML='<div class="gm-empty">先填分组名称并保存，再查询成员</div>';box.dataset.loaded='1';return;}
+  list.innerHTML='<div class="gm-empty">查询中…</div>';
+  try{
+    await refresh(); // 查询：拉最新 /api/endpoints + /api/groups
+    const g=(window._groupDefs||[]).find(x=>x.name===gname)||{};
+    const sel=new Set(Array.isArray(g.rotate_members)?g.rotate_members:[]);
+    const eps=(poolSnapshot.endpoints||[]).filter(e=>e.in_pool&&gmGroupsOf(e).includes(gname))
+      .sort((a,b)=>gmPrioOf(a,gname)-gmPrioOf(b,gname));
+    list.innerHTML=eps.length
+      ?eps.map(e=>`<label class="gm-row"><input type="checkbox" value="${esc(e.id)}" ${sel.has(e.id)?'checked':''}><span class="name-cell">${esc(e.name)}${e.model?' · '+esc(e.model):''}</span></label>`).join('')
+      :'<div class="gm-empty">组内暂无成员</div>';
+    box.dataset.loaded='1';
+    gmUpdateSummary();
+  }catch(err){
+    list.innerHTML='<div class="gm-empty">查询失败</div>';
+    toast(`查询组内成员失败: ${err.message||err}`,'error');
+  }
+}
 // 上下文长度输入解析（2026-09-13）：纯数字=tokens；K/M 后缀（1000K、1M、1.5M）换算为 tokens；空/0=不声明
 function parseCtxTokens(raw){
   const s=String(raw??'').trim().toUpperCase().replace(/[\s,_]/g,'');
@@ -1334,8 +1373,12 @@ async function savePoolGroup(editName){
   const log_level=document.getElementById('gLogLevel')?document.getElementById('gLogLevel').value:'all';
   const rotateRaw=(document.getElementById('gRotate')||{value:''}).value.trim();
   const rotate_requests=rotateRaw===''?0:parseInt(rotateRaw,10);
+  const rmBox=document.getElementById('gRotateMembersBox');
   const rmEl=document.getElementById('gRotateMembers');
-  const rotate_members=rmEl?Array.from(rmEl.querySelectorAll('input[type=checkbox]:checked')).map(c=>c.value):[];
+  // 未展开查询面板 = 未改动选择：沿用组内已存 rotate_members，避免保存其它字段时把选择清空
+  const rotate_members=(rmBox&&rmBox.dataset.loaded==='1'&&rmEl)
+    ?Array.from(rmEl.querySelectorAll('input[type=checkbox]:checked')).map(c=>c.value)
+    :((editName?((window._groupDefs||[]).find(x=>x.name===editName)||{}).rotate_members:null)||[]);
   const idleEl=document.getElementById('gIdle');  // 仅 main 组弹窗含该输入
   const idleRaw=idleEl?idleEl.value.trim():'';
   const idle_seconds=idleRaw===''?0:parseInt(idleRaw,10);
