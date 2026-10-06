@@ -3067,6 +3067,8 @@ class APIPool:
                         ep.disabled_groups = [g for g in (ep.disabled_groups or []) if g in ep.pool_groups]
                     # 出池清组绑定，避免残留（全量出池路径；单组移除走 remove_from_group）
                     if not in_pool:
+                        for grp in list(self._ep_groups(ep)):  # 所属组对本端点全成历史
+                            self._retire_group_key(ep, grp)
                         ep.pool_groups = []
                         ep.disabled_groups = []
                         self._clear_pointers_for(ep_id)
@@ -3084,6 +3086,7 @@ class APIPool:
                 if ep.id != ep_id or not ep.in_pool:
                     continue
                 remaining = [g for g in self._ep_groups(ep) if g != group]
+                self._retire_group_key(ep, group)  # 该组对本端点成历史
                 if remaining:
                     ep.pool_groups = remaining
                     ep.disabled_groups = [g for g in (ep.disabled_groups or []) if g in remaining]
@@ -3156,6 +3159,7 @@ class APIPool:
                     new_priority = updates.get("priority")
                     old_priority = ep.priority
 
+                    prev_groups = list(self._ep_groups(ep))
                     # 先处理所有字段
                     for k, v in updates.items():
                         if hasattr(ep, k) and not k.startswith("_") and k != "id":
@@ -3166,6 +3170,9 @@ class APIPool:
                     if updates.get("pool_groups") is not None:
                         sanitized = self._sanitize_groups(ep.pool_groups)
                         ep.pool_groups = sanitized or [self.MAIN_GROUP]
+                        for grp in prev_groups:  # 退出的组：该组键成历史
+                            if grp not in ep.pool_groups:
+                                self._retire_group_key(ep, grp)
                     # 组级停用（2026-10-06）：接受列表入参，且只保留仍属的组
                     if updates.get("disabled_groups") is not None:
                         raw_dg = updates.get("disabled_groups")
@@ -4080,21 +4087,14 @@ class APIPool:
             # 应用改名：端点 pool_groups / 指针态 / fallback 锁 / defs
             if new_name != name:
                 for ep in self._endpoints:
-                    if name in self._ep_groups(ep):
+                    member = name in self._ep_groups(ep)
+                    if member:
                         ep.pool_groups = [new_name if g == name else g for g in self._ep_groups(ep)]
-                    if name in (ep.disabled_groups or []):
-                        ep.disabled_groups = [new_name if g == name else g for g in ep.disabled_groups]
-                    # 组内优先级 / 延迟回迁状态都以组名为键：不同步改名 → 新组名查不到值，
-                    # 回退全局 priority（子组端点该字段未镜像，恒为旧值）→ 名次全丢（2026-10-06）
-                    if ep.priority_by_group and name in ep.priority_by_group:
-                        ep.priority_by_group[new_name] = ep.priority_by_group.pop(name)
-                    if name in ep._defer_until_by_group:
-                        ep._defer_until_by_group[new_name] = ep._defer_until_by_group.pop(name)
-                    if name in ep._defer_borrow_by_group:
-                        ep._defer_borrow_by_group.discard(name)
-                        ep._defer_borrow_by_group.add(new_name)
+                    # 键收口：仍是成员 → 跟随新名；已退组的残留键 → 直接清（组名成历史）
+                    self._retire_group_key(ep, name, new_name if member else None)
                 for state in (self._current_endpoint_by_group, self._manual_override_by_group,
-                              self._persisted_endpoint_by_group):
+                              self._persisted_endpoint_by_group, self._route_epoch_by_group,
+                              self._rotate_counts, self._cache_stats_site_id_by_group):
                     if name in state:
                         state[new_name] = state.pop(name)
                 if name in self._fallback_lock_until_by_group:
@@ -4142,9 +4142,14 @@ class APIPool:
             for ep in list(self._endpoints):
                 if ep.in_pool and name in self._ep_groups(ep):
                     self.remove_from_group(ep.id, name)
+            # 组名成历史：清掉所有端点上以该组名为键的残留状态（成员已在上面逐个移出）
+            for ep in self._endpoints:
+                self._retire_group_key(ep, name)
             self._group_defs.pop(name, None)
             for state in (self._current_endpoint_by_group, self._manual_override_by_group,
-                          self._persisted_endpoint_by_group, self._fallback_lock_until_by_group):
+                          self._persisted_endpoint_by_group, self._fallback_lock_until_by_group,
+                          self._route_epoch_by_group, self._rotate_counts,
+                          self._cache_stats_site_id_by_group):
                 state.pop(name, None)
             self._group_fallback_lock_until.pop(name, None)
             self._group_fallback_pending.pop(name, None)
@@ -4173,6 +4178,36 @@ class APIPool:
         # main 组值镜像到全局 priority 字段（旧格式兼容：config、探活日志、prio99 兜底语义）
         if group == self.MAIN_GROUP:
             ep.priority = value
+
+    def _retire_group_key(self, ep, group, new_group=None):
+        """以组名为键的 per-endpoint 状态收口（唯一出口）：组名成为历史即清除。
+
+        覆盖 priority_by_group / disabled_groups / _defer_until_by_group /
+        _defer_borrow_by_group 四处。`new_group` 非空表示这仍是同一个组、只是改名
+        （键跟随改名）；为空表示该键成历史（端点退组 / 组被删除 / 端点出池）→ 删掉。
+        新增此类以组名为键的字段必须挂到这里，否则改名或退组会留下孤儿键
+        （2026-10-06 改组名丢名次事故的收口点）。
+        """
+        pbg = ep.priority_by_group
+        if pbg and group in pbg:
+            if new_group:
+                pbg[new_group] = pbg.pop(group)
+            else:
+                pbg.pop(group, None)
+        if group in (ep.disabled_groups or []):
+            rest = [g for g in ep.disabled_groups if g != group]
+            if new_group:
+                rest.append(new_group)
+            ep.disabled_groups = rest
+        if group in ep._defer_until_by_group:
+            if new_group:
+                ep._defer_until_by_group[new_group] = ep._defer_until_by_group.pop(group)
+            else:
+                ep._defer_until_by_group.pop(group, None)
+        if group in ep._defer_borrow_by_group:
+            ep._defer_borrow_by_group.discard(group)
+            if new_group:
+                ep._defer_borrow_by_group.add(new_group)
 
     def _resolve_request_group(self, model):
         """请求 model 字段 → 路由组名（薄封装，唯一解析点）。

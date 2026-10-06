@@ -361,6 +361,100 @@ class GroupManagementTests(unittest.TestCase):
             self.assertIn("api-pool-bg", ids)  # bg 组 selector（非组名）
             self.assertIn("deepseek-v4-flash", ids)  # dedicated 组 selector
 
+    # ── 组名键的生死（2026-10-06：成为历史即清，不留孤儿键）──
+
+    def test_rename_purges_stale_key_of_nonmember(self):
+        """改名前已退组的残留键直接清；仍属的成员键跟随新名。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            member = self.endpoint(module, "b1", 1, "m1", groups=["bg", "main"])
+            member.priority_by_group = {"bg": 1, "main": 2}
+            stale = self.endpoint(module, "b2", 1, "m2", groups=["main"])
+            stale.priority_by_group = {"bg": 5}  # 历史残留（已退 bg）
+            pool = self.make_pool(module, [member, stale])
+            pool._derive_group_defs()
+            ok, msg = pool.update_group("bg", {"name": "bg2"})
+            self.assertTrue(ok, msg)
+            self.assertEqual(member.priority_by_group.get("bg2"), 1)
+            self.assertNotIn("bg", member.priority_by_group)
+            self.assertNotIn("bg", stale.priority_by_group)  # 残留键不跟到新名
+            self.assertNotIn("bg2", stale.priority_by_group)
+
+    def test_remove_from_group_purges_priority_key(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            ep = self.endpoint(module, "b1", 1, "m1", groups=["bg", "main"])
+            ep.priority_by_group = {"bg": 1, "main": 2}
+            ep.disabled_groups = ["bg"]
+            pool = self.make_pool(module, [ep])
+            pool._derive_group_defs()
+            pool.remove_from_group("b1", "bg")
+            self.assertEqual(ep.pool_groups, ["main"])
+            self.assertNotIn("bg", ep.priority_by_group)
+            self.assertNotIn("bg", ep.disabled_groups)
+            self.assertIn("main", ep.priority_by_group)  # 其他组不动
+
+    def test_set_pool_out_purges_all_group_keys(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            ep = self.endpoint(module, "b1", 1, "m1", groups=["bg", "main"])
+            ep.priority_by_group = {"bg": 1, "main": 2}
+            pool = self.make_pool(module, [ep])
+            pool._derive_group_defs()
+            pool.set_pool("b1", False)
+            self.assertFalse(ep.in_pool)
+            self.assertEqual(ep.priority_by_group, {})
+
+    def test_delete_group_purges_keys_of_members_and_stale(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            member = self.endpoint(module, "b1", 1, "m1", groups=["bg", "main"])
+            member.priority_by_group = {"bg": 1, "main": 2}
+            stale = self.endpoint(module, "b2", 1, "m2", groups=["main"])
+            stale.priority_by_group = {"bg": 7}  # 非成员的残留键
+            pool = self.make_pool(module, [member, stale])
+            pool._derive_group_defs()
+            ok, msg = pool.delete_group("bg")
+            self.assertTrue(ok, msg)
+            self.assertNotIn("bg", member.priority_by_group)
+            self.assertNotIn("bg", stale.priority_by_group)
+            self.assertIn("main", member.priority_by_group)
+            self.assertEqual(member.pool_groups, ["main"])
+
+    def test_update_endpoint_group_change_purges_left_keys(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            ep = self.endpoint(module, "b1", 1, "m1", groups=["bg", "main"])
+            ep.priority_by_group = {"bg": 1, "main": 2}
+            pool = self.make_pool(module, [ep])
+            pool._derive_group_defs()
+            pool.update_endpoint("b1", {"pool_groups": ["main"]})
+            self.assertEqual(ep.pool_groups, ["main"])
+            self.assertNotIn("bg", ep.priority_by_group)
+            self.assertIn("main", ep.priority_by_group)
+
+
+    def test_pool_level_group_keys_follow_rename_and_delete(self):
+        """池级以组名为键的状态（轮换计数 / 路由版本 / 缓存账户）同样跟随改名、删组即清。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            ep = self.endpoint(module, "b1", 1, "m1", groups=["bg", "main"])
+            pool = self.make_pool(module, [ep])
+            pool._derive_group_defs()
+            pool._rotate_counts["bg"] = 7
+            pool._route_epoch_by_group["bg"] = 3
+            pool._cache_stats_site_id_by_group["bg"] = "site-x"
+            ok, msg = pool.update_group("bg", {"name": "bg2"})
+            self.assertTrue(ok, msg)
+            self.assertEqual(pool._rotate_counts.get("bg2"), 7)
+            self.assertNotIn("bg", pool._rotate_counts)
+            self.assertEqual(pool._route_epoch_by_group.get("bg2"), 3)
+            self.assertEqual(pool._cache_stats_site_id_by_group.get("bg2"), "site-x")
+            pool.delete_group("bg2")
+            self.assertNotIn("bg2", pool._rotate_counts)
+            self.assertNotIn("bg2", pool._route_epoch_by_group)
+            self.assertNotIn("bg2", pool._cache_stats_site_id_by_group)
+
 
 if __name__ == "__main__":
     unittest.main()
