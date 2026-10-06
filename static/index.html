@@ -197,7 +197,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .mb-row.selected .free-tag{background:rgba(255,255,255,.2);color:#fff}
 .mb-row .lat-cell{font-size:10px;white-space:nowrap}
 /* 组内轮换成员选择（2026-10-06）：折叠摘要（默认不展开，点击弹出）+ 紧凑复选框列表 */
-.gm-dd{flex:1;min-width:0}
+.gm-dd{flex:0 1 auto;min-width:0}   /* 折叠态宽度=文字宽度，不撑满整行 */
+.gm-dd[open]{flex:1 1 auto}          /* 展开时才占满余宽，保证成员名不被截断 */
 .gm-dd>summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:6px;height:34px;padding:0 11px;background:rgba(0,0,0,.2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;box-shadow:inset 0 1px 2px rgba(0,0,0,.1)}
 .gm-dd>summary::-webkit-details-marker{display:none}
 .gm-dd>summary::after{content:'▾';font-size:10px;color:var(--text-dim);transition:transform .12s}
