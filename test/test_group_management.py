@@ -121,11 +121,16 @@ class GroupManagementTests(unittest.TestCase):
             pool = self.make_pool(module, [ep])
             # 端点声明使 bg 已隐式存在（无实体）→ 先派生实体再改名
             pool._derive_group_defs()
+            pool.set_group_priority("b1", "bg", 2)  # 组内优先级（per-group 键）
+            pbg_before = ep.priority_by_group["bg"]
             pool._set_current("bg", "b1")
             pool._set_manual("bg", "b1")
             ok, msg = pool.update_group("bg", {"name": "bg2"})
             self.assertTrue(ok, msg)
             self.assertEqual(ep.pool_groups, ["bg2", "main"])
+            # 组内优先级键跟随改名：否则新组名查不到 → 回退全局 priority（名次全丢）
+            self.assertNotIn("bg", ep.priority_by_group)
+            self.assertEqual(ep.priority_by_group.get("bg2"), pbg_before)
             self.assertEqual(pool._current_endpoint_by_group.get("bg2"), "b1")
             self.assertNotIn("bg", pool._current_endpoint_by_group)
             self.assertEqual(pool._group_defs["bg2"]["model"], "bg2")  # 派生选择器跟随新名

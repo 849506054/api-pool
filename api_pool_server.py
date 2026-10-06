@@ -4084,6 +4084,15 @@ class APIPool:
                         ep.pool_groups = [new_name if g == name else g for g in self._ep_groups(ep)]
                     if name in (ep.disabled_groups or []):
                         ep.disabled_groups = [new_name if g == name else g for g in ep.disabled_groups]
+                    # 组内优先级 / 延迟回迁状态都以组名为键：不同步改名 → 新组名查不到值，
+                    # 回退全局 priority（子组端点该字段未镜像，恒为旧值）→ 名次全丢（2026-10-06）
+                    if ep.priority_by_group and name in ep.priority_by_group:
+                        ep.priority_by_group[new_name] = ep.priority_by_group.pop(name)
+                    if name in ep._defer_until_by_group:
+                        ep._defer_until_by_group[new_name] = ep._defer_until_by_group.pop(name)
+                    if name in ep._defer_borrow_by_group:
+                        ep._defer_borrow_by_group.discard(name)
+                        ep._defer_borrow_by_group.add(new_name)
                 for state in (self._current_endpoint_by_group, self._manual_override_by_group,
                               self._persisted_endpoint_by_group):
                     if name in state:
