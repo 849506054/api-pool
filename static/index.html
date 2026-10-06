@@ -197,13 +197,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .mb-row.selected .free-tag{background:rgba(255,255,255,.2);color:#fff}
 .mb-row .lat-cell{font-size:10px;white-space:nowrap}
 /* 组内轮换成员选择（2026-10-06）：折叠摘要（默认不展开，点击弹出）+ 紧凑复选框列表 */
-.gm-dd{flex:0 1 auto;min-width:0}   /* 宽度由内容决定：折叠=摘要文字宽，展开=最宽成员名宽（与按钮同一元素，天然对齐） */
+.gm-dd{position:relative;flex:0 0 auto;min-width:0}   /* 按钮=内容宽；面板绝对定位，宽度=按钮宽度 */
 .gm-dd>summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:6px;height:34px;padding:0 11px;background:rgba(0,0,0,.2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;box-shadow:inset 0 1px 2px rgba(0,0,0,.1)}
 .gm-dd>summary::-webkit-details-marker{display:none}
 .gm-dd>summary::after{content:'▾';font-size:10px;color:var(--text-dim);transition:transform .12s}
 .gm-dd[open]>summary{border-color:var(--accent)}
 .gm-dd[open]>summary::after{transform:rotate(180deg)}
-.gm-list{margin-top:4px;max-height:132px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;background:rgba(255,255,255,.02)}
+.gm-list{position:absolute;left:0;right:0;top:calc(100% + 4px);max-height:132px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;background:#14151c;box-shadow:0 10px 26px rgba(0,0,0,.5);z-index:30}
 /* 行内 .form-group .gm-row 一档提高特异性，覆盖 .form-group label 的块级/大写/字重/下边距 */
 .gm-row,.form-group .gm-row{display:flex;align-items:center;gap:5px;padding:2px 6px;margin-bottom:0;font-size:11px;font-weight:400;color:var(--text);text-transform:none;letter-spacing:0;line-height:1.4;cursor:pointer}
 .gm-row input[type=checkbox]{flex:none;width:13px;height:13px;min-width:0;padding:0;margin:0;border:none;border-radius:3px;background:none;box-shadow:none;accent-color:var(--accent);cursor:pointer}
@@ -1291,7 +1291,7 @@ function openGroupModal(editName){
         </select></div>
       <div class="form-group"><label title="组内端点轮换（成功请求次数）：>0 时每成功 N 次请求把本组当前端点按组内优先级自动推进到下一名（循环）；0/留空=不轮换。手动切换是那一刻的动作，组配了轮换就按配置继续推进，两者不冲突">端点轮换 (每 N 次请求)</label>
         <div style="display:flex;gap:8px;align-items:flex-start">
-          <input type="number" id="gRotate" min="0" max="100000" value="${g.rotate_requests||''}" placeholder="0=不轮换" style="flex:0 0 78px;min-width:0">
+          <input type="number" id="gRotate" min="0" max="100000" value="${g.rotate_requests||''}" placeholder="0=不轮换" style="flex:1 1 auto;min-width:0">
           <details class="gm-dd" id="gRotateMembersBox" ontoggle="gmLoadMembers(this)">
             <summary id="gRotateMembersSum" title="点击查询组内成员并勾选；不勾选 = 全部成员参与">${gmSummary}</summary>
             <div class="gm-list" id="gRotateMembers" onchange="gmUpdateSummary()"></div>
