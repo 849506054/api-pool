@@ -204,5 +204,99 @@ class GroupRotationTests(unittest.TestCase):
             self.assertNotIn("rotate_minutes", entry)
 
 
+    def test_rotate_members_subset_advances_within_selection(self):
+        """选择性轮换（2026-10-06）：只在选中成员之间推进，未选中的成员被跳过。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            m = load_module(tmp)
+            pool, _ = self.pool_with_bg(m)
+            pool._set_group_rotate_members("bg", ["b1", "b3"])
+            pool._set_current("bg", "b1")
+            pool._rotate_group_once("bg")
+            self.assertEqual(pool._get_current("bg"), "b3")   # b2 不在选中集，跳过
+            pool._rotate_group_once("bg")
+            self.assertEqual(pool._get_current("bg"), "b1")   # 选中集内循环
+
+    def test_rotate_members_empty_selection_means_all(self):
+        """不选任何成员 = 全体参与（现状行为零回归）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            m = load_module(tmp)
+            pool, _ = self.pool_with_bg(m)
+            self.assertEqual(pool._group_rotate_members("bg"), [])
+            pool._set_current("bg", "b1")
+            pool._rotate_group_once("bg")
+            self.assertEqual(pool._get_current("bg"), "b2")
+
+    def test_rotate_members_selection_all_unavailable_noop(self):
+        """选中成员当前全不可用 → 本轮不轮换，且不回落全体成员。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            m = load_module(tmp)
+            pool, eps = self.pool_with_bg(m)
+            pool._set_group_rotate_members("bg", ["b2", "b3"])
+            pool._set_current("bg", "b1")
+            eps[1]._cooldown_until = m.time.time() + 600
+            eps[2]._cooldown_until = m.time.time() + 600
+            pool._rotate_group_once("bg")
+            self.assertEqual(pool._get_current("bg"), "b1")   # 不落回 b1 之外的全体成员
+
+    def test_rotate_members_single_selection_converges(self):
+        """只选 1 个成员：下一次轮换切到它并停住（已在其上则无动作）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            m = load_module(tmp)
+            pool, _ = self.pool_with_bg(m)
+            pool._set_group_rotate_members("bg", ["b3"])
+            pool._set_current("bg", "b1")
+            pool._rotate_group_once("bg")
+            self.assertEqual(pool._get_current("bg"), "b3")
+            pool._rotate_group_once("bg")
+            self.assertEqual(pool._get_current("bg"), "b3")
+
+    def test_rotate_members_normalization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m = load_module(tmp)
+            pool = m.APIPool([])
+            self.assertEqual(pool._valid_group_rotate_members(None), [])
+            self.assertEqual(pool._valid_group_rotate_members(""), [])
+            self.assertEqual(pool._valid_group_rotate_members([]), [])
+            self.assertEqual(pool._valid_group_rotate_members(["a", "a", " b "]), ["a", "b"])
+            self.assertIsNone(pool._valid_group_rotate_members("a"))
+            self.assertIsNone(pool._valid_group_rotate_members([1, 2]))
+
+    def test_create_update_store_and_clear_rotate_members(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m = load_module(tmp)
+            pool = m.APIPool([])
+            ok, msg = pool.create_group("bg", "mixed", "", 0, 0, "all", 5, ["e1", "e2"])
+            self.assertTrue(ok, msg)
+            self.assertEqual(pool._group_rotate_members("bg"), ["e1", "e2"])
+            # 非法拒绝
+            ok, msg = pool.create_group("bad", "mixed", "", 0, 0, "all", 5, "e1")
+            self.assertFalse(ok)
+            self.assertIn("轮换成员", msg)
+            # 编辑改集 / 清空（空 = 全体参与，不落键）
+            ok, _ = pool.update_group("bg", {"rotate_members": ["e2"]})
+            self.assertTrue(ok)
+            self.assertEqual(pool._group_rotate_members("bg"), ["e2"])
+            ok, _ = pool.update_group("bg", {"rotate_members": []})
+            self.assertTrue(ok)
+            self.assertNotIn("rotate_members", pool._group_defs["bg"])
+            # 默认态不落键
+            pool.create_group("bg2", "mixed", "", 0, 0, "all", 5)
+            self.assertNotIn("rotate_members", pool._group_defs["bg2"])
+
+    def test_rotate_members_persistence_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m = load_module(tmp)
+            m.pool.create_group("bg", "mixed", "", 0, 0, "all", 15, ["e1", "e3"])
+            m._sync_to_config()
+            saved = json.load(open(m.CONFIG_FILE, encoding="utf-8"))
+            entry = next(d for d in saved["pool_group_defs"] if d["name"] == "bg")
+            self.assertEqual(entry["rotate_members"], ["e1", "e3"])
+            raw = m.load_group_defs_config()
+            pool2 = m.APIPool([])
+            pool2._load_group_defs(raw)
+            self.assertEqual(pool2._group_rotate_members("bg"), ["e1", "e3"])
+            self.assertEqual(pool2._group_rotate_members("main"), [])   # 默认态读回空
+
+
 if __name__ == "__main__":
     unittest.main()

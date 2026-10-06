@@ -3665,6 +3665,49 @@ class APIPool:
         sys_log(f"组 '{group}' 端点轮换设为 {('每 %s 次请求' % requests) if requests else '不轮换'}", "INFO", group=group)
         return True
 
+    # 轮换成员集（2026-10-06）：限定组内哪些端点参与轮换；空 = 全体成员参与（默认态，不落键）
+    def _valid_group_rotate_members(self, value):
+        """轮换成员 id 列表归一化：空/None → []（全体参与）；非列表或含非字符串 → None（调用方拒绝）。"""
+        if value is None or value == "":
+            return []
+        if not isinstance(value, (list, tuple)):
+            return None
+        out = []
+        for item in value:
+            if not isinstance(item, str):
+                return None
+            v = item.strip()
+            if v and v not in out:
+                out.append(v)
+        return out
+
+    def _group_rotate_members(self, group):
+        """该组声明的轮换成员 id 列表；未声明/存值非法 → []（全体成员参与）。"""
+        return self._valid_group_rotate_members(self._group_defs.get(group, {}).get("rotate_members")) or []
+
+    def _loaded_group_rotate_members(self, d):
+        """配置读入：rotate_members 归一化，非法值当未声明（不阻断启动）。"""
+        return self._valid_group_rotate_members(d.get("rotate_members")) or []
+
+    def _set_group_rotate_members(self, group, members):
+        """写入/清除组的轮换成员集（空 = 全体成员参与，不落键），返回是否有变更。"""
+        gd = self._group_defs.get(group)
+        if gd is None:
+            return False
+        if members:
+            if gd.get("rotate_members") == members:
+                return False
+            gd["rotate_members"] = list(members)
+        elif gd.pop("rotate_members", None) is None:
+            return False
+        names = [ep.name for ep in self._endpoints if ep.id in set(members)]
+        if not members:
+            label = "全体成员"
+        else:
+            label = "、".join(names) + f"（{len(names)} 个）" if names else f"（{len(members)} 个已失效 id）"
+        sys_log(f"组 '{group}' 轮换成员设为 {label}", "INFO", group=group)
+        return True
+
     def _count_rotate_request(self, group):
         """成功请求计数：达到组声明的阈值就把该组当前端点推进到下一名。
 
@@ -3691,7 +3734,13 @@ class APIPool:
             if group == self.MAIN_GROUP and cur and cur in self._joined_subgroups():
                 return  # 「整组」指针优先于轮换（2026-09-27 手动切子组整体语义）
             cands, _ = self._group_sticky_candidates(group)
-            if len(cands) < 2:
+            sel = set(self._group_rotate_members(group))
+            if sel:
+                # 选择性轮换（2026-10-06）：只在选中成员之间推进；选中集当前全不可用则本轮不动
+                cands = [e for e in cands if e.id in sel]
+                if not cands:
+                    return
+            elif len(cands) < 2:
                 return
             cands.sort(key=lambda e: self._candidate_sort_key(e, group))
             ids = [e.id for e in cands]
@@ -3817,6 +3866,9 @@ class APIPool:
                     req = self._loaded_group_rotate_requests(d)
                     if req:
                         self._group_defs[self.MAIN_GROUP]["rotate_requests"] = req
+                    rmem = self._loaded_group_rotate_members(d)
+                    if rmem:
+                        self._group_defs[self.MAIN_GROUP]["rotate_members"] = rmem
                     continue
                 if name == self.VISION_GROUP:
                     # 内置图片解析池：类型恒 mixed，选择器沿用配置（缺省 VISION_SELECTOR）
@@ -3833,6 +3885,9 @@ class APIPool:
                     req = self._loaded_group_rotate_requests(d)
                     if req:
                         entry["rotate_requests"] = req
+                    rmem = self._loaded_group_rotate_members(d)
+                    if rmem:
+                        entry["rotate_members"] = rmem
                     self._group_defs[name] = entry
                     continue
                 if str(d.get("role", "") or "").strip():
@@ -3850,6 +3905,9 @@ class APIPool:
                 req = self._loaded_group_rotate_requests(d)
                 if req:
                     entry["rotate_requests"] = req
+                rmem = self._loaded_group_rotate_members(d)
+                if rmem:
+                    entry["rotate_members"] = rmem
                 # 加入 main 的名次（2026-09-27）：int>0 恢复，其余忽略
                 try:
                     mp = int(d.get("main_priority") or 0)
@@ -3868,7 +3926,7 @@ class APIPool:
                 self._group_defs[grp] = {"type": "mixed", "model": grp}
         return self._group_defs
 
-    def create_group(self, name, gtype="mixed", model="", context_tokens=0, idle_seconds=0, log_level="all", rotate_requests=0):
+    def create_group(self, name, gtype="mixed", model="", context_tokens=0, idle_seconds=0, log_level="all", rotate_requests=0, rotate_members=None):
         """新建分组。返回 (ok, message)。main / 图片解析池为系统内置组，不可由此创建。"""
         with self._lock:
             name = str(name or "").strip()
@@ -3895,6 +3953,9 @@ class APIPool:
             if req is None:
                 return False, ("端点轮换次数非法（0=不轮换，或 "
                                f"{self.GROUP_ROTATE_MIN_REQUESTS}–{self.GROUP_ROTATE_MAX_REQUESTS} 次）")
+            rmem = self._valid_group_rotate_members(rotate_members)
+            if rmem is None:
+                return False, "轮换成员非法（应为端点 id 列表）"
             model = str(model or "").strip()
             if gtype == "dedicated":
                 if not model:
@@ -3917,7 +3978,9 @@ class APIPool:
                 self._group_defs[name]["log_level"] = lvl
             if req:
                 self._group_defs[name]["rotate_requests"] = req
-            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%s tokens' % format(ck, ',') if ck else '未声明'}{'，空闲借用 %s 秒' % idle if idle else ''}，日志 {lvl}，轮换 {('每 %s 次请求' % req) if req else '不轮换'}）", "INFO", group=name)
+            if rmem:
+                self._group_defs[name]["rotate_members"] = rmem
+            sys_log(f"新建分组 '{name}'（{gtype}，选择器 {model}，上下文 {'%s tokens' % format(ck, ',') if ck else '未声明'}{'，空闲借用 %s 秒' % idle if idle else ''}，日志 {lvl}，轮换 {('每 %s 次请求' % req) if req else '不轮换'}{'，轮换成员 ' + str(len(rmem)) + ' 个' if rmem else ''}）", "INFO", group=name)
             return True, name
 
     def update_group(self, name, updates):
@@ -3952,6 +4015,9 @@ class APIPool:
             if new_req is None:
                 return False, ("端点轮换次数非法（0=不轮换，或 "
                                f"{self.GROUP_ROTATE_MIN_REQUESTS}–{self.GROUP_ROTATE_MAX_REQUESTS} 次）")
+            new_rmem = self._valid_group_rotate_members(updates.get("rotate_members", old.get("rotate_members", [])))
+            if new_rmem is None:
+                return False, "轮换成员非法（应为端点 id 列表）"
 
             if not self._valid_group_type(new_type):
                 return False, "分组类型必须为 mixed 或 dedicated"
@@ -3969,6 +4035,8 @@ class APIPool:
                     changed = True
                 if self._set_group_rotate_requests(name, new_req):
                     changed = True
+                if self._set_group_rotate_members(name, new_rmem):
+                    changed = True
                 return True, (name if changed else "无变更")
 
             if name == self.VISION_GROUP:
@@ -3981,6 +4049,8 @@ class APIPool:
                 if self._set_group_log_level(name, new_lvl):
                     changed = True
                 if self._set_group_rotate_requests(name, new_req):
+                    changed = True
+                if self._set_group_rotate_members(name, new_rmem):
                     changed = True
                 return True, (name if changed else "无变更")
 
@@ -4035,6 +4105,8 @@ class APIPool:
                 self._group_defs[new_name]["log_level"] = new_lvl
             if new_req:
                 self._group_defs[new_name]["rotate_requests"] = new_req
+            if new_rmem:
+                self._group_defs[new_name]["rotate_members"] = new_rmem
             # 加入 main 名次跟随改名（2026-09-27）；main 指针若指向旧子组名同步改名
             if old.get("main_priority"):
                 self._group_defs[new_name]["main_priority"] = old["main_priority"]
@@ -4045,7 +4117,7 @@ class APIPool:
                         self._set_current(self.MAIN_GROUP, new_name)
             # 空闲借用仅配置时显示（main 组更新走 _set_group_idle_seconds 专属日志，此处恒为子组路径）
             idle_seg = f"，空闲借用 {new_idle} 秒" if new_idle else ""
-            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}{idle_seg}，日志 {new_lvl}，轮换 {('每 %s 次请求' % new_req) if new_req else '不轮换'}）", "INFO", group=name)
+            sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}{idle_seg}，日志 {new_lvl}，轮换 {('每 %s 次请求' % new_req) if new_req else '不轮换'}{'，轮换成员 ' + str(len(new_rmem)) + ' 个' if new_rmem else ''}）", "INFO", group=name)
             return True, new_name
 
     def delete_group(self, name):
@@ -9454,6 +9526,7 @@ def api_handler(method, path, body):
                 "idle_seconds": pool._group_idle_seconds(grp),
                 "log_level": pool._group_defs.get(grp, {}).get("log_level") or "all",
                 "rotate_requests": pool._group_defs.get(grp, {}).get("rotate_requests") or 0,
+                "rotate_members": pool._group_defs.get(grp, {}).get("rotate_members") or [],
                 "is_vision": grp == pool.VISION_GROUP,
                 "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)) + (len(pool._joined_subgroups()) if grp == pool.MAIN_GROUP else 0),
                 "current_endpoint": cur_ep.name if cur_ep else None,
@@ -9470,7 +9543,7 @@ def api_handler(method, path, body):
         model = str(body.get("model", "") or "").strip()
         ok, msg = pool.create_group(name, gtype, model, body.get("context_tokens", 0),
                                     body.get("idle_seconds", 0), body.get("log_level", "all"),
-                                    body.get("rotate_requests", 0))
+                                    body.get("rotate_requests", 0), body.get("rotate_members", []))
         if not ok:
             return 400, {"error": msg}, False
         _sync_to_config()
@@ -9964,6 +10037,8 @@ def _sync_to_config():
                 entry["log_level"] = gd["log_level"]
             if gd.get("rotate_requests"):
                 entry["rotate_requests"] = gd["rotate_requests"]
+            if gd.get("rotate_members"):
+                entry["rotate_members"] = gd["rotate_members"]
             if gd.get("main_priority"):
                 entry["main_priority"] = gd["main_priority"]
             defs_list.append(entry)

@@ -13,7 +13,7 @@ for (const lv of ['all','error','live','silent']) {
 assert(/g\.log_level==='live'/.test(src), '编辑回填 live 档');
 // 保存收集 + PUT/POST 携带
 assert(/const log_level=document\.getElementById\('gLogLevel'\)\?document\.getElementById\('gLogLevel'\)\.value:'all';/.test(src), '取值容忍缺失元素');
-assert(/context_tokens,idle_seconds,log_level,rotate_requests\}\)/.test(src), 'PUT/POST 携带 log_level');
+assert(/context_tokens,idle_seconds,log_level,rotate_requests,rotate_members\}\)/.test(src), 'PUT/POST 携带 log_level');
 // 可见性判定只在服务端：前端无过滤函数，直接采用服务端结果
 assert(!/groupLogVisible|chatLogVisible|_groupLogLevels|applyGroupLogFilter/.test(src), '前端不含可见性过滤函数');
 assert(/function addLogLine\(entry\) \{\n    if \(!logContainer\) return;\n    const d = document\.createElement\('div'\);/.test(src), 'addLogLine 直接渲染服务端行');
