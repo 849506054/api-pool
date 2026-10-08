@@ -1114,6 +1114,17 @@ class ChatLogger:
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
+    # prompt 两档保留（2026-10-08）：prompt 占库容 99%（实测近期均值 272 KB/行），池已承接
+    # 全部业务出口、单日增量约 0.66 GB。近 FULL_PROMPT_HOURS 小时存全文作为事故回溯窗口，
+    # 更早的行滚动截断成「首 head + 尾 tail」预览；只改存储，不改统计字段。
+    FULL_PROMPT_HOURS = 24
+    PREVIEW_HEAD = 6000
+    PREVIEW_TAIL = 2000
+    TRIM_MIN_CHARS = 12000
+    TRIM_BATCH_ROWS = 400      # 每批单事务行数（限定 WAL 增长与写锁占用）
+    TRIM_MAX_BATCHES = 25      # 单次调用批数上限（≈1 万行/小时，高于 ~9.4k 行/天增速）
+    TRIM_SLEEP_SECONDS = 0.2   # 批间让出写路径
+
     def _retention_loop(self):
         """每日 `cleanup_at`（本地时间）清理一次过期日志；当天错过则补跑一次。
 
@@ -1122,6 +1133,8 @@ class ChatLogger:
         该时刻停机也不漏清理）。配置每分钟从 api_config.json 重读，改文件即生效。
         """
         last_run_date = ""
+        # 首次截断等下一个整点：启动瞬间不做重写，避免与启动写路径/测试临时目录清理抢 IO
+        last_trim_hour = time.strftime("%Y-%m-%d %H")
         while True:
             try:
                 cfg = load_log_retention()
@@ -1131,6 +1144,10 @@ class ChatLogger:
                 if _log_cleanup_due(now, self.cleanup_at, last_run_date):
                     self.prune_old_logs()
                     last_run_date = time.strftime("%Y-%m-%d", now)
+                # 截断每小时一次（每日一次跟不上 0.66 GB/天的增速）
+                if last_trim_hour != time.strftime("%Y-%m-%d %H", now):
+                    self.trim_old_prompts()
+                    last_trim_hour = time.strftime("%Y-%m-%d %H", now)
             except Exception as e:
                 sys_log(f"滚动清理对话日志失败: {e}", "ERROR")
             time.sleep(60)
@@ -1155,6 +1172,45 @@ class ChatLogger:
                 sys_log(f"滚动清理对话日志失败: {e}", "ERROR")
                 return 0
 
+
+    def trim_old_prompts(self):
+        """把超出全文窗口的 prompt 滚动截断为预览（幂等；返回截断行数）。
+
+        只动 prompt 正文与 prompt_trimmed 标记，不改 token/统计字段。截断释放的页由后续
+        写入复用（SQLite 不自动缩文件，回收磁盘需停机 VACUUM）。
+
+        分批执行：一次 UPDATE 重写整个积压会长时间占用写锁并把 WAL 撑到数 GB（实测单事务
+        在 4.6 GB 库上超时），因此按批单事务提交、批间让出写路径；单次调用批数有上限，
+        未清完的积压由下一小时继续。
+        """
+        marker = f"\n\n…[已截断：仅保留首尾预览，全文窗口 {self.FULL_PROMPT_HOURS} 小时]…\n\n"
+        total = 0
+        for _ in range(self.TRIM_MAX_BATCHES):
+            with self._lock:
+                try:
+                    conn = self._connect()
+                    c = conn.cursor()
+                    c.execute(
+                        "UPDATE chat_logs SET prompt = substr(prompt, 1, ?) || ? || substr(prompt, -?), "
+                        "prompt_trimmed = 1 WHERE id IN ("
+                        "SELECT id FROM chat_logs WHERE COALESCE(prompt_trimmed, 0) = 0 "
+                        "AND length(prompt) > ? AND timestamp < datetime('now', ?) LIMIT ?)",
+                        (self.PREVIEW_HEAD, marker, self.PREVIEW_TAIL, self.TRIM_MIN_CHARS,
+                         f"-{self.FULL_PROMPT_HOURS} hours", self.TRIM_BATCH_ROWS),
+                    )
+                    trimmed = c.rowcount
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    sys_log(f"对话日志 prompt 截断失败: {e}", "ERROR")
+                    return total
+            total += trimmed
+            if trimmed < self.TRIM_BATCH_ROWS:
+                break
+            time.sleep(self.TRIM_SLEEP_SECONDS)
+        if total > 0:
+            sys_log(f"对话日志 prompt 截断: {total} 条超过 {self.FULL_PROMPT_HOURS} 小时的行保留首尾预览")
+        return total
 
     def _init_db(self):
         with self._lock:
@@ -1190,9 +1246,12 @@ class ChatLogger:
                 ("reasoning_tokens", "INTEGER"),
                 ("reasoning_effort", "TEXT"),
                 ("reasoning_detected", "INTEGER"),
+                ("prompt_trimmed", "INTEGER DEFAULT 0"),  # 2026-10-08 两档保留：1=已截断为预览
             ):
                 if _col not in _cols:
                     c.execute(f"ALTER TABLE chat_logs ADD COLUMN {_col} {_ddl}")
+            # 滚动截断/清理都按 timestamp 过滤（此前无索引 → 每分钟全表扫 66k×272KB）
+            c.execute("CREATE INDEX IF NOT EXISTS idx_chat_logs_timestamp ON chat_logs(timestamp)")
             # 组级日志级别过滤（2026-10-05）：/api/chat-logs 按 pool_group 排除隐藏组，
             # 无索引时 COUNT 会全表扫（2.8GB 实测 9.7s）→ 建覆盖索引后走索引扫描
             c.execute("CREATE INDEX IF NOT EXISTS idx_chat_logs_pool_group ON chat_logs(pool_group)")
