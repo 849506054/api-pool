@@ -20,6 +20,8 @@
 
 ## 🎯 里程碑
 
+- [ ] **[P2] 首包 SSE 分类重试（2026-10-08，待部署实测）** — `_classify_retryable_stream_error` 统一管理限流与 Azure 临时风控签名，前置排除容量/确定性内容拦截，复用 `retry_on_rate_limit` 与原有次数/预算。文件：`api_pool_server.py`、`test/test_retry_on_rate_limit.py`；备份：`/opt/data/backups/api-pool2-sse-retry-20261008-120507/`；验证：`python3 -m unittest discover -s test -p test_retry_on_rate_limit.py`（含本地 HTTP 隔离实例）。隔离回归 12 项通过；完整回归 551 项，549 通过、2 项既有 Hermes 测试桩报错；ruff 新增 0。Chat/Responses 实测临时风控首包后原样重试成功，INFO 含 `temporary_policy_block`，组指向与冷却状态保持。日志：`workspace/records/sse-retry-20261008/`。部署须用户单独批准。
+
 - [x] **[P2] 配置式端点定向入口（2026-10-08 已部署实测）** — `/endpoints/<id>/v1` 严格绑定已保存端点，复用协议桥与端点参数，组模型目录维持原有选择器；对话日志池组统一为 `apipool`。文件：`api_pool_server.py`、`test/test_endpoint_route.py`；使用示例见 README「按配置定向调用单端点」。生产 SHA-256 `77c983e9748633c6214123965410d62d622ad4271cd4a52277fa316450e3cdf9`。隔离 HTTP 回归覆盖四种上游协议、Chat/Responses 流式、错误与组状态隔离；生产非流式/流式成功，Hermes 客户端解析与实际请求返回 `ACCOUNTING_OK`，数据库及详情接口记录 `64269` 的 `pool_group=apipool`。完整回归 548 项，546 通过、2 项既有 Hermes 测试桩缺少 `_capture_nous_model_switch` 报错，ruff 新增问题 0。备份：`/opt/data/backups/api-pool2-endpoint-route-20261008-113310/`；验证日志：`workspace/records/endpoint-route-20261008/`。
 
 - 2026-10-06 上游积分徽标（纯展示层，**只读登记值零触发**）：端点 api_key 前 12 位匹配

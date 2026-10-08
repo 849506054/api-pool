@@ -1,7 +1,7 @@
-"""端点级「限流优先重试」开关（retry_on_rate_limit）行为契约。
+"""端点级 retry_on_rate_limit 开关：HTTP 429 与首包 SSE 分类重试。
 
-开关开启：限流类错误（429 / too_many_requests / exceeded rate limit）按 max_retries 在原端点
-退避重试，耗尽才返回错误交给 _rotate；开关关闭（默认）保持「限流即轮转」，只发 1 次。
+首包覆盖限流和上游临时风控，按 max_retries 与请求预算原样重试。
+容量与确定性内容拦截优先交给原有处置，开关关闭时首包错误直接返回。
 """
 import importlib.util
 import io
@@ -12,6 +12,9 @@ import tempfile
 import time
 import unittest
 import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 from unittest import mock
 
 MODULE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "api_pool_server.py")
@@ -227,7 +230,7 @@ class RetryOnRateLimitTests(unittest.TestCase):
     def test_rate_limit_detector_markers(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
-            detect = module.APIPool()._is_rate_limit_error
+            detect = module.APIPool()._classify_retryable_stream_error
             for text in (
                 "HTTP 502: upstream stream error: too_many_requests: exceeded rate limit",
                 "HTTP 502: upstream stream error: too_many_requests: slow down",
@@ -242,6 +245,133 @@ class RetryOnRateLimitTests(unittest.TestCase):
                 "",
             ):
                 self.assertFalse(detect(text), text)
+
+    def test_temporary_policy_stream_retry_boundaries(self):
+        message = (
+            "Your resource has been temporarily blocked because we detected behavior "
+            "that may violate our content policy. See https://aka.ms/aoaicodeofconduct"
+        )
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            frame = stream_error_frame("forbidden", message)
+            payload = {"model": "m", "messages": [], "stream": True}
+            for enabled, retries, controls, expected_calls in (
+                (True, 2, {}, 3),
+                (False, 2, {}, 1),
+                (True, 0, {}, 1),
+                (True, 2, {"force_no_retry": True}, 1),
+                (True, 2, {"request_deadline": time.time() + 1}, 1),
+            ):
+                with self.subTest(enabled=enabled, retries=retries, controls=controls):
+                    ep = self._endpoint(module, retry_on_rate_limit=enabled, max_retries=retries)
+                    responses = []
+
+                    def respond(*args, responses=responses, **kwargs):
+                        response = FakeStreamResponse([frame])
+                        responses.append(response)
+                        return response
+
+                    with mock.patch.object(module.urllib.request, "urlopen", side_effect=respond), \
+                            mock.patch.object(module.time, "sleep"):
+                        result, error = module.APIPool()._try_endpoint(ep, payload, 60, log_usage=False, **controls)
+                    self.assertIsNone(result)
+                    self.assertIn("temporarily blocked", error)
+                    self.assertEqual(len(responses), expected_calls)
+                    self.assertTrue(all(r.closed for r in responses))
+                    if "request_deadline" in controls:
+                        self.assertIn("request budget exhausted", error)
+
+            for suffix in ("insufficient balance", "quota exceeded", "sensitive_words_detected"):
+                result, error, calls = self._run(
+                    module, self._endpoint(module, retry_on_rate_limit=True, max_retries=2), payload,
+                    lambda _i, suffix=suffix: FakeStreamResponse([stream_error_frame("forbidden", message + suffix)]),
+                )
+                self.assertIsNone(result)
+                self.assertEqual(len(calls), 1, suffix)
+                self.assertIn(suffix, error)
+
+    def test_retryable_stream_error_categories(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            classify = module.APIPool._classify_retryable_stream_error
+            temporary = ("forbidden: Your resource has been temporarily blocked because we detected "
+                         "behavior that may violate our content policy.")
+            self.assertEqual(classify(temporary.upper()), "temporary_policy_block")
+            self.assertEqual(classify("too_many_requests: exceeded rate limit"), "rate_limit")
+            for text in ("", None, "forbidden: request violates content policy",
+                         "Your resource has been temporarily blocked", "HTTP 405: WAF block",
+                         temporary + " insufficient balance", temporary + " quota exceeded",
+                         temporary + " sensitive_words_detected", "HTTP 429 quota exceeded"):
+                self.assertEqual(classify(text), "", text)
+
+    def test_temporary_policy_retry_over_isolated_http(self):
+        """Real HTTP ingress -> pool -> SSE upstream: retry once, keep the same route."""
+        calls = []
+
+        class Upstream(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                calls.append(body)
+                if len(calls) % 2:
+                    data = stream_error_frame("forbidden", "Your resource has been temporarily blocked because "
+                                              "we detected behavior that may violate our content policy.")
+                else:
+                    chunk = {"model": "m", "choices": [{"index": 0, "delta": {"content": "RETRY_OK"},
+                                                        "finish_reason": None}]}
+                    data = b"data: " + json.dumps(chunk).encode() + b"\n\ndata: [DONE]\n\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+            proxy = ThreadingHTTPServer(("127.0.0.1", 0), module.Handler)
+            threads = [Thread(target=s.serve_forever, daemon=True) for s in (upstream, proxy)]
+            ep = self._endpoint(module, in_pool=True, use_proxy=False, retry_on_rate_limit=True,
+                                max_retries=2, base_url=f"http://127.0.0.1:{upstream.server_port}/v1")
+            module.pool = module.APIPool([ep])
+            module.pool._set_current("main", ep.id)
+            module.pool._set_persisted("main", ep.id)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            for thread in threads:
+                thread.start()
+            try:
+                for path, body in (
+                    ("/v1/chat/completions", {"model": "api-pool", "messages": [{"role": "user", "content": "ping"}]}),
+                    ("/v1/responses", {"model": "api-pool", "input": "ping"}),
+                ):
+                    with self.subTest(path=path):
+                        request = urllib.request.Request(
+                            f"http://127.0.0.1:{proxy.server_port}{path}",
+                            data=json.dumps(dict(body, stream=True)).encode(),
+                            headers={"Content-Type": "application/json", "User-Agent": "isolated-retry-check/1"},
+                        )
+                        with opener.open(request, timeout=15) as response:
+                            data = response.read()
+                            self.assertEqual(response.status, 200)
+                        self.assertIn(b"RETRY_OK", data)
+                        self.assertNotIn(b"temporarily blocked", data)
+                        self.assertEqual(module.pool._get_current("main"), ep.id)
+                        self.assertEqual(module.pool._get_persisted("main"), ep.id)
+                        self.assertEqual(ep._cooldown_until, 0)
+                        self.assertEqual(ep._fail_count, 0)
+                self.assertEqual(len(calls), 4)
+                self.assertEqual(calls[0], calls[1])
+                self.assertEqual(calls[2], calls[3])
+                logs = module.sys_logger.get_logs_since(0)
+                self.assertTrue(any("temporary_policy_block" in str(row) for row in logs))
+            finally:
+                for server in (proxy, upstream):
+                    server.shutdown()
+                    server.server_close()
+                for thread in threads:
+                    thread.join(timeout=2)
 
     def test_endpoint_field_default_and_config_load_path(self):
         with tempfile.TemporaryDirectory() as tmp_path:

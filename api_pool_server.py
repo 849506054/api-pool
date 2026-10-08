@@ -5574,17 +5574,23 @@ class APIPool:
         now = now if now is not None else time.time()
         return {grp: max(0, int(u - now)) for grp, u in ep._defer_until_by_group.items() if u > now}
 
-    @staticmethod
-    def _is_rate_limit_error(error_msg):
-        """限流类判定（只看报文文本，不看状态码）。
-
-        上游常把限流包在 502 壳里返回（`HTTP 502: upstream stream error: too_many_requests: ...`），
-        因此不能按 429 状态码判定。仅用于 `retry_on_rate_limit` 开关的命中判断。
-        """
+    @classmethod
+    def _classify_retryable_stream_error(cls, error_msg):
+        """首包 SSE 重试类别；容量与确定性内容拦截优先交给原有处置。"""
+        if cls._classify_capacity_error(error_msg):
+            return ""
         text = str(error_msg or "").lower()
-        return any(marker in text for marker in (
-            "too_many_requests", "rate limit", "rate_limit", "429", "retry-after",
-        ))
+        signatures = {
+            "rate_limit": ("too_many_requests", "rate limit", "rate_limit", "429", "retry-after"),
+            "temporary_policy_block": (
+                ("your resource has been temporarily blocked because we detected behavior "
+                 "that may violate our content policy"),
+            ),
+        }
+        for category, markers in signatures.items():
+            if any(marker in text for marker in markers):
+                return category
+        return ""
 
     @staticmethod
     def _classify_capacity_error(error_msg):
@@ -7873,7 +7879,7 @@ class APIPool:
                         _gate_stall_deadline = time.time() + _stall_budget if _stall_budget > 0 else None
                         _gate_max_deadline = time.time() + _max_budget if _max_budget > 0 else None
                         _gate_max_lines = 200
-                        _first_packet_rate_limit = ""
+                        _first_packet_retry_error = ""
                         while True:
                             if _gate_stall_deadline is not None and time.time() > _gate_stall_deadline:
                                 _gate_elapsed_stall = True
@@ -7912,10 +7918,9 @@ class APIPool:
                             if stream_error:
                                 resp.close()
                                 if (ep.retry_on_rate_limit and not force_no_retry and attempt < retries
-                                        and not self._classify_capacity_error(stream_error)
-                                        and self._is_rate_limit_error(stream_error)):
-                                    # 限流优先重试（2026-09-20）：首包限流不直接冷却，退避重试后再定夺
-                                    _first_packet_rate_limit = stream_error
+                                        and (retry_category := self._classify_retryable_stream_error(stream_error))):
+                                    # retry_on_rate_limit 兼容原配置名，首包覆盖统一分类器的全部可重试类别。
+                                    _first_packet_retry_error = stream_error
                                     break
                                 return None, f"HTTP 502: upstream stream error: {stream_error}"
                             if _is_business_chunk(chunk):
@@ -7944,13 +7949,13 @@ class APIPool:
                             pass
                         return None, f"HTTP 502: upstream stream pre-read failed: {type(e).__name__}: {e}"
 
-                    if _first_packet_rate_limit:
+                    if _first_packet_retry_error:
                         retry_delay = 3 * (2 ** attempt)
                         if request_deadline is not None and time.time() + retry_delay >= request_deadline:
-                            return None, (f"HTTP 502: upstream stream error: {_first_packet_rate_limit}"
+                            return None, (f"HTTP 502: upstream stream error: {_first_packet_retry_error}"
                                           "; retry skipped: request budget exhausted")
-                        sys_log(f"{request_tag}端点 '{endpoint_log_label}' 首包限流，{retry_delay} 秒后进行第 "
-                                f"{attempt+1}/{retries} 次原端点重试（限流优先重试）: {_first_packet_rate_limit[:120]}", "INFO")
+                        sys_log(f"{request_tag}端点 '{endpoint_log_label}' 首包可重试错误[{retry_category}]，{retry_delay} 秒后进行第 "
+                                f"{attempt+1}/{retries} 次原端点重试: {_first_packet_retry_error[:120]}", "INFO")
                         time.sleep(retry_delay)
                         continue
 
