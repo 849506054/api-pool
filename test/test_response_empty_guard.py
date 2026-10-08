@@ -224,6 +224,65 @@ class ResponseGuardTests(unittest.TestCase):
         self.assertTrue(any(c.choices and c.choices[0].delta.content == "OK" for c in answer))
         self.assertEqual(self.p._get_current("main"), self.other.id)
 
+    def test_empty_stream_retries_same_endpoint_before_error(self):
+        """空响应先原地重放：重放成功则正常下发且不冻结（2026-10-08 用户纠正）。"""
+        m = self.m
+        counters = {"calls": 0}
+        always_empty = {"value": False}
+
+        class Upstream(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                del args
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                counters["calls"] += 1
+                if always_empty["value"] or counters["calls"] == 1:
+                    # 只思考无正文：过首包业务门（reasoning 算业务），在空响应守卫处判定
+                    frames = [frame({"reasoning_content": "thinking"}), frame(finish="stop")]
+                else:
+                    frames = [frame({"content": "OK"}), frame(finish="stop")]
+                wire = b"".join(frames) + b"data: [DONE]\n\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(wire)))
+                self.end_headers()
+                self.wfile.write(wire)
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        proxy = ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
+        for server in (upstream, proxy):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+        self.ep.base_url = f"http://127.0.0.1:{upstream.server_port}/v1"
+        self.ep.api_key = "isolated"
+        self.ep.use_proxy = False
+        self.ep.max_retries = 1
+        m.pool = self.p
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        payload = {"model": "api-pool", "messages": [{"role": "user", "content": "ping"}], "stream": True}
+
+        def call():
+            req = urllib.request.Request(f"http://127.0.0.1:{proxy.server_port}/v1/chat/completions",
+                                         data=json.dumps(payload).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with opener.open(req, timeout=10) as response:
+                return response.read()
+
+        with mock.patch.object(m.time, "sleep", lambda *_: None):
+            wire = call()
+        self.assertEqual(counters["calls"], 2, "空响应后必须原地重放同一端点")
+        self.assertNotIn(b'"empty_content"', wire)
+        self.assertIn(b"OK", wire)
+        self.assertEqual(self.ep._cooldown_until, 0)
+        self.assertEqual(self.p._get_current("main"), self.ep.id)
+        always_empty["value"] = True
+        with mock.patch.object(m.time, "sleep", lambda *_: None):
+            wire = call()
+        self.assertIn(b'"empty_content"', wire)
+        self.assertGreater(self.ep._cooldown_until, 0)
+
     def test_image_url_and_detail_shape_roundtrip(self):
         for url in ("https://example.com/image.png", "data:image/png;base64,AAAA"):
             for raw in (url, {"url": url, "detail": "high"}):

@@ -4350,49 +4350,68 @@ class APIPool:
         if not owners:
             self._inflight_owner.pop(ep_id, None)
 
-    def _guard_empty_stream(self, gen, ep, group, request_id, route_epoch):
-        """Validate normalized Chat output before DONE; preserve valid non-text completions."""
-        usable = False
-        terminal = False
-        pending_finish = None
+    def _guard_empty_stream(self, gen, ep, group, request_id, route_epoch, empty_retry=None):
+        """Validate normalized Chat output before DONE; preserve valid non-text completions.
+
+        空响应（无正文/工具调用/拒绝的非终止收尾）先按端点重试预算原地重放同一端点，
+        重试仍空才回错误并交给既有轮转——实测该场景重放即可正常继续，不直接冻结端点
+        （2026-10-08 用户纠正）。
+        """
+        state = {"usable": False, "terminal": False, "finish": None}
+        streams = [gen]
         done = b"data: [DONE]\n\n"
-        try:
-            for chunk in gen:
+
+        def consume(stream):
+            for chunk in stream:
                 if chunk.strip() == done.strip():
                     break
                 parsed = _parse_chat_completion_chunk(chunk) or {}
-                terminal = terminal or bool(parsed.get("error"))
+                state["terminal"] = state["terminal"] or bool(parsed.get("error"))
                 for choice in parsed.get("choices") or []:
                     delta = choice.get("delta") or {}
-                    usable = usable or bool(
+                    state["usable"] = state["usable"] or bool(
                         (delta.get("content") or "").strip() or delta.get("tool_calls")
                         or delta.get("function_call") or delta.get("refusal") or delta.get("audio")
                     )
-                    terminal = terminal or choice.get("finish_reason") in (
+                    state["terminal"] = state["terminal"] or choice.get("finish_reason") in (
                         "tool_calls", "function_call", "length", "content_filter", "error",
                     )
-                if not usable and not terminal and any(c.get("finish_reason") == "stop" for c in parsed.get("choices") or []):
+                if (not state["usable"] and not state["terminal"]
+                        and any(c.get("finish_reason") == "stop" for c in parsed.get("choices") or [])):
                     # Only the empty stop frame is delayed; reasoning/content continue streaming.
-                    pending_finish = chunk
+                    state["finish"] = chunk
                     continue
                 yield chunk
-            if not usable and not terminal:
+
+        try:
+            yield from consume(gen)
+            attempt = 0
+            while not state["usable"] and not state["terminal"] and empty_retry is not None:
+                replacement = empty_retry(attempt)
+                if replacement is None:
+                    break
+                attempt += 1
+                state["finish"] = None  # 被重放的尝试作废，其空收尾帧不再下发
+                streams.append(replacement)
+                yield from consume(replacement)
+            if not state["usable"] and not state["terminal"]:
                 message = "Provider returned an empty response"
                 sys_log(f"[req={request_id}] 端点 '{self._endpoint_log_label(ep, group)}' 空响应确认 "
-                        "content=0 tool_calls=0 terminal=stop/EOF", "INFO", group=group)
+                        f"content=0 tool_calls=0 terminal=stop/EOF 原地重试 {attempt} 次", "INFO", group=group)
                 if group and not group.startswith("endpoint:"):
                     with self._lock:
                         self._rotate(ep, message, group=group, expected_route_epoch=route_epoch, request_id=request_id)
                 yield b"data: " + json.dumps({"error": {
                     "message": message, "type": "server_error", "code": "empty_content",
                 }}).encode() + b"\n\n"
-            elif pending_finish is not None:
-                yield pending_finish
+            elif state["finish"] is not None:
+                yield state["finish"]
             yield done
         finally:
-            close = getattr(gen, "close", None)
-            if close:
-                close()
+            for stream in streams:
+                close = getattr(stream, "close", None)
+                if close:
+                    close()
 
     def _wrap_stream_release(self, gen, ep_id, group):
         """流式响应外层 generator：正常结束/异常/提前关闭时释放在途占用。
@@ -7654,6 +7673,7 @@ class APIPool:
         self, ep, payload, timeout, log_usage=True, force_no_retry=False,
         is_probe=False, stream_stall_retry_used=False, debug_trace=None,
         pool_group=None, reset_cached_stats=False, request_id=None, request_deadline=None,
+        empty_stream_retry_used=False,
     ):
         req_t0 = time.time()
         stream_route_epoch = self._get_route_epoch(pool_group) if pool_group else None
@@ -8550,8 +8570,29 @@ class APIPool:
                                 self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
                             resp.close()
                     stream = stream_generator()
-                    if not is_probe:
-                        stream = self._guard_empty_stream(stream, ep, pool_group, request_id, stream_route_epoch)
+                    if not is_probe and not empty_stream_retry_used:
+                        def _empty_stream_retry(attempt_index, _ep=ep, _payload=payload):
+                            """空响应原地重放：预算 = 端点 max_retries，耗尽才上报（2026-10-08）。"""
+                            if attempt_index >= retries:
+                                return None
+                            delay = 3 * (2 ** attempt_index)
+                            if request_deadline is not None and time.time() + delay >= request_deadline:
+                                sys_log(f"{request_tag}端点 '{endpoint_log_label}' 空响应重试跳过：请求预算不足", "WARN")
+                                return None
+                            sys_log(f"{request_tag}端点 '{endpoint_log_label}' 空响应，{delay} 秒后进行第 "
+                                    f"{attempt_index+1}/{retries} 次原端点重试（空响应重放）", "INFO")
+                            time.sleep(delay)
+                            retry_stream, retry_error = self._try_endpoint(
+                                _ep, _payload, timeout, log_usage=log_usage, force_no_retry=True,
+                                is_probe=False, pool_group=pool_group,
+                                reset_cached_stats=reset_cached_stats, request_id=request_id,
+                                request_deadline=request_deadline, empty_stream_retry_used=True,
+                            )
+                            if retry_error or retry_stream is None:
+                                return None
+                            return retry_stream
+                        stream = self._guard_empty_stream(stream, ep, pool_group, request_id, stream_route_epoch,
+                                                          empty_retry=_empty_stream_retry)
                     return stream, ""
                 else:
                     body = json.loads(resp.read().decode("utf-8"))
