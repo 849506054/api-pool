@@ -1690,10 +1690,10 @@ def _chat_content_to_responses_content(content, text_type="input_text"):
             else:
                 url = raw_url or ""
                 detail = c.get("detail")
-            image = {"url": url}
+            image = {"type": "input_image", "image_url": url}
             if detail:
                 image["detail"] = detail
-            parts.append({"type": "input_image", "image_url": image})
+            parts.append(image)
     return parts
 
 
@@ -2004,9 +2004,9 @@ def _parse_chat_completion_chunk(chunk):
     raw = chunk.decode("utf-8", errors="ignore")
     for line in raw.splitlines():
         line = line.strip()
-        if not line.startswith("data: "):
+        if not line.startswith("data:"):
             continue
-        payload = line[6:].strip()
+        payload = line[5:].strip()
         if payload == "[DONE]":
             return None
         try:
@@ -2101,6 +2101,9 @@ def _responses_stream_generator(upstream_gen, body, meta=None, model="api-pool-a
                 continue
             elif parsed.get("type") == "response.completed":
                 parsed = {"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": (parsed.get("response") or {}).get("usage")}
+            if parsed.get("error"):
+                error = parsed["error"]
+                raise RuntimeError(error.get("message", "Upstream stream error") if isinstance(error, dict) else str(error))
             choices = parsed.get("choices") or []
             if choices:
                 delta = choices[0].get("delta") or {}
@@ -4346,6 +4349,50 @@ class APIPool:
             owners.pop(group, None)
         if not owners:
             self._inflight_owner.pop(ep_id, None)
+
+    def _guard_empty_stream(self, gen, ep, group, request_id, route_epoch):
+        """Validate normalized Chat output before DONE; preserve valid non-text completions."""
+        usable = False
+        terminal = False
+        pending_finish = None
+        done = b"data: [DONE]\n\n"
+        try:
+            for chunk in gen:
+                if chunk.strip() == done.strip():
+                    break
+                parsed = _parse_chat_completion_chunk(chunk) or {}
+                terminal = terminal or bool(parsed.get("error"))
+                for choice in parsed.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    usable = usable or bool(
+                        (delta.get("content") or "").strip() or delta.get("tool_calls")
+                        or delta.get("function_call") or delta.get("refusal") or delta.get("audio")
+                    )
+                    terminal = terminal or choice.get("finish_reason") in (
+                        "tool_calls", "function_call", "length", "content_filter", "error",
+                    )
+                if not usable and not terminal and any(c.get("finish_reason") == "stop" for c in parsed.get("choices") or []):
+                    # Only the empty stop frame is delayed; reasoning/content continue streaming.
+                    pending_finish = chunk
+                    continue
+                yield chunk
+            if not usable and not terminal:
+                message = "Provider returned an empty response"
+                sys_log(f"[req={request_id}] 端点 '{self._endpoint_log_label(ep, group)}' 空响应确认 "
+                        "content=0 tool_calls=0 terminal=stop/EOF", "INFO", group=group)
+                if group and not group.startswith("endpoint:"):
+                    with self._lock:
+                        self._rotate(ep, message, group=group, expected_route_epoch=route_epoch, request_id=request_id)
+                yield b"data: " + json.dumps({"error": {
+                    "message": message, "type": "server_error", "code": "empty_content",
+                }}).encode() + b"\n\n"
+            elif pending_finish is not None:
+                yield pending_finish
+            yield done
+        finally:
+            close = getattr(gen, "close", None)
+            if close:
+                close()
 
     def _wrap_stream_release(self, gen, ep_id, group):
         """流式响应外层 generator：正常结束/异常/提前关闭时释放在途占用。
@@ -7257,11 +7304,10 @@ class APIPool:
                         )
                     except Exception:
                         pass
-                if return_endpoint: return result, ep
-                # 分组池：流式结果包一层释放在途占用的 wrapper（迭代完成/关闭/异常时释放）
+                # 所有消费方（含 return_endpoint 的 Responses 入口）共用流式在途释放。
                 if payload.get("stream") and isinstance(result, _types.GeneratorType):
-                    return self._wrap_stream_release(result, ep.id, group)
-                return result
+                    result = self._wrap_stream_release(result, ep.id, group)
+                return (result, ep) if return_endpoint else result
             errors.append(f"[{ep.name}] {error}")
             sys_log(f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 请求失败: {error}", "ERROR")
             # 敏感词诊断只在 DEBUG 且确实出现相关拦截错误时执行；使用当前失败尝试的 payload，避免共享状态串扰。
@@ -7610,6 +7656,7 @@ class APIPool:
         pool_group=None, reset_cached_stats=False, request_id=None, request_deadline=None,
     ):
         req_t0 = time.time()
+        stream_route_epoch = self._get_route_epoch(pool_group) if pool_group else None
         # 推理强度（第1层出站真值，2026-09-27）：payload 已过 _map_reasoning_effort 家族改写，
         # 此处取的是「池实际发给上游的档位」，非客户端原始值、非上游内部实际强度。
         # anthropic 端点无 reasoning_effort 概念，改用 thinking 是否启用作为强度标记（thinking→'on'）。
@@ -7633,6 +7680,8 @@ class APIPool:
         elif is_responses:
             url = ep.base_url.rstrip("/") + "/responses"
             responses_payload = _responses_body_from_chat(payload)
+            if self._has_images(payload.get("messages", [])):
+                sys_log(f"{request_tag}Responses 图片桥接 image_url=string detail=part", "INFO", group=pool_group)
             responses_payload.setdefault("model", ep.model)
             responses_payload.pop("response_format", None)
             data = json.dumps(responses_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -7852,7 +7901,7 @@ class APIPool:
                                 return True
                             return any(p.get("text") or p.get("functionCall") for p in _gemini_chunk_parts(chunk))
                         if is_responses and str(chunk.get("type", "")).startswith("response."):
-                            return chunk.get("type") in ("response.output_text.delta", "response.output_item.added", "response.function_call_arguments.delta", "response.completed")
+                            return chunk.get("type") in ("response.output_text.delta", "response.output_item.added", "response.function_call_arguments.delta", "response.completed", "response.refusal.delta", "response.incomplete")
                         if is_anthropic:
                             ctype = chunk.get("type")
                             delta = chunk.get("delta") or {}
@@ -8151,6 +8200,14 @@ class APIPool:
                                                 responses_reasoning_seen = True
                                                 final_reasoning_text += rdelta
                                                 yield b"data: " + json.dumps({"choices": [{"delta": {"reasoning_content": rdelta}, "finish_reason": None}]}).encode() + b"\n\n"
+                                        elif ctype == "response.refusal.delta":
+                                            yield delta_chunk({"refusal": chunk.get("delta", "")})
+                                        elif ctype == "response.incomplete":
+                                            reason = ((chunk.get("response") or {}).get("incomplete_details") or {}).get("reason")
+                                            yield finish_chunk("length" if reason == "max_output_tokens" else "content_filter" if reason == "content_filter" else "error")
+                                        elif ctype in ("response.failed", "error"):
+                                            error = chunk.get("error") or (chunk.get("response") or {}).get("error") or {"message": "Upstream Responses stream failed"}
+                                            yield b"data: " + json.dumps({"error": error}).encode() + b"\n\n"
                                         elif ctype == "response.output_item.done":
                                             # 兜底：部分上游不逐字下发摘要，只在 item 收尾时带完整 summary。
                                             item = chunk.get("item") or {}
@@ -8175,7 +8232,18 @@ class APIPool:
                                             state["arguments"] += arg_delta
                                             yield b"data: " + json.dumps({"choices": [{"delta": {"tool_calls": [{"index": idx, "function": {"arguments": arg_delta}}]}, "finish_reason": None}]}).encode() + b"\n\n"
                                         elif ctype == "response.completed":
-                                            usage = (chunk.get("response") or {}).get("usage") or {}
+                                            completed = chunk.get("response") or {}
+                                            text, calls, _ = _responses_output_to_chat_message(completed.get("output"))
+                                            if text and not final_completion_text:
+                                                final_completion_text = text
+                                                yield delta_chunk({"content": text})
+                                            if calls and not responses_tool_states:
+                                                yield delta_chunk({"tool_calls": [dict(call, index=i) for i, call in enumerate(calls)]})
+                                            for item in completed.get("output") or []:
+                                                for part in item.get("content") or []:
+                                                    if part.get("type") == "refusal":
+                                                        yield delta_chunk({"refusal": part.get("refusal", "")})
+                                            usage = completed.get("usage") or {}
                                             final_prompt_tokens = usage.get("input_tokens", 0) or 0
                                             final_completion_tokens = usage.get("output_tokens", 0) or 0
                                             final_total_tokens = usage.get("total_tokens", 0) or 0
@@ -8481,7 +8549,10 @@ class APIPool:
                                 chat_logger.add_log(ep.name, ep.model, prompt_text_to_log, final_completion_text.strip() or final_reasoning_text.strip(), final_total_tokens, int((time.time() - req_t0) * 1000), pool_group, final_prompt_tokens, stats_cached_tokens, final_reasoning_tokens, log_reasoning_effort, self._reasoning_detected(final_reasoning_text, final_reasoning_tokens, _collected))
                                 self._mark_cache_stats_account(pool_group or self.MAIN_GROUP, ep.site_id)
                             resp.close()
-                    return stream_generator(), ""
+                    stream = stream_generator()
+                    if not is_probe:
+                        stream = self._guard_empty_stream(stream, ep, pool_group, request_id, stream_route_epoch)
+                    return stream, ""
                 else:
                     body = json.loads(resp.read().decode("utf-8"))
                     # 非 OpenAI 信封解包（2026-09-19）：Cline 非流式把 OpenAI 载荷整体包在
