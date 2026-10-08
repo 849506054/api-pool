@@ -50,6 +50,28 @@ python api_pool_server.py
 
 完整使用说明见 [Wiki](https://github.com/849506054/api-pool/wiki)。
 
+## 按配置定向调用单端点
+
+已经保存且启用的 Endpoint 可通过 `/endpoints/<端点ID>/v1` 独立调用，入池状态任意。端点 ID 取自 `GET /api/endpoints`；改名保持 ID，重新创建则产生新 ID。
+
+Hermes 可直接写主模型配置：
+
+```yaml
+model:
+  provider: custom
+  default: <端点配置的真实模型名>
+  base_url: http://localhost:5200/endpoints/<端点ID>/v1
+  api_key: ${API_SERVER_KEY}
+  api_mode: chat_completions
+```
+
+地址替换为 API Pool 实际监听地址；`API_SERVER_KEY` 使用 Hermes `.env` 中已有的池侧凭据，上游 Key 仍由 API Pool 管理。辅助任务在对应配置项填写同一 `provider/base_url/api_key`，模型字段用 `model`。
+
+- 定向入口支持 Chat Completions、Responses 及流式，复用端点自身的协议、客户端身份和兼容参数；出站模型以端点绑定为准。
+- 失败只在本端点内部按已有重试规则处理，耗尽即返回错误；组路由指向维持原状态，图片由目标端点处理。
+- 对话日志“池组”统一记为 `apipool`，端点名、模型和 Token 用量保持各自归属；内部请求日志保留端点 ID 供排障。
+- 全局 `/v1/models` 仍只列组选择器；定向入口的 `/models` 只返回该端点绑定模型。Hermes 使用手写配置即可，选择器继续使用原有组目录。
+
 ## 入口敏感词过滤
 
 API Pool 可在请求进入 Endpoint 路由前执行一次统一清洗，避免同一份请求在重试或故障转移时重复处理。过滤器只修改请求副本，不改变客户端原始 payload；词典加载或执行失败时拒绝请求，不会降级放行未清洗内容。

@@ -1200,6 +1200,8 @@ class ChatLogger:
             conn.close()
 
     def add_log(self, endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group=None, prompt_tokens=None, cached_tokens=None, reasoning_tokens=None, reasoning_effort=None, reasoning_detected=None):
+        if pool_group and pool_group.startswith("endpoint:"):
+            pool_group = "apipool"
         row = (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected)
         try:
             self._log_queue.put_nowait(row)
@@ -2895,6 +2897,12 @@ class Endpoint:
     _health_error: str = field(default="", repr=False)
 
 
+class EndpointRequestError(Exception):
+    def __init__(self, status, message):
+        self.status = status
+        super().__init__(message)
+
+
 class AllEndpointsFailed(Exception):
     def __init__(self, errors: list):
         self.errors = errors
@@ -4311,6 +4319,8 @@ class APIPool:
 
     def _mark_cache_stats_account(self, group, site_id):
         """usage 成功落库后更新本组统计账户边界。"""
+        if group.startswith("endpoint:"):
+            return
         with self._lock:
             self._cache_stats_site_id_by_group[group] = site_id
 
@@ -6839,7 +6849,127 @@ class APIPool:
             ep._health_error = "" if success else (str(err) if err else "未知错误")
         return success, err
 
-    def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False, request_id=None):
+    def _repair_tool_history(self, messages):
+        # 修复消息顺序：tool 消息前缺少 tool_calls 时自动补 assistant 回复
+        needs_fix = False
+        tool_call_ids = set()
+        for m in messages:
+            for tc in (m.get("tool_calls") or []):
+                tool_call_ids.add(tc.get("id", ""))
+        for m in messages:
+            if m.get("role") == "tool" and m.get("tool_call_id", "") not in tool_call_ids:
+                needs_fix = True
+                break
+        if needs_fix:
+            fixed = []
+            seen_tc_ids = set()
+            for m in messages:
+                if m.get("role") == "tool":
+                    tc_id = m.get("tool_call_id", "")
+                    if tc_id and tc_id not in seen_tc_ids:
+                        fixed.append({"role": "assistant", "content": None, "tool_calls": [{"id": tc_id, "type": "function", "function": {"name": "resolved", "arguments": "{}"}}]})
+                elif m.get("role") == "assistant":
+                    for tc in (m.get("tool_calls") or []):
+                        seen_tc_ids.add(tc.get("id", ""))
+                fixed.append(m)
+            messages = fixed
+        # 悬空 tool_calls（assistant 有 tool_calls 但缺对应 tool 结果）→ 补合成结果：
+        # DeepSeek 校验「tool_calls 后必须跟齐每条 tool_call_id」（2026-09-10 观测）。
+        messages = self._repair_dangling_tool_calls(messages)
+
+        return messages
+
+    def _prepare_endpoint_payload(self, messages, ep, extra_payload=None, skip_prefix_rewrite=False):
+        loop_messages = self._messages_for_endpoint(messages, ep)
+        is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
+        # tool_call id 前缀重写：端点配置 tool_call_id_prefix 非空时，把消息里所有 tool_call id
+        # 重写为该前缀格式（如 DeepSeek 官方 call_00_ET_）。跨端点切换后历史里混入其他端点
+        # 生成的 id（不同前缀/格式），Kcne 等 DeepSeek 官方会校验并报 400
+        # "reasoning_text must be passed back"；重写为统一格式后服务端视为新消息跳过校验。
+        ep_prefix = getattr(ep, "tool_call_id_prefix", "") or ""
+        attempt_prefix_applied = 0
+        if ep_prefix and not is_anthropic and not skip_prefix_rewrite:
+            # 非变异重写：返回新列表，原始历史（轮转各次尝试共用）不被改动
+            loop_messages, attempt_prefix_applied = self._rewrite_tool_call_ids(loop_messages, ep_prefix)
+
+        payload = {
+            "model": ep.model, "messages": loop_messages,
+            **(extra_payload or {}),
+        }
+        # GLM 系列推理强度适配：reasoning_effort 按官方映射改写/剔除；
+        # preserved_thinking 开关：注入 clear_thinking=False 开启保留式思考
+        if not is_anthropic:
+            self._map_reasoning_effort(payload, ep)
+            if getattr(ep, "preserved_thinking", False):
+                t = payload.get("thinking")
+                if isinstance(t, dict):
+                    t["clear_thinking"] = False
+                else:
+                    payload["thinking"] = {"type": "enabled", "clear_thinking": False}
+            # GLM-5.3 思考不可关闭：客户端/nightly LLM 下发的 disabled 在这里
+            # 折叠为官方形态（enabled + effort low），避免上游 400。
+            self._normalize_glm_thinking(payload, ep)
+            # 端点级思考配置（2026-10-05）：档位替换 + 关闭思考，覆盖在上面之上
+            self._apply_thinking_config(payload, ep)
+
+        return payload, attempt_prefix_applied
+
+    def _chat_endpoint(self, endpoint_id, messages, model=None, extra_payload=None,
+                       timeout=None, return_endpoint=False, request_id=None):
+        """Execute a configured endpoint using the shared protocol bridge and endpoint-local state."""
+        import uuid
+        with self._lock:
+            ep = self.get_endpoint(endpoint_id)
+            if ep is None:
+                raise EndpointRequestError(404, "Endpoint not found")
+            if not ep.enabled or ep._manual_unlock_required or self._is_in_cooldown(ep):
+                raise EndpointRequestError(503, "Endpoint disabled, locked or cooling down")
+        if not isinstance(messages, list) or not messages or any(not isinstance(m, dict) for m in messages):
+            raise EndpointRequestError(400, "messages must be a non-empty array of objects")
+        group = f"endpoint:{ep.id}"
+        set_log_group(group)
+        request_id = request_id or uuid.uuid4().hex[:8]
+        if model and model != ep.model:
+            # 端点绑定优先：客户端下发的模型名只作提示，出站一律使用端点自身模型。
+            sys_log(f"[req={request_id}] 下发模型 '{model}' 与端点绑定 '{ep.model}' 不一致，按端点绑定执行", "WARN", group=group)
+        sys_log(f"[req={request_id}] 定向请求 endpoint_id={ep.id} model={ep.model} accounting=apipool", "INFO", group=group)
+        messages = self._repair_tool_history(messages)
+        payload, _ = self._prepare_endpoint_payload(messages, ep, extra_payload)
+        if ep.max_context_k > 0 and self._estimate_context_tokens(payload["messages"]) > ep.max_context_k * 1000:
+            raise EndpointRequestError(400, "Endpoint context limit exceeded")
+        # Targeting is exclusive: image content is handled by this endpoint's own protocol.
+        with self._lock:
+            self._acquire_inflight(ep.id, group)
+        streaming = False
+        try:
+            result, error = self._try_endpoint(
+                ep, payload, timeout or ep.timeout, pool_group=group, request_id=request_id,
+                request_deadline=time.time() + self._FALLBACK_DEADLINE_SECONDS,
+            )
+            if result is None:
+                with self._lock:
+                    ep._total_failures += 1
+                    ep._last_error = str(error)
+                    ep._last_error_ts = time.time()
+                    self._set_capacity_cooldown(ep, str(error))
+                sys_log(f"[req={request_id}] 定向请求 endpoint_id={ep.id} 失败: {error}", "ERROR", group=group)
+                raise EndpointRequestError(502, str(error))
+            with self._lock:
+                ep._total_calls += 1
+                ep._last_success_ts = time.time()
+            streaming = isinstance(result, _types.GeneratorType)
+            if streaming:
+                result = self._wrap_stream_release(result, ep.id, group)
+            return (result, ep) if return_endpoint else result
+        finally:
+            if not streaming:
+                with self._lock:
+                    self._release_inflight(ep.id, group)
+
+    def chat(self, messages, model=None, extra_payload=None, timeout=None, return_endpoint=False, request_id=None, endpoint_id=None):
+        if endpoint_id is not None:
+            return self._chat_endpoint(endpoint_id, messages, model, extra_payload,
+                                       timeout, return_endpoint, request_id)
         self._cleanup_expired_cooldowns()
         if request_id is None:
             import uuid
@@ -6918,32 +7048,7 @@ class APIPool:
         # main 组用统一轴键（子组整体钉在 main_priority），否则借来的子组成员
         # 会被这次 re-sort 按各自 pbg['main'] 打散，故障后跳出子组（2026-09-27）。
         active.sort(key=lambda e: self._candidate_sort_key(e, group))
-        # 修复消息顺序：tool 消息前缺少 tool_calls 时自动补 assistant 回复
-        needs_fix = False
-        tool_call_ids = set()
-        for m in messages:
-            for tc in (m.get("tool_calls") or []):
-                tool_call_ids.add(tc.get("id", ""))
-        for m in messages:
-            if m.get("role") == "tool" and m.get("tool_call_id", "") not in tool_call_ids:
-                needs_fix = True
-                break
-        if needs_fix:
-            fixed = []
-            seen_tc_ids = set()
-            for m in messages:
-                if m.get("role") == "tool":
-                    tc_id = m.get("tool_call_id", "")
-                    if tc_id and tc_id not in seen_tc_ids:
-                        fixed.append({"role": "assistant", "content": None, "tool_calls": [{"id": tc_id, "type": "function", "function": {"name": "resolved", "arguments": "{}"}}]})
-                elif m.get("role") == "assistant":
-                    for tc in (m.get("tool_calls") or []):
-                        seen_tc_ids.add(tc.get("id", ""))
-                fixed.append(m)
-            messages = fixed
-        # 悬空 tool_calls（assistant 有 tool_calls 但缺对应 tool 结果）→ 补合成结果：
-        # DeepSeek 校验「tool_calls 后必须跟齐每条 tool_call_id」（2026-09-10 观测）。
-        messages = self._repair_dangling_tool_calls(messages)
+        messages = self._repair_tool_history(messages)
 
         # 当前端点保持粘性：无明确故障/手动切换/恢复回迁时，后续请求继续使用
         # 最近成功或故障转移选中的端点，而不是每次回到最高优先级端点。
@@ -7005,41 +7110,13 @@ class APIPool:
                 base_messages = self._downgrade_developer_role(messages)
             else:
                 base_messages = messages
-            loop_messages = self._messages_for_endpoint(base_messages, ep)
-            is_anthropic = (getattr(ep, "protocol", "openai") == "anthropic")
-            # tool_call id 前缀重写：端点配置 tool_call_id_prefix 非空时，把消息里所有 tool_call id
-            # 重写为该前缀格式（如 DeepSeek 官方 call_00_ET_）。跨端点切换后历史里混入其他端点
-            # 生成的 id（不同前缀/格式），Kcne 等 DeepSeek 官方会校验并报 400
-            # "reasoning_text must be passed back"；重写为统一格式后服务端视为新消息跳过校验。
+            payload, attempt_prefix_applied = self._prepare_endpoint_payload(
+                base_messages, ep, extra_payload, skip_prefix_rewrite=skip_prefix_rewrite,
+            )
+            loop_messages = payload["messages"]
             ep_prefix = getattr(ep, "tool_call_id_prefix", "") or ""
-            attempt_prefix_applied = 0
-            if ep_prefix and not is_anthropic and not skip_prefix_rewrite:
-                # 非变异重写：返回新列表，原始历史（轮转各次尝试共用）不被改动
-                loop_messages, attempt_prefix_applied = self._rewrite_tool_call_ids(loop_messages, ep_prefix)
-            # 变体开关只作用于紧随其后的那一次尝试（消费一次即清除）：轮转后各端点
-            # 按自己的配置重新决定是否重写，不会把本端点的变体状态带给其他端点。
             skip_prefix_rewrite = False
-            
-            payload = {
-                "model": ep_model, "messages": loop_messages,
-                **(extra_payload or {}),
-            }
-            # GLM 系列推理强度适配：reasoning_effort 按官方映射改写/剔除；
-            # preserved_thinking 开关：注入 clear_thinking=False 开启保留式思考
-            if not is_anthropic:
-                self._map_reasoning_effort(payload, ep)
-                if getattr(ep, "preserved_thinking", False):
-                    t = payload.get("thinking")
-                    if isinstance(t, dict):
-                        t["clear_thinking"] = False
-                    else:
-                        payload["thinking"] = {"type": "enabled", "clear_thinking": False}
-                # GLM-5.3 思考不可关闭：客户端/nightly LLM 下发的 disabled 在这里
-                # 折叠为官方形态（enabled + effort low），避免上游 400。
-                self._normalize_glm_thinking(payload, ep)
-                # 端点级思考配置（2026-10-05）：档位替换 + 关闭思考，覆盖在上面之上
-                self._apply_thinking_config(payload, ep)
-            
+
             # [VISION TRANSLATION INTERCEPT]
             if self._has_images(payload["messages"]) and getattr(ep, "is_vision", True) is False:
                 vision_cands, vision_grp = self._vision_pool_candidates()
@@ -9356,9 +9433,42 @@ if isinstance(restored_fallback, dict) and restored_fallback:
     )
 
 
+_ENDPOINT_PATH = re.compile(r"/endpoints/([A-Za-z0-9_-]{1,128})(/v1(?:/.*)?)")
+
+
 def api_handler(method, path, body):
     parsed = urlparse(path)
     cp = parsed.path
+    endpoint_id = None
+    if cp.startswith("/endpoints/"):
+        route = _ENDPOINT_PATH.fullmatch(cp)
+        if route is None:
+            return 400, {"error": {"message": "Invalid endpoint path", "type": "invalid_request_error"}}, False
+        endpoint_id, cp = route.groups()
+        ep = pool.get_endpoint(endpoint_id)
+        if ep is None:
+            return 404, {"error": {"message": "Endpoint not found", "type": "invalid_request_error"}}, False
+        if method == "GET" and (cp == "/v1/models" or cp.startswith("/v1/models/")):
+            # 定向路由只暴露本端点绑定的模型；聚合各组的模型目录不因此增加条目。
+            entry = {"id": ep.model, "object": "model", "created": 0, "owned_by": "api-pool"}
+            if ep.max_context_k > 0:
+                entry["context_length"] = ep.max_context_k * 1000
+            if cp == "/v1/models":
+                return 200, {"object": "list", "data": [entry]}, False
+            if unquote(cp[len("/v1/models/"):]) != ep.model:
+                return 404, {"error": {"message": "Model not found", "type": "invalid_request_error"}}, False
+            return 200, entry, False
+        inference = method == "POST" and cp in ("/v1/chat/completions", "/v1/responses")
+        stored_response = method in ("GET", "DELETE") and cp.startswith("/v1/responses/")
+        if not (inference or stored_response):
+            return 404, {"error": {"message": "Not found", "type": "invalid_request_error"}}, False
+        if inference and not isinstance(body, dict):
+            return 400, {"error": {"message": "Request body must be an object", "type": "invalid_request_error"}}, False
+        if inference and cp == "/v1/responses":
+            try:
+                body = content_filter.filter_payload(body)
+            except ContentFilterError:
+                return 503, {"error": {"message": "API Pool content filter unavailable", "type": "service_unavailable"}}, False
 
     # ================= OpenAI 兼容模型目录 =================
     if method == "GET" and cp in ("/v1/models", "/models"):
@@ -9398,19 +9508,19 @@ def api_handler(method, path, body):
 
     if method == "GET" and (cp.startswith("/v1/responses/") or cp.startswith("/responses/")):
         rid = unquote(cp.rsplit("/", 1)[-1])
-        stored = _responses_store_get(rid)
+        stored = _responses_store_get(f"{endpoint_id}:{rid}" if endpoint_id else rid)
         if stored:
             return 200, stored.get("response", stored), False
         return 404, {"error": {"message": "Response not found", "type": "invalid_request_error", "param": None, "code": None}}, False
 
     if method == "DELETE" and (cp.startswith("/v1/responses/") or cp.startswith("/responses/")):
         rid = unquote(cp.rsplit("/", 1)[-1])
-        if _responses_store_delete(rid):
+        if _responses_store_delete(f"{endpoint_id}:{rid}" if endpoint_id else rid):
             return 200, {"deleted": True, "id": rid}, False
         return 404, {"error": {"message": "Response not found", "type": "invalid_request_error", "param": None, "code": None}}, False
 
     if method == "POST" and cp in ("/v1/responses", "/responses"):
-        return _handle_responses(body)
+        return _handle_responses(body, endpoint_id=endpoint_id)
 
     # ================= 代理接口 =================
     if method == "POST" and cp in ("/v1/chat/completions", "/chat/completions"):
@@ -9435,7 +9545,8 @@ def api_handler(method, path, body):
         try:
             # 分组池：model 字段作为组选择器传入 chat()（api-pool→main 别名，
             # 精确匹配组名，无匹配→main；Hermes 侧配置 api-pool-bg 即路由 bg 组）
-            result = pool.chat(messages, model=body.get("model"), extra_payload=extra_payload)
+            route_args = {"endpoint_id": endpoint_id} if endpoint_id is not None else {}
+            result = pool.chat(messages, model=body.get("model"), extra_payload=extra_payload, **route_args)
             if is_stream: return 200, result, True 
             
             # result is the full upstream response body (preserves reasoning_content etc.)
@@ -9445,6 +9556,8 @@ def api_handler(method, path, body):
             # response["model"] = "api-pool-aggregated"
             return 200, response, False
             
+        except EndpointRequestError as e:
+            return e.status, {"error": {"message": str(e), "type": "invalid_request_error" if e.status < 500 else "server_error"}}, False
         except AllEndpointsFailed as e:
             return 500, {"error": {"message": f"所有端点均已失效: {e.errors}", "type": "server_error"}}, False
         except Exception as e:
@@ -10006,7 +10119,7 @@ def api_handler(method, path, body):
 
     return 404, {"error": "Not found"}, False
 
-def _handle_responses(body):
+def _handle_responses(body, endpoint_id=None):
     try:
         messages, extra_payload = _responses_to_chat_request(body)
     except ValueError as e:
@@ -10014,7 +10127,7 @@ def _handle_responses(body):
 
     previous_response_id = body.get("previous_response_id")
     if previous_response_id:
-        stored = _responses_store_get(previous_response_id)
+        stored = _responses_store_get(f"{endpoint_id}:{previous_response_id}" if endpoint_id else previous_response_id)
         if not stored:
             return 400, {"error": {
                 "message": f"previous_response_id '{previous_response_id}' not found",
@@ -10034,14 +10147,16 @@ def _handle_responses(body):
 
     def maybe_store(response_obj):
         if body.get("store"):
-            _responses_store_put(response_obj.get("id") or response_id, {
+            rid = response_obj.get("id") or response_id
+            _responses_store_put(f"{endpoint_id}:{rid}" if endpoint_id else rid, {
                 "messages": messages, "response": response_obj
             })
 
     try:
+        route_args = {"endpoint_id": endpoint_id} if endpoint_id is not None else {}
         result, served_ep = pool.chat(
             messages, model=body.get("model"), extra_payload=extra_payload,
-            return_endpoint=True
+            return_endpoint=True, **route_args
         )
         if is_stream:
             return 200, _responses_stream_generator(
@@ -10061,6 +10176,8 @@ def _handle_responses(body):
         )
         maybe_store(response_obj)
         return 200, response_obj, False
+    except EndpointRequestError as e:
+        return e.status, {"error": {"message": str(e), "type": "invalid_request_error" if e.status < 500 else "server_error"}}, False
     except AllEndpointsFailed as e:
         return 500, {"error": {"message": f"所有端点均已失败: {e.errors}", "type": "server_error", "param": None, "code": None}}, False
     except Exception as e:
@@ -10184,7 +10301,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             except ConnectionError:
                 pass
-        elif self.path.startswith("/api/") or self.path.startswith("/v1/") or self.path.startswith("/responses/") or self.path == "/models":
+        elif self.path.startswith(("/api/", "/v1/", "/responses/", "/endpoints/")) or self.path == "/models":
             res = api_handler("GET", self.path, {})
             if len(res) == 3 and res[2] is True:
                 code, stream_gen = res[0], res[1]
@@ -10208,7 +10325,9 @@ class Handler(BaseHTTPRequestHandler):
     _PROXY_PATHS = ("/v1/chat/completions", "/chat/completions", "/v1/responses", "/responses")
 
     def _is_proxy_path(self):
-        return urlparse(self.path).path in self._PROXY_PATHS
+        path = urlparse(self.path).path
+        route = _ENDPOINT_PATH.fullmatch(path)
+        return (route.group(2) if route else path) in self._PROXY_PATHS
 
     def do_POST(self):
         body = self._read_body()

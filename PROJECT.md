@@ -20,6 +20,8 @@
 
 ## 🎯 里程碑
 
+- [x] **[P2] 配置式端点定向入口（2026-10-08 已部署实测）** — `/endpoints/<id>/v1` 严格绑定已保存端点，复用协议桥与端点参数，组模型目录维持原有选择器；对话日志池组统一为 `apipool`。文件：`api_pool_server.py`、`test/test_endpoint_route.py`；使用示例见 README「按配置定向调用单端点」。生产 SHA-256 `77c983e9748633c6214123965410d62d622ad4271cd4a52277fa316450e3cdf9`。隔离 HTTP 回归覆盖四种上游协议、Chat/Responses 流式、错误与组状态隔离；生产非流式/流式成功，Hermes 客户端解析与实际请求返回 `ACCOUNTING_OK`，数据库及详情接口记录 `64269` 的 `pool_group=apipool`。完整回归 548 项，546 通过、2 项既有 Hermes 测试桩缺少 `_capture_nous_model_switch` 报错，ruff 新增问题 0。备份：`/opt/data/backups/api-pool2-endpoint-route-20261008-113310/`；验证日志：`workspace/records/endpoint-route-20261008/`。
+
 - 2026-10-06 上游积分徽标（纯展示层，**只读登记值零触发**）：端点 api_key 前 12 位匹配
   wkm `manager.db`（credits_snapshot + api_keys 表，只读 sqlite）与 qoder `accounts/*.json`
   的 `credits.remain`，按 realm 汇总（kind=pool）或 key 级现剩（kind=key）。serve-time 触发
