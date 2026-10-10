@@ -20,6 +20,8 @@
 
 ## 🎯 里程碑
 
+- [x] **[P2] 积分徽标数据源切上游只读接口（2026-10-10 已部署验证）** — 既定方案（口径 → `api-pool-management/references/credit-badge-read-only.md`）= `_read_*_credits()` 改打上游只读接口、删本地读取段、触发层与展示不动。实现：wkm 三接口（`GET /api/keys` 一次取全 key 级 prefix/realm/quota_credit/used_credit，免逐端点打 `/v1/usage` 每分钟在上游请求日志留 0-token 记录；`GET /api/accounts/credits-snapshot` 取 uid→积分；`GET /api/accounts` 取 uid→realm）共用一把只读令牌，wkm 侧零本地文件读取；qoder `GET /credits/summary` 取 `by_realm`（用池内端点自己的 key 鉴权，首把被拒换下一把），唯一保留的本地读是 qoder 自己的 `settings.json`（key→realm 绑定，无等价 HTTP 接口）。触发层与展示三处未动；硬化三项：刷新非阻塞守卫（HTTP 慢时不叠请求）、出站硬超时 3s、源失败保留旧读数（原实现失败即清空徽标）。文件：`api_pool_server.py`、`test/test_credit_sources.py`、`_verify_readers.py`（改为直调池模块读接口并与 `/api/endpoints` 逐条对账）；备份：宿主机同目录 `api_pool_server.py.bak-20261010-2245-credit-http` 与 `/etc/systemd/system/api-pool2.service.bak-20261010-2245-credit-http`。令牌：wkm 只读令牌 `api-pool2-credit`（scope readonly、永不过期，用容器自带 `tokensvc.create_token` 创建，不经面板会话），明文入宿主机 `/etc/api-pool2.env`（600），unit 加 `EnvironmentFile=-/etc/api-pool2.env`。验证：`test/test_credit_sources.py` **10 例全绿**；全量 **572 例**（仅 `test_hermes_stream_error_e2e` 2 例基线既有桩漂移）；部署前带令牌全量对账 7 条读数与池在跑值零字段差异；部署后 `systemctl restart api-pool2` 2026-10-10 22:32:05（2 秒就绪），前后 9 行 credit 逐字段零差异（wkm cn 14450 / global 3923、qoder cn 2999 / intl 400，kind 不变），wkm 访问日志同一时刻起每轮刷新三条 200、令牌 `last_used_at` 落在重启之后，部署文件已无 `WKM_MANAGER_DB`/`WKM_AUTHS_DIR` 引用（grep 计数 0）。部署 SHA-256 `7ba8db1d24d0515fbff4806fb22653b05c6abbf996bcc108693424e0a17eb371`。
+
 - [x] **[P2] 对话日志 prompt 两档保留（2026-10-08 已部署，磁盘回收待停服 VACUUM）** — prompt 占库容 99%（全库均摊 68KB/行、近期均值 272KB/行、上限 1MB），池承接全部业务出口后库 4,637MB / 约 66,000 行 / 7 天 ≈ 0.66GB 每天，freelist=0 说明全为活数据。现行：近 24 小时存全文，更早的行由 `trim_old_prompts()` 分批截断为「首 6000 + 尾 2000」预览（`prompt_trimmed` 幂等标记 + `idx_chat_logs_timestamp`），保留期仍 7 天；每批 400 行、每小时一遍。文件：`api_pool_server.py`、`test/test_chat_log_prompt_trim.py`；备份 `/opt/data/backups/api-pool2-chatlog-trim-20261008/`；证据 `workspace/records/chatlog-trim-full2.log`。全量 562 项：560 通过、2 项既有 Hermes 测试桩错误；ruff 仅新增 1 条 BLE001（与文件既有 61 处同型）。部署 SHA-256 `cfa3e267009e547ce3c82cad1d610fbee9f7d62cf0f0e4877d18eb2ff432b556`（15:39 重启 active；`prompt_trimmed` 列与 timestamp 索引已回读确认）。决策记录：不缩短保留期（保住诊断窗口）、prompt 不转 zlib blob（池与前端读取路径改动更大）、组级 `log_level` 维持现状（journal 非瓶颈）。同批把部署目录 94 个 `*.bak*` 按「一家一份备份」收敛为每家族最新一份（删 73 个、释放 22.2MB）。
 
 - [x] **[P2] Responses 图片形状与空响应兜底（2026-10-08 已部署，分层验收完成；空响应改为先原地重放）** — 图片 `image_url` 字符串、`detail` 同级；规范化 Chat 流收尾区分正文/工具/拒绝/截断与真正空响应，空流在 DONE 前回可重试错误；组路由复用既有冷却/轮转，定向端点保持绑定。文件：`api_pool_server.py`、`test/test_response_empty_guard.py`；备份：`/opt/data/backups/api-pool2-responses-fixes-20261008/`；测试：`python3 -m unittest discover -s test -p test_response_empty_guard.py`；证据目录：`workspace/records/responses-fixes-20261008/`。 本地验证：7 项定向回归（含隔离 HTTP、OpenAI SDK 异常及 Hermes retryable 分类）通过；全量 558 项，556 通过、2 项既有 Hermes 测试桩错误；Responses/Anthropic pytest 12 通过，Gemini 36 检查通过，ruff 新增 0。部署 SHA-256 `e083ccc3384126f287509aafc55f111b20c4587aabe84e1c484d7d61f2a4a644`。 13:05:51 重启后服务 active；宿主机部署文件 7 项隔离验收、回读文件 SDK/Hermes 分类 7 项验收通过。生产图片请求 `c162ed27` 记录规范化 INFO 并正常完成，正文 `Peach`、finish=`stop`，原图片类型 400 消失；颜色断言未通过，视觉准确性独立于协议验收。空响应生产自然触发样本待观察，当前效果证据为部署文件隔离实测。代码提交 `589b889`。 2026-10-08 追加修正（用户纠正）：空响应不再直接冷却，先按端点 `max_retries` 与请求预算在同一端点重放（日志 `空响应，N 秒后进行第 x/y 次原端点重试（空响应重放）`），重放仍空才回可重试错误并走既有轮转；首次尝试的延迟 stop 帧在重放时作废。部署 SHA-256 `d57330d149b6da7dffd96c2d98856c5f5b669e1baf1db61cbcefa74d8d3caea1`（16:14 重启 active）；宿主机部署文件 8 项隔离验收通过，全量 559 项 557 通过、2 项既有 Hermes 测试桩错误；备份 `/opt/data/backups/api-pool2-empty-retry-20261008/`。代码提交 `800fc39`。
@@ -28,13 +30,15 @@
 
 - [x] **[P2] 配置式端点定向入口（2026-10-08 已部署实测）** — `/endpoints/<id>/v1` 严格绑定已保存端点，复用协议桥与端点参数，组模型目录维持原有选择器；对话日志池组统一为 `apipool`。文件：`api_pool_server.py`、`test/test_endpoint_route.py`；使用示例见 README「按配置定向调用单端点」。生产 SHA-256 `77c983e9748633c6214123965410d62d622ad4271cd4a52277fa316450e3cdf9`。隔离 HTTP 回归覆盖四种上游协议、Chat/Responses 流式、错误与组状态隔离；生产非流式/流式成功，Hermes 客户端解析与实际请求返回 `ACCOUNTING_OK`，数据库及详情接口记录 `64269` 的 `pool_group=apipool`。完整回归 548 项，546 通过、2 项既有 Hermes 测试桩缺少 `_capture_nous_model_switch` 报错，ruff 新增问题 0。备份：`/opt/data/backups/api-pool2-endpoint-route-20261008-113310/`；验证日志：`workspace/records/endpoint-route-20261008/`。
 
-- 2026-10-06 上游积分徽标（纯展示层，**只读登记值零触发**）：端点 api_key 前 12 位匹配
-  wkm `manager.db`（credits_snapshot + api_keys 表，只读 sqlite）与 qoder `accounts/*.json`
-  的 `credits.remain`，按 realm 汇总（kind=pool）或 key 级现剩（kind=key）。serve-time 触发
-  （距上次 ≥60s 重扫，本地 IO；时间戳读前置位防坏源每帧重试），无常驻线程、无令牌、无 HTTP
-  探针。展示三处：端点列表、聚合池成员卡（取代 🔗N组）、main 子组聚合条目（chain 的
-  current_credit）；图标 = wkm lucide coins 内联 SVG。口径铁律与数据源细节见
-  api-pool-management skill 的 references/credit-badge-read-only.md。测试 522 例=基线（2 既有 openai 导入 error）。
+- 2026-10-10 上游积分徽标（纯展示层，**只读上游已登记值零触发**）：数据源 = 上游只读接口。
+  wkm 三接口（`GET /api/keys` key 级 realm/额度、`GET /api/accounts/credits-snapshot` uid→积分、
+  `GET /api/accounts` uid→realm）共用一把只读 `wbt_` 令牌（宿主机 `/etc/api-pool2.env` → unit
+  `EnvironmentFile=-/etc/api-pool2.env`）；qoder `GET /credits/summary` 取 `by_realm`，key→realm
+  绑定仍读它自己的 `settings.json`。端点 api_key 前 12 位匹配 prefix，按 realm 汇总（kind=pool）
+  或 key 级现剩（kind=key）。serve-time 触发（距上次 ≥60s、非阻塞守卫，出站硬超时 3s，源失败保留
+  旧读数），无常驻线程；出站显式绕开全局代理。展示三处：端点列表、聚合池成员卡（取代 🔗N组）、
+  main 子组聚合条目（chain 的 current_credit）；图标 = wkm lucide coins 内联 SVG。口径铁律与接口
+  映射见 api-pool-management skill 的 references/credit-badge-read-only.md；对账工具 `_verify_readers.py`。
 
 ### 已完成
 
