@@ -2063,8 +2063,8 @@ function renderCFManager(){
     <h2>🛡 敏感词过滤</h2>
     <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">请求入口清洗（/v1/chat/completions）：命中词替换后转发上游；保存立即生效，无需重启。pattern 为空串=删除命中内容。</div>
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
-      <div class="cf-switch on" id="cfSwitch" onclick="cfToggleSwitch()"></div>
-      <span class="cf-status on" id="cfStatus">已开启</span>
+      <div class="cf-switch${cf.enabled?' on':''}" id="cfSwitch" onclick="cfToggleSwitch()"></div>
+      <span class="cf-status ${cf.enabled?'on':'off'}" id="cfStatus">${cf.enabled?'已开启':'已关闭'}</span>
       <span class="badge" style="background:var(--green-dim);color:var(--green)">热生效</span>
       <span style="margin-left:auto;font-size:11px;color:var(--text-dim);font-family:monospace">词典 ${esc(cf.dictionary_version||'—')} · ${cf.rules.length} 条规则</span>
     </div>
