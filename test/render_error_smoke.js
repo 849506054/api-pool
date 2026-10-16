@@ -43,7 +43,11 @@ const VENDOR_SRC=js.match(/const VENDOR_RULES=\[[\s\S]*?\];\nfunction vendorOf\(
 const HOST_SRC=js.match(/function epHost\(ep\)\{[\s\S]*?\n\}/)[0];
 const ALIAS_SRC=js.match(/function epSiteAlias\(eps,host\)\{[\s\S]*?\n\}/)[0];
 const MU_SRC=js.match(/function muInfo\(ep\)\{[\s\S]*?\n\}/)[0];
-const FNS=[VENDOR_SRC,HOST_SRC,ALIAS_SRC,MU_SRC,js.match(/function epErr\(ep\)\{[^\n]*\}/)[0],js.match(/function applyEpFilter\(\)\{[^\n]*\}/)[0],js.match(/function setFilter\(f\)\{[^\n]*\}/)[0],js.match(/function setVendorFilter\(v\)\{[^\n]*\}/)[0],grab('renderStats'),grab('renderFilterBar'),grab('renderEndpoints'),grab('renderPoolList'),grab('renderChain')].join('\n');
+/* 积分徽标（2026-10-10）：renderEndpoints/renderPoolList/renderChain 直接调用 wkmCreditBadge，
+   与 epHost/epSiteAlias 同属「被同步调用但忘了进 FNS」型；连带其依赖的 WKM_COINS_SVG 常量。 */
+const CREDIT_SVG_SRC=js.match(/const WKM_COINS_SVG=[^\n]*\n/)[0];
+const CREDIT_SRC=js.match(/function wkmCreditBadge\(c\)\{[\s\S]*?\n\}/)[0];
+const FNS=[VENDOR_SRC,HOST_SRC,ALIAS_SRC,MU_SRC,CREDIT_SVG_SRC,CREDIT_SRC,js.match(/function epErr\(ep\)\{[^\n]*\}/)[0],js.match(/function applyEpFilter\(\)\{[^\n]*\}/)[0],js.match(/function setFilter\(f\)\{[^\n]*\}/)[0],js.match(/function setVendorFilter\(v\)\{[^\n]*\}/)[0],grab('renderStats'),grab('renderFilterBar'),grab('renderEndpoints'),grab('renderPoolList'),grab('renderChain')].join('\n');
 /* ── stub 覆盖静态自检（2026-10-04）──────────────────────────────────────
    页面新增 helper 后 FNS 必须同步带入，否则 eval 后第一次调用才 ReferenceError
    （epHost / epSiteAlias 各漏过一次）。这里在 eval 之前按「源码引用」比对：
@@ -161,6 +165,9 @@ setVendorFilter('DeepSeek');
 chk(els['epList'].innerHTML.includes('BetaDs')&&!els['epList'].innerHTML.includes('BetaAuto')&&els['filterCount'].textContent==='1 个','setVendorFilter 同步重绘：Beta×DeepSeek 1 条');
 chk(/onclick="setFilter\('/.test(els['filterBar'].innerHTML)&&/onclick="setVendorFilter\('/.test(els['vendorBar'].innerHTML),'两栏按钮 onclick 直连同步函数');
 epFilter='all';epVendorFilter='all';
+/* 积分徽标（2026-10-16）：wkmCreditBadge 已进 FNS，验证它确实被渲染出来（而非只求不报错） */
+renderEndpoints([Object.assign({},epOk,{id:'e4',name:'CreditEp',credit:{remaining:1234,kind:'key',realm:'cn'}})]);
+chk(els['epList'].innerHTML.includes('1.2k'),'积分徽标：有 credit 的端点渲染出剩余积分');
 console.log(fail?'\n有断言失败':'\n全部断言通过');
 process.exit(fail);
 

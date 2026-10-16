@@ -802,19 +802,26 @@ function epHost(ep){
 function epSiteLabel(ep){ /* 标签展示名：host（同站唯一） */
   return epHost(ep)||String(ep.site_name||'').trim();
 }
-/* 同站短名（2026-10-04）：host 下多个 site_name 取其公共前缀做展示名。
+/* 同站短名（2026-10-04 立，2026-10-16 修订）：host 下多个 site_name 取其公共前缀做展示名。
    Cline/Cline2/Cline3/Cline4 → "Cline"；AgentRouter/P/Z → "AgentRouter"。
-   单个站点名原样返回；无公共前缀（完全不同的名字）回落 host。
+   前缀比较大小写不敏感（Qoder/qoderCN → "Qoder"）；单个站点名原样返回。
+   名字之间没有公共前缀时（WorkBuddy/CodeBuddy）并列显示全部名字、端点数多的在前，
+   内网网关的 ip:port 不出现在标签上。
    注意：这只是**展示名**，筛选值仍用 host（setFilter 传 host）。 */
 function epSiteAlias(eps,host){
-  const names=[...new Set(eps.filter(e=>epHost(e)===host).map(e=>String(e.site_name||'').trim()).filter(Boolean))];
+  const mine=eps.filter(e=>epHost(e)===host);
+  const names=[...new Set(mine.map(e=>String(e.site_name||'').trim()).filter(Boolean))];
   if(names.length<=1)return names[0]||host;
+  const low=n=>n.toLowerCase();
   let pre=names[0];
   for(const n of names){
-    while(pre&&!n.startsWith(pre))pre=pre.slice(0,-1);
+    while(pre&&!low(n).startsWith(low(pre)))pre=pre.slice(0,-1);
     if(!pre)break;
   }
-  return pre||host;
+  if(pre)return pre;
+  const cnt=new Map();
+  for(const e of mine){const n=String(e.site_name||'').trim();if(n)cnt.set(n,(cnt.get(n)||0)+1);}
+  return [...names].sort((a,b)=>(cnt.get(b)||0)-(cnt.get(a)||0)||a.localeCompare(b)).join('/');
 }
 
 function renderFilterBar(eps){
