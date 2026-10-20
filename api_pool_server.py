@@ -4868,6 +4868,15 @@ class APIPool:
                 # 端点接手。前提：main 配了空闲窗口（否则=始终避让的旧行为）；配了
                 # 轮换的组不挂（轮换是组内循环意图，回切会与之互相拉锯）。
                 if self._group_idle_seconds(self.MAIN_GROUP) and not self._group_rotate_requests(group):
+                    # 挂上的那一刻留一行：谁占用了它、哪个组让位、窗口多长。
+                    # 已在延迟期内不重复打（每次请求都会走到这里）。
+                    if ep._defer_until_by_group.get(group, 0) <= time.time():
+                        owner = self._get_manual(self.MAIN_GROUP) or self._get_current(self.MAIN_GROUP)
+                        sys_log(
+                            f"端点 '{self._endpoint_log_label(ep, group)}' 被 main 占用"
+                            f"（main 当前端点 '{owner or '无'}'），组 '{group}' 挂延迟回切 300s（借用避让）",
+                            "INFO",
+                        )
                     ep._defer_until_by_group[group] = time.time() + 300
                     ep._defer_borrow_by_group.add(group)  # 借用避让型：判据=接手端点自身空闲
                 continue

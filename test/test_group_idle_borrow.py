@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 MODULE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "api_pool_server.py")
 
@@ -66,6 +67,23 @@ class IdleBorrowTests(unittest.TestCase):
 
             candidates, _ = pool._group_sticky_candidates("bg")
             self.assertIn("shared", [ep.id for ep in candidates])
+
+    def test_defer_creation_logs_once_with_main_owner(self):
+        """借用避让挂 defer 时留一行（谁占用、哪个组让位），重复调用不刷屏。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module(tmp)
+            pool, shared = self.make_pool(module)
+            pool._set_group_idle_seconds("main", 600)
+            shared._last_success_ts = time.time()
+
+            with mock.patch.object(module, "sys_log") as log:
+                pool._group_sticky_candidates("bg")
+                pool._group_sticky_candidates("bg")
+
+            lines = [c.args[0] for c in log.call_args_list if "挂延迟回切" in str(c.args[0])]
+            self.assertEqual(len(lines), 1, lines)
+            self.assertIn("shared", lines[0])
+            self.assertIn("main 当前端点", lines[0])
 
     def test_before_window_elapses_still_avoided(self):
         with tempfile.TemporaryDirectory() as tmp:
