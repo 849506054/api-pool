@@ -7171,6 +7171,9 @@ class APIPool:
                     self._group_fallback_pending.pop(group, None)
         request_route_epoch = self._get_route_epoch(group)
         group_fallback_used = False  # bg 组入口/耗尽 fallback 到 main 的标记
+        # 单请求饿死的退出语义（2026-10-20）：饿死不是端点故障，也不是组已耗尽，
+        # 本请求按失败交回调用方重试；禁止整组落到 main（那会连模型一起换掉）。
+        starvation_handback = False
         set_log_group(group)  # 本请求的日志组归属：其行是否进 UI ring 由该组日志级别决定
         # 终极兜底锁定：锁定期间该组请求直连 prio99（per-group 滑动窗口，prio99 仅 main 组语义生效）
         if self._is_fallback_locked_group(group):
@@ -7552,6 +7555,14 @@ class APIPool:
                 if skip_cooldown:
                     # 单请求饿死不是 API Pool 的端点故障。不要探活或切换到
                     # 其他模型；交回 Hermes，由其现有请求重试机制善后。
+                    # 退出语义只到「本请求失败」为止：标记后跳过下方组级 fallback，
+                    # 否则整组落 main 会连模型一起换掉（2026-10-20 实战暴露）。
+                    starvation_handback = True
+                    sys_log(
+                        f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' "
+                        f"单请求饿死，交回调用方重试（不跨组、不换模型）",
+                        "INFO", group=group,
+                    )
                     break
                 active = self._failover_active(group)
                 total = len(active)
@@ -7678,7 +7689,12 @@ class APIPool:
         # bg → main 轮转耗尽兜底（触发点 2）：bg 组内轮转完仍失败 → 追加 main 组一轮；
         # 再失败才报 AllEndpointsFailed 交 Hermes。530s 预算跨组共享不翻倍（剩余预算内执行）。
         # 仅当请求原生属于非 main 组且尚未 fallback 过（入口触发点 1 会改写 group）。
-        if group != self.MAIN_GROUP and not group_fallback_used and errors and not budget_exhausted:
+        # 饿死交回（starvation_handback）不在此列：组内没耗尽，换到 main 等于绕开
+        # 「不切换端点」的语义，还会连模型一起换。
+        if (
+            group != self.MAIN_GROUP and not group_fallback_used and errors
+            and not budget_exhausted and not starvation_handback
+        ):
             sys_log(f"组 '{group}' 轮转耗尽仍失败，fallback 到 main 组追加一轮", "WARN", group=group)
             # A0：耗尽 fallback 同样建立组级延迟回切锁（+ 标记待回切）
             with self._lock:
