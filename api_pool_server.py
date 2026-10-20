@@ -50,6 +50,10 @@ FAKE_SUCCESS_PATTERNS = ["无法给到相关内容"]
 # 这些原因要保留可见的 error finish，让 Hermes 走续写路径（`_timeout_abort`）。
 _TRUNCATED_STREAM_REASONS = ("流式总时长超限", "流式无有效业务增量停滞", "流式无新数据停滞", "上游流式错误")
 
+# 请求轮转预算耗尽、请求**未出站**时的失败标签（2026-10-20）：端点没收到任何字节，
+# 不记端点失败、不冷却；遇到它即停止轮转，把错误交回调用方。
+_BUDGET_EXHAUSTED_MSG = "request budget exhausted before upstream call"
+
 # ── 出站 User-Agent 透传（2026-09-05）──
 # 客户端原始 UA 经线程局部存储送到出站请求构造点。ThreadingHTTPServer 每请求独占
 # 线程，流式生成器与图片翻译都在同一线程内消费，因此该作用域覆盖整个请求生命周期
@@ -7190,6 +7194,7 @@ class APIPool:
             raise ValueError("没有可用的 API 端点")
         errors = []
         client_error_tried = set()  # 本请求内已因客户端类错误轮转过的端点（防不冻结路径死循环）
+        budget_exhausted = False  # 轮转预算已耗尽：停止轮转，端点状态一律不动
         role_downgraded = False  # 已因角色不兼容 400 触发 developer→system 降级（每请求一次）
         # 严格校验 400 的请求级重试预算（2026-09-12 定案：上限 1）：唯一一次重试就是
         # 「改用客户端原始 tool_call id」的换形态请求（替换原「原样复读」重试）。
@@ -7240,8 +7245,8 @@ class APIPool:
                 continue
             # 530s 预算：正常轮转超时 → 立即切终极兜底（不再继续轮转，避免 Hermes 600s 超时并发重试）
             # 分组池：prio99 终极兜底语义仅 main 组生效（spec），预算跨组共享不翻倍。
-            if (time.time() - _chat_start) >= self._FALLBACK_DEADLINE_SECONDS and group == self.MAIN_GROUP:
-                fb = self._get_fallback_endpoint()
+            if (time.time() - _chat_start) >= self._FALLBACK_DEADLINE_SECONDS:
+                fb = self._get_fallback_endpoint() if group == self.MAIN_GROUP else None
                 if fb is not None and fb is not ep and not self._is_in_cooldown(fb):
                     sys_log(f"轮转超 {self._FALLBACK_DEADLINE_SECONDS}s，切换终极兜底 '{fb.name}'", "WARN")
                     with self._lock:
@@ -7249,6 +7254,15 @@ class APIPool:
                     if fb in active:
                         idx = active.index(fb)
                         continue
+                # 预算见底且没有可用兜底：立刻收尾。请求不再出站，端点状态一律不动
+                # （2026-10-20：此前会继续轮转，把「未发出」记成每个候选端点失败并逐个冷却）。
+                sys_log(
+                    f"{request_tag}轮转预算 {self._FALLBACK_DEADLINE_SECONDS}s 已耗尽且无可用兜底，停止轮转交回调用方",
+                    "WARN",
+                )
+                budget_exhausted = True
+                errors.append(f"请求预算 {self._FALLBACK_DEADLINE_SECONDS}s 已耗尽，停止轮转")
+                break
             # 快照请求开始时的缓存保护延迟状态：用于 _on_success 判断是否为回切后的请求。
             # 竞态保护：defer 设置前已进入的请求（快照=0）成功后不清 defer。
             defer_at_request = ep._defer_until_by_group.get(group, 0)
@@ -7413,6 +7427,18 @@ class APIPool:
                 if payload.get("stream") and isinstance(result, _types.GeneratorType):
                     result = self._wrap_stream_release(result, ep.id, group)
                 return (result, ep) if return_endpoint else result
+            if error == _BUDGET_EXHAUSTED_MSG:
+                # 预算在出站前耗尽：该端点一个字节都没收到，端点无责。
+                # 停止轮转、跳过探活、不动冷却/失败计数，把真实错误交回调用方。
+                sys_log(
+                    f"{request_tag}请求预算在发出前耗尽（端点 '{self._endpoint_log_label(ep, group)}' 未收到请求），停止轮转",
+                    "WARN",
+                )
+                budget_exhausted = True
+                errors.append(f"请求预算 {self._FALLBACK_DEADLINE_SECONDS}s 已耗尽，停止轮转")
+                with self._lock:
+                    self._release_inflight(ep.id, group)
+                break
             errors.append(f"[{ep.name}] {error}")
             sys_log(f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 请求失败: {error}", "ERROR")
             # 敏感词诊断只在 DEBUG 且确实出现相关拦截错误时执行；使用当前失败尝试的 payload，避免共享状态串扰。
@@ -7543,6 +7569,12 @@ class APIPool:
                         # 客户端类错误：探活必然通过（小请求不带畸形 payload），无信息量，直接轮转
                         sys_log(f"跳过候选端点 '{self._endpoint_log_label(next_ep, group)}' 探活直接重试", "INFO")
                         continue
+                    # 预算见底就不再探活：探活要 2-10s，探完也发不出请求
+                    if request_deadline is not None and time.time() >= request_deadline:
+                        sys_log(f"{request_tag}请求预算已耗尽，跳过候选端点探活，停止轮转", "WARN")
+                        budget_exhausted = True
+                        errors.append(f"请求预算 {self._FALLBACK_DEADLINE_SECONDS}s 已耗尽，停止轮转")
+                        break
                     # 对候选端点做探活
                     sys_log(f"对候选端点 '{self._endpoint_log_label(next_ep, group)}' 进行探活...", "INFO")
                     probe_ok, probe_error = self._probe_endpoint(next_ep)
@@ -7637,7 +7669,7 @@ class APIPool:
         # bg → main 轮转耗尽兜底（触发点 2）：bg 组内轮转完仍失败 → 追加 main 组一轮；
         # 再失败才报 AllEndpointsFailed 交 Hermes。530s 预算跨组共享不翻倍（剩余预算内执行）。
         # 仅当请求原生属于非 main 组且尚未 fallback 过（入口触发点 1 会改写 group）。
-        if group != self.MAIN_GROUP and not group_fallback_used and errors:
+        if group != self.MAIN_GROUP and not group_fallback_used and errors and not budget_exhausted:
             sys_log(f"组 '{group}' 轮转耗尽仍失败，fallback 到 main 组追加一轮", "WARN", group=group)
             # A0：耗尽 fallback 同样建立组级延迟回切锁（+ 标记待回切）
             with self._lock:
@@ -7947,7 +7979,7 @@ class APIPool:
                 if request_deadline is not None:
                     remaining_budget = request_deadline - time.time()
                     if remaining_budget <= 0:
-                        return None, "request budget exhausted before upstream call"
+                        return None, _BUDGET_EXHAUSTED_MSG
                     _open_timeout = min(_open_timeout, max(0.1, remaining_budget))
                 if getattr(ep, "use_proxy", True) is False:
                     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -10387,6 +10419,18 @@ def _handle_responses(body, endpoint_id=None):
         return 500, {"error": {"message": str(e), "type": "server_error", "param": None, "code": None}}, False
 
 
+def _endpoint_config_record(ep: Endpoint) -> dict:
+    """配置字段直接取自端点对象；运行状态由 runtime_state 单独保存。"""
+    record = {
+        name: _copy.deepcopy(getattr(ep, name))
+        for name in Endpoint.__dataclass_fields__
+        if not name.startswith("_")
+    }
+    # 保持既有文件键与加载路径的手动解锁状态兼容。
+    record["manual_unlock_required"] = bool(ep._manual_unlock_required)
+    return record
+
+
 def _sync_to_config():
     # 组管理（2026-08-30）：组实体定义随配置持久化（dict → list 有序形态，main 恒在首位）
     defs_list = [{"name": pool.MAIN_GROUP, **pool._group_defs[pool.MAIN_GROUP]}]
@@ -10408,10 +10452,12 @@ def _sync_to_config():
             defs_list.append(entry)
     for entry in defs_list:
         entry.pop("rotate_minutes", None)  # 旧分钟制键（2026-10-05 起按请求次数）：清空不迁移
-    save_config([{"id": ep.get("id"), "name": ep["name"], "site_name": ep.get("site_name", ""), "site_id": ep.get("site_id", ""), "base_url": ep["base_url"], "api_key": ep.get("api_key_full", ep.get("api_key", "")), "model": ep["model"], "priority": ep["priority"], "priority_by_group": ep.get("priority_by_group", {}), "timeout": ep["timeout"], "max_retries": ep["max_retries"], "enabled": ep["enabled"], "cooldown_minutes": ep["cooldown_minutes"], "use_proxy": ep.get("use_proxy", True), "protocol": ep.get("protocol", "openai"), "extra_headers": ep.get("extra_headers", {}), "default_headers": ep.get("default_headers", {}), "client_profile": ep.get("client_profile", ""), "health_mode": ep.get("health_mode", "chat"), "billing_mode": ep.get("billing_mode", "subscription"), "manual_unlock_required": ep.get("manual_unlock_required", False), "is_vision": ep.get("is_vision", True),
-            "in_pool": ep.get("in_pool", False), "check_fake_success": ep.get("check_fake_success", False), "retry_on_rate_limit": ep.get("retry_on_rate_limit", False), "tool_call_id_prefix": ep.get("tool_call_id_prefix", ""), "strict400_retries": ep.get("strict400_retries", 2), "reasoning_policy": ep.get("reasoning_policy", "auto"), "preserved_thinking": ep.get("preserved_thinking", False), "thinking_disabled": ep.get("thinking_disabled", False), "deferrable": ep.get("deferrable", True), "max_context_k": ep.get("max_context_k", 0), "stream_first_packet_timeout": ep.get("stream_first_packet_timeout", 120), "stream_stall_timeout": ep.get("stream_stall_timeout", 60), "stream_max_duration": ep.get("stream_max_duration", 120), "pool_groups": ep.get("pool_groups", ["main"]), "disabled_groups": ep.get("disabled_groups", [])} for ep in pool.list_endpoints()], group_defs=defs_list, client_profiles=pool._client_profiles,
+    with pool._lock:
+        endpoints = [_endpoint_config_record(ep) for ep in pool._endpoints]
+    save_config(endpoints, group_defs=defs_list, client_profiles=pool._client_profiles,
         probe_client_profile=getattr(pool, "_probe_client_profile", ""),
         log_retention=load_log_retention())
+    sys_log(f"端点配置已保存（{len(endpoints)} 个端点，字段由端点定义生成）", "INFO")
 
 
 GUI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")

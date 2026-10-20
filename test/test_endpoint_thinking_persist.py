@@ -1,11 +1,7 @@
-"""端点级 `thinking_disabled` 落盘持久化（2026-10-06）。
+"""端点级 thinking_disabled 配置保存与加载契约。
 
-背景：`thinking_disabled` 是 `_apply_thinking_config` 的输入（True → 注入
-`{"thinking":{"type":"disabled"}}`），但 `_sync_to_config` 的端点字段白名单里
-没有它 —— 通过 API 置上只在内存生效，池重启即丢，靠它兜底的车道端点会退回
-「思考吃满输出预算、正文为空」的形态（2026-10-06 Tokenrhythm-sr 实测）。
-
-契约：白名单含该字段；配置读入 → 写回 的往返不丢；未设置时不落键值噪声。
+端点对象的配置字段自动进入配置文件，关闭思考开关在保存、加载后
+保持设置值。默认态显式保存为 false。
 """
 import importlib.util
 import json
@@ -71,11 +67,17 @@ def read_saved(config_file):
 
 
 class ThinkingDisabledPersistenceTests(unittest.TestCase):
-    def test_whitelist_carries_the_field(self):
-        """源码护栏：落盘白名单必须含 thinking_disabled（否则设置只在内存生效）。"""
-        with open(MODULE_PATH, encoding="utf-8") as fh:
-            src = fh.read()
-        self.assertIn('"thinking_disabled": ep.get("thinking_disabled"', src)
+    def test_field_is_covered_by_derived_record(self):
+        """thinking_disabled 由端点定义自动进入配置记录。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_config(os.path.join(tmp, "api_config.json"), endpoint_config())
+            with loaded_module(tmp) as module:
+                ep = module.pool._endpoints[0]
+                ep.thinking_disabled = True
+                record = module._endpoint_config_record(ep)
+                self.assertIn("thinking_disabled", record)
+                self.assertTrue(record["thinking_disabled"])
+                self.assertNotIn("_fail_count", record)
 
     def test_loaded_flag_survives_sync(self):
         """配置里带 thinking_disabled=true → 加载 → 写回仍是 true。"""
