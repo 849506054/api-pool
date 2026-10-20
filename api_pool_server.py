@@ -7047,6 +7047,13 @@ class APIPool:
             "model": ep.model, "messages": loop_messages,
             **(extra_payload or {}),
         }
+        # 出站私有键隔离（2026-10-20）：`_responses_response_format` 是 chat 入口给
+        # Responses 桥接留的私有载体（见 chat/completions 入口对 response_format 的改名）。
+        # 非 responses 协议的出站体由 payload 原样序列化，必须在此摘掉，否则严格上游
+        # 判 UNKNOWN_FIELD 400（Tokenrhythm 系实测）；responses 协议保留，供
+        # _responses_body_from_chat 转成 text.format。
+        if getattr(ep, "protocol", "openai") != "responses":
+            payload.pop("_responses_response_format", None)
         # GLM 系列推理强度适配：reasoning_effort 按官方映射改写/剔除；
         # preserved_thinking 开关：注入 clear_thinking=False 开启保留式思考
         if not is_anthropic:
