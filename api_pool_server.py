@@ -1060,6 +1060,9 @@ class TokenTracker:
 token_tracker = TokenTracker()
 
 CONFIG_FILE = "api_config.json"
+# 限流类原端点重试的退避封顶（秒）：3s 起步翻倍，到顶后固定间隔；
+# 重试次数仍按端点配置的 max_retries，两个值互不影响。
+RATE_LIMIT_RETRY_CAP_SECONDS = 20
 
 # 对话日志滚动清理后台配置（顶层键 `log_retention`，无前端 UI 入口，直接改 api_config.json）：
 #   {"log_retention": {"days": 7, "cleanup_at": "03:00"}}
@@ -6468,8 +6471,21 @@ class APIPool:
                 })
         return rebuilt
 
+    @staticmethod
+    def _retry_backoff(attempt, category=None):
+        """原端点重试退避：3s 起步翻倍；限流类按 RATE_LIMIT_RETRY_CAP_SECONDS 封顶。
+
+        限流按窗口恢复，指数翻到几百秒只是把端点重试预算耗在等待上
+        （10 次 × 3·2^n 光等待就要 3069s，超过 530s 请求预算），
+        封顶后预算内才走得完。重试次数仍由端点配置的 max_retries 决定。
+        """
+        delay = 3 * (2 ** attempt)
+        if category == "rate_limit":
+            delay = min(delay, RATE_LIMIT_RETRY_CAP_SECONDS)
+        return delay
+
     def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False, health_impact=True, group=None,
-                expected_route_epoch=None, request_id=None):
+                expected_route_epoch=None, request_id=None, budget_cut=False):
         grp = group or self.MAIN_GROUP
         request_tag = f"[req={request_id}] " if request_id else ""
         if getattr(_POOL_INITIATED_CTX, "active", False):
@@ -6484,7 +6500,18 @@ class APIPool:
                 "WARN",
             )
             return self._get_route_epoch(grp)
-        if health_impact:
+        if budget_cut:
+            # 请求预算截断：重试被 530s 预算挡下、根本没发出去，不是端点故障。
+            # 不冻结、不计 fail_count，但仍按组内顺序切到下一个候选——
+            # 本请求还剩预算时，换候选比冻死一个健康端点更有价值。
+            failed_ep._last_error = error_msg
+            failed_ep._last_error_ts = time.time()
+            sys_log(
+                f"{request_tag}端点 '{self._endpoint_log_label(failed_ep, grp)}' "
+                f"重试被请求预算截断（非端点故障，不冻结），组内继续轮转",
+                "WARN",
+            )
+        elif health_impact:
             failed_ep._fail_count += 1
             failed_ep._total_failures += 1
             failed_ep._last_error = error_msg
@@ -6502,7 +6529,10 @@ class APIPool:
             failed_ep._last_error_ts = time.time()
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 客户端类错误(不冻结/不记账)，同请求继续轮转: {error_msg}", "WARN")
             return self._get_route_epoch(grp)
-        capacity_kind, capacity_seconds = self._set_capacity_cooldown(failed_ep, error_msg)
+        if budget_cut:
+            capacity_kind, capacity_seconds = "", None
+        else:
+            capacity_kind, capacity_seconds = self._set_capacity_cooldown(failed_ep, error_msg)
         if capacity_kind == "balance_insufficient":
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 余额不足，已冻结，仅支持手动解冻", "WARN")
         elif capacity_kind == "sensitive_words":
@@ -6523,6 +6553,8 @@ class APIPool:
             # → 单请求饿死，非端点故障；不冻结、不切换当前端点。
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 活跃(窗口内有成功)，判定单请求饿死，不冻结不切换", "WARN")
             return self._get_route_epoch(grp)
+        elif budget_cut:
+            pass  # 预算截断已在上面记观测态，不冻结，直接进组内轮转
         else:
             self._set_cooldown(failed_ep)
             # 抖动+阶梯后实际窗口为 cooldown_minutes×[80%,120%]×连续失败次数，日志展示真实值
@@ -7542,11 +7574,15 @@ class APIPool:
                     if self._is_role_reject_error(error):
                         role_downgraded = True
                         sys_log(f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 拒绝 developer 角色，后续候选降级为 system 重试", "WARN")
+                # 请求预算截断（下一次重试根本发不出去）不是端点故障：
+                # 不冻结、不计失败，但仍按组内顺序轮转，剩余预算内换候选答完。
+                budget_cut = "; retry skipped: request budget exhausted" in error
                 request_route_epoch = self._rotate(
                     ep, error, skip_cooldown=skip_cooldown,
                     health_impact=not client_error, group=group,
                     expected_route_epoch=request_route_epoch,
                     request_id=request_id,
+                    budget_cut=budget_cut,
                 )
                 with self._lock:
                     self._release_inflight(ep.id, group)
@@ -8162,7 +8198,7 @@ class APIPool:
                         return None, f"HTTP 502: upstream stream pre-read failed: {type(e).__name__}: {e}"
 
                     if _first_packet_retry_error:
-                        retry_delay = 3 * (2 ** attempt)
+                        retry_delay = self._retry_backoff(attempt, retry_category)
                         if request_deadline is not None and time.time() + retry_delay >= request_deadline:
                             return None, (f"HTTP 502: upstream stream error: {_first_packet_retry_error}"
                                           "; retry skipped: request budget exhausted")
@@ -8962,7 +8998,7 @@ class APIPool:
                 if e.code == 429:
                     if (ep.retry_on_rate_limit and not force_no_retry and attempt < retries
                             and not self._classify_capacity_error(msg)):
-                        retry_delay = 3 * (2 ** attempt)
+                        retry_delay = self._retry_backoff(attempt, "rate_limit")
                         if request_deadline is not None and time.time() + retry_delay >= request_deadline:
                             return None, msg + " (429 rate-limited; retry skipped: request budget exhausted)"
                         sys_log(f"{request_tag}端点 '{endpoint_log_label}' {retry_delay} 秒后进行第 "
