@@ -319,6 +319,45 @@ class IdleBorrowTests(unittest.TestCase):
             candidates, _ = pool._group_sticky_candidates("bg")
             self.assertNotIn("shared", [ep.id for ep in candidates])
 
+    def test_borrower_own_inflight_is_not_main_occupancy(self):
+        """本组自己的并发在途不算「main 占用」，不得挂借用避让（2026-10-27 虚空避让回归）。
+
+        产线样本 23:34:33：feishu 一条流式请求在共享端点上，本组下一条请求选路时
+        把全局在途（含本组自己）算成「不空闲」→ 误判 main 占用 → 挂 300s 借用避让，
+        而 main 组当时零请求。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module(tmp)
+            pool, shared = self.make_pool(module)
+            pool._set_group_idle_seconds("main", 60)
+            self.main_used(shared, time.time() - 700)
+            pool._acquire_inflight("shared", "bg")  # 本组自己一条在途
+
+            with mock.patch.object(module, "sys_log") as log:
+                candidates, _ = pool._group_sticky_candidates("bg")
+
+            self.assertIn("shared", [ep.id for ep in candidates])
+            self.assertEqual(shared._defer_until_by_group, {})
+            lines = [c.args[0] for c in log.call_args_list if "挂延迟回切" in str(c.args[0])]
+            self.assertEqual([], lines)
+
+    def test_other_group_inflight_does_not_block_borrow(self):
+        """跨组互斥是单向的：别的子组在这条端点上跑，不构成 main 占用、不拦本组借用。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module(tmp)
+            pool, shared = self.make_pool(module)
+            pool._set_group_idle_seconds("main", 60)
+            self.main_used(shared, time.time() - 700)
+            pool._acquire_inflight("shared", "other")
+
+            with mock.patch.object(module, "sys_log") as log:
+                candidates, _ = pool._group_sticky_candidates("bg")
+
+            self.assertIn("shared", [ep.id for ep in candidates])
+            self.assertEqual(shared._defer_until_by_group, {})
+            lines = [c.args[0] for c in log.call_args_list if "挂延迟回切" in str(c.args[0])]
+            self.assertEqual([], lines)
+
 
 if __name__ == "__main__":
     unittest.main()

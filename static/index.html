@@ -1259,8 +1259,8 @@ function openGroupModal(editName){
     ?`对外声明 ${g.context_tokens.toLocaleString()} tokens`
     :'未声明：本组不对外声明窗口（Hermes 侧回落到其自身配置）';
   const idleHint=g.idle_seconds
-    ?`main 工作端点空闲满 ${g.idle_seconds} 秒后，子组不再避让它（main 在途时仍避让）`
-    :'未启用：子组始终避让 main 的当前/手动端点';
+    ?`main 工作端点空闲满 ${g.idle_seconds} 秒后，子组不再避让它（main 在途时仍避让）。建议 ≥ 300 秒`
+    :'未启用：子组始终避让 main 的当前/手动端点。启用建议 ≥ 300 秒（留空或 0 = 关闭）';
   // 参与轮换的成员（2026-10-06）：默认折叠；点摘要才向后端查询组内成员并列出勾选（不勾 = 全体参与）
   const gmSel=new Set(Array.isArray(g.rotate_members)?g.rotate_members:[]);
   const gmSummary=`参与轮换的成员：${gmSel.size?`已选 ${gmSel.size} 个`:'全部'}`;
@@ -1305,7 +1305,7 @@ function openGroupModal(editName){
           </details>
         </div>
       </div>
-      ${g.is_main?`<div class="form-group"><label title="main 的当前/手动工作端点空闲满该时长后，子组不再避让它，按本组优先级正常使用；端点有在途（main 或子组）时仍避让，main 也可随时抢占。0=关闭（子组始终避让）">空闲时间 (秒)</label>
+      ${g.is_main?`<div class="form-group"><label title="main 的当前/手动工作端点空闲满该时长后，子组不再避让它，按本组优先级正常使用；main 在途时仍避让，main 也可随时抢占。0=关闭（子组始终避让）">空闲时间 (秒)</label>
         <input type="number" id="gIdle" min="0" max="86400" value="${g.idle_seconds||''}" placeholder="0=关闭，如 600">
         <div style="font-size:11px;color:var(--text-dim)">${idleHint}</div>
       </div>`:''}

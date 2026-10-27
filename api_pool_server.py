@@ -4582,22 +4582,16 @@ class APIPool:
             return False
         return not self._ep_idle_ready(ep)
 
-    def _is_ep_inflight_anywhere(self, ep):
-        """端点是否有任何组在途（空闲借用要求端点完全空闲）。"""
-        return bool(self._inflight_owner.get(ep.id))
-
     def _ep_idle_ready(self, ep):
-        """端点是否已空闲满 main 组配置的空闲窗口（2026-09-18 需求 1）。
+        """main 在这个端点上的最近一次使用，是否已过空闲窗口（2026-09-18 需求 1）。
 
-        窗口配在 main 组实体（`idle_seconds`），0/未声明=关闭 → 恒 False（行为同现状）；
-        空闲时间只看 **main 组自己** 在该端点的最后一次成功/失败：子组借用期间的活动
-        不刷新这个计时，借到后可连续使用；main 一旦再动它，窗口重新计时。main 从未
-        用过该端点视为一直空闲。在途仍按全局（任何组在途都不算空闲，跨组互斥不变）。
+        判定只有一条：main 组在该端点的最近使用时间距今 ≥ 窗口 → 空闲，子组可用；
+        否则避让。窗口配在 main 组实体（`idle_seconds`），可随时调整，0/未声明=关闭。
+        时间戳只读 main 侧（`_last_activity_by_group`）：子组借用的活动不写它，借到后
+        可连续使用；main 从没用过这个端点 → 一直空闲。
         """
         window = self._group_idle_seconds(self.MAIN_GROUP)
         if not window:
-            return False
-        if self._is_ep_inflight_anywhere(ep):
             return False
         last_main = ep._last_activity_by_group.get(self.MAIN_GROUP, 0)
         return (time.time() - last_main) >= window
