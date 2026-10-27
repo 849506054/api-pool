@@ -43,7 +43,7 @@ class ChatLoggerBatchingTests(unittest.TestCase):
     def test_add_log_eventually_persists(self):
         lg = self._make_logger()
         lg.add_log("ep1", "model-x", "hello", "world", 10, 123, "main", 5, 0)
-        self.assertTrue(self._wait_until(lambda: lg.get_logs(limit=10, detail=False)["total"] >= 1))
+        self.assertTrue(self._wait_until(lambda: bool(lg.get_logs(limit=10, detail=False)["logs"])))
         logs = lg.get_logs(limit=10, detail=False)["logs"]
         self.assertEqual(logs[0]["endpoint_name"], "ep1")
         self.assertEqual(logs[0]["model"], "model-x")
@@ -57,8 +57,8 @@ class ChatLoggerBatchingTests(unittest.TestCase):
         n = 60  # > BATCH_SIZE(50)，验证跨批全部落库
         for i in range(n):
             lg.add_log(f"ep{i % 3}", "m", f"p{i}", f"c{i}", i, 1, "main", i, 0)
-        self.assertTrue(self._wait_until(lambda: lg.get_logs(limit=200, detail=False)["total"] >= n, timeout=10))
-        self.assertEqual(lg.get_logs(limit=200, detail=False)["total"], n)
+        self.assertTrue(self._wait_until(lambda: len(lg.get_logs(limit=200, detail=False)["logs"]) >= n, timeout=10))
+        self.assertEqual(len(lg.get_logs(limit=200, detail=False)["logs"]), n)
 
     def test_reads_not_blocked_by_writes(self):
         lg = self._make_logger()
@@ -89,7 +89,7 @@ class ChatLoggerBatchingTests(unittest.TestCase):
         tw.join(timeout=3)
         tr.join(timeout=3)
         self.assertEqual(errors, [])
-        self.assertTrue(self._wait_until(lambda: lg.get_logs(limit=10, detail=False)["total"] > 0))
+        self.assertTrue(self._wait_until(lambda: bool(lg.get_logs(limit=10, detail=False)["logs"])))
 
     def test_prune_old_logs_deletes_only_old_rows(self):
         lg = self._make_logger()
@@ -114,14 +114,15 @@ class ChatLoggerBatchingTests(unittest.TestCase):
     def test_clear_logs(self):
         lg = self._make_logger()
         lg.add_log("a", "m", "p", "c", 1, 1, "main", 1, 0)
-        self.assertTrue(self._wait_until(lambda: lg.get_logs(limit=10, detail=False)["total"] >= 1))
+        self.assertTrue(self._wait_until(lambda: bool(lg.get_logs(limit=10, detail=False)["logs"])))
+        self.assertEqual(lg.get_logs(limit=10, detail=False)["total"], 1)  # 建立 total 缓存
         lg.clear_logs()
-        self.assertEqual(lg.get_logs(limit=10, detail=False)["total"], 0)
+        self.assertEqual(lg.get_logs(limit=10, detail=False)["total"], 0)  # 清空主动失效，不等 TTL
 
     def test_get_log_by_id_after_batch_write(self):
         lg = self._make_logger()
         lg.add_log("ep9", "m", "prompt-abc", "completion-xyz", 42, 7, "bg", 42, 0)
-        self.assertTrue(self._wait_until(lambda: lg.get_logs(limit=10, detail=False)["total"] >= 1))
+        self.assertTrue(self._wait_until(lambda: bool(lg.get_logs(limit=10, detail=False)["logs"])))
         row = lg.get_logs(limit=1, detail=True)["logs"][0]
         got = lg.get_log_by_id(row["id"])
         self.assertIsNotNone(got)
@@ -131,9 +132,27 @@ class ChatLoggerBatchingTests(unittest.TestCase):
     def test_reasoning_tokens_roundtrip(self):
         lg = self._make_logger()
         lg.add_log("ep", "m", "p", "c", 10, 1, "main", 4, 0, 7)
-        self.assertTrue(self._wait_until(lambda: lg.get_logs(limit=10, detail=False)["total"] >= 1))
+        self.assertTrue(self._wait_until(lambda: bool(lg.get_logs(limit=10, detail=False)["logs"])))
         row = lg.get_logs(limit=1, detail=False)["logs"][0]
         self.assertEqual(row["reasoning_tokens"], 7)
+
+    def test_total_count_cache_follows_writes(self):
+        """total 缓存：无组过滤的键随写入增量维护（不必等 TTL），带组过滤的键写入后失效重算。"""
+        lg = self._make_logger()
+        lg.add_log("a", "m", "p", "c", 1, 1, "main", 1, 0)
+        self.assertTrue(self._wait_until(lambda: bool(lg.get_logs(limit=10, detail=False)["logs"])))
+        self.assertEqual(lg.get_logs(limit=10, detail=False)["total"], 1)
+        self.assertTrue(any(not k[0] for k in lg._count_cache))  # 无过滤键已进缓存（不再每页重算）
+        lg.add_log("b", "m", "p", "c", 1, 1, "main", 1, 0)
+        self.assertTrue(self._wait_until(lambda: lg.get_logs(limit=10, detail=False)["total"] == 2))
+        self.assertEqual(lg.get_logs(limit=10, detail=False, exclude_groups=["hidden"])["total"], 2)  # 建带过滤键缓存
+        lg.add_log("c", "m", "p", "c", 1, 1, "hidden", 1, 0)  # 隐藏组的行不进该键
+        self.assertTrue(self._wait_until(lambda: lg.get_logs(limit=10, detail=False)["total"] == 3))
+        self.assertEqual(lg.get_logs(limit=10, detail=False, exclude_groups=["hidden"])["total"], 2)
+        lg.add_log("d", "m", "p", "c", 1, 1, "main", 1, 0)  # 可见组的行进该键
+        self.assertTrue(self._wait_until(
+            lambda: lg.get_logs(limit=10, detail=False, exclude_groups=["hidden"])["total"] == 3))
+        self.assertEqual(lg.get_logs(limit=10, detail=False)["total"], 4)
 
     def test_queue_full_fallback_persists(self):
         lg = self._make_logger()

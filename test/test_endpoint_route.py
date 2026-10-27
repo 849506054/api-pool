@@ -66,8 +66,10 @@ class EndpointRouteTests(unittest.TestCase):
                 self.wfile.write(data)
 
         old_cwd = os.getcwd()
+        old_db_dir = os.environ.get("API_POOL_DB_DIR")
         with tempfile.TemporaryDirectory(prefix="endpoint-route-", dir=os.environ.get("TMPDIR")) as tmp:
             os.chdir(tmp)
+            os.environ["API_POOL_DB_DIR"] = tmp  # 全局库随 tmp 隔离：否则其他用例写入的行会混进下面的 pool_group 断言
             servers = []
             try:
                 spec = importlib.util.spec_from_file_location("pool_endpoint_route_test", SOURCE)
@@ -187,6 +189,10 @@ class EndpointRouteTests(unittest.TestCase):
                     server.shutdown()
                     server.server_close()
                 os.chdir(old_cwd)
+                if old_db_dir is None:
+                    os.environ.pop("API_POOL_DB_DIR", None)
+                else:
+                    os.environ["API_POOL_DB_DIR"] = old_db_dir
 
 
 if __name__ == "__main__":

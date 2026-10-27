@@ -2573,7 +2573,7 @@ function toggleChatLogsPause(){
   document.getElementById('clPauseBtn').textContent = chatLogsPaused ? '▶ 恢复' : '⏸ 暂停';
 }
 setInterval(() => {
-    if (!chatLogsPaused) loadChatLogs(chatLogsPage);
+    if (!chatLogsPaused && chatLogsInFlight === 0) loadChatLogs(chatLogsPage);
 }, 3000);
 let chatLogsPage = 0;
 let currentChatLogs = []
@@ -2663,6 +2663,7 @@ function updateChatScrollbar() {
   document.addEventListener('mouseup', () => { dragging = false; });
 })();
 let chatLogsReqSeq = 0;
+let chatLogsInFlight = 0; /* 在途请求数：轮询见在途就让路，避免用旧页码抢掉用户点击的结果 */
 // 推理强度列（2026-09-27）：显示池实际发给上游的 reasoning_effort 档位（第1层出站真值），
 // 佐证响应侧是否检测到推理内容（第3层执行侧证据）——三态：
 //   ✓ = 采到了，确实推理了
@@ -2689,7 +2690,13 @@ async function loadChatLogs(page, opts = {}) {
   const seq = ++chatLogsReqSeq; // 竞态守卫：轮询/翻页并发时只认最后一次请求
   const limit = 50;
   const offset = page * limit;
-  const res = await api('GET', `/api/chat-logs?limit=${limit}&offset=${offset}&detail=false`);
+  chatLogsInFlight++;
+  let res;
+  try {
+    res = await api('GET', `/api/chat-logs?limit=${limit}&offset=${offset}&detail=false`);
+  } finally {
+    chatLogsInFlight--;
+  }
   if (seq !== chatLogsReqSeq) return; // 过期响应丢弃
   if (!res.ok && res.error) { toast('加载失败', 'error'); return; }
   chatLogsPage = page;

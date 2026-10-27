@@ -888,8 +888,14 @@ class ContentFilter:
 
 content_filter = ContentFilter()
 
+# DB 路径：目录可用 API_POOL_DB_DIR 覆盖（测试/旁路实例指到临时目录），默认指向存储池
+_DB_DIR = os.environ.get("API_POOL_DB_DIR", "/vol2/1000/tool/api-pool2")
+TOKEN_STATS_DB_PATH = os.path.join(_DB_DIR, "token_stats.db")
+CHAT_LOGS_DB_PATH = os.path.join(_DB_DIR, "chat_logs.db")
+
+
 class TokenTracker:
-    def __init__(self, db_path="token_stats.db"):
+    def __init__(self, db_path=TOKEN_STATS_DB_PATH):
         self.db_path = db_path
         self._init_db()
 
@@ -1117,10 +1123,12 @@ class ChatLogger:
     RETENTION_DAYS = DEFAULT_LOG_RETENTION_DAYS  # 默认保留天数（可被 log_retention.days 覆盖）
     CLEANUP_AT = DEFAULT_LOG_CLEANUP_AT  # 默认每日清理时刻（本地时间）
     BATCH_SIZE = 50  # 批量写攒批上限（条）
+    COUNT_CACHE_TTL = 10.0  # 列表 total 缓存秒数（页数最多晚 10s 反映新增，换掉每页重扫计数索引）
 
-    def __init__(self, db_path="chat_logs.db"):
+    def __init__(self, db_path=CHAT_LOGS_DB_PATH):
         self.db_path = db_path
         self._lock = threading.Lock()  # 仅串行化写路径（SQLite 单写者）；读路径无锁，WAL 下多读并发
+        self._count_cache = {}  # (where, wargs) -> (过期时间戳, total)
         self._log_queue = queue.Queue(maxsize=512)
         self.retention_days = self.RETENTION_DAYS  # 生效值，由 _retention_loop 按 log_retention 刷新
         self.cleanup_at = self.CLEANUP_AT
@@ -1188,6 +1196,7 @@ class ChatLogger:
                 deleted = c.rowcount
                 conn.commit()
                 conn.close()
+                self._count_cache.clear()  # total 缓存同步失效
                 if deleted > 0:
                     sys_log(f"滚动清理对话日志: 删除 {deleted} 条超过 {self.retention_days} 天的记录")
                 return deleted
@@ -1278,6 +1287,14 @@ class ChatLogger:
             # 组级日志级别过滤（2026-10-05）：/api/chat-logs 按 pool_group 排除隐藏组，
             # 无索引时 COUNT 会全表扫（2.8GB 实测 9.7s）→ 建覆盖索引后走索引扫描
             c.execute("CREATE INDEX IF NOT EXISTS idx_chat_logs_pool_group ON chat_logs(pool_group)")
+            # 列表页查询（detail=false，ORDER BY id DESC LIMIT/OFFSET）取 12 个字段：全放进索引后
+            # 纯索引扫描，不再回表读几十 KB 正文行（/vol2 机械盘冷读实测 128~690ms → 6~14ms，
+            # 盘读 4~32MB → 44~664KB）。新增/调整 _list_logs 的 SELECT 列时要同步这里。
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_logs_list_cover ON chat_logs("
+                "id DESC, timestamp, endpoint_name, model, total_tokens, latency_ms, pool_group, "
+                "prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected)"
+            )
             conn.commit()
             conn.close()
 
@@ -1313,8 +1330,46 @@ class ChatLogger:
                 )
                 conn.commit()
                 conn.close()
+                self._bump_count_cache(batch)
             except Exception as e:
                 sys_log(f"记录对话日志失败: {e}", "ERROR")
+
+    def _bump_count_cache(self, batch):
+        """写入成功后按批内容维护 total 缓存，缓存期内的页数也保持准确。
+
+        每个键的 where 只有一种形态（隐藏组用 NOT IN，NULL 组算在内），所以每行按 pool_group
+        判定是否计入该键；不做这步时，缓存期内的 total 会停留在写入前的值。
+        """
+        if not batch:
+            return
+        for key in list(self._count_cache):
+            where, wargs = key
+            if where:
+                excluded = set(wargs)
+                added = sum(1 for row in batch if (row[6] or "") not in excluded)
+            else:
+                added = len(batch)
+            if added:
+                expires, total = self._count_cache[key]
+                self._count_cache[key] = (expires, total + added)
+
+    def _count_logs(self, c, where, wargs):
+        """列表 total：按 where/wargs 组合缓存 COUNT_CACHE_TTL 秒。
+
+        每次重算要扫散布在文件里的计数索引页（机械盘冷读实测 ~0.6s/次），而列表本身已走覆盖索引；
+        页数晚 10s 反映新增对翻页没有实际影响。清空、滚动清理会主动失效缓存。
+        """
+        key = (where, wargs)
+        now = time.time()
+        cached = self._count_cache.get(key)
+        if cached and cached[0] > now:
+            return cached[1]
+        c.execute("SELECT COUNT(*) FROM chat_logs" + where, wargs)
+        total = c.fetchone()[0]
+        if len(self._count_cache) > 32:  # 分组组合有限，超上限直接丢弃旧表
+            self._count_cache.clear()
+        self._count_cache[key] = (now + self.COUNT_CACHE_TTL, total)
+        return total
 
     def get_logs(self, limit=50, offset=0, detail=True, exclude_groups=None):
         # 读路径无锁：WAL 下多读者并发安全，不被日志写入/滚动清理阻塞
@@ -1340,8 +1395,7 @@ class ChatLogger:
                     wargs + (limit, offset)
                 )
                 rows = [r[:4] + (None, None) + r[4:] for r in c.fetchall()]
-                c.execute("SELECT COUNT(*) FROM chat_logs" + where, wargs)
-                total = c.fetchone()[0]
+                total = self._count_logs(c, where, wargs)
                 conn.close()
                 return {
                     "total": total,
@@ -1357,8 +1411,7 @@ class ChatLogger:
                 }
             rows = c.fetchall()
             
-            c.execute("SELECT COUNT(*) FROM chat_logs" + where, wargs)
-            total = c.fetchone()[0]
+            total = self._count_logs(c, where, wargs)
             conn.close()
             
             return {
@@ -1427,6 +1480,7 @@ class ChatLogger:
                 c.execute("DELETE FROM chat_logs")
                 conn.commit()
                 conn.close()
+                self._count_cache.clear()  # total 缓存同步失效
             except Exception:
                 pass
 
