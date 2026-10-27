@@ -49,6 +49,11 @@ class IdleBorrowTests(unittest.TestCase):
             in_pool=True, use_proxy=False, pool_groups=groups,
         )
 
+    @staticmethod
+    def main_used(ep, ts):
+        """模拟 main 组在该端点的最后一次真实活动（空闲借用只读 main 侧计时）。"""
+        ep._last_activity_by_group["main"] = ts
+
     def make_pool(self, module):
         """shared 同时属 main 与 bg，且是 main 当前工作端点；b1/b2 为 bg 自有成员。"""
         shared = self.endpoint(module, "shared", 1, ["main", "bg"])
@@ -63,7 +68,7 @@ class IdleBorrowTests(unittest.TestCase):
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
             pool._set_group_idle_seconds("main", 600)
-            shared._last_success_ts = time.time() - 700
+            self.main_used(shared, time.time() - 700)
 
             candidates, _ = pool._group_sticky_candidates("bg")
             self.assertIn("shared", [ep.id for ep in candidates])
@@ -74,7 +79,7 @@ class IdleBorrowTests(unittest.TestCase):
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
             pool._set_group_idle_seconds("main", 600)
-            shared._last_success_ts = time.time()
+            self.main_used(shared, time.time())
 
             with mock.patch.object(module, "sys_log") as log:
                 pool._group_sticky_candidates("bg")
@@ -90,7 +95,7 @@ class IdleBorrowTests(unittest.TestCase):
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
             pool._set_group_idle_seconds("main", 600)
-            shared._last_success_ts = time.time() - 60
+            self.main_used(shared, time.time() - 60)
 
             candidates, _ = pool._group_sticky_candidates("bg")
             self.assertNotIn("shared", [ep.id for ep in candidates])
@@ -99,7 +104,7 @@ class IdleBorrowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
-            shared._last_success_ts = time.time() - 700  # 默认 idle_seconds=0=关闭
+            self.main_used(shared, time.time() - 700)  # 默认 idle_seconds=0=关闭
 
             candidates, _ = pool._group_sticky_candidates("bg")
             self.assertNotIn("shared", [ep.id for ep in candidates])
@@ -110,7 +115,7 @@ class IdleBorrowTests(unittest.TestCase):
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
             pool._set_group_idle_seconds("main", 600)
-            shared._last_success_ts = time.time() - 700
+            self.main_used(shared, time.time() - 700)
             pool._acquire_inflight("shared", "main")
 
             candidates, _ = pool._group_sticky_candidates("bg")
@@ -123,7 +128,7 @@ class IdleBorrowTests(unittest.TestCase):
             pool._set_current("main", None)
             pool._set_manual("main", "shared")
             pool._set_group_idle_seconds("main", 600)
-            shared._last_success_ts = time.time() - 700
+            self.main_used(shared, time.time() - 700)
 
             candidates, _ = pool._group_sticky_candidates("bg")
             self.assertIn("shared", [ep.id for ep in candidates])
@@ -134,7 +139,7 @@ class IdleBorrowTests(unittest.TestCase):
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
             pool._set_group_idle_seconds("main", 600)
-            shared._last_success_ts = time.time() - 700
+            self.main_used(shared, time.time() - 700)
             pool._set_ep_priority(shared, "bg", 9)  # 组内优先级最低
 
             candidates, _ = pool._group_sticky_candidates("bg")
@@ -186,7 +191,7 @@ class IdleBorrowTests(unittest.TestCase):
             pool._set_group_idle_seconds("main", 600)
             pool._set_current("bg", "b1")
             b1 = next(e for e in pool._endpoints if e.id == "b1")
-            shared._last_success_ts = time.time() - 60  # main 正在用
+            self.main_used(shared, time.time() - 60)  # main 正在用
 
             candidates, _ = pool._group_sticky_candidates("bg")
             self.assertNotIn("shared", [ep.id for ep in candidates])
@@ -222,11 +227,11 @@ class IdleBorrowTests(unittest.TestCase):
             pool._set_group_idle_seconds("main", 600)
             pool._set_current("bg", "b1")
             b1 = next(e for e in pool._endpoints if e.id == "b1")
-            shared._last_success_ts = time.time() - 60
+            self.main_used(shared, time.time() - 60)
             pool._group_sticky_candidates("bg")  # 触发挂 defer
             self.assertIn("bg", shared._defer_until_by_group)
 
-            shared._last_success_ts = time.time() - 700  # main 已空闲
+            self.main_used(shared, time.time() - 700)  # main 已空闲
             b1._last_success_ts = time.time()  # 接手端点刚执行过
             pool._reconcile_deferred()
             self.assertEqual(pool._get_current("bg"), "b1")  # 仍在执行 → 不回切
@@ -240,7 +245,7 @@ class IdleBorrowTests(unittest.TestCase):
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
             pool._set_current("bg", "b1")
-            shared._last_success_ts = time.time() - 700  # 窗口=0=关闭
+            self.main_used(shared, time.time() - 700)  # 窗口=0=关闭
 
             candidates, _ = pool._group_sticky_candidates("bg")
             self.assertNotIn("shared", [ep.id for ep in candidates])
@@ -257,12 +262,12 @@ class IdleBorrowTests(unittest.TestCase):
             pool._set_current("bg", "b1")
             b1 = next(e for e in pool._endpoints if e.id == "b1")
             pool._set_manual("bg", "b2")  # 开机恢复/用户手动：本组被钉在 b2
-            shared._last_success_ts = time.time() - 60
+            self.main_used(shared, time.time() - 60)
 
             pool._group_sticky_candidates("bg")
             self.assertIn("bg", shared._defer_until_by_group)  # 锁定不阻止挂
 
-            shared._last_success_ts = time.time() - 700  # main 空闲窗口满足
+            self.main_used(shared, time.time() - 700)  # main 空闲窗口满足
             b1._last_success_ts = time.time() - 400  # 接手端点 300s 无新请求
             b2 = next(e for e in pool._endpoints if e.id == "b2")
             b2._last_success_ts = time.time() - 400  # 手动锁定的 b2 同样已空闲
@@ -280,10 +285,39 @@ class IdleBorrowTests(unittest.TestCase):
             pool._set_group_rotate_requests("bg", 5)
             self.assertEqual(pool._group_rotate_requests("bg"), 5)  # 前置条件自检
             pool._set_current("bg", "b1")
-            shared._last_success_ts = time.time() - 60
+            self.main_used(shared, time.time() - 60)
 
             pool._group_sticky_candidates("bg")
             self.assertEqual(shared._defer_until_by_group, {})
+
+
+    def test_borrower_own_success_does_not_reset_window(self):
+        """借用方自己跑成功后，main 侧计时不动 → 下一请求仍是合法候选（2026-10-27 定稿）。
+
+        回归样本：22:00 轮借到共享端点第一条成功，秒级后第二条被判「main 占用」退避。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module(tmp)
+            pool, shared = self.make_pool(module)
+            pool._set_group_idle_seconds("main", 60)
+            self.main_used(shared, time.time() - 700)
+
+            pool._on_success(shared, group="bg", clear_defer=False)  # 借用方完成一条请求
+            candidates, _ = pool._group_sticky_candidates("bg")
+            self.assertIn("shared", [ep.id for ep in candidates])
+            self.assertEqual(shared._defer_until_by_group, {})  # 不挂借用避让
+
+    def test_main_use_restarts_window(self):
+        """main 自己再动这个端点 → 窗口重新计时，子组重新避让（单向互斥不变）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module(tmp)
+            pool, shared = self.make_pool(module)
+            pool._set_group_idle_seconds("main", 60)
+            self.main_used(shared, time.time() - 700)
+
+            pool._on_success(shared, group="main", clear_defer=False)
+            candidates, _ = pool._group_sticky_candidates("bg")
+            self.assertNotIn("shared", [ep.id for ep in candidates])
 
 
 if __name__ == "__main__":

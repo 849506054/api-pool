@@ -3019,6 +3019,9 @@ class Endpoint:
     _last_error: str = field(default="", repr=False)
     _last_error_ts: float = field(default=0, repr=False)
     _last_success_ts: float = field(default=0, repr=False)
+    # 各组在本端点的最后一次真实活动（成功/失败）；空闲借用只读 main 侧，
+    # 借用人自己的成功不刷新它（否则借用按单条请求结算）
+    _last_activity_by_group: dict[str, float] = field(default_factory=dict, repr=False)
     _total_calls: int = field(default=0, repr=False)
     _total_failures: int = field(default=0, repr=False)
     _cooldown_until: float = field(default=0, repr=False)
@@ -4587,15 +4590,27 @@ class APIPool:
         """端点是否已空闲满 main 组配置的空闲窗口（2026-09-18 需求 1）。
 
         窗口配在 main 组实体（`idle_seconds`），0/未声明=关闭 → 恒 False（行为同现状）；
-        空闲时间取端点全局最后一次成功/失败时间（子组借用本身也会顺带刷新该时间，
-        用户已确认此口径），从未工作过的端点（无时间戳）视为一直空闲。
+        空闲时间只看 **main 组自己** 在该端点的最后一次成功/失败：子组借用期间的活动
+        不刷新这个计时，借到后可连续使用；main 一旦再动它，窗口重新计时。main 从未
+        用过该端点视为一直空闲。在途仍按全局（任何组在途都不算空闲，跨组互斥不变）。
         """
         window = self._group_idle_seconds(self.MAIN_GROUP)
         if not window:
             return False
         if self._is_ep_inflight_anywhere(ep):
             return False
-        return (time.time() - max(ep._last_success_ts, ep._last_error_ts)) >= window
+        last_main = ep._last_activity_by_group.get(self.MAIN_GROUP, 0)
+        return (time.time() - last_main) >= window
+
+    @staticmethod
+    def _mark_group_activity(ep, group, ts=None):
+        """记下某组在该端点上的真实活动（成功/失败），供空闲借用读 main 侧计时。
+
+        只由真实业务请求路径调用：池自身发起的探活/测试、预算截断（请求没出站）
+        都不算 main 的业务占用。
+        """
+        if group:
+            ep._last_activity_by_group[group] = ts if ts is not None else time.time()
 
     # ── 子组整组加入 main（2026-09-27）──
     # 子组 def 的 main_priority（int>0）= 已作为 main 成员参与、占 main 优先级轴该名次；
@@ -6570,6 +6585,7 @@ class APIPool:
             failed_ep._total_failures += 1
             failed_ep._last_error = error_msg
             failed_ep._last_error_ts = time.time()
+            self._mark_group_activity(failed_ep, grp)
             # chat() 已带同一 request_id 记录过本次失败；直接调用 _rotate
             # （探活/测试等）才在这里补日志，避免同一错误重复两行。
             if request_id is None:
@@ -6581,6 +6597,7 @@ class APIPool:
             # 候选轮转由 chat() 的 client_error_tried 集合控制）。
             failed_ep._last_error = error_msg
             failed_ep._last_error_ts = time.time()
+            self._mark_group_activity(failed_ep, grp)
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 客户端类错误(不冻结/不记账)，同请求继续轮转: {error_msg}", "WARN")
             return self._get_route_epoch(grp)
         if budget_cut:
@@ -6643,6 +6660,7 @@ class APIPool:
             self._defer_clear(ep, [grp])
         ep._total_calls += 1
         ep._last_success_ts = now
+        self._mark_group_activity(ep, grp, now)
         ep._health = "ok"
         ep._fail_count = 0
         ep._last_error = ""
@@ -7208,12 +7226,14 @@ class APIPool:
                     ep._total_failures += 1
                     ep._last_error = str(error)
                     ep._last_error_ts = time.time()
+                    self._mark_group_activity(ep, group)
                     self._set_capacity_cooldown(ep, str(error))
                 sys_log(f"[req={request_id}] 定向请求 endpoint_id={ep.id} 失败: {error}", "ERROR", group=group)
                 raise EndpointRequestError(502, str(error))
             with self._lock:
                 ep._total_calls += 1
                 ep._last_success_ts = time.time()
+                self._mark_group_activity(ep, group)
             streaming = isinstance(result, _types.GeneratorType)
             if streaming:
                 result = self._wrap_stream_release(result, ep.id, group)
