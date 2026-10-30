@@ -6115,13 +6115,19 @@ class APIPool:
         """
         if isinstance(probe_current_ids, str) or probe_current_ids is None:
             probe_current_ids = {self.MAIN_GROUP: probe_current_ids} if probe_current_ids else {}
+        probe_disabled = self._probe_disabled(ep)
         try:
-            probe_ok, probe_error = self._probe_endpoint(ep)
+            if probe_disabled:
+                # 关闭检测：不探活、不发 ping，冷却到期直接按可用恢复
+                probe_ok, probe_error = True, ""
+            else:
+                probe_ok, probe_error = self._probe_endpoint(ep)
             if probe_ok is None:
                 # 无可用身份 → 未探测：端点状态保持原样，不做任何恢复/冷却动作（伤害隔离）
                 return False
             if probe_ok:
                 now = time.time()
+                recovery_reason = "关闭检测，冷却到期直接恢复" if probe_disabled else "冷却过期探活通过"
                 with self._lock:
                     ep._fail_count = 0
                     ep._last_error = ""
@@ -6150,7 +6156,7 @@ class APIPool:
                             # （端点级共享字段曾被后一组的 else 分支覆盖清零）
                             ep._defer_until_by_group[grp] = now + 300
                         current_label = self._endpoint_log_label(current_ep, grp) if current_ep else f"[{grp}]无"
-                        sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 冷却过期探活通过；当前端点 '{current_label}' 已开启缓存保护，延迟回切 5 分钟", "INFO")
+                        sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}；当前端点 '{current_label}' 已开启缓存保护，延迟回切 5 分钟", "INFO")
                     else:
                         switched = False
                         with self._lock:
@@ -6161,11 +6167,11 @@ class APIPool:
                                 self._set_current(grp, ep.id)
                                 switched = True
                         if switched and current_ep is not None and current_ep is not ep and not current_ep.deferrable:
-                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 冷却过期探活通过；当前端点 '{self._endpoint_log_label(current_ep, grp)}' 未开启缓存保护，立即回切", "INFO")
+                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}；当前端点 '{self._endpoint_log_label(current_ep, grp)}' 未开启缓存保护，立即回切", "INFO")
                         elif self._get_manual(grp):
-                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 冷却过期探活通过；保留手动端点 '{self._endpoint_log_label(current_ep, grp)}'", "INFO")
+                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}；保留手动端点 '{self._endpoint_log_label(current_ep, grp)}'", "INFO")
                         else:
-                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 冷却过期探活通过，已恢复", "INFO")
+                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}，已恢复", "INFO")
                     # 仅在该组当前端点不存在或已不可用时更新指针；恢复一个端点不应
                     # 在池仍使用其他健康端点时把路由无故改回 priority 最小端点。
                     with self._lock:
@@ -7081,16 +7087,21 @@ class APIPool:
             return 0.0
         return (base_ms * random.uniform(1.0, 1.4)) / 1000.0
 
+    @staticmethod
+    def _probe_disabled(ep):
+        """端点「后台探针」配置为关闭检测：不参与探活，冷却到期直接按可用恢复。"""
+        return getattr(ep, "health_mode", "") == "none"
+
     def _probe_endpoint(self, ep):
         """对单个端点做快速探活，成功返回 True、失败返回 False、无可用身份返回 None（跳过）。统一用 chat ping 检测。"""
         started = time.time()
-        if ep.health_mode == "none":
+        if self._probe_disabled(ep):
             with self._lock:
                 ep._health = "unknown"
                 ep._health_latency_ms = 0
                 ep._health_last_check = started
                 ep._health_error = "已禁用健康检测"
-            return True, ""  # 关闭检测视为可用
+            return True, ""  # 关闭检测视为可用（正常路径已在调用点跳过，此分支仅兜底）
         # 统一使用 chat ping 探活：models 接口可访问不代表模型可响应
         with self._lock:
             prev_health, prev_health_error = ep._health, ep._health_error
@@ -7703,6 +7714,10 @@ class APIPool:
                         budget_exhausted = True
                         errors.append(f"请求预算 {self._FALLBACK_DEADLINE_SECONDS}s 已耗尽，停止轮转")
                         break
+                    # 关闭检测的候选端点无探活可言：不发 ping，直接发起真实请求
+                    if self._probe_disabled(next_ep):
+                        sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' 已关闭检测，直接重试", "INFO")
+                        continue
                     # 对候选端点做探活
                     sys_log(f"对候选端点 '{self._endpoint_log_label(next_ep, group)}' 进行探活...", "INFO")
                     probe_ok, probe_error = self._probe_endpoint(next_ep)
@@ -7721,6 +7736,12 @@ class APIPool:
                         # 两阶段等待：11s 内返回结果的端点直接按优先级使用，最多等 21s。
                         remaining = [e for e in candidates if e is not next_ep]
                         if remaining:
+                            # 关闭检测的候选无探活可言：按优先级顺序直接用
+                            probe_off = next((e for e in remaining if self._probe_disabled(e)), None)
+                            if probe_off is not None:
+                                sys_log(f"候选端点 '{probe_off.name}' 已关闭检测，直接使用", "INFO")
+                                idx = active.index(probe_off)
+                                continue
                             sys_log(f"并发探活剩余 {len(remaining)} 个候选端点...", "INFO")
                             probe_results = {}
                             chosen = None
