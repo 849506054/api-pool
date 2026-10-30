@@ -4928,12 +4928,16 @@ class APIPool:
         free = []
         for ep in base:
             if self._is_ep_sticky_elsewhere(ep, group):
-                # main 占用中：本次剔除，并按「延迟回迁」机制挂 defer —— 组内 300s
-                # 无新请求（=接手端点执行完）即由 _reconcile_deferred 释放，回切到该
-                # 端点。回迁后 main 若再抢占，后续请求重新避让、本组再交给组内其他
-                # 端点接手。前提：main 配了空闲窗口（否则=始终避让的旧行为）；配了
-                # 轮换的组不挂（轮换是组内循环意图，回切会与之互相拉锯）。
-                if self._group_idle_seconds(self.MAIN_GROUP) and not self._group_rotate_requests(group):
+                # main 占用中：本次剔除。挂「延迟回切」的前提是本组当班在这个端点
+                # （组指针正指向它）——被 main 抢占、由组内其他端点接手，等接手端点
+                # 跑完再回来。本组指针不在它上面时只是一次绕开，没有交接可回迁；
+                # 此时挂 defer 会在释放时把该组顶到这个端点上（连手动锁一起清），
+                # 手动钉住的整点组每小时都会被顶掉一次（2026-10-30）。
+                # 前置条件：main 配了空闲窗口（否则=始终避让的旧行为）；配了轮换的组
+                # 不挂（轮换是组内循环意图，回切会与之互相拉锯）。
+                if (self._group_idle_seconds(self.MAIN_GROUP)
+                        and not self._group_rotate_requests(group)
+                        and group in self._groups_pointing_at(ep.id)):
                     # 挂上的那一刻留一行：谁占用了它、哪个组让位、窗口多长。
                     # 已在延迟期内不重复打（每次请求都会走到这里）。
                     if ep._defer_until_by_group.get(group, 0) <= time.time():
