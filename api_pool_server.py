@@ -3064,7 +3064,6 @@ class APIPool:
         # ── 分组池路由状态（2026-08-29 spec：四个路由全局态 per-group 化）──
         # 每组独立的粘性指针/手动覆盖/持久化指针/兜底锁。旧扁平状态在 _migrate_legacy_state 兼容。
         self._current_endpoint_by_group: dict[str, str | None] = {}
-        self._manual_override_by_group: dict[str, str | None] = {}
         # 每组路由决策版本：请求开始后若发生手动切换、恢复回迁或其他轮转，
         # 迟到的旧请求只更新自身健康状态，不得覆盖更新的路由决策。
         self._route_epoch_by_group: dict[str, int] = {}
@@ -3177,9 +3176,6 @@ class APIPool:
                 if self._current_endpoint_by_group.get(grp) == ep_id:
                     self._set_current(grp, None)
             self._renumber_pool_priorities()
-            for grp in list(self._manual_override_by_group):
-                if self._manual_override_by_group.get(grp) == ep_id:
-                    self._set_manual(grp, None)
             self._inflight_owner.pop(ep_id, None)
 
     @staticmethod
@@ -3245,8 +3241,6 @@ class APIPool:
                     # 该组粘性指针若指向本端点 → 清除（其他组指针不动）
                     if self._current_endpoint_by_group.get(group) == ep_id:
                         self._set_current(group, None)
-                    if self._manual_override_by_group.get(group) == ep_id:
-                        self._set_manual(group, None)
                     sys_log(f"端点 '{ep.name}' 已从组 '{group}' 移除（仍属其他组）", "INFO", group=group)
                 else:
                     # 最后一组 → 整体出池
@@ -3281,8 +3275,6 @@ class APIPool:
                 if disabled:
                     if self._current_endpoint_by_group.get(group) == ep_id:
                         self._set_current(group, None)
-                    if self._manual_override_by_group.get(group) == ep_id:
-                        self._set_manual(group, None)
                 sys_log(
                     f"端点 '{self._endpoint_log_label(ep, group)}' 在本组"
                     + ("停用（不参与该组轮转，其他组不受影响）" if disabled else "启用（恢复参与该组轮转）"),
@@ -3296,9 +3288,6 @@ class APIPool:
         for grp in list(self._current_endpoint_by_group):
             if self._current_endpoint_by_group.get(grp) == ep_id:
                 self._set_current(grp, None)
-        for grp in list(self._manual_override_by_group):
-            if self._manual_override_by_group.get(grp) == ep_id:
-                self._set_manual(grp, None)
         for grp in list(self._persisted_endpoint_by_group):
             if self._persisted_endpoint_by_group.get(grp) == ep_id:
                 self._set_persisted(grp, None)
@@ -3574,7 +3563,6 @@ class APIPool:
             pointer_moved = False
             for getter, setter in (
                 (self._get_current, self._set_current),
-                (self._get_manual, self._set_manual),
                 (self._get_persisted, self._set_persisted),
             ):
                 if getter(group) == source.id:
@@ -3885,8 +3873,7 @@ class APIPool:
     def _rotate_group_once(self, group):
         """把组当前端点按组内优先级推进到下一名（循环）；成员不足 2 不轮换。
 
-        手动切换是那一刻的用户动作：组配了轮换就按配置继续推进，两者不冲突
-        （2026-10-05 口径——轮换不因 manual 暂停）。
+        手动切换是那一刻的用户动作：组配了轮换就按配置继续推进，两者不冲突。
         """
         with self._lock:
             cur = self._get_current(group)
@@ -3908,12 +3895,9 @@ class APIPool:
             if nxt.id == cur:
                 return
             prev_name = next((e.name for e in cands if e.id == cur), "-")
-            # 轮换要落到实处：开机恢复/手动切换留下的组内锁定会盖住新指针
-            # （_set_manual 会推进 route epoch，在途旧请求的成功回调不会覆盖本次决策）
-            had_manual = bool(self._get_manual(group))
-            self._set_manual(group, None)
+            # 轮换要落到实处（_set_current 推进 route epoch，在途旧请求的成功回调不会覆盖本次决策）
             self._set_current(group, nxt.id)
-            sys_log(f"组 '{group}' 端点轮换 '{prev_name}' → '{nxt.name}'" + ("（清除组内手动锁定）" if had_manual else ""), "INFO", group=group)
+            sys_log(f"组 '{group}' 端点轮换 '{prev_name}' → '{nxt.name}'", "INFO", group=group)
 
     GROUP_LOG_LEVELS = ("all", "error", "live", "silent")
 
@@ -4244,7 +4228,7 @@ class APIPool:
                         ep.pool_groups = [new_name if g == name else g for g in self._ep_groups(ep)]
                     # 键收口：仍是成员 → 跟随新名；已退组的残留键 → 直接清（组名成历史）
                     self._retire_group_key(ep, name, new_name if member else None)
-                for state in (self._current_endpoint_by_group, self._manual_override_by_group,
+                for state in (self._current_endpoint_by_group,
                               self._persisted_endpoint_by_group, self._route_epoch_by_group,
                               self._rotate_counts, self._cache_stats_site_id_by_group):
                     if name in state:
@@ -4272,8 +4256,6 @@ class APIPool:
             if old.get("main_priority"):
                 self._group_defs[new_name]["main_priority"] = old["main_priority"]
                 if new_name != name:
-                    if self._get_manual(self.MAIN_GROUP) == name:
-                        self._set_manual(self.MAIN_GROUP, new_name)
                     if self._get_current(self.MAIN_GROUP) == name:
                         self._set_current(self.MAIN_GROUP, new_name)
             # 空闲借用仅配置时显示（main 组更新走 _set_group_idle_seconds 专属日志，此处恒为子组路径）
@@ -4298,7 +4280,7 @@ class APIPool:
             for ep in self._endpoints:
                 self._retire_group_key(ep, name)
             self._group_defs.pop(name, None)
-            for state in (self._current_endpoint_by_group, self._manual_override_by_group,
+            for state in (self._current_endpoint_by_group,
                           self._persisted_endpoint_by_group, self._fallback_lock_until_by_group,
                           self._route_epoch_by_group, self._rotate_counts,
                           self._cache_stats_site_id_by_group):
@@ -4306,8 +4288,6 @@ class APIPool:
             self._group_fallback_lock_until.pop(name, None)
             self._group_fallback_pending.pop(name, None)
             # 删的是已加入 main 的子组：清 main 指向该子组名的指针（2026-09-27）
-            if self._get_manual(self.MAIN_GROUP) == name:
-                self._set_manual(self.MAIN_GROUP, None)
             if self._get_current(self.MAIN_GROUP) == name:
                 self._set_current(self.MAIN_GROUP, None)
             sys_log(f"删除分组 '{name}'（成员已移出）", "INFO", group=name)
@@ -4387,10 +4367,8 @@ class APIPool:
     def _migrate_legacy_state(self):
         """启动时把旧扁平路由状态迁移为 main 组状态（一次性）。"""
         legacy_current = getattr(self, "_legacy_current_endpoint_id", None)
-        legacy_manual = getattr(self, "_legacy_manual_override_id", None)
-        if legacy_current or legacy_manual:
+        if legacy_current:
             self._current_endpoint_by_group[self.MAIN_GROUP] = legacy_current
-            self._manual_override_by_group[self.MAIN_GROUP] = legacy_manual
 
     # ── 旧扁平属性兼容层：映射到 main 组（测试与外部脚本零改动迁移）──
     @property
@@ -4400,14 +4378,6 @@ class APIPool:
     @_current_endpoint_id.setter
     def _current_endpoint_id(self, ep_id):
         self._set_current(self.MAIN_GROUP, ep_id)
-
-    @property
-    def _manual_override_id(self):
-        return self._manual_override_by_group.get(self.MAIN_GROUP)
-
-    @_manual_override_id.setter
-    def _manual_override_id(self, ep_id):
-        self._set_manual(self.MAIN_GROUP, ep_id)
 
     @property
     def _persisted_endpoint_id(self):
@@ -4426,18 +4396,6 @@ class APIPool:
             self._current_endpoint_by_group.pop(group, None)
         else:
             self._current_endpoint_by_group[group] = ep_id
-        if previous != ep_id:
-            self._route_epoch_by_group[group] = self._route_epoch_by_group.get(group, 0) + 1
-
-    def _get_manual(self, group):
-        return self._manual_override_by_group.get(group)
-
-    def _set_manual(self, group, ep_id):
-        previous = self._manual_override_by_group.get(group)
-        if ep_id is None:
-            self._manual_override_by_group.pop(group, None)
-        else:
-            self._manual_override_by_group[group] = ep_id
         if previous != ep_id:
             self._route_epoch_by_group[group] = self._route_epoch_by_group.get(group, 0) + 1
 
@@ -4568,17 +4526,14 @@ class APIPool:
                 self._release_inflight(ep_id, group)
 
     def _is_ep_sticky_elsewhere(self, ep, group):
-        """子组避让 main 的当前/手动工作端点；main 不受子组指针约束。
+        """子组避让 main 的当前工作端点；main 不受子组指针约束。
 
         例外（2026-09-18）：main 在该端点已空闲满窗口时不再避让 —— 端点回到子组的
         正常候选序列，按本组组内优先级参与选择（不是等候选耗尽才用）。
         """
         if group == self.MAIN_GROUP or self._group_defs.get(group, {}).get("type") == "dedicated":
             return False
-        if ep.id not in {
-            self._get_current(self.MAIN_GROUP),
-            self._get_manual(self.MAIN_GROUP),
-        }:
+        if ep.id != self._get_current(self.MAIN_GROUP):
             return False
         return not self._ep_idle_ready(ep)
 
@@ -4686,7 +4641,7 @@ class APIPool:
         cands = self._subgroup_raw_available(sub)
         if not cands:
             return None
-        sub_cur = self._get_manual(sub) or self._get_current(sub)
+        sub_cur = self._get_current(sub)
         if sub_cur and any(e.id == sub_cur for e in cands):
             return sub_cur
         return cands[0].id
@@ -4695,8 +4650,8 @@ class APIPool:
         """展示口径「组当前端点 id」唯一来源（2026-10-04 收口）。
 
         成员卡片（list_endpoints 的 is_current/current_groups、get_active_chain 成员行）
-        此前读裸指针 `manual or current`，而组卡片/聚合链子组条目走 _resolve_subgroup_current
-        下钻：同一个组出现两个「当前端点」答案——子组自身 manual 指针指向的成员进入冷却后
+        此前成员行读裸指针，而组卡片/聚合链子组条目走 _resolve_subgroup_current
+        下钻：同一个组出现两个「当前端点」答案——子组自身指针指向的成员进入冷却后
         无人清理，面板显示 Cline-ds4.1f，实际在跑 Cline4-ds4.1f（2026-10-04 生产）。
         口径与组卡片一致：已加入 main 的子组一律走 _resolve_subgroup_current（main 借用期间
         也报真实当前成员），main 走 _main_pointer_target 下钻，其他组保持裸指针。
@@ -4710,7 +4665,7 @@ class APIPool:
             # 已加入 main 的子组：与组卡片/聚合链子组条目同源下钻——main 借用期间子组自身
             # 指针可能尚未回写，直接取真实当前成员；组内全不可用 → None（与组卡片一致）。
             return self._resolve_subgroup_current(grp)
-        return self._fallback_if_unroutable(grp, self._get_manual(grp) or self._get_current(grp))
+        return self._fallback_if_unroutable(grp, self._get_current(grp))
 
     def _ep_routable_in_group(self, ep, grp):
         """该端点此刻是否仍可被该组路由：enabled + in_pool + 非冷却 + 非维护锁定 + 仍属该组。
@@ -4757,11 +4712,11 @@ class APIPool:
         显示空——用户看不到整组冻结 fallback 后当前实际在用的端点。路由本身
         （chat 里 current_id 解析）一直是正确回落的，只有展示口径漏了。
 
-        Bug 5 后（2026-09-27）：main 粘在子组名次时 current 指针也可能存子组名
-        （不止 manual）。两种指针统一处理：指向子组 → 组内可用则保持子组名，
+        Bug 5 后（2026-09-27）：main 粘在子组名次时 current 指针存的就是子组名。
+        指针统一处理：指向子组 → 组内可用则保持子组名，
         全冻结则回落 main 候选首位。
         """
-        pointer = self._get_manual(self.MAIN_GROUP) or self._get_current(self.MAIN_GROUP)
+        pointer = self._get_current(self.MAIN_GROUP)
         if pointer in self._joined_subgroups():
             if self._resolve_subgroup_current(pointer) is None:
                 cands, _ = self._group_sticky_candidates(self.MAIN_GROUP)
@@ -4892,8 +4847,6 @@ class APIPool:
                 return False, f"子组 '{sub}' 不存在"
             if gd.pop("main_priority", None) is None:
                 return False, f"子组 '{sub}' 未加入 main"
-            if self._get_manual(self.MAIN_GROUP) == sub:
-                self._set_manual(self.MAIN_GROUP, None)
             if self._get_current(self.MAIN_GROUP) == sub:
                 self._set_current(self.MAIN_GROUP, None)
             sys_log(f"子组 '{sub}' 已移出 main", "INFO", group=sub)
@@ -4949,7 +4902,7 @@ class APIPool:
                     # 挂上的那一刻留一行：谁占用了它、哪个组让位、窗口多长。
                     # 已在延迟期内不重复打（每次请求都会走到这里）。
                     if ep._defer_until_by_group.get(group, 0) <= time.time():
-                        owner = self._get_manual(self.MAIN_GROUP) or self._get_current(self.MAIN_GROUP)
+                        owner = self._get_current(self.MAIN_GROUP)
                         sys_log(
                             f"端点 '{self._endpoint_log_label(ep, group)}' 被 main 占用"
                             f"（main 当前端点 '{owner or '无'}'），组 '{group}' 挂延迟回切 300s（借用避让）",
@@ -5073,7 +5026,7 @@ class APIPool:
             for g in self._ep_groups(ep):
                 if g not in names:
                     names.append(g)
-        for state in (self._current_endpoint_by_group, self._manual_override_by_group,
+        for state in (self._current_endpoint_by_group,
                       self._persisted_endpoint_by_group):
             for g in state:
                 if g not in names:
@@ -5083,13 +5036,8 @@ class APIPool:
         return names
 
     def _groups_pointing_at(self, ep_id):
-        """哪些组的粘性/手动指针正指向该端点（UI 展示 + 互斥透明度）。"""
-        groups = []
-        for state in (self._current_endpoint_by_group, self._manual_override_by_group):
-            for grp, eid in state.items():
-                if eid == ep_id and grp not in groups:
-                    groups.append(grp)
-        return groups
+        """哪些组的粘性指针正指向该端点（UI 展示 + 互斥透明度）。"""
+        return [grp for grp, eid in self._current_endpoint_by_group.items() if eid == ep_id]
 
     def _ep_to_dict(self, ep, is_current, now, in_flight=False, current_groups=None):
         return {
@@ -5427,7 +5375,6 @@ class APIPool:
                 ep._manual_unlock_required = False
                 self._defer_clear(ep)
             self._current_endpoint_by_group.clear()
-            self._manual_override_by_group.clear()
 
     def _check_one_health(self, ep):
         if ep.health_mode == "none":
@@ -5812,7 +5759,6 @@ class APIPool:
             ep._defer_until_by_group.pop(group, None)
             ep._defer_borrow_by_group.discard(group)
         # 旧口径留下的持续覆盖（手动锁）一并作废：手动切换只表达「现在用这个端点」。
-        self._set_manual(group, None)
         self._fallback_lock_until_by_group.pop(group, None)
         self._group_fallback_pending.pop(group, None)
 
@@ -6121,7 +6067,7 @@ class APIPool:
                 # 探活前快照当前端点：探活耗时数秒，期间并发请求可能修改指针，
                 # 用快照保证 defer 判断基于探活开始时的状态（避免 999554"已恢复"竞态）
                 probe_current_ids = {
-                    grp: (self._manual_override_by_group.get(grp) or self._current_endpoint_by_group.get(grp))
+                    grp: self._current_endpoint_by_group.get(grp)
                     for grp in self._all_group_names()
                 }
                 self._probe_inflight.add(ep.id)
@@ -6183,24 +6129,18 @@ class APIPool:
                         current_label = self._endpoint_log_label(current_ep, grp) if current_ep else f"[{grp}]无"
                         sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}；当前端点 '{current_label}' 已开启缓存保护，延迟回切 5 分钟", "INFO")
                     else:
-                        switched = False
                         with self._lock:
                             ep._defer_until_by_group.pop(grp, None)
-                            # 手动指定端点不被后台恢复覆盖；自动路由则立即回切
-                            # 到刚恢复的端点，兑现"关闭缓存保护=立即回切"。
-                            if not self._get_manual(grp):
-                                self._set_current(grp, ep.id)
-                                switched = True
-                        if switched and current_ep is not None and current_ep is not ep and not current_ep.deferrable:
+                            # 自动路由：立即回切到刚恢复的端点，兑现"关闭缓存保护=立即回切"。
+                            self._set_current(grp, ep.id)
+                        if current_ep is not None and current_ep is not ep and not current_ep.deferrable:
                             sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}；当前端点 '{self._endpoint_log_label(current_ep, grp)}' 未开启缓存保护，立即回切", "INFO")
-                        elif self._get_manual(grp):
-                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}；保留手动端点 '{self._endpoint_log_label(current_ep, grp)}'", "INFO")
                         else:
                             sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}，已恢复", "INFO")
                     # 仅在该组当前端点不存在或已不可用时更新指针；恢复一个端点不应
                     # 在池仍使用其他健康端点时把路由无故改回 priority 最小端点。
                     with self._lock:
-                        current_id = self._get_manual(grp) or self._get_current(grp)
+                        current_id = self._get_current(grp)
                         current_ep = next(
                             (e for e in self._endpoints if e.id == current_id), None
                         ) if current_id else None
@@ -6211,7 +6151,7 @@ class APIPool:
                             or self._is_in_cooldown(current_ep)
                             or self._ep_disabled_in(current_ep, grp)
                         )
-                        if not self._get_manual(grp) and current_unavailable:
+                        if current_unavailable:
                             group_eps = [e for e in self._endpoints if e.enabled and e.in_pool
                                          and grp in self._ep_groups(e)
                                          and not self._ep_disabled_in(e, grp)
@@ -6252,7 +6192,7 @@ class APIPool:
             now = time.time()
         with self._lock:
             current_by_group = {
-                grp: (self._manual_override_by_group.get(grp) or self._current_endpoint_by_group.get(grp))
+                grp: self._current_endpoint_by_group.get(grp)
                 for grp in self._all_group_names()
             }
             released = []  # [(ep, grp)]
@@ -6261,7 +6201,6 @@ class APIPool:
                 for grp, eid in current_by_group.items() if eid
             }
             released = []  # [(ep, grp)]
-            borrow_released = set()  # 因「main 占用/借用」而释放的回切组：其锁定允许被清除
             for ep in self._endpoints:
                 if not ep.in_pool or not ep._defer_until_by_group:
                     continue
@@ -6283,30 +6222,13 @@ class APIPool:
                     #   回迁后 main 若再抢占，后续请求重新避让、本组再交给组内其他端点接手。
                     # - 缓存保护型：沿用全池活跃判据（池还在忙就不切走当前端点）。
                     is_borrow = grp in ep._defer_borrow_by_group
-                    manual_id = self._get_manual(grp) if is_borrow else None
-                    if is_borrow and manual_id is not None and manual_id != ep.id:
-                        # 手动决定优先：窗口期内用户把本组切到了别的端点，交接作废。
-                        # 回切不得把指针从用户刚选的端点拉走，更不能清掉这把锁
-                        # （2026-10-30 产线：feishu 15:32 挂借用 defer，15:48 手动切
-                        # AgentRouter，16:07 旧码按手动端点的空闲时间判「接手端点跑完」，
-                        # 清锁并把指针拉回被 main 占用的共享端点）。
-                        ep._defer_until_by_group.pop(grp, None)
-                        ep._defer_borrow_by_group.discard(grp)
-                        target = next((e for e in self._endpoints if e.id == manual_id), None)
-                        label = self._endpoint_log_label(target, grp) if target else manual_id
-                        sys_log(
-                            f"端点 '{self._endpoint_log_label(ep, grp)}' 延迟回切取消"
-                            f"（组已手动切换到 '{label}'，保留当前端点）",
-                            "INFO",
-                        )
-                        continue
                     # 接手端点 = 本组现在真正当班的那个端点；指针还停在被 main 占用的
                     # 这个端点上时不存在接手端点，谈不上「跑完」。
                     takeover_idle = (cur is not None and cur is not ep
                                      and cur._last_success_ts > 0
                                      and (now - cur._last_success_ts) >= defer_window)
                     if is_borrow:
-                        if manual_id is None and (cur is None or cur is ep):
+                        if cur is None or cur is ep:
                             # 尚未交接：请求被剔除但组指针没挪过（同一秒内挂上又解除、
                             # 指针原地不动的那对日志即此形态，2026-10-30 收紧）。
                             # 没有可等的接手端点 → 续期保持，不打解除行、不动指针。
@@ -6314,7 +6236,7 @@ class APIPool:
                             continue
                         # 借用型只看接手端点自身停走，与缓存保护的 deferrable 开关无关
                         # （接手端点是整点/批处理端点时同样要等它跑完）。
-                        hold = manual_id != ep.id and not takeover_idle
+                        hold = not takeover_idle
                     else:
                         protected = cur is not None and cur is not ep and cur.deferrable
                         hold = protected and pool_active
@@ -6328,22 +6250,14 @@ class APIPool:
                             reason = "接手端点已无新请求（回迁窗口满足）"
                         else:
                             reason = "当前端点未开启缓存保护"
-                        if grp != self.MAIN_GROUP and ep.id in (self._get_current(self.MAIN_GROUP), self._get_manual(self.MAIN_GROUP)):
+                        if grp != self.MAIN_GROUP and ep.id == self._get_current(self.MAIN_GROUP):
                             reason = "接手端点已无新请求（借用回切）"
-                            borrow_released.add(grp)
                         sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' 延迟回切解除（{reason}）", "INFO")
             if released:
                 for grp in self._all_group_names():
-                    if self._get_manual(grp) and grp not in borrow_released:
-                        continue
                     group_eps = [e for e, g in released if g == grp]
                     if group_eps:
                         best = min(group_eps, key=lambda e: self._ep_priority(e, grp))
-                        if grp in borrow_released and self._get_manual(grp):
-                            # 空闲借用回切按配置推进（2026-10-05 A 口径，与轮换一致）：
-                            # 手动的锁定由本次回切清除（_set_manual 推进 route epoch，
-                            # 在途旧请求的成功回调不会覆盖）
-                            self._set_manual(grp, None)
                         self._set_current(grp, best.id)
     def _failover_endpoints(self):
         """Return failover-eligible endpoints, including deferred recoveries.
@@ -6697,17 +6611,13 @@ class APIPool:
         candidates = self._ordered_failover_candidates(failed_ep, active, group=grp)
         with self._lock:
             # 请求启动后若已有更新的路由决策，保留该决策；本请求仍可在局部
-            # active 列表中继续重试，但不得让迟到失败覆盖 current/manual。
+            # active 列表中继续重试，但不得让迟到失败覆盖 current。
             if expected_route_epoch is not None and self._get_route_epoch(grp) != expected_route_epoch:
                 return expected_route_epoch
             if candidates:
                 self._set_current(grp, candidates[0].id)
             else:
                 self._set_current(grp, None)
-            # 手动切到子组整体时保留 manual 指针（2026-09-27）：子组内单端点失败
-            # 不该撤销用户「切到该子组」的意图，子组自身会按优先级轮转下一个端点。
-            if not (grp == self.MAIN_GROUP and self._get_manual(grp) in self._joined_subgroups()):
-                self._set_manual(grp, None)  # 当前路由决策内的失败才清除手动覆盖
             return self._get_route_epoch(grp)
 
     def _on_success(self, ep, result=None, clear_defer=True, group=None, expected_route_epoch=None):
@@ -6742,12 +6652,12 @@ class APIPool:
                 or self._get_route_epoch(grp) == expected_route_epoch
             )
             if route_is_current:
-                # 手动切到子组整体（2026-09-27 口径A）：main 的 manual/current 存的是子组名，
+                # 手动切到子组整体（2026-09-27 口径A）：main 的 current 存的是子组名，
                 # 本次请求只是下钻解析出具体端点执行——不得把指针回写成端点 id，否则
                 # 下一次请求就丢失「切到子组」的意图、自动跳回 main 原生端点。
                 keep_subgroup_pointer = (
                     grp == self.MAIN_GROUP
-                    and self._get_manual(grp) in self._joined_subgroups()
+                    and self._get_current(grp) in self._joined_subgroups()
                 )
                 # 子组作为 main 名次服务（2026-09-27 Bug 5）：main 粘在「子组」这一名次，
                 # 子组维护自身当前成员的粘性。否则 main 指针在子组成员 id 之间横跳
@@ -6759,12 +6669,8 @@ class APIPool:
                     # main 粘在子组名（下钻由 _resolve_subgroup_current 复用上面的成员）。
                     if not keep_subgroup_pointer:
                         self._set_current(grp, axis_sub)
-                        if self._get_manual(grp) and self._get_manual(grp) != axis_sub:
-                            self._set_manual(grp, None)
                 elif not keep_subgroup_pointer:
                     self._set_current(grp, ep.id)
-                    if self._get_manual(grp) and self._get_manual(grp) != ep.id:
-                        self._set_manual(grp, None)
         self._count_rotate_request(grp)  # 成功请求计一次，达阈值推进组内下一名
 
     def _rewrite_tool_call_ids(self, messages, prefix):
@@ -7400,7 +7306,7 @@ class APIPool:
         # 当前端点保持粘性：无明确故障/手动切换/恢复回迁时，后续请求继续使用
         # 最近成功或故障转移选中的端点，而不是每次回到最高优先级端点。
         # 分组池：粘性指针按组读取（fallback 到 main 后读 main 组指针）。
-        current_id = self._get_manual(group) or self._get_current(group)
+        current_id = self._get_current(group)
         # 2026-09-27：main 手动/当前指针可能是「已加入子组名」（口径A 手动切到子组整体）。
         # 命中子组名则下钻到该子组当前应用端点（子组当前端点变化自动跟随），无可用端点则忽略。
         if group == self.MAIN_GROUP and current_id and current_id in self._joined_subgroups():
@@ -9465,7 +9371,7 @@ def snapshot_runtime_state():
     try:
         groups_state: dict = {}
         for grp in pool._all_group_names():
-            ep_id = pool._get_manual(grp) or pool._get_current(grp)
+            ep_id = pool._get_current(grp)
             if isinstance(ep_id, str) and ep_id:
                 groups_state[grp] = ep_id
         cooldowns = _collect_cooldown_state()
@@ -9758,9 +9664,7 @@ if isinstance(restored_groups, dict):
             None,
         )
         if restored_endpoint is not None:
-            # 重启恢复的是「当前端点」这个状态：只还原指针，**不写 manual** ——
-            # 重启是还原重启前的状态，不是用户手动指定（manual 只记用户显式动作）。
-            # 此前用 manual 承载恢复态，会让轮换/空闲借用回切被静默挡住。
+            # 重启恢复的是「当前端点」这个状态：只还原指针。
             pool._set_current(grp, restored_endpoint.id)
             pool._set_persisted(grp, restored_endpoint.id)
         else:

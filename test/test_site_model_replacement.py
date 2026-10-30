@@ -111,7 +111,7 @@ class SiteModelReplacementTests(unittest.TestCase):
         )
         self.pool._derive_group_defs()
         self.pool._set_current("bg", source.id)
-        self.pool._set_manual("bg", source.id)
+        self.pool._set_current("bg", source.id)
         self.pool._set_persisted("bg", source.id)
 
         result, created, moved = self.pool.replace_group_model("bg", source.id, "model-b")
@@ -124,7 +124,6 @@ class SiteModelReplacementTests(unittest.TestCase):
         self.assertEqual(self.pool._ep_priority(replacement, "bg"), 1)
         self.assertEqual(self.pool._ep_priority(other, "bg"), 2)
         self.assertEqual(self.pool._get_current("bg"), replacement.id)
-        self.assertEqual(self.pool._get_manual("bg"), replacement.id)
         self.assertEqual(self.pool._get_persisted("bg"), replacement.id)
 
     def test_matching_prefers_connection_then_enabled_cooldown_priority_and_config_order(self):
@@ -207,7 +206,7 @@ class SiteModelReplacementTests(unittest.TestCase):
     def test_api_persists_config_and_moved_runtime_pointer(self):
         source = self.endpoint("source", "model-a")
         self.pool._set_current("main", source.id)
-        self.pool._set_manual("main", source.id)
+        self.pool._set_current("main", source.id)
         self.pool._set_persisted("main", source.id)
 
         status, response, _ = self.module.api_handler(

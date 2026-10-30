@@ -279,7 +279,6 @@ class GroupJoinMainTests(unittest.TestCase):
             pool.set_main_priority("bg", 2)
             self.assertTrue(pool.switch_main_to_subgroup("bg")[0])
             # main 指针=子组名
-            self.assertIsNone(pool._get_manual("main"))
             # 下钻：子组内最高优先级可用端点 b2
             self.assertEqual(pool._resolve_subgroup_current("bg"), "b2")
             # 请求真正落到子组端点
@@ -288,12 +287,10 @@ class GroupJoinMainTests(unittest.TestCase):
             self.assertIn(r["choices"][0]["message"]["content"], ("from-b2", "from-b1"))
             # 关键回归（2026-09-27）：请求成功后 main 指针必须仍指向子组名，
             # 不得被下钻出的端点 id 覆盖，否则下一次请求自动跳回 main 原生端点。
-            self.assertIsNone(pool._get_manual("main"))
             self.assertEqual(pool._get_current("main"), "bg")
             # 第二个请求仍走子组（不被回写成 m1）
             r2 = pool.chat([{"role": "user", "content": "y"}], model="api-pool")
             self.assertIn(r2["choices"][0]["message"]["content"], ("from-b2", "from-b1"))
-            self.assertIsNone(pool._get_manual("main"))
 
     def test_switch_subgroup_follows_current_endpoint_change(self):
         """子组当前端点变化时，main 手动指向子组自动跟随（不锁死具体端点）。"""
@@ -330,7 +327,6 @@ class GroupJoinMainTests(unittest.TestCase):
             pool.switch_main_to_subgroup("bg")
             self.assertEqual(pool._get_current("main"), "bg")
             pool.delete_group("bg")
-            self.assertIsNone(pool._get_manual("main"))
             self.assertIsNone(pool._get_current("main"))
             self.assertEqual(pool._joined_subgroups(), {})
 
@@ -393,7 +389,6 @@ class GroupJoinMainTests(unittest.TestCase):
             pool = module.pool
             self.assertIn("bg", pool._joined_subgroups())
             # 恢复为子组名（而非被 WARN 忽略 / 或锁死在端点 id 上）
-            self.assertIsNone(pool._get_manual("main"))
             self.assertEqual(pool._get_current("main"), "bg")
             # 下钻仍解析到同一端点，且后续请求走该子组
             self.assertEqual(pool._resolve_subgroup_current("bg"), "b1")
@@ -620,7 +615,7 @@ class GroupJoinMainTests(unittest.TestCase):
                                   {"cline": {"type": "mixed", "model": "cline"}})
             pool.set_main_priority("cline", 1)
             self.assertTrue(pool.switch_main_to_subgroup("cline")[0])
-            pool._set_manual("cline", "c1")    # 子组自身陈旧手动指针
+            pool._set_current("cline", "c1")    # 子组自身陈旧手动指针
             pool._set_current("cline", "c4")   # main 借用成功后回写子组当前指针
             c1._cooldown_until = _t.time() + 999
             self.assertEqual(pool._resolve_subgroup_current("cline"), "c4")
@@ -657,7 +652,7 @@ class GroupJoinMainTests(unittest.TestCase):
             pool.set_main_priority("cline", 1)
             pool.set_main_priority("bg", 2)
             pool._set_current("main", "m1")      # main 用原生端点
-            pool._set_manual("cline", "c1")      # 子组自身陈旧手动指针
+            pool._set_current("cline", "c1")      # 子组自身陈旧手动指针
             pool._set_current("cline", "c4")
             pool._set_current("bg", "b1")
             c1._cooldown_until = _t.time() + 999
@@ -684,7 +679,7 @@ class GroupJoinMainTests(unittest.TestCase):
             d1 = self.endpoint(module, "d1", 1, "ds", groups=["ds"])
             d2 = self.endpoint(module, "d2", 2, "ds", groups=["ds"])
             pool = self.make_pool(module, [d1, d2], {"ds": {"type": "mixed", "model": "ds"}})
-            pool._set_manual("ds", "d1")
+            pool._set_current("ds", "d1")
             d1._cooldown_until = _t.time() + 999
             eps = {e["name"]: e for e in pool.list_endpoints()}
             self.assertTrue(eps["d2"]["is_current"])
@@ -719,7 +714,7 @@ class GroupJoinMainTests(unittest.TestCase):
             import time as _t
             d1 = self.endpoint(module, "d1", 1, "ds", groups=["ds"])
             pool = self.make_pool(module, [d1], {"ds": {"type": "mixed", "model": "ds"}})
-            pool._set_manual("ds", "d1")
+            pool._set_current("ds", "d1")
             d1._cooldown_until = _t.time() + 999
             eps = {e["name"]: e for e in pool.list_endpoints()}
             self.assertTrue(eps["d1"]["is_current"])
@@ -734,7 +729,7 @@ class GroupJoinMainTests(unittest.TestCase):
             d2 = self.endpoint(module, "d2", 2, "ds", groups=["ds"])
             pool = self.make_pool(module, [d1, d2], {"ds": {"type": "mixed", "model": "ds"}})
             module.pool = pool
-            pool._set_manual("ds", "d1")
+            pool._set_current("ds", "d1")
             d1._cooldown_until = _t.time() + 999
 
             status, body, _ = module.api_handler("GET", "/api/chain", None)

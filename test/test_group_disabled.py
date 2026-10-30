@@ -90,13 +90,12 @@ class GroupDisabledTests(unittest.TestCase):
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
             pool._set_current("bg", "shared")
-            pool._set_manual("bg", "shared")
+            pool._set_current("bg", "shared")
             pool._set_current("main", "shared")
 
             pool.toggle_group_disabled("shared", "bg")
 
             self.assertIsNone(pool._get_current("bg"))
-            self.assertIsNone(pool._get_manual("bg"))
             self.assertEqual(pool._get_current("main"), "shared")  # 其他组指针不动
 
     def test_manual_switch_clears_group_disable(self):
@@ -108,7 +107,6 @@ class GroupDisabledTests(unittest.TestCase):
             self.assertTrue(pool.switch_to_endpoint("shared", "bg"))
 
             self.assertEqual(shared.disabled_groups, [])
-            self.assertIsNone(pool._get_manual("bg"))  # 手动切换只写当前指针（2026-10-30 口径）
             self.assertEqual(pool._get_current("bg"), "shared")
 
     def test_membership_change_prunes_disabled_groups(self):

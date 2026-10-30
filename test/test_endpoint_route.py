@@ -87,7 +87,7 @@ class EndpointRouteTests(unittest.TestCase):
                 mod.pool = mod.APIPool([ep, other])
                 p = mod.pool
                 p._set_current("main", other.id)
-                p._set_manual("main", other.id)
+                p._set_current("main", other.id)
                 p._cache_stats_site_id_by_group["main"] = "original"
                 before = copy.deepcopy({k: v for k, v in vars(p).items() if "by_group" in k or k in (
                     "_group_defs", "_group_fallback_lock_until", "_group_fallback_pending", "_rotate_counts")})

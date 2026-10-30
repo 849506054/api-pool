@@ -43,7 +43,6 @@ class PersistentCurrentEndpointTests(unittest.TestCase):
             restored = self.endpoint(module, "restored", 3)
             pool = module.APIPool([first, restored])
             pool._current_endpoint_id = restored.id
-            pool._manual_override_id = restored.id
             calls = []
 
             def fake_try(ep, payload, timeout, **kwargs):
@@ -55,17 +54,15 @@ class PersistentCurrentEndpointTests(unittest.TestCase):
             pool.chat([{"role": "user", "content": "two"}])
 
             self.assertEqual(calls, ["restored", "restored"])
-            self.assertEqual(pool._manual_override_id, restored.id)
             self.assertEqual(pool._current_endpoint_id, restored.id)
 
-    def test_restored_endpoint_failure_clears_override_and_fails_over(self):
+    def test_restored_endpoint_failure_fails_over(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             first = self.endpoint(module, "first", 1)
             restored = self.endpoint(module, "restored", 3)
             pool = module.APIPool([first, restored])
             pool._current_endpoint_id = restored.id
-            pool._manual_override_id = restored.id
             calls = []
 
             def fake_try(ep, payload, timeout, **kwargs):
@@ -80,7 +77,6 @@ class PersistentCurrentEndpointTests(unittest.TestCase):
             self.assertEqual(result["choices"][0]["message"]["content"], "ok")
             self.assertEqual(calls[0], "restored")
             self.assertIn("first", calls[1:])
-            self.assertIsNone(pool._manual_override_id)
             self.assertEqual(pool._current_endpoint_id, first.id)
 
     def test_manual_switch_replaces_restored_current_endpoint(self):
@@ -90,10 +86,8 @@ class PersistentCurrentEndpointTests(unittest.TestCase):
             restored = self.endpoint(module, "restored", 3)
             pool = module.APIPool([first, restored])
             pool._current_endpoint_id = restored.id
-            pool._manual_override_id = restored.id
 
             self.assertTrue(pool.switch_to_endpoint(first.id))
-            self.assertIsNone(pool._manual_override_id)  # 手动切换作废旧锁（2026-10-30 口径）
             self.assertEqual(pool._current_endpoint_id, first.id)
 
 

@@ -71,7 +71,7 @@ class DeferGroupIsolationTests(unittest.TestCase):
         # pool-ds 的当前就是 X 自己 → pool-ds 无需保护
         self.pool._set_current("main", self.m.id)
         self.pool._set_current("pool-ds", self.x.id)
-        self.pool._set_manual("pool-ds", self.x.id)
+        self.pool._set_current("pool-ds", self.x.id)
         self.pool._background_probe(self.x, {"main": self.m.id, "pool-ds": self.x.id})
 
         self.assertIn("main", self.x._defer_until_by_group,
@@ -98,7 +98,7 @@ class DeferGroupIsolationTests(unittest.TestCase):
     def _defer_on_main(self):
         self.pool._set_current("main", self.m.id)
         self.pool._set_current("pool-ds", self.x.id)
-        self.pool._set_manual("pool-ds", self.x.id)
+        self.pool._set_current("pool-ds", self.x.id)
         self.pool._background_probe(self.x, {"main": self.m.id, "pool-ds": self.x.id})
 
     def test_active_pool_rolls_defer_forward(self):
@@ -116,13 +116,14 @@ class DeferGroupIsolationTests(unittest.TestCase):
         self.assertEqual(self.pool._current_endpoint_by_group.get("main"), self.x.id,
                          "释放后未回迁到恢复端点")
 
-    def test_released_group_skipped_when_manual(self):
+    def test_released_group_fails_back_after_pointer_change(self):
+        """指针改到别处后，池空闲释放仍回迁到恢复端点（2026-10-30 起无覆盖锁挡路）。"""
         self._defer_on_main()
-        self.pool._set_manual("main", self.m.id)  # 用户手动指定 main 端点
+        self.pool._set_current("main", self.m.id)
         self.pool._last_pool_activity = time.time() - 400
         self.pool._reconcile_deferred()
-        self.assertEqual(self.pool._current_endpoint_by_group.get("main"), self.m.id,
-                         "手动端点不应被自动回迁覆盖")
+        self.assertEqual(self.pool._current_endpoint_by_group.get("main"), self.x.id,
+                         "释放后应回迁到恢复端点")
 
     # ── 手动断言只影响本组 ────────────────────────────────────────────
     def test_manual_switch_clears_only_target_group(self):

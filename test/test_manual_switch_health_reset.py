@@ -137,7 +137,6 @@ class ManualSwitchClearsHealthTests(unittest.TestCase):
             pool.chat([{"role": "user", "content": "again"}])
 
             self.assertEqual(hits, ["cooling", "cooling"])
-            self.assertIsNone(pool._get_manual(pool.MAIN_GROUP))  # 手动切换只写当前指针（2026-10-30 口径）
             self.assertEqual(pool._get_current(pool.MAIN_GROUP), "cooling")
             self.assertEqual(cooling._health, "ok")
 
@@ -168,7 +167,6 @@ class ManualSwitchClearsHealthTests(unittest.TestCase):
 
             self.assertFalse(pool.switch_to_endpoint("disabled"))
             self.assertFalse(pool.switch_to_endpoint("out"))
-            self.assertIsNone(pool._get_manual(pool.MAIN_GROUP))
 
 
     def test_switch_rest_persists_cleared_cooldown_snapshot(self):

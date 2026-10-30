@@ -82,7 +82,7 @@ class RuntimeStateEventTests(unittest.TestCase):
             module.pool.create_group("bg", "mixed", "api-pool-bg")
             module.pool._set_current("main", "m1")
             module.pool._set_current("bg", "b1")
-            module.pool._set_manual("bg", "b2")  # manual 优先于 current
+            module.pool._set_current("bg", "b2")  # manual 优先于 current
 
             self.assertTrue(module.snapshot_runtime_state())
 

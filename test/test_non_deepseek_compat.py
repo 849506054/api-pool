@@ -51,13 +51,11 @@ class NonDeepSeekCompatibilityTests(unittest.TestCase):
             )
             pool = module.APIPool([first, second])
             pool._current_endpoint_id = first.id
-            pool._manual_override_id = first.id
 
             pool._rotate(first, "连接/超时错误: simulated", skip_cooldown=True)
 
             self.assertEqual(first._cooldown_until, 0)
             self.assertEqual(pool._current_endpoint_id, first.id)
-            self.assertEqual(pool._manual_override_id, first.id)
 
     def test_non_deepseek_messages_drop_deepseek_reasoning_fields(self):
         with tempfile.TemporaryDirectory() as tmp_path:

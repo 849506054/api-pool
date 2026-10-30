@@ -145,7 +145,8 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             self.assertEqual(recovered._defer_until_by_group.get("main", 0), 0)
             self.assertEqual(pool._current_endpoint_id, recovered.id)
 
-    def test_manual_override_is_not_replaced_by_background_recovery(self):
+    def test_background_recovery_returns_to_recovered_endpoint(self):
+        """缓存保护关闭时，后台恢复立即把指针回切到恢复的端点（2026-10-30 起无覆盖锁挡路）。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             recovered = self.endpoint(module, "recovered", 1, "deepseek-v4-flash")
@@ -153,15 +154,13 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             current.deferrable = False
             pool = module.APIPool([recovered, current])
             pool._current_endpoint_id = current.id
-            pool._manual_override_id = current.id
             pool._last_pool_activity = module.time.time()
             pool._probe_endpoint = lambda ep: (True, "")
 
             pool._background_probe(recovered, current.id)
 
             self.assertEqual(recovered._defer_until_by_group.get("main", 0), 0)
-            self.assertEqual(pool._current_endpoint_id, current.id)
-            self.assertEqual(pool._manual_override_id, current.id)
+            self.assertEqual(pool._current_endpoint_id, recovered.id)
 
     def test_deferred_recovery_does_not_proactively_replace_healthy_current(self):
         with tempfile.TemporaryDirectory() as tmp_path:
@@ -236,7 +235,6 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool._on_success(old, {"choices": []}, expected_route_epoch=request_epoch)
 
             self.assertEqual(pool._get_current(pool.MAIN_GROUP), manual.id)
-            self.assertIsNone(pool._get_manual(pool.MAIN_GROUP))  # 手动切换只写当前指针（2026-10-30 口径）
 
     def test_chat_inflight_success_does_not_override_manual_switch(self):
         with tempfile.TemporaryDirectory() as tmp_path:
@@ -266,7 +264,6 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
 
             self.assertFalse(worker.is_alive())
             self.assertEqual(pool._get_current(pool.MAIN_GROUP), manual.id)
-            self.assertIsNone(pool._get_manual(pool.MAIN_GROUP))  # 手动切换只写当前指针（2026-10-30 口径）
 
     def test_late_failure_does_not_override_newer_manual_switch(self):
         with tempfile.TemporaryDirectory() as tmp_path:
@@ -282,7 +279,6 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool._rotate(old, "HTTP 503: simulated", expected_route_epoch=request_epoch)
 
             self.assertEqual(pool._get_current(pool.MAIN_GROUP), manual.id)
-            self.assertIsNone(pool._get_manual(pool.MAIN_GROUP))  # 手动切换只写当前指针（2026-10-30 口径）
 
     def test_late_success_does_not_override_background_failback(self):
         with tempfile.TemporaryDirectory() as tmp_path:
@@ -300,7 +296,6 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool._on_success(old, {"choices": []}, expected_route_epoch=request_epoch)
 
             self.assertEqual(pool._get_current(pool.MAIN_GROUP), recovered.id)
-            self.assertIsNone(pool._get_manual(pool.MAIN_GROUP))
 
 
 if __name__ == "__main__":

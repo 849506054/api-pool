@@ -395,14 +395,13 @@ class GroupAwareRemoveTests(unittest.TestCase):
             shared = self.endpoint(module, "shared", 1, "glm", groups=["main", "bg"])
             pool = module.APIPool([shared])
             pool._set_current("bg", "shared")
-            pool._set_manual("bg", "shared")
+            pool._set_current("bg", "shared")
 
             pool.remove_from_group("shared", "bg")
 
             self.assertTrue(shared.in_pool)
             self.assertEqual(shared.pool_groups, ["main"])
             self.assertIsNone(pool._get_current("bg"))  # bg 指针已清
-            self.assertIsNone(pool._get_manual("bg"))
 
     def test_remove_last_group_exits_pool(self):
         with tempfile.TemporaryDirectory() as tmp_path:
@@ -423,14 +422,13 @@ class GroupAwareRemoveTests(unittest.TestCase):
             ep = self.endpoint(module, "e1", 1, "glm", groups=["main", "bg"])
             pool = module.APIPool([ep])
             pool._set_current("main", "e1")
-            pool._set_manual("bg", "e1")
+            pool._set_current("bg", "e1")
             pool._set_persisted("main", "e1")
 
             pool.set_pool("e1", False)
 
             self.assertFalse(ep.in_pool)
             self.assertIsNone(pool._get_current("main"))
-            self.assertIsNone(pool._get_manual("bg"))
             self.assertIsNone(pool._get_persisted("main"))
 
     def test_pool_rest_append_and_group_remove_persist(self):
@@ -557,7 +555,7 @@ class PerGroupPriorityTests(unittest.TestCase):
             for endpoint in (main_ep, shared, bg_ep):
                 module.pool.add_endpoint(endpoint)
             module.pool._set_current("main", "main-1")
-            module.pool._set_manual("main", "main-1")
+            module.pool._set_current("main", "main-1")
             self.assertTrue(module.save_runtime_state_groups({"main": "main-1"}))
 
             status, response, _ = module.api_handler(
@@ -566,9 +564,7 @@ class PerGroupPriorityTests(unittest.TestCase):
 
             self.assertEqual((status, response["ok"]), (200, True))
             self.assertEqual(module.pool._get_current("main"), "main-1")
-            self.assertEqual(module.pool._get_manual("main"), "main-1")
             self.assertEqual(module.pool._get_current("bg"), "shared")
-            self.assertEqual(module.pool._get_manual("bg"), "shared")
             with open(module.RUNTIME_STATE_FILE, encoding="utf-8") as handle:
                 groups = json.load(handle)["groups"]
             self.assertEqual(groups, {"main": "main-1", "bg": "shared"})

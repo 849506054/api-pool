@@ -127,7 +127,7 @@ class IdleBorrowTests(unittest.TestCase):
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
             pool._set_current("main", None)
-            pool._set_manual("main", "shared")
+            pool._set_current("main", "shared")
             pool._set_group_idle_seconds("main", 600)
             self.main_used(shared, time.time() - 700)
 
@@ -262,7 +262,7 @@ class IdleBorrowTests(unittest.TestCase):
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
             pool._set_group_idle_seconds("main", 600)
-            pool._set_manual("bg", "shared")  # 用户把本组钉在这个共享端点
+            pool._set_current("bg", "shared")  # 用户把本组钉在这个共享端点
             self.main_used(shared, time.time() - 60)
 
             pool._group_sticky_candidates("bg")
@@ -270,7 +270,6 @@ class IdleBorrowTests(unittest.TestCase):
 
             pool._reconcile_deferred()
             self.assertEqual(pool._get_current("bg"), "shared")  # 回切
-            self.assertIsNone(pool._get_manual("bg"))  # 锁定被回切清除（同轮换 A 口径）
 
     def test_manual_pin_elsewhere_mounts_no_defer_and_keeps_pin(self):
         """回归（2026-10-30 产线）：组钉在别处时，成员被 main 占用只剔除，不挂回切。
@@ -283,9 +282,8 @@ class IdleBorrowTests(unittest.TestCase):
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
             pool._set_group_idle_seconds("main", 600)
-            pool._set_current("bg", "b1")
             b1 = next(e for e in pool._endpoints if e.id == "b1")
-            pool._set_manual("bg", "b2")  # 本组被钉在 b2
+            pool._set_current("bg", "b2")  # 本组当班在 b2
             self.main_used(shared, time.time() - 60)
 
             with mock.patch.object(module, "sys_log") as log:
@@ -298,8 +296,7 @@ class IdleBorrowTests(unittest.TestCase):
 
             b1._last_success_ts = time.time() - 400  # 本组自己空闲一小时（整点组常态）
             pool._reconcile_deferred()
-            self.assertEqual(pool._get_current("bg"), "b1")  # 指针不被顶走
-            self.assertEqual(pool._get_manual("bg"), "b2")  # 手动锁保留
+            self.assertEqual(pool._get_current("bg"), "b2")  # 指针保持在本组当班端点
 
     def test_no_handoff_keeps_defer_without_release(self):
         """回归（2026-10-30 产线噪音）：指针还没挪开就当没有交接，不解除、不打日志。
@@ -347,13 +344,13 @@ class IdleBorrowTests(unittest.TestCase):
             pool._reconcile_deferred()
             self.assertEqual(pool._get_current("bg"), "shared")
 
-    def test_manual_switch_during_defer_window_cancels_return(self):
+    def test_manual_switch_during_defer_window_clears_pending_return(self):
         """回归（2026-10-30 产线）：窗口期内用户手动切端点 → 回切作废，保留手动端点。
 
         产线样本：feishu 15:32:58 在共享端点挂 300s 借用 defer（接手端点为
         CodeBuddy-feishu），15:48 用户手动切到 AgentRouter，16:07 旧码按手动端点
         自身的空闲时间判「接手端点跑完」，清掉手动锁并把指针拉回 Tokenrhythm。
-        手动选择晚于挂 defer，优先级最高，回切不得覆盖。
+        手动切换会直接清掉本组挂着的 defer，回切不再发生。
         """
         with tempfile.TemporaryDirectory() as tmp:
             module = load_module(tmp)
@@ -368,18 +365,16 @@ class IdleBorrowTests(unittest.TestCase):
 
             pool._set_current("bg", "b1")               # b1 接手
             b1._last_success_ts = time.time() - 400     # 接手端点早已跑完
-            pool._set_manual("bg", "b2")                # 用户手动切到 b2
-            b2._last_success_ts = time.time() - 400     # 与产线同形：手动端点自身也空闲
+            self.assertTrue(pool.switch_to_endpoint("b2", group="bg"))  # 用户手动切到 b2
+            b2._last_success_ts = time.time() - 400     # 手动端点自身也空闲
 
             with mock.patch.object(module, "sys_log") as log:
                 pool._reconcile_deferred()
 
-            self.assertEqual(pool._get_current("bg"), "b1")  # 指针不被顶到共享端点
-            self.assertEqual(pool._get_manual("bg"), "b2")   # 手动锁保留
+            self.assertEqual(pool._get_current("bg"), "b2")  # 手动端点保持
             self.assertNotIn("bg", shared._defer_until_by_group)
-            lines = [c.args[0] for c in log.call_args_list if "延迟回切取消" in str(c.args[0])]
-            self.assertEqual(len(lines), 1, lines)
-            self.assertIn("b2", lines[0])
+            lines = [c.args[0] for c in log.call_args_list if "延迟回切" in str(c.args[0])]
+            self.assertEqual(lines, [], lines)  # 手动切换已清掉本组 defer，无回切动作
 
     def test_rotate_enabled_group_does_not_mount_defer(self):
         """配了轮换的组不挂 defer：轮换本就是组内循环意图，回切会与之拉锯。"""
