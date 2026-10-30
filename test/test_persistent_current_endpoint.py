@@ -93,7 +93,7 @@ class PersistentCurrentEndpointTests(unittest.TestCase):
             pool._manual_override_id = restored.id
 
             self.assertTrue(pool.switch_to_endpoint(first.id))
-            self.assertEqual(pool._manual_override_id, first.id)
+            self.assertIsNone(pool._manual_override_id)  # 手动切换作废旧锁（2026-10-30 口径）
             self.assertEqual(pool._current_endpoint_id, first.id)
 
 

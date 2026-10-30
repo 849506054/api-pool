@@ -108,7 +108,8 @@ class GroupDisabledTests(unittest.TestCase):
             self.assertTrue(pool.switch_to_endpoint("shared", "bg"))
 
             self.assertEqual(shared.disabled_groups, [])
-            self.assertEqual(pool._get_manual("bg"), "shared")
+            self.assertIsNone(pool._get_manual("bg"))  # 手动切换只写当前指针（2026-10-30 口径）
+            self.assertEqual(pool._get_current("bg"), "shared")
 
     def test_membership_change_prunes_disabled_groups(self):
         with tempfile.TemporaryDirectory() as tmp:

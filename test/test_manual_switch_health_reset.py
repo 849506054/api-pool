@@ -137,7 +137,7 @@ class ManualSwitchClearsHealthTests(unittest.TestCase):
             pool.chat([{"role": "user", "content": "again"}])
 
             self.assertEqual(hits, ["cooling", "cooling"])
-            self.assertEqual(pool._get_manual(pool.MAIN_GROUP), "cooling")
+            self.assertIsNone(pool._get_manual(pool.MAIN_GROUP))  # 手动切换只写当前指针（2026-10-30 口径）
             self.assertEqual(pool._get_current(pool.MAIN_GROUP), "cooling")
             self.assertEqual(cooling._health, "ok")
 

@@ -236,7 +236,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool._on_success(old, {"choices": []}, expected_route_epoch=request_epoch)
 
             self.assertEqual(pool._get_current(pool.MAIN_GROUP), manual.id)
-            self.assertEqual(pool._get_manual(pool.MAIN_GROUP), manual.id)
+            self.assertIsNone(pool._get_manual(pool.MAIN_GROUP))  # 手动切换只写当前指针（2026-10-30 口径）
 
     def test_chat_inflight_success_does_not_override_manual_switch(self):
         with tempfile.TemporaryDirectory() as tmp_path:
@@ -266,7 +266,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
 
             self.assertFalse(worker.is_alive())
             self.assertEqual(pool._get_current(pool.MAIN_GROUP), manual.id)
-            self.assertEqual(pool._get_manual(pool.MAIN_GROUP), manual.id)
+            self.assertIsNone(pool._get_manual(pool.MAIN_GROUP))  # 手动切换只写当前指针（2026-10-30 口径）
 
     def test_late_failure_does_not_override_newer_manual_switch(self):
         with tempfile.TemporaryDirectory() as tmp_path:
@@ -282,7 +282,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool._rotate(old, "HTTP 503: simulated", expected_route_epoch=request_epoch)
 
             self.assertEqual(pool._get_current(pool.MAIN_GROUP), manual.id)
-            self.assertEqual(pool._get_manual(pool.MAIN_GROUP), manual.id)
+            self.assertIsNone(pool._get_manual(pool.MAIN_GROUP))  # 手动切换只写当前指针（2026-10-30 口径）
 
     def test_late_success_does_not_override_background_failback(self):
         with tempfile.TemporaryDirectory() as tmp_path:

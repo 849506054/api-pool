@@ -4826,21 +4826,29 @@ class APIPool:
         return max(0, int(min(remainings)))
 
     def switch_main_to_subgroup(self, sub):
-        """手动把 main 切到一个已加入子组整体（口径A）：main 手动/当前指针指向子组名，
-        每次请求由子组按自身优先级+可用性选端点。返回 (ok, message)。
+        """手动把 main 切到一个已加入子组整体（口径A）：main 当前指针指向子组名，
+        每次请求由子组按自身优先级+可用性选端点。
 
-        整组冻结（组内无可用端点且全部冷却中）时拒绝：与普通端点冻结后不可手动
-        切到它同语义，避免切过去后请求立刻落空。"""
+        子组整组被当作一个端点使用，所以这里与手动切换普通端点同构：
+        - 用户断言该子组现在可用 → 组内每个端点清掉观测态（冷却/失败计数/上次错误/
+          手动解冻标记），健康置回 unknown，由真实请求重新分类；因此组内全在冷却时
+          也允许切换，不再拒绝；
+        - main 组此前的等待意图（各端点上的延迟回切、组级回切锁/待回切）作废；
+        - 只写当前指针，不写持续覆盖的手动状态；子组成员、优先级、子组自身指针不变。
+        """
         with self._lock:
             if sub not in self._joined_subgroups():
                 return False, f"子组 '{sub}' 未加入 main"
-            frozen_remaining = self._group_all_frozen_remaining(sub)
-            if frozen_remaining > 0:
-                return False, (f"子组 '{sub}' 组内端点全部冻结"
-                               f"（最短剩余 {frozen_remaining}s），暂不能切换")
-            self._set_manual(self.MAIN_GROUP, sub)
+            for ep in self._endpoints:
+                if ep.enabled and ep.in_pool and sub in self._ep_groups(ep):
+                    self._reset_endpoint_assertion_state(ep, defer_group=sub)
+            self._clear_group_waiting_state(self.MAIN_GROUP)
             self._set_current(self.MAIN_GROUP, sub)
-            sys_log(f"手动切换 main → 子组 '{sub}'（整组作为 main 成员，按子组优先级选端点）", "INFO", group=sub)
+            sys_log(
+                f"手动切换 main → 子组 '{sub}'（整组作为 main 成员，按子组优先级选端点；"
+                f"组内端点按用户断言重置为待验证，main 的延迟回切与回切锁已作废）",
+                "INFO", group=sub,
+            )
             return True, sub
 
     def set_main_priority(self, sub, priority):
@@ -5003,9 +5011,11 @@ class APIPool:
                         ep.disabled_groups = [g for g in (ep.disabled_groups or []) if g != grp]
                     self._reset_endpoint_assertion_state(ep, defer_group=grp)
                     grp = group or self.MAIN_GROUP
-                    self._set_manual(grp, ep_id)
+                    # 手动指定 = 用户主观要求这个端点工作：本组此前的等待意图随之作废，
+                    # 指针之外不留持续覆盖（2026-10-30 口径）。
+                    self._clear_group_waiting_state(grp)
                     self._set_current(grp, ep_id)
-                    sys_log(f"手动切换端点: '{self._endpoint_log_label(ep, grp)}'（按用户断言重置为待验证：清除冷却/上游配额/余额冻结与失败计数）", "INFO")
+                    sys_log(f"手动切换端点: '{self._endpoint_log_label(ep, grp)}'（按用户断言重置为待验证：清除冷却/上游配额/余额冻结与失败计数；本组延迟回切与回切锁已作废）", "INFO")
                     return True
         return False
 
@@ -5790,6 +5800,21 @@ class APIPool:
             for grp in groups:
                 ep._defer_until_by_group.pop(grp, None)
                 ep._defer_borrow_by_group.discard(grp)
+
+    def _clear_group_waiting_state(self, group):
+        """手动指定端点后，本组此前的等待意图全部作废。
+
+        组内每个端点身上挂着的本组延迟回切/借用避让、组级回切锁与待回切标记一起清掉，
+        只留当前指针：用户已主观选定端点，那些「等某个端点空闲/跑完再回切」的计划没有
+        继续执行的理由，留着只会在下一次轮换或借用释放时把指针拉回旧意图。
+        """
+        for ep in self._endpoints:
+            ep._defer_until_by_group.pop(group, None)
+            ep._defer_borrow_by_group.discard(group)
+        # 旧口径留下的持续覆盖（手动锁）一并作废：手动切换只表达「现在用这个端点」。
+        self._set_manual(group, None)
+        self._fallback_lock_until_by_group.pop(group, None)
+        self._group_fallback_pending.pop(group, None)
 
     @staticmethod
     def _defer_remaining_max(ep, now=None):
@@ -9700,7 +9725,6 @@ if isinstance(restored_groups, dict):
         # 具体端点由路由时下钻决定；子组必须仍处于已加入状态，否则视为残留。
         if grp == pool.MAIN_GROUP and ep_id in pool._joined_subgroups():
             pool._set_current(grp, ep_id)
-            pool._set_manual(grp, ep_id)
             pool._set_persisted(grp, ep_id)
             continue
         # main 指针还可能是「已加入子组的成员端点 id」（2026-09-27）：旧版本会在请求成功后
@@ -9721,7 +9745,6 @@ if isinstance(restored_groups, dict):
             )
             if owner_sub is not None:
                 pool._set_current(grp, owner_sub)
-                pool._set_manual(grp, owner_sub)
                 pool._set_persisted(grp, owner_sub)
                 continue
         restored_endpoint = next(

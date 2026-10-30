@@ -279,7 +279,7 @@ class GroupJoinMainTests(unittest.TestCase):
             pool.set_main_priority("bg", 2)
             self.assertTrue(pool.switch_main_to_subgroup("bg")[0])
             # main 指针=子组名
-            self.assertEqual(pool._get_manual("main"), "bg")
+            self.assertIsNone(pool._get_manual("main"))
             # 下钻：子组内最高优先级可用端点 b2
             self.assertEqual(pool._resolve_subgroup_current("bg"), "b2")
             # 请求真正落到子组端点
@@ -288,12 +288,12 @@ class GroupJoinMainTests(unittest.TestCase):
             self.assertIn(r["choices"][0]["message"]["content"], ("from-b2", "from-b1"))
             # 关键回归（2026-09-27）：请求成功后 main 指针必须仍指向子组名，
             # 不得被下钻出的端点 id 覆盖，否则下一次请求自动跳回 main 原生端点。
-            self.assertEqual(pool._get_manual("main"), "bg")
+            self.assertIsNone(pool._get_manual("main"))
             self.assertEqual(pool._get_current("main"), "bg")
             # 第二个请求仍走子组（不被回写成 m1）
             r2 = pool.chat([{"role": "user", "content": "y"}], model="api-pool")
             self.assertIn(r2["choices"][0]["message"]["content"], ("from-b2", "from-b1"))
-            self.assertEqual(pool._get_manual("main"), "bg")
+            self.assertIsNone(pool._get_manual("main"))
 
     def test_switch_subgroup_follows_current_endpoint_change(self):
         """子组当前端点变化时，main 手动指向子组自动跟随（不锁死具体端点）。"""
@@ -328,7 +328,7 @@ class GroupJoinMainTests(unittest.TestCase):
             pool = self.make_pool(module, [m1, b1], {"bg": {"type": "mixed", "model": "bg"}})
             pool.set_main_priority("bg", 2)
             pool.switch_main_to_subgroup("bg")
-            self.assertEqual(pool._get_manual("main"), "bg")
+            self.assertEqual(pool._get_current("main"), "bg")
             pool.delete_group("bg")
             self.assertIsNone(pool._get_manual("main"))
             self.assertIsNone(pool._get_current("main"))
@@ -347,7 +347,7 @@ class GroupJoinMainTests(unittest.TestCase):
             self.assertEqual(newname, "bg2")
             self.assertEqual(pool._joined_subgroups(), {"bg2": 2})
             # main 指针跟随改名
-            self.assertEqual(pool._get_manual("main"), "bg2")
+            self.assertEqual(pool._get_current("main"), "bg2")
 
     # ── persist / restore ──
 
@@ -393,7 +393,7 @@ class GroupJoinMainTests(unittest.TestCase):
             pool = module.pool
             self.assertIn("bg", pool._joined_subgroups())
             # 恢复为子组名（而非被 WARN 忽略 / 或锁死在端点 id 上）
-            self.assertEqual(pool._get_manual("main"), "bg")
+            self.assertIsNone(pool._get_manual("main"))
             self.assertEqual(pool._get_current("main"), "bg")
             # 下钻仍解析到同一端点，且后续请求走该子组
             self.assertEqual(pool._resolve_subgroup_current("bg"), "b1")
@@ -436,8 +436,8 @@ class GroupJoinMainTests(unittest.TestCase):
             b1._cooldown_until = time.time() - 10  # 已过期
             self.assertEqual(pool._group_all_frozen_remaining("bg"), 0)
 
-    def test_switch_main_to_frozen_subgroup_rejected(self):
-        """整组冻结的子组拒绝手动切换（与普通端点冻结后不可切到同语义）。"""
+    def test_switch_main_to_frozen_subgroup_resets_observation(self):
+        """整组冻结的子组也能切：用户断言优先，组内端点观测态被重置后由真实请求重新分类。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
@@ -445,14 +445,16 @@ class GroupJoinMainTests(unittest.TestCase):
             pool = self.make_pool(module, [m1, b1], {"bg": {"type": "mixed", "model": "bg"}})
             pool.set_main_priority("bg", 2)
             b1._cooldown_until = time.time() + 600
-            ok, msg = pool.switch_main_to_subgroup("bg")
-            self.assertFalse(ok)
-            self.assertIn("全部冻结", msg)
-            # 指针未被写入
-            self.assertIsNone(pool._get_manual("main"))
+            b1._fail_count = 3
+            ok, _ = pool.switch_main_to_subgroup("bg")
+            self.assertTrue(ok)
+            self.assertEqual(pool._get_current("main"), "bg")
+            self.assertLessEqual(b1._cooldown_until, time.time())
+            self.assertEqual(b1._fail_count, 0)
+            self.assertEqual(b1._health, "unknown")
 
     def test_switch_main_to_healthy_subgroup_allowed(self):
-        """有可用端点的子组可正常手动切换（冻结守卫不影响正常路径）。"""
+        """有可用端点的子组可正常手动切换（重置路径不影响正常情形）。"""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
@@ -461,7 +463,7 @@ class GroupJoinMainTests(unittest.TestCase):
             pool.set_main_priority("bg", 2)
             ok, _ = pool.switch_main_to_subgroup("bg")
             self.assertTrue(ok)
-            self.assertEqual(pool._get_manual("main"), "bg")
+            self.assertEqual(pool._get_current("main"), "bg")
 
     # ── 零回归 ──
 
