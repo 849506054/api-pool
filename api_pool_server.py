@@ -6251,7 +6251,6 @@ class APIPool:
                     # （探活/请求期间 current 被并发修改，如场景9 竞态）。
                     # 分组池：只按本组当前端点判断——main 不受子组指针影响，子组也不替 main 决定。
                     cur = current_eps.get(grp)
-                    protected = cur is not None and cur is not ep and cur.deferrable
                     pool_active = self._last_pool_activity > now - defer_window
                     # 释放条件（2026-10-05 用户定稿）：
                     # - 借用避让型：只看**接手端点**执行完了没——该端点自身无新成功请求
@@ -6259,9 +6258,42 @@ class APIPool:
                     #   回迁后 main 若再抢占，后续请求重新避让、本组再交给组内其他端点接手。
                     # - 缓存保护型：沿用全池活跃判据（池还在忙就不切走当前端点）。
                     is_borrow = grp in ep._defer_borrow_by_group
-                    takeover_idle = (cur is not None and cur._last_success_ts > 0
+                    manual_id = self._get_manual(grp) if is_borrow else None
+                    if is_borrow and manual_id is not None and manual_id != ep.id:
+                        # 手动决定优先：窗口期内用户把本组切到了别的端点，交接作废。
+                        # 回切不得把指针从用户刚选的端点拉走，更不能清掉这把锁
+                        # （2026-10-30 产线：feishu 15:32 挂借用 defer，15:48 手动切
+                        # AgentRouter，16:07 旧码按手动端点的空闲时间判「接手端点跑完」，
+                        # 清锁并把指针拉回被 main 占用的共享端点）。
+                        ep._defer_until_by_group.pop(grp, None)
+                        ep._defer_borrow_by_group.discard(grp)
+                        target = next((e for e in self._endpoints if e.id == manual_id), None)
+                        label = self._endpoint_log_label(target, grp) if target else manual_id
+                        sys_log(
+                            f"端点 '{self._endpoint_log_label(ep, grp)}' 延迟回切取消"
+                            f"（组已手动切换到 '{label}'，保留当前端点）",
+                            "INFO",
+                        )
+                        continue
+                    # 接手端点 = 本组现在真正当班的那个端点；指针还停在被 main 占用的
+                    # 这个端点上时不存在接手端点，谈不上「跑完」。
+                    takeover_idle = (cur is not None and cur is not ep
+                                     and cur._last_success_ts > 0
                                      and (now - cur._last_success_ts) >= defer_window)
-                    if protected and (not takeover_idle if is_borrow else pool_active):
+                    if is_borrow:
+                        if manual_id is None and (cur is None or cur is ep):
+                            # 尚未交接：请求被剔除但组指针没挪过（同一秒内挂上又解除、
+                            # 指针原地不动的那对日志即此形态，2026-10-30 收紧）。
+                            # 没有可等的接手端点 → 续期保持，不打解除行、不动指针。
+                            ep._defer_until_by_group[grp] = now + defer_window
+                            continue
+                        # 借用型只看接手端点自身停走，与缓存保护的 deferrable 开关无关
+                        # （接手端点是整点/批处理端点时同样要等它跑完）。
+                        hold = manual_id != ep.id and not takeover_idle
+                    else:
+                        protected = cur is not None and cur is not ep and cur.deferrable
+                        hold = protected and pool_active
+                    if hold:
                         ep._defer_until_by_group[grp] = now + defer_window  # 滚动延长，保持 cache
                     else:
                         ep._defer_until_by_group.pop(grp, None)

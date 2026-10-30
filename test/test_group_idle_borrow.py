@@ -301,6 +301,86 @@ class IdleBorrowTests(unittest.TestCase):
             self.assertEqual(pool._get_current("bg"), "b1")  # 指针不被顶走
             self.assertEqual(pool._get_manual("bg"), "b2")  # 手动锁保留
 
+    def test_no_handoff_keeps_defer_without_release(self):
+        """回归（2026-10-30 产线噪音）：指针还没挪开就当没有交接，不解除、不打日志。
+
+        产线样本：pool-bg 指针停在 Tokenrhythm（被 main 占用），每次请求挂 defer、
+        下一个 reconcile 立刻「解除」，同一秒成对，指针原地没动。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module(tmp)
+            pool, shared = self.make_pool(module)
+            pool._set_group_idle_seconds("main", 600)
+            pool._set_current("bg", "shared")      # 当班在共享端点，还没被顶走
+            self.main_used(shared, time.time() - 60)
+            pool._group_sticky_candidates("bg")
+            self.assertIn("bg", shared._defer_until_by_group)
+
+            with mock.patch.object(module, "sys_log") as log:
+                pool._reconcile_deferred()
+
+            self.assertIn("bg", shared._defer_until_by_group)   # defer 保持等待
+            self.assertEqual(pool._get_current("bg"), "shared")
+            lines = [c.args[0] for c in log.call_args_list if "延迟回切解除" in str(c.args[0])]
+            self.assertEqual([], lines)
+
+    def test_non_deferrable_takeover_still_waits_for_idle(self):
+        """借用型等待与接手端点的缓存保护开关无关：deferrable=False 也要等它跑完。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module(tmp)
+            pool, shared = self.make_pool(module)
+            pool._set_group_idle_seconds("main", 600)
+            pool._set_current("bg", "shared")
+            b1 = next(e for e in pool._endpoints if e.id == "b1")
+            b1.deferrable = False                     # 接手端点未开缓存保护
+            self.main_used(shared, time.time() - 60)
+            pool._group_sticky_candidates("bg")
+            self.assertIn("bg", shared._defer_until_by_group)
+
+            pool._set_current("bg", "b1")             # b1 接手
+            b1._last_success_ts = time.time()         # 刚跑过
+            pool._reconcile_deferred()
+            self.assertEqual(pool._get_current("bg"), "b1")     # 仍在执行 → 不解除
+            self.assertIn("bg", shared._defer_until_by_group)
+
+            b1._last_success_ts = time.time() - 400   # 停走满窗口
+            pool._reconcile_deferred()
+            self.assertEqual(pool._get_current("bg"), "shared")
+
+    def test_manual_switch_during_defer_window_cancels_return(self):
+        """回归（2026-10-30 产线）：窗口期内用户手动切端点 → 回切作废，保留手动端点。
+
+        产线样本：feishu 15:32:58 在共享端点挂 300s 借用 defer（接手端点为
+        CodeBuddy-feishu），15:48 用户手动切到 AgentRouter，16:07 旧码按手动端点
+        自身的空闲时间判「接手端点跑完」，清掉手动锁并把指针拉回 Tokenrhythm。
+        手动选择晚于挂 defer，优先级最高，回切不得覆盖。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module(tmp)
+            pool, shared = self.make_pool(module)
+            pool._set_group_idle_seconds("main", 600)
+            pool._set_current("bg", "shared")           # 当班在共享端点
+            b1 = next(e for e in pool._endpoints if e.id == "b1")
+            b2 = next(e for e in pool._endpoints if e.id == "b2")
+            self.main_used(shared, time.time() - 60)    # main 正在用
+            pool._group_sticky_candidates("bg")         # → 挂借用 defer
+            self.assertIn("bg", shared._defer_until_by_group)
+
+            pool._set_current("bg", "b1")               # b1 接手
+            b1._last_success_ts = time.time() - 400     # 接手端点早已跑完
+            pool._set_manual("bg", "b2")                # 用户手动切到 b2
+            b2._last_success_ts = time.time() - 400     # 与产线同形：手动端点自身也空闲
+
+            with mock.patch.object(module, "sys_log") as log:
+                pool._reconcile_deferred()
+
+            self.assertEqual(pool._get_current("bg"), "b1")  # 指针不被顶到共享端点
+            self.assertEqual(pool._get_manual("bg"), "b2")   # 手动锁保留
+            self.assertNotIn("bg", shared._defer_until_by_group)
+            lines = [c.args[0] for c in log.call_args_list if "延迟回切取消" in str(c.args[0])]
+            self.assertEqual(len(lines), 1, lines)
+            self.assertIn("b2", lines[0])
+
     def test_rotate_enabled_group_does_not_mount_defer(self):
         """配了轮换的组不挂 defer：轮换本就是组内循环意图，回切会与之拉锯。"""
         with tempfile.TemporaryDirectory() as tmp:
