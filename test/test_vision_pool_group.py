@@ -292,24 +292,13 @@ class VisionPoolGroupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             pool = module.APIPool([])
-            m_ab = [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "a"}},
-                {"type": "image_url", "image_url": {"url": "b"}},
-            ]}]
-            m_ab_again = [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "a"}},
-                {"type": "image_url", "image_url": {"url": "b"}},
-            ]}]
-            m_ba = [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "b"}},
-                {"type": "image_url", "image_url": {"url": "a"}},
-            ]}]
-            m_c = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "c"}}]}]
-            # 同一批图片（有序签名）→ 同 key；顺序变化/换图 → 不同 key；无图 → None
-            self.assertEqual(pool._vision_cache_key(m_ab), pool._vision_cache_key(m_ab_again))
-            self.assertNotEqual(pool._vision_cache_key(m_ab), pool._vision_cache_key(m_ba))
-            self.assertNotEqual(pool._vision_cache_key(m_ab), pool._vision_cache_key(m_c))
-            self.assertIsNone(pool._vision_cache_key([{"role": "user", "content": "text"}]))
+            def part(url, **kwargs):
+                return {"type": "image_url", "image_url": {"url": url, **kwargs}}
+            self.assertEqual(pool._vision_cache_key(part("a")), pool._vision_cache_key(part("a", detail="auto")))
+            self.assertNotEqual(pool._vision_cache_key(part("a")), pool._vision_cache_key(part("b")))
+            self.assertNotEqual(pool._vision_cache_key(part("a", detail="low")), pool._vision_cache_key(part("a", detail="high")))
+            self.assertEqual(pool._vision_cache_key({"type": "image_url", "image_url": "a"}), pool._vision_cache_key(part("a")))
+            self.assertIsNone(pool._vision_cache_key({"type": "text", "text": "a"}))
 
 
     # ── 入池前探测夹具 ──

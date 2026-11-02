@@ -165,7 +165,7 @@ class NullContentTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
-    def test_image_translation_falls_back_to_reasoning_when_content_is_null(self):
+    def test_image_translation_preserves_image_when_only_reasoning_is_returned(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             # 图片解析池 = 系统内置 vision 组（2026-09-12）：端点入内置池即可
@@ -198,7 +198,8 @@ class NullContentTests(unittest.TestCase):
                 }
             ]
             translated = pool._translate_images_sync(messages, [ep])
-            self.assertIn("image description", translated[0]["content"][0]["text"])
+            self.assertEqual(translated, messages)
+            self.assertEqual(pool._vision_cache, {})
 
 
 if __name__ == "__main__":

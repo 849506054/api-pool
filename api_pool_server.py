@@ -366,6 +366,8 @@ def _group_from_message(msg):
 
 
 def sys_log(msg, level="INFO", group=None):
+    if level == "DEBUG" and not globals().get("_DEBUG_LOGGING", False):
+        return
     grp = group or _current_log_group() or _group_from_message(msg)
     if _group_log_records(grp, level):
         sys_logger.log(level, msg, grp)
@@ -3158,8 +3160,10 @@ class APIPool:
         # 池自身出站的默认身份 profile（探活/测试/拉模型；2026-09-12）
         self._probe_client_profile: str = load_probe_client_profile()
         self._identity_skip_log_ts: dict = {}   # 无身份跳过日志去重 {(ep_id, reason): ts}
-        # 图片翻译短 TTL 缓存：图片集合签名 → (时间戳, 描述)，消除多轮重发历史含图的重译（2026-09-10 视觉池组）
+        # 单图源 + detail → (时间戳, 成功描述)；专用有界条带锁串行化同图冷解析。
         self._vision_cache: dict[str, tuple[float, str]] = {}
+        self._vision_cache_lock = threading.RLock()
+        self._vision_image_locks = [threading.Lock() for _ in range(self._VISION_CACHE_MAX)]
         # 端点模型目录短 TTL 缓存：连接指纹 → (时间戳, 模型列表)。UI 展开聚合池/模型
         # 下拉会按需拉取，逐个上游往返 0.2~4 秒；缓存后页面刷新不再重复打上游
         # （2026-10-01）。键含连接指纹，端点配置变更自动换键。
@@ -4615,7 +4619,7 @@ class APIPool:
                 if close:
                     close()
 
-    def _wrap_stream_release(self, gen, ep_id, group):
+    def _wrap_stream_release(self, gen, ep_id, group, prefix=b""):
         """流式响应外层 generator：正常结束/异常/提前关闭时释放在途占用。
 
         泄漏兜底：若消费方从不迭代也不 close（罕见），10 分钟无活动的清零
@@ -4623,10 +4627,22 @@ class APIPool:
         也是合法释放路径。
         """
         try:
+            if prefix:
+                # 先启动目标 generator，使提示后立刻 close 也能执行其资源清理。
+                try:
+                    first = next(gen)
+                except StopIteration:
+                    return
+                yield prefix
+                yield first
             yield from gen
         finally:
-            with self._lock:
-                self._release_inflight(ep_id, group)
+            try:
+                if hasattr(gen, "close"):
+                    gen.close()
+            finally:
+                with self._lock:
+                    self._release_inflight(ep_id, group)
 
     def _is_ep_sticky_elsewhere(self, ep, group):
         """子组避让 main 的当前工作端点；main 不受子组指针约束。
@@ -5563,31 +5579,6 @@ class APIPool:
         return False
 
     @staticmethod
-    def _strip_historical_images(messages):
-        """保留最新助手消息之后的图片；历史文字与工具调用结构原样保留。"""
-        boundary = next((i for i in range(len(messages) - 1, -1, -1)
-                         if messages[i].get("role") == "assistant"), -1)
-        if boundary < 0:
-            return messages
-        result = list(messages)
-        removed = 0
-        for i, msg in enumerate(messages[:boundary + 1]):
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            kept = [part for part in content
-                    if not (isinstance(part, dict) and part.get("type") == "image_url")]
-            count = len(content) - len(kept)
-            if count:
-                removed += count
-                # 纯图片历史消息保留位置，避免空 content 被严格上游拒绝。
-                result[i] = {**msg, "content": kept or [{"type": "text", "text": "[历史图片]"}]}
-        if removed:
-            sys_log(f"历史图片已略过：{removed} 张，助手消息边界={boundary}；仅解析本轮新图", "INFO")
-            return result
-        return messages
-
-    @staticmethod
     def _normalize_strict400_retries(value):
         """严格校验 400 同端点重试上限：只允许 0/1/2（2026-09-12）。"""
         try:
@@ -5611,147 +5602,169 @@ class APIPool:
     _MODELS_CACHE_MAX = 512  # 缓存条目上限（按连接指纹计，条数 ≈ 端点数的数倍）
 
     @staticmethod
-    def _vision_cache_key(translation_msgs):
-        """图片集合签名：全部 image_url 的有序 md5；无图 → None。"""
-        urls = []
-        for m in translation_msgs:
-            content = m.get("content") if isinstance(m, dict) else None
-            if not isinstance(content, list):
-                continue
-            for c in content:
-                if isinstance(c, dict) and c.get("type") == "image_url":
-                    u = c.get("image_url")
-                    if isinstance(u, dict):
-                        u = u.get("url", "")
-                    if u:
-                        urls.append(str(u))
-        if not urls:
+    def _vision_cache_key(part):
+        """单图 URL/data URL 与有效 detail 的身份；省略 detail 等同 auto。"""
+        if not isinstance(part, dict) or part.get("type") != "image_url":
             return None
-        return hashlib.md5("|".join(urls).encode("utf-8")).hexdigest()
+        source = part.get("image_url")
+        detail = "auto"
+        if isinstance(source, dict):
+            detail = source.get("detail") or "auto"
+            source = source.get("url")
+        if not isinstance(source, str) or not source:
+            return None
+        identity = json.dumps([source, detail], ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
     def _vision_cache_get(self, key):
         if not key:
             return None
-        item = self._vision_cache.get(key)
-        if not item:
-            return None
-        ts, desc = item
-        if time.time() - ts > self._VISION_CACHE_TTL:
-            self._vision_cache.pop(key, None)
-            return None
-        return desc
+        with self._vision_cache_lock:
+            item = self._vision_cache.get(key)
+            if not item:
+                return None
+            ts, desc = item
+            if time.time() - ts >= self._VISION_CACHE_TTL:
+                self._vision_cache.pop(key, None)
+                return None
+            return desc
 
     def _vision_cache_set(self, key, desc):
-        if not key or not desc:
+        if not key or not isinstance(desc, str) or not desc.strip():
             return
-        if len(self._vision_cache) >= self._VISION_CACHE_MAX:
-            now = time.time()
-            for k in [k for k, (ts, _) in list(self._vision_cache.items())
-                      if now - ts > self._VISION_CACHE_TTL]:
-                self._vision_cache.pop(k, None)
+        with self._vision_cache_lock:
             if len(self._vision_cache) >= self._VISION_CACHE_MAX:
-                # 全部新鲜：按插入序丢最旧一条（近似 LRU，够用）
-                self._vision_cache.pop(next(iter(self._vision_cache)), None)
-        self._vision_cache[key] = (time.time(), desc)
+                now = time.time()
+                for k in [k for k, (ts, _) in self._vision_cache.items()
+                          if now - ts >= self._VISION_CACHE_TTL]:
+                    self._vision_cache.pop(k, None)
+                if len(self._vision_cache) >= self._VISION_CACHE_MAX:
+                    self._vision_cache.pop(next(iter(self._vision_cache)), None)
+            self._vision_cache[key] = (time.time(), desc)
+
+    @staticmethod
+    def _vision_notice(text):
+        return b"data: " + json.dumps({"choices": [{"index": 0, "delta": {"content": text}}]},
+                                      ensure_ascii=False).encode("utf-8") + b"\n\n"
 
     def _translate_images_sync(
         self, messages, active_eps, pool_group=None, request_id=None, request_deadline=None,
+        *, allow_translation=True, stats=None,
     ):
-        """图片转译：候选来源 = 系统内置图片解析池（VISION_GROUP），不再从请求组内抓取任意视觉端点。
+        work = self._translate_images_iter(
+            messages, active_eps, pool_group, request_id, request_deadline,
+            allow_translation=allow_translation, stats=stats,
+        )
+        try:
+            while True:
+                next(work)
+        except StopIteration as done:
+            return done.value
+        finally:
+            work.close()
 
-        降级策略（2026-09-10 拍板 B）：视觉池无可用成员时本函数静默返回原消息，
-        图片原样交给目标端点；降级告警由调用方（chat 拦截处）记录一次。
-        """
-        messages = self._strip_historical_images(messages)
-        if not self._has_images(messages):
-            return messages
-        vision_eps, vision_group = self._vision_pool_candidates()
-        if not vision_eps:
-            return messages
-
-        translation_msgs = []
-        for m in messages:
-            if isinstance(m.get("content"), list):
-                new_content = []
-                has_image = False
-                for c in m["content"]:
-                    if c.get("type") == "image_url":
-                        has_image = True
-                        new_content.append(c)
-                if has_image:
-                    translation_msgs.append({"role": "user", "content": new_content})
-
-        if not translation_msgs:
-            return messages
-
-        cache_key = self._vision_cache_key(translation_msgs)
-        description = self._vision_cache_get(cache_key) or ""
-
-        if description:
-            sys_log(f"图片解析命中缓存，跳过转译（视觉池 '{vision_group}'）", "INFO")
-        else:
-            sys_prompt = "你是一个专业图像解析器。请将用户提供的图片内容转化为极其详细的文字描述（包括画面细节、OCR文字、代码片段等），只输出文字描述，不要有多余的客套话。"
-            translation_msgs.insert(0, {"role": "system", "content": sys_prompt})
-
-            for v_ep in vision_eps:
-                v_label = self._endpoint_log_label(v_ep, vision_group, v_ep.model)
-                sys_log(f"启动图片解析 -> 视觉池 '{vision_group}' 端点 '{v_label}'", "INFO")
-                payload = {"model": v_ep.model, "messages": translation_msgs, "stream": False, "max_tokens": 4096}
-                result, error = self._try_endpoint(
-                    v_ep, payload, timeout=60, log_usage=True, force_no_retry=True,
-                    pool_group=vision_group, request_id=request_id,
-                    request_deadline=request_deadline,
-                )
-                if error:
-                    sys_log(f"图片解析端点 '{v_label}' 请求失败: {error}", "WARNING")
-                    # 失败写阶梯短冷却（幂等：已冷却不刷新），避免坏端点让每个图片请求重复付 60s 超时
-                    with self._lock:
-                        v_ep._fail_count = int(v_ep._fail_count or 0) + 1
-                        self._set_probe_cooldown(v_ep, 60, 600)
-                        v_ep._cooldown_reason = "vision_translate_failed"
+    def _translate_images_iter(
+        self, messages, active_eps, pool_group=None, request_id=None, request_deadline=None,
+        *, allow_translation=True, stats=None,
+    ):
+        """逐图原位替换；只有实际冷解析才产出提示，定向请求只读取成功缓存。"""
+        stats = stats if stats is not None else {}
+        stats.update(reused=0, parsed=0, unresolved=0)
+        result = list(messages)
+        memo = {}  # 本次请求内的成功与失败去重，容量随输入有界。
+        started = False
+        request_tag = f"[req={request_id or '-'}] "
+        deadline = request_deadline if request_deadline is not None else time.time() + self._FALLBACK_DEADLINE_SECONDS
+        for i, msg in enumerate(messages):
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            parts = list(content)
+            changed = False
+            for j, part in enumerate(content):
+                if not isinstance(part, dict) or part.get("type") != "image_url":
                     continue
-
-                if isinstance(result, str):
-                    description = result
-                    result_message = {}
-                elif isinstance(result, dict):
-                    result_message = (result.get("choices") or [{}])[0].get("message") or {}
-                    description = result_message.get("content") or ""
-                else:
-                    result_message = {}
-                    description = ""
-                if not description.strip():
-                    reasoning = result_message.get("reasoning_content") or ""
-                    if reasoning:
-                        description = reasoning
+                key = self._vision_cache_key(part)
+                description = memo.get(key) if key in memo else self._vision_cache_get(key)
+                parsed = False
+                if not description and key and key not in memo and allow_translation:
+                    # 专用条带锁只阻塞对应哈希槽，不持有全局池锁；等待受请求预算约束。
+                    lock = self._vision_image_locks[int(key, 16) % len(self._vision_image_locks)]
+                    acquired = lock.acquire(timeout=max(0.0, deadline - time.time()))
+                    try:
+                        description = self._vision_cache_get(key)
+                        if acquired and not description and time.time() < deadline:
+                            vision_eps, vision_group = self._vision_pool_candidates()
+                            translation_msgs = [
+                                {"role": "system", "content": "你是一个专业图像解析器。请将用户提供的图片内容转化为极其详细的文字描述（包括画面细节、OCR文字、代码片段等），只输出文字描述，不要有多余的客套话。"},
+                                {"role": "user", "content": [_copy.deepcopy(part)]},
+                            ]
+                            for v_ep in vision_eps:
+                                if time.time() >= deadline:
+                                    break
+                                if not started:
+                                    started = True
+                                    yield self._vision_notice("[API Pool: 检测到图片，当前目标不支持视觉，正在调用视觉模型进行解析...]\n\n")
+                                if time.time() >= deadline:
+                                    break
+                                v_label = self._endpoint_log_label(v_ep, vision_group, v_ep.model)
+                                sys_log(f"{request_tag}启动图片解析 -> 视觉池 '{vision_group}' 端点 '{v_label}'", "INFO", group=pool_group)
+                                payload = {"model": v_ep.model, "messages": translation_msgs, "stream": False, "max_tokens": 4096}
+                                try:
+                                    reply, error = self._try_endpoint(
+                                        v_ep, payload, timeout=60, log_usage=True, force_no_retry=True,
+                                        pool_group=vision_group, request_id=request_id,
+                                        request_deadline=deadline,
+                                    )
+                                except Exception as exc:  # noqa: BLE001 — preserve the original image on provider failures
+                                    reply, error = None, str(exc)
+                                if not error:
+                                    if isinstance(reply, str):
+                                        description = reply
+                                    elif isinstance(reply, dict):
+                                        choices = reply.get("choices")
+                                        choice = choices[0] if isinstance(choices, list) and choices else {}
+                                        message = choice.get("message") if isinstance(choice, dict) else None
+                                        description = message.get("content") if isinstance(message, dict) else None
+                                    if not isinstance(description, str) or not description.strip():
+                                        description = None
+                                        error = "未返回有效图片描述"
+                                if error:
+                                    description = None
+                                    sys_log(f"{request_tag}图片解析端点 '{v_label}' 请求失败: {error}", "WARN", group=pool_group)
+                                    if error != _BUDGET_EXHAUSTED_MSG:
+                                        with self._lock:
+                                            v_ep._fail_count = int(v_ep._fail_count or 0) + 1
+                                            self._set_probe_cooldown(v_ep, 60, 600)
+                                            v_ep._cooldown_reason = "vision_translate_failed"
+                                    continue
+                                with self._lock:
+                                    v_ep._fail_count = 0
+                                    v_ep._cooldown_until = 0
+                                    v_ep._cooldown_reason = ""
+                                self._vision_cache_set(key, description)
+                                parsed = True
+                                break
+                    finally:
+                        if acquired:
+                            lock.release()
+                if key:
+                    memo[key] = description
                 if description:
-                    with self._lock:
-                        v_ep._fail_count = 0
-                        v_ep._cooldown_until = 0
-                        v_ep._cooldown_reason = ""
-                    break
-
-            if not description:
-                sys_log(f"视觉池 '{vision_group}' 内所有端点图片解析均失败", "ERROR")
-                return messages
-
-            self._vision_cache_set(cache_key, description)
-
-        new_msgs = _copy.deepcopy(messages)
-        for m in new_msgs:
-            if isinstance(m.get("content"), list):
-                has_image = False
-                filtered_content = []
-                for c in m["content"]:
-                    if c.get("type") != "image_url":
-                        filtered_content.append(c)
-                    else:
-                        has_image = True
-                if has_image:
-                    filtered_content.append({"type": "text", "text": f"\n\n[图片解析内容]: {description}"})
-                m["content"] = filtered_content
-        sys_log("图片解析完成", "INFO")
-        return new_msgs
+                    parts[j] = {"type": "text", "text": f"\n\n[图片解析内容]: {description}"}
+                    changed = True
+                    stats["parsed" if parsed else "reused"] += 1
+                else:
+                    stats["unresolved"] += 1
+            if changed:
+                result[i] = {**msg, "content": parts}
+        if any(stats.values()):
+            sys_log(f"{request_tag}图片处理：复用={stats['reused']} 新解析={stats['parsed']} 未解析={stats['unresolved']}",
+                    "INFO" if stats["parsed"] else "DEBUG", group=pool_group)
+            if stats["unresolved"]:
+                reason = "定向请求仅复用缓存" if not allow_translation else "解析不可用或预算耗尽"
+                sys_log(f"{request_tag}{reason}，未解析图片={stats['unresolved']}，原样转发目标端点", "WARN", group=pool_group)
+        return result if stats["parsed"] or stats["reused"] else messages
 
     def check_all_health(self):
         """探活全部池内端点；批次互斥且与后台探活共享端点级去重。"""
@@ -7156,7 +7169,7 @@ class APIPool:
                 now = time.time()
                 if now - self._identity_skip_log_ts.get(key, 0) >= 600:
                     self._identity_skip_log_ts[key] = now
-                    sys_log(f"池自身出站已跳过：{label} health_mode=none", "INFO")
+                    sys_log(f"池自身出站已跳过：{label} health_mode=none", "DEBUG")
                 raise PoolIdentityUnavailable(POOL_OUTBOUND_DISABLED_REASON)
 
     def _pool_identity_headers(self, ep, label=""):
@@ -7280,8 +7293,6 @@ class APIPool:
             "model": ep.model, "messages": loop_messages,
             **(extra_payload or {}),
         }
-        if getattr(ep, "is_vision", True) is False:
-            payload["messages"] = self._strip_historical_images(payload["messages"])
         # 出站私有键隔离（2026-10-20）：`_responses_response_format` 是 chat 入口给
         # Responses 桥接留的私有载体（见 chat/completions 入口对 response_format 的改名）。
         # 非 responses 协议的出站体由 payload 原样序列化，必须在此摘掉，否则严格上游
@@ -7328,6 +7339,10 @@ class APIPool:
         sys_log(f"[req={request_id}] 定向请求 endpoint_id={ep.id} model={ep.model} accounting=apipool", "INFO", group=group)
         messages = self._repair_tool_history(messages)
         payload, _ = self._prepare_endpoint_payload(messages, ep, extra_payload)
+        if getattr(ep, "is_vision", True) is False:
+            payload["messages"] = self._translate_images_sync(
+                payload["messages"], [], group, request_id=request_id, allow_translation=False,
+            )
         if ep.max_context_k > 0 and self._estimate_context_tokens(payload["messages"]) > ep.max_context_k * 1000:
             raise EndpointRequestError(400, "Endpoint context limit exceeded")
         # Targeting is exclusive: image content is handled by this endpoint's own protocol.
@@ -7403,7 +7418,7 @@ class APIPool:
         if self._is_fallback_locked_group(group):
             fb = self._get_fallback_endpoint()
             if fb is not None:
-                sys_log(f"终极兜底锁定中（组 '{group}'），直连端点 '{fb.name}'", "INFO", group=group)
+                sys_log(f"终极兜底锁定中（组 '{group}'），直连端点 '{fb.name}'", "DEBUG", group=group)
                 active = [fb]
                 starved = False
             else:
@@ -7465,6 +7480,7 @@ class APIPool:
 
         idx = 0
         previous_attempt_site_id = None
+        image_parse_completed = False
         while tried < total:
             ep = active[idx]
             if getattr(_POOL_INITIATED_CTX, "active", False):
@@ -7533,58 +7549,29 @@ class APIPool:
             ep_prefix = getattr(ep, "tool_call_id_prefix", "") or ""
             skip_prefix_rewrite = False
 
-            # [VISION TRANSLATION INTERCEPT]
-            if self._has_images(payload["messages"]) and getattr(ep, "is_vision", True) is False:
-                vision_cands, vision_grp = self._vision_pool_candidates()
-                if not vision_cands:
-                    # 降级策略 B（2026-09-10）：视觉池无可用端点 → 图片原样直发，
-                    # 打一次 WARNING 保持可观测；不回退"组内任意 is_vision 端点"。
-                    _why = f"图片解析池 '{vision_grp}' 无可用端点"
-                    sys_log(f"{_why}，图片未转译，原样转发目标端点", "WARNING")
-                else:
-                    if payload.get("stream"):
-                        def vision_wrapper(tgt_ep, pld, t_out, a_eps, _grp=group):
-                            import json
-                            yield f"data: {{'choices':[{{'delta':{{'content':'[API Pool: 检测到图片，当前目标不支持视觉，正在调用视觉模型进行解析...]\\n\\n'}}}}]}}\n\n".replace("'", '"').encode("utf-8")
-                            translated_msgs = self._translate_images_sync(
-                                pld["messages"], a_eps, _grp,
-                                request_id=request_id, request_deadline=request_deadline,
-                            )
-                            yield f"data: {{'choices':[{{'delta':{{'content':'[图片解析完成，交由目标模型继续处理...]\\n\\n'}}}}]}}\n\n".replace("'", '"').encode("utf-8")
-                            pld["messages"] = translated_msgs
-                            gen, err = self._try_endpoint(
-                                tgt_ep, pld, t_out, pool_group=group,
-                                request_id=request_id, request_deadline=request_deadline,
-                            )
-                            if err:
-                                yield f"data: {{'choices':[{{'delta':{{'content':'\\n\\n[API Pool Error: 请求最终目标失败: {err}]'}}}}]}}\n\n".replace("'", '"').encode("utf-8")
-                            else:
-                                # 实际请求成功后标记端点成功
-                                # clear_defer：仅当请求开始时端点已在 defer（兜底使用）才清除
-                                with self._lock:
-                                    self._on_success(
-                                        tgt_ep, clear_defer=defer_at_request > 0, group=group,
-                                        expected_route_epoch=request_route_epoch,
-                                    )
-                                yield from gen
-                                with self._lock:
-                                    self._release_inflight(tgt_ep.id, group)
-                        return vision_wrapper(ep, payload, ep_timeout, vision_cands)
-                    else:
-                        payload["messages"] = self._translate_images_sync(
-                            payload["messages"], vision_cands, group,
-                            request_id=request_id, request_deadline=request_deadline,
-                        )
-            
             if tried == 0:
                 sys_log(f"{request_tag}收到 API 请求，尝试请求端点 '{self._endpoint_log_label(ep, group, ep_model)}'", "INFO")
             else:
                 sys_log(f"{request_tag}重试请求，尝试请求端点 '{self._endpoint_log_label(ep, group, ep_model)}'", "INFO")
+
+            # 逐图兼容预处理完成后，所有目标共用上下文检查、重试及轮转。
+            if getattr(ep, "is_vision", True) is False and self._has_images(payload["messages"]):
+                image_stats = {}
+                payload["messages"] = self._translate_images_sync(
+                    payload["messages"], active, group,
+                    request_id=request_id, request_deadline=request_deadline, stats=image_stats,
+                )
+                loop_messages = payload["messages"]
+                if image_stats.get("parsed") and not image_stats.get("unresolved"):
+                    image_parse_completed = True
+
             # 上下文长度检查：超过限制时跳过该端点（不冻结、不记失败），轮转到下一个
             if ep.max_context_k > 0:
                 estimated = self._estimate_context_tokens(loop_messages)
                 if estimated > ep.max_context_k * 1000:
                     sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 上下文约 {estimated}t 超过限制 {ep.max_context_k}K，跳过", "INFO")
+                    with self._lock:
+                        self._release_inflight(ep.id, group)
                     tried += 1
                     idx = (idx + 1) % total
                     continue
@@ -7648,7 +7635,8 @@ class APIPool:
                         # 非流式（或流已由 _try_endpoint 内部消费完）→ 立即释放在途占用；
                         # 流式 generator 的占用由消费方迭代结束时释放（见 stream close 路径）。
                         self._release_inflight(ep.id, group)
-                sys_log(f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 请求成功", "INFO")
+                sys_log(f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 请求成功",
+                        "DEBUG" if payload.get("stream") and isinstance(result, _types.GeneratorType) else "INFO")
                 # 请求耗时 DEBUG（API_POOL_DEBUG / /api/debug 开关控制）
                 if _DEBUG_LOGGING:
                     try:
@@ -7669,7 +7657,10 @@ class APIPool:
                         pass
                 # 所有消费方（含 return_endpoint 的 Responses 入口）共用流式在途释放。
                 if payload.get("stream") and isinstance(result, _types.GeneratorType):
-                    result = self._wrap_stream_release(result, ep.id, group)
+                    # 首个业务帧已验证成功才交付完成提示；失败仍可走共同重试链。
+                    notice = (self._vision_notice("[图片解析完成，交由目标模型继续处理...]\n\n")
+                              if image_parse_completed else b"")
+                    result = self._wrap_stream_release(result, ep.id, group, prefix=notice)
                 return (result, ep) if return_endpoint else result
             if error == _BUDGET_EXHAUSTED_MSG:
                 # 预算在出站前耗尽：该端点一个字节都没收到，端点无责。
@@ -8022,11 +8013,8 @@ class APIPool:
             "underscore_paths": self._cf_probe_paths(payload, und),
         }
 
-    # 失败尝试的出站摘要：URL + body 体积 + 字段规模，**绝不含明文内容**。
-    # 背景（2026-09-13）：ps.air `/responses` 真实请求被阿里云边缘 405 拦截，而探活小 ping 通过；
-    # 池日志此前没有任何出站形态证据，无法证明「探活 vs 真实请求」在 body 上的差异。
-    # 只在失败 attempt 上执行（正常路径零开销）；DEBUG 开关不覆盖此项——它的 trace 只有
-    # {endpoint, result, kind}，开 DEBUG 也拿不到 URL/body 规模。
+    # DEBUG 失败诊断摘要：URL + body 体积 + 字段规模；字段只记录规模。
+    # 仅开启 DEBUG 时解析失败请求的 payload；失败原因、HTTP 码及轮转另有常规日志。
     _OUTBOUND_DIGEST_KEYS = (
         "input", "instructions", "messages", "system", "contents", "systemInstruction",
         "tools", "stream", "store", "previous_response_id", "max_tokens", "max_output_tokens",
@@ -8035,7 +8023,7 @@ class APIPool:
 
     @staticmethod
     def _outbound_digest(url, data):
-        """出站请求摘要（体积/字段规模，无明文）。不抛异常：失败时也必须打得出这行日志。"""
+        """DEBUG 出站请求摘要：体积与字段规模，兼容非 JSON 请求体。"""
         parts = [f"url={url}", f"body_bytes={len(data)}"]
         try:
             obj = json.loads(data.decode("utf-8", errors="ignore"))
@@ -8075,6 +8063,20 @@ class APIPool:
         log_reasoning_effort = self._captured_reasoning_effort(payload, ep)
         endpoint_log_label = self._endpoint_log_label(ep, pool_group)
         request_tag = f"[req={request_id}] " if request_id else ""
+        if _DEBUG_LOGGING and getattr(ep, "is_vision", True):
+            messages = payload.get("messages", [])
+            boundary = next((i for i in range(len(messages) - 1, -1, -1)
+                             if messages[i].get("role") == "assistant"), -1)
+            total = historical = 0
+            for i, message in enumerate(messages):
+                content = message.get("content")
+                if isinstance(content, list):
+                    count = sum(isinstance(part, dict) and part.get("type") == "image_url" for part in content)
+                    total += count
+                    if i <= boundary:
+                        historical += count
+            if total:
+                sys_log(f"{request_tag}图片原样转发 total={total} history={historical} endpoint={ep.id}", "DEBUG", group=pool_group)
         prompt_text_to_log = extract_prompt_text(payload) if log_usage and not ep.name.startswith("test_") else ""
         
         # 协议层处理：Anthropic 端点做完整格式转换以保证 Kcne 缓存 key 一致性
@@ -8092,8 +8094,8 @@ class APIPool:
         elif is_responses:
             url = ep.base_url.rstrip("/") + "/responses"
             responses_payload = _responses_body_from_chat(payload)
-            if self._has_images(payload.get("messages", [])):
-                sys_log(f"{request_tag}Responses 图片桥接 image_url=string detail=part", "INFO", group=pool_group)
+            if _DEBUG_LOGGING and self._has_images(payload.get("messages", [])):
+                sys_log(f"{request_tag}Responses 图片 shape 转换 image_url=string detail=part", "DEBUG", group=pool_group)
             responses_payload.setdefault("model", ep.model)
             responses_payload.pop("response_format", None)
             data = json.dumps(responses_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -9204,11 +9206,12 @@ class APIPool:
                     
                     
             except urllib.error.HTTPError as e:
-                sys_log(
-                    f"{request_tag}端点 '{endpoint_log_label}' 出站摘要(失败{'(探活)' if is_probe else ''}): "
-                    f"{self._outbound_digest(url, data)}",
-                    "WARN",
-                )
+                if _DEBUG_LOGGING:
+                    sys_log(
+                        f"{request_tag}端点 '{endpoint_log_label}' 出站摘要(失败{'(探活)' if is_probe else ''}): "
+                        f"{self._outbound_digest(url, data)}",
+                        "DEBUG",
+                    )
                 err_body = ""
                 try: err_body = _DecodedResponse(e).read().decode("utf-8", errors="ignore")[:1000]
                 except Exception: pass
@@ -9262,11 +9265,12 @@ class APIPool:
                     return None, msg
                 return None, msg
             except (urllib.error.URLError, TimeoutError, OSError) as e:
-                sys_log(
-                    f"{request_tag}端点 '{endpoint_log_label}' 出站摘要(失败{'(探活)' if is_probe else ''}): "
-                    f"{self._outbound_digest(url, data)}",
-                    "WARN",
-                )
+                if _DEBUG_LOGGING:
+                    sys_log(
+                        f"{request_tag}端点 '{endpoint_log_label}' 出站摘要(失败{'(探活)' if is_probe else ''}): "
+                        f"{self._outbound_digest(url, data)}",
+                        "DEBUG",
+                    )
                 msg = f"连接/超时错误: {e}"
                 if attempt < retries:
                     if debug_trace is not None:
@@ -9286,11 +9290,12 @@ class APIPool:
                     continue
                 return None, msg
             except Exception as e:
-                sys_log(
-                    f"{request_tag}端点 '{endpoint_log_label}' 出站摘要(失败{'(探活)' if is_probe else ''}): "
-                    f"{self._outbound_digest(url, data)}",
-                    "WARN",
-                )
+                if _DEBUG_LOGGING:
+                    sys_log(
+                        f"{request_tag}端点 '{endpoint_log_label}' 出站摘要(失败{'(探活)' if is_probe else ''}): "
+                        f"{self._outbound_digest(url, data)}",
+                        "DEBUG",
+                    )
                 return None, f"未知错误: {e}"
         return None, "重试次数用尽"
 
@@ -10078,7 +10083,7 @@ def api_handler(method, path, body):
             sys_log(f"敏感字过滤不可用，拒绝请求: {e}", "ERROR")
             return 503, {"error": {"message": "API Pool content filter unavailable", "type": "service_unavailable"}}, False
         if filter_stats.get("matched"):
-            sys_log(f"敏感字过滤命中 {filter_stats['matched']} 处 ({filter_stats['duration_ms']}ms)", "INFO")
+            sys_log(f"敏感字过滤命中 {filter_stats['matched']} 处 ({filter_stats['duration_ms']}ms)", "DEBUG")
         extra_payload = {k: v for k, v in body.items() if k not in ("messages", "model")}
         extra_payload.pop("extra_body", None)
         response_format = extra_payload.pop("response_format", None)

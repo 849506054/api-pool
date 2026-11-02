@@ -1,17 +1,4 @@
-"""视觉转译流式包装器必须吐 bytes（2026-09-20 生产事故护栏）。
-
-背景：请求带图 + 命中 `is_vision=False` 端点 → 走 vision_wrapper 分支。该分支的
-三处提示帧是 f-string（`str`），而 `Handler.do_POST` 直接 `self.wfile.write(chunk)`
-→ `TypeError: a bytes-like object is required, not 'str'` → 响应头已发（200 +
-text/event-stream）但正文 0 字节 → Hermes 侧 EmptyStreamError，3×3 重试全崩 →
-「模型 provider failed after retries」。
-
-覆盖两层：
-1. 单测：从源码提取 `vision_wrapper`，用桩驱动两条分支（目标失败 / 目标成功），
-   断言每个 yield 都是 bytes 且提示帧是合法 SSE + JSON。
-2. 端到端：真起池 + mock 上游，发一条带 `image_url` 的流式请求（目标端点盲、
-   视觉池有候选），断言下游能收到完整流（含两条提示帧与目标回答）而非断流。
-"""
+"""共同流链的图片完成提示必须为合法 bytes SSE，并安全关闭目标流。"""
 
 import ast
 import importlib.util
@@ -49,86 +36,59 @@ def load_module(tmp_path):
         os.chdir(previous_cwd)
 
 
-def load_vision_wrapper():
-    """从 api_pool_server.py 源码中提取 vision_wrapper 并编译成可调用对象。"""
-    source = open(MODULE_PATH, encoding="utf-8").read()
+def load_stream_helpers():
+    """隔离加载共同流链和 SSE 编码辅助；实线错误行为由 loopback 用例覆盖。"""
+    with open(MODULE_PATH, encoding="utf-8") as source_file:
+        source = source_file.read()
     tree = ast.parse(source)
-    node = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "vision_wrapper"
-    )
-    segment = ast.get_source_segment(source, node)
-    assert segment is not None
-    code = textwrap.dedent(segment)
-    namespace = {
-        "group": "main",
-        "request_id": "vision-wrapper-test",
-        "request_deadline": None,
-        "defer_at_request": 0,
-        "request_route_epoch": 0,
-    }
-    exec(compile(code, "<vision_wrapper>", "exec"), namespace)
-    return namespace["vision_wrapper"], namespace
-
-
-class _StubPool:
-    """只实现 vision_wrapper 用到的池方法。"""
-
-    def __init__(self, err):
-        self._err = err
-        self._lock = threading.Lock()
-
-    def _translate_images_sync(self, messages, candidates, group, **kwargs):
-        return messages
-
-    def _try_endpoint(self, ep, payload, timeout, **kwargs):
-        if self._err:
-            return None, self._err
-        return iter([DONE_FRAME]), None
-
-    def _on_success(self, ep, **kwargs):
-        pass
-
-    def _release_inflight(self, ep_id, group):
-        pass
+    namespace = {"json": json}
+    for name in ("_vision_notice", "_wrap_stream_release"):
+        node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+        segment = ast.get_source_segment(source, node)
+        assert segment is not None
+        exec(compile(textwrap.dedent(segment), "<stream_helpers>", "exec"), namespace)  # noqa: S102 — trusted local source
+    return namespace
 
 
 class VisionStreamWrapperBytesTest(unittest.TestCase):
-    def _collect(self, err):
-        wrapper, namespace = load_vision_wrapper()
-        namespace["self"] = _StubPool(err)
-        endpoint = types.SimpleNamespace(id="ep-1", name="stub-endpoint")
-        payload = {"messages": [{"role": "user", "content": "hi"}]}
-        return list(wrapper(endpoint, payload, 30, ["vision-ep"]))
+    def test_notice_frames_are_valid_bytes_sse_json(self):
+        notice = load_stream_helpers()["_vision_notice"]
+        for text in ('图片解析完成\n\n', 'quoted "content"\nbackslash\\'):
+            frame = notice(text)
+            self.assertIsInstance(frame, bytes)
+            self.assertTrue(frame.startswith(b"data: "))
+            self.assertTrue(frame.endswith(b"\n\n"))
+            self.assertEqual(json.loads(frame[6:])["choices"][0]["delta"]["content"], text)
 
-    def test_all_frames_are_bytes_on_both_branches(self):
-        for err in ("HTTP 502: upstream boom", None):
-            with self.subTest(err=err):
-                frames = self._collect(err)
-                failed = [(i, type(f).__name__) for i, f in enumerate(frames) if not isinstance(f, bytes)]
-                self.assertEqual(failed, [], f"vision_wrapper 产出非 bytes 帧: {failed}")
-                self.assertTrue(frames, "vision_wrapper 未产出任何帧")
-
-    def test_notice_frames_are_valid_sse_json(self):
-        for err in ("HTTP 502: upstream boom", None):
-            with self.subTest(err=err):
-                for frame in self._collect(err):
-                    self.assertTrue(frame.startswith(b"data: "), frame[:40])
-                    self.assertTrue(frame.endswith(b"\n\n"), frame[-10:])
-                    json.loads(frame[len(b"data: "):].decode("utf-8"))
-
-    def test_vision_wrapper_source_encodes_every_yield(self):
-        """源码护栏：该函数内不得再有裸 str yield。"""
-        source = open(MODULE_PATH, encoding="utf-8").read()
-        tree = ast.parse(source)
-        node = next(
-            n for n in ast.walk(tree)
-            if isinstance(n, ast.FunctionDef) and n.name == "vision_wrapper"
-        )
-        for child in ast.walk(node):
-            if isinstance(child, ast.Yield) and isinstance(child.value, ast.JoinedStr):
-                call = ast.dump(child.value)
-                self.assertIn("encode", call, f"vision_wrapper 第 {child.lineno} 行 yield str 未 encode")
+    def test_common_stream_release_on_done_exception_and_notice_close(self):
+        helpers = load_stream_helpers()
+        for mode in ("done", "exception", "notice-close"):
+            with self.subTest(mode=mode):
+                released = []
+                closed = []
+                stub = types.SimpleNamespace(_lock=threading.Lock(),
+                    _release_inflight=lambda *args, released=released: released.append(args))
+                def target(mode=mode, closed=closed):
+                    try:
+                        yield DONE_FRAME
+                        if mode == "exception":
+                            raise RuntimeError("stream broke")
+                    finally:
+                        closed.append(True)
+                upstream = target()
+                # _try_endpoint validates raw upstream bytes before constructing this generator.
+                stream = helpers["_wrap_stream_release"](stub, upstream, "ep", "main",
+                    prefix=helpers["_vision_notice"]("图片解析完成"))
+                if mode == "notice-close":
+                    self.assertIsInstance(next(stream), bytes)
+                    stream.close()
+                elif mode == "exception":
+                    with self.assertRaises(RuntimeError):
+                        list(stream)
+                else:
+                    self.assertTrue(all(isinstance(frame, bytes) for frame in stream))
+                self.assertEqual(closed, [True])
+                self.assertEqual(released, [("ep", "main")])
 
 
 class _MockUpstream(BaseHTTPRequestHandler):
@@ -221,7 +181,7 @@ class VisionStreamInterceptEndToEndTest(unittest.TestCase):
             (chunk.choices[0].delta.content or "")
             for chunk in chunks if chunk.choices and chunk.choices[0].delta
         )
-        self.assertIn("检测到图片", text, "下游未收到转译提示帧（拦截分支未生效或帧丢失）")
+        self.assertNotIn("正在调用视觉模型", text)
         self.assertIn("图片解析完成", text, "下游未收到转译完成帧")
         self.assertIn("TARGET-ANSWER", text, "目标端点回答未到达下游（流被截断）")
 

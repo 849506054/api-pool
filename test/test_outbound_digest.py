@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from unittest import mock
 
-
 MODULE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "api_pool_server.py")
 
 
@@ -64,6 +63,7 @@ class OutboundDigestTests(unittest.TestCase):
     def test_failed_attempt_logs_digest_and_probe_marker(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
+            module._DEBUG_LOGGING = True
             ep = module.Endpoint(
                 id="p1", name="probe-target", base_url="https://up.example/v1", api_key="k",
                 model="gpt-6-astra", protocol="responses", max_retries=0, use_proxy=True, in_pool=True,
@@ -85,7 +85,44 @@ class OutboundDigestTests(unittest.TestCase):
         self.assertIn("body_bytes=", digests[0])
         self.assertNotIn("(探活)", digests[0])
         self.assertIn("(探活)", digests[1])
-        self.assertTrue(all(level == "WARN" for msg, level in logs if "出站摘要(失败" in msg))
+        self.assertTrue(all(level == "DEBUG" for msg, level in logs if "出站摘要(失败" in msg))
+
+    def test_failure_digest_obeys_debug_and_preserves_errors(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            ep = module.Endpoint(
+                id="failure", name="failure", base_url="https://up.example/v1", api_key="k",
+                model="m", max_retries=0, use_proxy=True, in_pool=True,
+            )
+            payload = {"model": "m", "messages": [{"role": "user", "content": "ping"}]}
+            for debug in (False, True):
+                for kind in ("http", "url", "unexpected"):
+                    with self.subTest(debug=debug, kind=kind):
+                        ep._cooldown_until = 0
+                        ep._fail_count = 0
+                        pool = module.APIPool([ep])
+                        errors = {
+                            "http": http_error("https://up.example/v1/chat/completions", 502, b"upstream-original-error"),
+                            "url": module.urllib.error.URLError("upstream-original-error"),
+                            "unexpected": RuntimeError("upstream-original-error"),
+                        }
+                        logs = []
+                        with (mock.patch.object(module, "_DEBUG_LOGGING", debug),
+                              mock.patch.object(module, "sys_log", side_effect=lambda msg, level="INFO", logs=logs, **kw: logs.append((msg, level))),
+                              mock.patch.object(module.urllib.request, "urlopen", side_effect=errors[kind]),
+                              mock.patch.object(pool, "_outbound_digest", wraps=pool._outbound_digest) as digest,
+                              self.assertRaises(module.AllEndpointsFailed)):
+                            pool.chat(payload["messages"], extra_payload={"stream": False})
+                        self.assertEqual(digest.call_count, int(debug))
+                        details = [(msg, level) for msg, level in logs if "出站摘要" in msg]
+                        self.assertEqual(len(details), int(debug))
+                        self.assertTrue(all(level == "DEBUG" for _, level in details))
+                        self.assertTrue(any("upstream-original-error" in msg and level in ("WARN", "ERROR")
+                                            for msg, level in logs), logs)
+                        if kind == "http":
+                            self.assertTrue(any("HTTP 502" in msg and level in ("WARN", "ERROR")
+                                                for msg, level in logs), logs)
+                        ep._cooldown_until = 0
 
     def test_successful_attempt_logs_no_digest(self):
         with tempfile.TemporaryDirectory() as tmp_path:
