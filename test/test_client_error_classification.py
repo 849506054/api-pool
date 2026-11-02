@@ -65,7 +65,10 @@ class ClientErrorClassificationTests(unittest.TestCase):
 
 
 class ClientErrorRotationTests(unittest.TestCase):
-    """A′ 方案：轮转但不记账、不冻结、不探活。"""
+    """客户端类错误：记账并按 cooldown_minutes 正常冻结，到期探活回迁。
+
+    本请求内不重复试同一端点、候选不探活（小探活包不带畸形 body，探活必过无信息量）。
+    """
 
     @staticmethod
     def endpoint(module, endpoint_id, priority, model="test-model"):
@@ -85,22 +88,22 @@ class ClientErrorRotationTests(unittest.TestCase):
         self.addCleanup(self.tmp_dir.cleanup)
         self.module = load_module(self.tmp_dir.name)
 
-    def test_client_400_does_not_freeze_or_count(self):
+    def test_client_400_freezes_and_counts(self):
         pool = self.module.APIPool()
         ep = self.endpoint(self.module, "ep-a", 1)
         pool._endpoints.append(ep)
+        ep.cooldown_minutes = 5
         ep._fail_count = 0
         ep._total_failures = 0
-        before_cooldown = ep._cooldown_until
 
-        pool._rotate(ep, "HTTP 400: invalid request", health_impact=False)
+        pool._rotate(ep, "HTTP 400: duplicate field reasoning_content")
 
-        self.assertEqual(ep._fail_count, 0)
-        self.assertEqual(ep._total_failures, 0)
-        self.assertEqual(ep._cooldown_until, before_cooldown)
-        self.assertEqual(ep._cooldown_reason, "")
+        self.assertEqual(ep._fail_count, 1)
+        self.assertEqual(ep._total_failures, 1)
+        self.assertGreater(ep._cooldown_until, time.time(), "客户端类错误按 cooldown_minutes 冻结")
+        self.assertEqual(ep._last_error, "HTTP 400: duplicate field reasoning_content")
 
-    def test_health_impact_default_keeps_old_semantics(self):
+    def test_normal_failure_still_counts(self):
         pool = self.module.APIPool()
         ep = self.endpoint(self.module, "ep-a", 1)
         pool._endpoints.append(ep)
@@ -126,12 +129,12 @@ class ClientErrorRotationTests(unittest.TestCase):
         pool._try_endpoint = fake_try
         with self.assertRaises(self.module.AllEndpointsFailed):
             pool.chat([{"role": "user", "content": "hi"}])
-        # 每个端点恰好尝试一次，无死循环
+        # 每个端点恰好尝试一次，无死循环；每个都被记账并冻结
         self.assertEqual(sorted(calls), ["ep-0", "ep-1", "ep-2"])
         for ep in eps:
-            self.assertEqual(ep._fail_count, 0)
-            self.assertEqual(ep._cooldown_until, 0)
-            self.assertEqual(ep._total_failures, 0)
+            self.assertEqual(ep._fail_count, 1)
+            self.assertGreater(ep._cooldown_until, time.time())
+            self.assertEqual(ep._total_failures, 1)
 
     def test_mixed_pool_healthy_endpoint_takes_over(self):
         pool = self.module.APIPool()
@@ -148,13 +151,13 @@ class ClientErrorRotationTests(unittest.TestCase):
         pool._try_endpoint = fake_try
         result = pool.chat([{"role": "user", "content": "hi"}])
         self.assertEqual(result["choices"][0]["message"]["content"], "ok")
-        # bad 未被记账/冻结，good 拿到成功
-        self.assertEqual(bad._fail_count, 0)
-        self.assertEqual(bad._cooldown_until, 0)
+        # bad 被记账并冻结，good 拿到成功
+        self.assertEqual(bad._fail_count, 1)
+        self.assertGreater(bad._cooldown_until, time.time())
         self.assertGreater(good._total_calls, 0)
 
-    def test_client_error_keeps_current_endpoint_sticky(self):
-        """客户端类错误不改路由指针：下一个请求仍从当前端点开始。"""
+    def test_freeze_hands_over_and_points_at_next(self):
+        """冻结后组指针交给下一个候选：下一个请求不再先撞 400。"""
         pool = self.module.APIPool()
         bad = self.endpoint(self.module, "bad", 1)
         good = self.endpoint(self.module, "good", 2)
@@ -168,11 +171,11 @@ class ClientErrorRotationTests(unittest.TestCase):
 
         pool._try_endpoint = fake_try
         pool.chat([{"role": "user", "content": "one"}])
-        # 路由指针未被 _rotate 的健康分支改写（good 成功后 _on_success 会设为 good，
-        # 这是成功语义；这里验证的是 bad 没有因 400 被踢出 current）
+        # bad 冻结中、指针落到 good；下一个请求从 good 开始
+        self.assertGreater(bad._cooldown_until, time.time())
         self.assertEqual(pool._current_endpoint_id, good.id)
-        # bad 无冷却，下一请求按粘性逻辑仍可先试 bad
-        self.assertEqual(pool._ordered_failover_candidates(good, [bad, good])[0].id, "bad")
+        active = [e for e in (bad, good) if not pool._is_in_cooldown(e)]
+        self.assertEqual([e.id for e in active], ["good"])
 
     def test_probe_not_triggered_for_client_error(self):
         """客户端类错误不触发候选探活（探活必然通过，无信息量）。"""

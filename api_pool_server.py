@@ -6528,7 +6528,7 @@ class APIPool:
             delay = min(delay, RATE_LIMIT_RETRY_CAP_SECONDS)
         return delay
 
-    def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False, health_impact=True, group=None,
+    def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False, group=None,
                 expected_route_epoch=None, request_id=None, budget_cut=False):
         grp = group or self.MAIN_GROUP
         request_tag = f"[req={request_id}] " if request_id else ""
@@ -6555,7 +6555,7 @@ class APIPool:
                 f"重试被请求预算截断（非端点故障，不冻结），组内继续轮转",
                 "WARN",
             )
-        elif health_impact:
+        else:
             failed_ep._fail_count += 1
             failed_ep._total_failures += 1
             failed_ep._last_error = error_msg
@@ -6565,16 +6565,6 @@ class APIPool:
             # （探活/测试等）才在这里补日志，避免同一错误重复两行。
             if request_id is None:
                 sys_log(f"{request_tag}端点 '{self._endpoint_log_label(failed_ep, grp)}' 请求失败: {error_msg}", "ERROR")
-        else:
-            # 客户端类错误：请求形状问题，非端点故障。不冻结、fail_count 不增、
-            # 不探活（探活小请求必然通过，无信息量），仅记录最后错误便于排查。
-            # 也不改路由指针：端点本身健康，后续请求仍应粘性使用（本请求内的
-            # 候选轮转由 chat() 的 client_error_tried 集合控制）。
-            failed_ep._last_error = error_msg
-            failed_ep._last_error_ts = time.time()
-            self._mark_group_activity(failed_ep, grp)
-            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 客户端类错误(不冻结/不记账)，同请求继续轮转: {error_msg}", "WARN")
-            return self._get_route_epoch(grp)
         if budget_cut:
             capacity_kind, capacity_seconds = "", None
         else:
@@ -6949,24 +6939,40 @@ class APIPool:
 
         字段名取该消息已存在的那个（reasoning_content 优先，其次 reasoning_text）；都不存在时补
         reasoning_content。只复制被改动的消息，原始历史对象不变（轮转各次尝试共用同一份历史）。
+
+        双载体去重（2026-11-02）：同一段思考同时挂在 reasoning_content 与 reasoning 上时
+        （Hermes 自定义 provider 的本机路由会两个都回放），只留 reasoning_content。上游若把
+        reasoning 当作 reasoning_content 的别名（serde alias），两个键会 400
+        duplicate field `reasoning_content`（Tokenrhythm18 / DeepSeek 系实测）。
         """
         out = None
         for index, message in enumerate(messages):
             if not isinstance(message, dict) or message.get("role") != "assistant":
                 continue
-            field = next((name for name in ("reasoning_content", "reasoning_text") if name in message),
-                         "reasoning_content")
-            value = message.get(field)
-            if value is not None and not (isinstance(value, str) and not value.strip()):
-                continue  # 有真实 reasoning
-            if not message.get("tool_calls"):
-                if "reasoning_content" not in message and "reasoning_text" not in message:
-                    continue  # 本来就没带该字段 → 无需改动（零拷贝）
+            item = None
+            rc = message.get("reasoning_content")
+            alias = message.get("reasoning")
+            if isinstance(rc, str) and isinstance(alias, str) and rc == alias:
                 item = dict(message)
+                item.pop("reasoning", None)
+            current = item if item is not None else message
+            field = next((name for name in ("reasoning_content", "reasoning_text") if name in current),
+                         "reasoning_content")
+            value = current.get(field)
+            if value is not None and not (isinstance(value, str) and not value.strip()):
+                if item is not None:
+                    if out is None:
+                        out = list(messages)
+                    out[index] = item
+                continue  # 有真实 reasoning
+            if not current.get("tool_calls"):
+                if "reasoning_content" not in current and "reasoning_text" not in current:
+                    continue  # 本来就没带该字段 → 无需改动（零拷贝）
+                item = dict(current)
                 item.pop("reasoning_content", None)
                 item.pop("reasoning_text", None)
             else:
-                item = dict(message)
+                item = dict(current)
                 item[field] = cls._REASONING_PLACEHOLDER
             if out is None:
                 out = list(messages)
@@ -7613,8 +7619,9 @@ class APIPool:
                     if since_success < ep.timeout:
                         skip_cooldown = True
                         sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 超时失败但 {since_success:.0f}s 前有成功响应（<timeout {ep.timeout}s），判定单请求饿死，不冻结", "WARN")
-                # 客户端类错误（改动二 A′）：不冻结、fail_count 不增、不探活，
-                # 同请求内继续轮转其余候选；全部候选同类失败时按现状把错误返回给客户端。
+                # 客户端类错误（400/404/413/422）：仍是端点级失败，走正常冷却流程
+                # （fail_count 记账、按 cooldown_minutes 冻结、到期探活回迁）；本请求内
+                # 不重复试同一端点、候选不探活（小探活包不带畸形 body，探活必过无信息量）。
                 client_error = self._classify_client_error(error)
                 if client_error and not role_downgraded and self._has_developer_role(messages):
                     if self._is_role_reject_error(error):
@@ -7625,7 +7632,7 @@ class APIPool:
                 budget_cut = "; retry skipped: request budget exhausted" in error
                 request_route_epoch = self._rotate(
                     ep, error, skip_cooldown=skip_cooldown,
-                    health_impact=not client_error, group=group,
+                    group=group,
                     expected_route_epoch=request_route_epoch,
                     request_id=request_id,
                     budget_cut=budget_cut,
@@ -7654,8 +7661,8 @@ class APIPool:
                 # 从失败端点之后的环形顺序选择候选（同模型优先分桶已移除，纯优先级顺延）。
                 candidates = self._ordered_failover_candidates(ep, active, group=group)
                 if client_error:
-                    # 客户端类错误不冻结端点，冷却机制不会收缩 total；
-                    # 排除本请求内已试过的端点，全部试完即终止轮转。
+                    # 本请求内已试过的端点不再重试：同类错误原地复读没有信息量，
+                    # 端点本身已由冷却排除，这里兜住同一请求内的重复尝试。
                     candidates = [e for e in candidates if e.id not in client_error_tried]
                 next_ep = candidates[0] if candidates else None
                 if next_ep is not None:

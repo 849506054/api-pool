@@ -161,7 +161,9 @@ class StrictValidationPrefixRetryTests(unittest.TestCase):
                          "第 2 级必须改回客户端原始 tool_call id（换形态）")
         self.assertEqual(self.messages[1]["tool_calls"][0]["id"], "call_client_1",
                          "调用方传入的历史不得被改写")
-        self.assertEqual(ep._cooldown_until, 0, "客户端类错误不冻结端点")
+        # 最后一级成功 → 失败计数与冷却由 _on_success 清空（前面的 400 只影响当次）
+        self.assertEqual(ep._fail_count, 0)
+        self.assertEqual(ep._cooldown_until, 0)
 
     # ── 集成：无前缀 → 只有第 1 级原样重试，不发第 2 级变体 ──────────────
     def test_no_prefix_skips_variant_retry(self):

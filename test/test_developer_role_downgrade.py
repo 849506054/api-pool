@@ -2,6 +2,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 MODULE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "api_pool_server.py")
@@ -138,9 +139,9 @@ class RoleDowngradeRotationTests(unittest.TestCase):
         self.assertEqual(seen_payloads[1][1]["messages"][0]["role"], "system")
         # 内容不丢失
         self.assertEqual(seen_payloads[1][1]["messages"][0]["content"], "You are helpful.")
-        # bad 不记账不冻结
-        self.assertEqual(bad._fail_count, 0)
-        self.assertEqual(bad._cooldown_until, 0)
+        # bad 按客户端类错误正常记账并冻结
+        self.assertEqual(bad._fail_count, 1)
+        self.assertGreater(bad._cooldown_until, time.time())
 
     def test_no_downgrade_when_no_developer_in_request(self):
         pool = self.module.APIPool()
