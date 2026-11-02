@@ -1,7 +1,7 @@
 """响应解压链 _DecodedResponse（2026-09-10 客户端伪装配套）。
 
 契约（铁律）：
-1. 无 Content-Encoding / identity / 未知编码 → 完全透传，零开销
+1. 无 Content-Encoding / identity → 原样读取；未知编码报错
 2. 解压失败 → 异常向上传播（按上游失败处理），绝不吐损坏字节
 3. deflate 双模式：zlib 头自动识别失败 → 回退裸 deflate（RFC1951）
 4. 集成：_try_endpoint 非流式路径收到 gzip 响应能正常解析 JSON
@@ -108,11 +108,9 @@ class DecodedResponseUnitTests(unittest.TestCase):
         self.assertEqual(w.read(), data)
         self.assertTrue(raw.closed or True)  # close 代理不炸即可
 
-    def test_unknown_encoding_passthrough(self):
-        data = b"br-bytes"
-        w, _ = self._wrap(data, "br")
-        self.assertEqual(w._encoding, "")
-        self.assertEqual(w.read(), data)
+    def test_unknown_encoding_raises(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported Content-Encoding"):
+            self._wrap(b"unknown-bytes", "unknown-codec")
 
     def test_read_size_boundaries(self):
         data = b"abcdefghij" * 100

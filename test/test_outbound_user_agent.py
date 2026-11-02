@@ -4,7 +4,7 @@
 - 优先级 端点自定义头 > 客户端特征（真实入站头 / 客户端基线） > 默认库标识
 - 只有代理路径写入真实入站头；探活/管理页测试/拉模型接口无客户端上下文 → 复用客户端基线
 - 请求结束后清理线程局部状态（本线程回退默认），基线保留供无上下文路径复用
-- 入站头里的连接级/池托管头（Host/Content-Length/Connection/Authorization/x-api-key/anthropic-version）不透传
+- 入站头里的连接级/池托管头（Host/Content-Length/Connection/Authorization/x-api-key）不透传
 """
 
 import importlib.util
@@ -162,16 +162,16 @@ class OutboundClientHeadersTests(unittest.TestCase):
 
     # ── Accept-Encoding 收敛 ──
 
-    def test_unsupported_accept_encoding_tokens_filtered(self):
+    def test_accept_encoding_tokens_preserved(self):
         self.module.set_client_headers({"User-Agent": "curl/8.5.0", "Accept-Encoding": "gzip, deflate, br, zstd"})
         h = self._capture_outbound_headers(self._endpoint())
-        self.assertEqual(h.get("accept-encoding"), "gzip, deflate")
+        self.assertEqual(h.get("accept-encoding"), "gzip, deflate, br, zstd")
 
-    def test_unsupported_only_accept_encoding_dropped(self):
-        # 只有 br 时丢弃该头（让上游不压缩），而不是把 br 放行给不支持的解压链
+    def test_brotli_zstd_accept_encoding_preserved(self):
+        # 透传值与客户端一致；解压链支持 br/zstd。
         self.module.set_client_headers({"User-Agent": "curl/8.5.0", "Accept-Encoding": "br, zstd"})
         h = self._capture_outbound_headers(self._endpoint())
-        self.assertNotIn("accept-encoding", h)
+        self.assertEqual(h.get("accept-encoding"), "br, zstd")
 
     # ── 线程隔离 / 基线 ──
 
@@ -241,7 +241,7 @@ class OutboundClientHeadersTests(unittest.TestCase):
         不影响"整份头映射"这一契约。
         """
         source = open(MODULE_PATH, encoding="utf-8").read()
-        self.assertIn("set_client_headers(self.headers, source=self.path)", source)
+        self.assertIn("set_client_headers(self.headers, source=self.path, body=body)", source)
         self.assertIn("clear_client_headers()", source)
 
     # ── fetch_models 复用同一来源 ──

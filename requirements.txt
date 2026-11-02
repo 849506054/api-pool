@@ -1,0 +1,2 @@
+Brotli>=1.0.9
+zstandard>=0.20.0

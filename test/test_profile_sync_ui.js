@@ -18,7 +18,7 @@ function grab(name){
 let clientProfiles=[{name:'hermes',builtin:false,headers:{'User-Agent':'hermes-agent/0.21.0','X-Stainless-Lang':'python'}}];
 let probeClientProfile='hermes';
 let hasClientBaseline=true;
-let hermesSample={available:false};
+let clientSample={available:false};
 const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 const escAttr=esc;
 const profileVersion=h=>{const ua=(h||{})['User-Agent']||'';const m=/^([^/]+)\/(.+)$/.exec(ua);return m?`${m[1]} ${m[2]}`:'';};
@@ -40,14 +40,14 @@ let fail=0;
 const chk=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m);if(!c)fail=1;};
 
 // 1) 无采样：按钮存在但禁用，title 说明原因
-hermesSample={available:false};
+clientSample={available:false};
 renderProfileManager();
 chk(/🔄/.test(profileOverlay().innerHTML),'无采样时仍渲染 🔄 按钮');
 chk(/disabled/.test(profileOverlay().innerHTML),'无采样时 🔄 禁用');
-chk(/暂无 Hermes 流量采样/.test(profileOverlay().innerHTML),'无采样时 tooltip 说明需 Hermes 流量');
+chk(/暂无客户端流量采样/.test(profileOverlay().innerHTML),'无采样时 tooltip 说明需客户端流量');
 
 // 2) 有采样：按钮可用，title 带版本与来源
-hermesSample={available:true,version:'0.21.2',source:'/v1/chat/completions',ts:1};
+clientSample={available:true,version:'0.21.2',source:'/v1/chat/completions',ts:1};
 renderProfileManager();
 const html=profileOverlay().innerHTML;
 chk(!/disabled/.test(html),'有采样时 🔄 可点');
@@ -69,9 +69,9 @@ apiResponses=[{ok:true,changes:[{header:'User-Agent',old:'hermes-agent/0.21.0',n
   await syncProfileIdentity('hermes');
   chk(toasts.length===1&&/无变更/.test(toasts[0].m),'无变更：提示已是最近值');
 
-  apiCalls=[];toasts=[];apiResponses=[{error:'暂无 Hermes 流量采样（需有一条 UA 为 hermes-agent/<ver> 的请求经过池）'}];
+  apiCalls=[];toasts=[];apiResponses=[{error:'暂无客户端流量采样（需有一条 UA 为 hermes-agent/<ver> 的请求经过池）'}];
   await syncProfileIdentity('hermes');
-  chk(toasts.length===1&&toasts[0].t==='error'&&/暂无 Hermes 流量采样/.test(toasts[0].m),'后端 400：原样提示错误');
+  chk(toasts.length===1&&toasts[0].t==='error'&&/暂无客户端流量采样/.test(toasts[0].m),'后端 400：原样提示错误');
 
   console.log(fail?'PROFILE_SYNC_UI_FAILED':'PROFILE_SYNC_UI_OK');
   process.exit(fail);

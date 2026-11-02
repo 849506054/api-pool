@@ -89,6 +89,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             recovered._cooldown_until = module.time.time() - 1
             pool._probe_endpoint = lambda ep: (True, "")
 
+            recovered._recovery_groups.add("main")  # 本用例模拟 main 已因故障交接
             pool._background_probe(recovered, current.id)
 
             self.assertEqual(pool._current_endpoint_id, current.id)
@@ -106,6 +107,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool._last_pool_activity = module.time.time()
             pool._probe_endpoint = lambda ep: (True, "")
 
+            recovered._recovery_groups.add("main")  # 本用例模拟 main 已因故障交接
             pool._background_probe(recovered, current.id)
 
             self.assertGreater(recovered._defer_until_by_group.get("main", 0), module.time.time())
@@ -123,6 +125,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool._last_pool_activity = module.time.time()
             pool._probe_endpoint = lambda ep: (True, "")
 
+            recovered._recovery_groups.add("main")  # 本用例模拟 main 已因故障交接
             pool._background_probe(recovered, current.id)
 
             self.assertEqual(recovered._defer_until_by_group.get("main", 0), 0)
@@ -157,6 +160,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool._last_pool_activity = module.time.time()
             pool._probe_endpoint = lambda ep: (True, "")
 
+            recovered._recovery_groups.add("main")  # 本用例模拟 main 已因故障交接
             pool._background_probe(recovered, current.id)
 
             self.assertEqual(recovered._defer_until_by_group.get("main", 0), 0)
@@ -292,6 +296,7 @@ class CurrentEndpointRoutingTests(unittest.TestCase):
             pool._last_pool_activity = module.time.time()
             pool._probe_endpoint = lambda ep: (True, "")
 
+            recovered._recovery_groups.add("main")
             pool._background_probe(recovered, old.id)
             pool._on_success(old, {"choices": []}, expected_route_epoch=request_epoch)
 

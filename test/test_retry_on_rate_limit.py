@@ -1,7 +1,7 @@
 """端点级 retry_on_rate_limit 开关：HTTP 429 与首包 SSE 分类重试。
 
-首包覆盖限流和上游临时风控，按 max_retries 与请求预算原样重试。
-容量与确定性内容拦截优先交给原有处置，开关关闭时首包错误直接返回。
+首包限流由开关控制，已识别的临时风控按常规重试处理。
+二者均复用 max_retries 与请求预算；容量与确定性内容拦截保持原处置。
 """
 import importlib.util
 import io
@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from unittest import mock
 
-MODULE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "api_pool_server.py")
+MODULE_PATH = os.environ.get("API_POOL_TEST_SOURCE") or os.path.join(os.path.dirname(os.path.dirname(__file__)), "api_pool_server.py")
 
 RATE_LIMIT_BODY = (
     b'{"error":{"type":"too_many_requests","message":"Your requests to gpt-6-astra '
@@ -190,7 +190,7 @@ class RetryOnRateLimitTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)  # 配额类不走限流重试
             self.assertIn("429 rate-limited", error)
 
-    def test_switch_on_non_rate_limit_stream_error_is_not_retried(self):
+    def test_empty_first_frame_uses_endpoint_retry_budget(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             endpoint = self._endpoint(module, max_retries=3, retry_on_rate_limit=True)
@@ -202,7 +202,7 @@ class RetryOnRateLimitTests(unittest.TestCase):
                 lambda _i: FakeStreamResponse([frame]),
             )
             self.assertIsNone(result)
-            self.assertEqual(len(calls), 1)  # 非限流首包错误不在开关范围内
+            self.assertEqual(len(calls), 4)  # 首帧前空流复用 max_retries，与限流开关独立
             self.assertIn("upstream stream error", error)
 
     def test_switch_on_skips_retry_when_request_budget_exhausted(self):
@@ -257,7 +257,10 @@ class RetryOnRateLimitTests(unittest.TestCase):
             payload = {"model": "m", "messages": [], "stream": True}
             for enabled, retries, controls, expected_calls in (
                 (True, 2, {}, 3),
-                (False, 2, {}, 1),
+                (False, 2, {}, 3),
+                (False, 0, {}, 1),
+                (False, 2, {"force_no_retry": True}, 1),
+                (False, 2, {"request_deadline": time.time() + 1}, 1),
                 (True, 0, {}, 1),
                 (True, 2, {"force_no_retry": True}, 1),
                 (True, 2, {"request_deadline": time.time() + 1}, 1),
@@ -333,7 +336,7 @@ class RetryOnRateLimitTests(unittest.TestCase):
             upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
             proxy = ThreadingHTTPServer(("127.0.0.1", 0), module.Handler)
             threads = [Thread(target=s.serve_forever, daemon=True) for s in (upstream, proxy)]
-            ep = self._endpoint(module, in_pool=True, use_proxy=False, retry_on_rate_limit=True,
+            ep = self._endpoint(module, in_pool=True, use_proxy=False, retry_on_rate_limit=False,
                                 max_retries=2, base_url=f"http://127.0.0.1:{upstream.server_port}/v1")
             module.pool = module.APIPool([ep])
             module.pool._set_current("main", ep.id)

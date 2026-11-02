@@ -23,6 +23,8 @@ import hashlib
 import base64
 import struct
 import zlib
+import brotli
+import zstandard
 import itertools
 import re
 import urllib.request
@@ -102,6 +104,9 @@ def credit_warn_once(key: str, message: str) -> None:
     sys_log(message, "WARN")
 
 
+POOL_OUTBOUND_DISABLED_REASON = "已关闭检测：该端点仅转发真实客户端请求"
+
+
 class PoolIdentityUnavailable(RuntimeError):
     """池自身出站解析不到可用客户端身份 → 调用方必须跳过本次出站（不改任何端点状态）。"""
 _client_ctx = threading.local()
@@ -109,89 +114,94 @@ _client_ctx = threading.local()
 # ponytail: 单份全局，多客户端混用时代表最近一个客户端；需要区分时改 per-endpoint 基线。
 _client_baseline: dict = {}
 _client_baseline_lock = threading.Lock()
-# ── Hermes 真实身份采样（2026-09-13）──
-# 代理路径上 UA 为 `hermes-agent/<ver>` 的入站请求会被采样，供「手动同步 profile 身份」使用：
-# 上游只认 Hermes 客户端指纹，而 profile 是静态快照，Hermes 升级后版本号会过期 ——
-# 采样让配置能一键对齐最近一次真实流量。**仅内存、不落盘**（重启后等下一次真实流量即可）。
-# ponytail: 只留最近一份；需要历史/多客户端区分时改环形缓冲或按 profile 分桶。
-_hermes_identity_sample: dict = {}
-_hermes_identity_lock = threading.Lock()
-_HERMES_UA_RE = re.compile(r"^hermes-agent/([^\s/]+)$", re.IGNORECASE)
-# 手动同步（策略 b）只动这些身份字段，profile 其余头保持原值 —— 全量覆盖会把偶发头写进 profile。
-_PROFILE_SYNC_IDENTITY_KEYS = (
-    "User-Agent", "Accept-Encoding", "X-Stainless-Lang", "X-Stainless-Package-Version",
-    "X-Stainless-OS", "X-Stainless-Arch", "X-Stainless-Runtime", "X-Stainless-Runtime-Version",
-)
-
+# 最近一次真实客户端请求的身份样本；内存中保留一份，现有同步按钮写入目标 profile。
+_client_identity_sample: dict = {}
+_client_identity_lock = threading.Lock()
 # ── 客户端伪装 Client Profile ──
 # 让选中端点的出站请求在头层面与真实客户端一致：profile.headers 为唯一来源。
 # profile 存配置文件顶层 client_profiles 键，均可编辑（hermes 亦为配置条目，版本号随客户端升级更新）。
 # hermes 黄金样本：/opt/hermes/.venv openai SDK 2.24.0 实测出站头集合。
 # profile 不允许覆盖的保留头（由 pool 按端点协议管理）
 _PROFILE_RESERVED_HEADERS = frozenset({
-    "host", "content-length", "authorization", "x-api-key", "anthropic-version", "x-goog-api-key",
+    "host", "content-length", "authorization", "x-api-key", "x-goog-api-key",
 })
-# 透传时跳过的头：连接级/端到端头 + pool 托管头（host/content-length 由 urllib 重算，
-# authorization/x-api-key/anthropic-version 由 pool 按端点协议写入）
+# 透传跳过连接级和鉴权头；host/content-length 由 urllib 重算，协议版本沿用客户端。
 _PASSTHROUGH_SKIP_HEADERS = _PROFILE_RESERVED_HEADERS | frozenset({
     "connection", "transfer-encoding", "te", "trailer", "upgrade",
     "proxy-authorization", "proxy-connection", "keep-alive",
 })
-# 解压链（_DecodedResponse）支持的压缩编码；其余 token（br/zstd）透传会让下游收到无法解码的字节
-_SUPPORTED_ACCEPT_ENCODINGS = frozenset({"gzip", "deflate", "identity"})
+# Profile 使用目标客户端样本；请求级追踪、会话凭证留在原请求。
+_PROFILE_SAMPLE_SKIP_HEADERS = _PASSTHROUGH_SKIP_HEADERS | frozenset({
+    "cookie", "set-cookie", "x-auth-token", "x-access-token", "api-key",
+    "x-request-id", "request-id", "x-stainless-request-id", "idempotency-key",
+    "traceparent", "tracestate", "baggage",
+})
+_PROFILE_BODY_IDENTITY_KEYS = frozenset({"user", "safety_identifier"})
+_PROFILE_METADATA_IDENTITY_KEYS = frozenset({
+    "user_id", "client_id", "device_id", "session_id", "client_name", "client_version",
+    "app_name", "app_version", "sdk_name", "sdk_version",
+})
 
 
-def set_client_headers(headers, source=""):
+def set_client_headers(headers, source="", body=None):
     """代理路径写入真实入站头，并更新进程级基线供探活/测试/拉模型复用。"""
-    hdrs = {k: v for k, v in dict(headers or {}).items() if isinstance(k, str) and isinstance(v, str)}
+    hdrs = {k: v for k, v in (headers or {}).items() if isinstance(k, str) and isinstance(v, str)}
     _client_ctx.headers = hdrs
     with _client_baseline_lock:
         _client_baseline.clear()
         _client_baseline.update(hdrs)
-    _sample_hermes_identity(hdrs, source=source)
+    try:
+        _sample_client_identity(hdrs, source=source, body=body)
+    except (TypeError, ValueError):
+        with _client_identity_lock:
+            _client_identity_sample.clear()
+        sys_log("客户端身份采样已跳过：请求头格式无法用作 profile", "WARN")
 
 
-def _sample_hermes_identity(headers, source=""):
-    """UA 为 `hermes-agent/<ver>` 时记一份身份样本（内存，仅留最近一次），供 profile 手动同步。"""
+def _sample_client_identity(headers, source="", body=None):
+    """只保留最近一次真实客户端请求的身份样本，供现有同步按钮使用。"""
     ua = ""
     for k, v in (headers or {}).items():
         if k.strip().lower() == "user-agent":
             ua = str(v or "").strip()
             break
-    m = _HERMES_UA_RE.match(ua)
-    if not m:
-        return
     clean, _dropped = _sanitize_profile_headers(dict(headers or {}))
-    clean = _filter_accept_encoding(clean)
-    with _hermes_identity_lock:
-        _hermes_identity_sample.clear()
-        _hermes_identity_sample.update({
+    if not clean:
+        with _client_identity_lock:
+            _client_identity_sample.clear()
+        return
+    m = re.search(r"/([^\s/]+)", ua)
+    with _client_identity_lock:
+        _client_identity_sample.clear()
+        _client_identity_sample.update({
             "headers": clean,
-            "version": m.group(1),
+            "version": m.group(1) if m else "",
+            "body_identity": _sample_body_identity(body),
             "user_agent": ua,
             "ts": time.time(),
             "source": str(source or ""),
         })
 
 
-def get_hermes_identity_sample():
-    """最近一次 Hermes 真实身份采样（只读快照）；无采样 → {"available": False}。"""
-    with _hermes_identity_lock:
-        sample = {k: (dict(v) if isinstance(v, dict) else v) for k, v in _hermes_identity_sample.items()}
+def get_client_identity_sample():
+    """最近一次客户端真实身份采样（只读快照）。"""
+    with _client_identity_lock:
+        sample = _copy.deepcopy(_client_identity_sample)
     if not sample:
         return {"available": False}
     sample["available"] = True
     return sample
 
 
-def _hermes_sample_meta():
-    """采样元信息（不含头值），供前端展示「最近 Hermes 流量」。"""
-    sample = get_hermes_identity_sample()
+def _client_sample_meta():
+    """采样元信息供现有同步按钮展示；私有身份值留在样本内。"""
+    sample = get_client_identity_sample()
     if not sample.get("available"):
         return {"available": False}
     return {
         "available": True,
         "version": sample.get("version"),
+        "user_agent": sample.get("user_agent"),
         "ts": sample.get("ts"),
         "source": sample.get("source"),
     }
@@ -207,25 +217,33 @@ def _header_value_ci(headers, name):
 
 
 def _profile_identity_sync_diff(profile_headers, sample_headers):
-    """策略 b 差异计算：只用采样值更新身份白名单键，profile 其余头保持原值。
-
-    返回 (新 headers, 变更列表)；采样里没有的键保持原值（不删不增），值相同则不计入变更。
-    """
-    new_headers = dict(profile_headers or {})
+    """以最新样本完整替换身份头；按 HTTP 大小写无关语义报告差异。"""
+    new_headers, _ = _sanitize_profile_headers(sample_headers)
+    old = {k.lower(): (k, v) for k, v in (profile_headers or {}).items()}
+    current = {k.lower(): (k, v) for k, v in new_headers.items()}
     changes = []
-    for key in _PROFILE_SYNC_IDENTITY_KEYS:
-        sample_val = _header_value_ci(sample_headers, key)
-        if sample_val is None:
-            continue
-        existing_key = next(
-            (k for k in new_headers if isinstance(k, str) and k.strip().lower() == key.lower()), key,
-        )
-        old_val = new_headers.get(existing_key)
-        if old_val is not None and str(old_val) == str(sample_val):
-            continue
-        changes.append({"header": existing_key, "old": old_val, "new": sample_val})
-        new_headers[existing_key] = sample_val
+    for key in sorted(old.keys() | current.keys()):
+        old_value = old.get(key, (key, None))[1]
+        name, value = current.get(key, (old.get(key, (key, None))[0], None))
+        if old_value != value:
+            changes.append({"header": name, "old": old_value, "new": value})
     return new_headers, changes
+
+
+def _sample_body_identity(body):
+    """采集已定义的身份字段；业务内容由每次请求提供。"""
+    if not isinstance(body, dict):
+        return {}
+    out = {key: body[key] for key in _PROFILE_BODY_IDENTITY_KEYS
+           if isinstance(body.get(key), str)}
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        picked = {key: metadata[key] for key in _PROFILE_METADATA_IDENTITY_KEYS
+                  if isinstance(metadata.get(key), str)}
+        if picked:
+            out["metadata"] = picked
+    return out
+
 
 
 def clear_client_headers():
@@ -2487,31 +2505,51 @@ def _get_resp_socket(resp):
         return None
 
 
+def _open_identity_request(req, timeout, use_proxy):
+    """保留身份头缺省语义；代理选择沿用端点配置。"""
+    if use_proxy and req.has_header("User-agent"):
+        return urllib.request.urlopen(req, timeout=timeout)
+    handlers = [] if use_proxy else [urllib.request.ProxyHandler({})]
+    opener = urllib.request.build_opener(*handlers)
+    opener.addheaders = []
+    return opener.open(req, timeout=timeout)
+
+
 class _DecodedResponse:
-    """Content-Encoding 感知解压（仅 gzip/deflate）的 HTTPResponse 包装。
+    """增量解码 gzip/deflate/br/zstd，组合编码按逆序解开。
 
-    客户端伪装（2026-09-10）配套：出站声明 Accept-Encoding: gzip, deflate 后，
-    上游可能真实压缩响应，urllib 不会自动解压，必须在此处理。
-
-    铁律：
-    1. 无 Content-Encoding / identity / 未知编码 → 完全透传，零开销
-    2. 解压失败 → 异常向上传播（调用方按上游失败处理），绝不吐损坏字节
-    3. deflate 双模式：wbits=47（gzip/zlib 自动识别）首块失败回退 wbits=-15（裸 deflate RFC1951）
+    JSON、SSE、HTTP 错误体共用此包装；损坏或截断的压缩流向调用方报错。
     """
 
-    def __init__(self, resp):
+    def __init__(self, resp, encoding=None):
         self._resp = resp
-        try:
-            enc = (resp.headers.get("Content-Encoding") or "").strip().lower()
-        except Exception:
-            enc = ""
-        self._encoding = enc if enc in ("gzip", "deflate") else ""
+        enc = encoding if encoding is not None else ((getattr(resp, "headers", None) or {}).get("Content-Encoding") or "")
+        enc = enc if isinstance(enc, str) else ""
+        encodings = [item.strip().lower() for item in enc.split(",") if item.strip().lower() != "identity" and item.strip()]
+        if any(item not in ("gzip", "deflate", "br", "zstd") for item in encodings):
+            raise ValueError(f"Unsupported Content-Encoding: {enc}")
+        if len(encodings) > 1:
+            self._resp = _DecodedResponse(resp, ",".join(encodings[1:]))
+        self._encoding = encodings[0] if encodings else ""
         self._decoder = None
         self._buf = b""
         self._eof = False
         self._first_raw = None  # 首块原始字节，用于裸 deflate 回退重放
 
     def _decode(self, raw):
+        if self._encoding == "br":
+            if self._decoder is None:
+                self._decoder = brotli.Decompressor()
+            return self._decoder.process(raw)
+        if self._encoding == "zstd":
+            if self._decoder is None or self._decoder.eof:
+                self._decoder = zstandard.ZstdDecompressor().decompressobj()
+            output = self._decoder.decompress(raw)
+            while self._decoder.eof and self._decoder.unused_data:
+                remaining = self._decoder.unused_data
+                self._decoder = zstandard.ZstdDecompressor().decompressobj()
+                output += self._decoder.decompress(remaining)
+            return output
         if self._decoder is None:
             self._decoder = zlib.decompressobj(47)
         if self._first_raw is None:
@@ -2534,11 +2572,20 @@ class _DecodedResponse:
     def _flush(self):
         if self._decoder is None:
             return b""
-        return self._decoder.flush()
+        if self._encoding == "br":
+            if not self._decoder.is_finished():
+                raise ValueError("Truncated brotli response")
+            return b""
+        output = self._decoder.flush()
+        if not self._decoder.eof:
+            raise ValueError(f"Truncated {self._encoding} response")
+        return output
 
     def _fill(self):
         """从底层拉一块数据解压进缓冲。返回 False 表示 EOF 且缓冲已空。"""
-        raw = self._resp.read(65536)
+        # read1 返回当前已到达的字节，使压缩 SSE 首帧按到达时刻输出。
+        read = getattr(self._resp, "read1", self._resp.read)
+        raw = read(65536)
         if not raw:
             self._eof = True
             out = self._flush()
@@ -2559,6 +2606,17 @@ class _DecodedResponse:
         while len(self._buf) < size and not self._eof:
             self._fill()
         out, self._buf = self._buf[:size], self._buf[size:]
+        return out
+
+    def read1(self, size=65536):
+        if not self._encoding:
+            return getattr(self._resp, "read1", self._resp.read)(size)
+        if size == 0:
+            return b""
+        while not self._buf and not self._eof:
+            self._fill()
+        end = len(self._buf) if size is None or size < 0 else size
+        out, self._buf = self._buf[:end], self._buf[end:]
         return out
 
     def readline(self, limit=-1):
@@ -3028,6 +3086,7 @@ class Endpoint:
     _cooldown_reason: str = field(default="", repr=False)
     _manual_unlock_required: bool = field(default=False, repr=False)
     _defer_until_by_group: dict[str, float] = field(default_factory=dict, repr=False)  # 延迟回迁到期时间（按组）；该组在此期间不主动回迁到此端点
+    _recovery_groups: set[str] = field(default_factory=set, repr=False)  # 因本端点冷却实际交接过的组
     _defer_borrow_by_group: set[str] = field(default_factory=set, repr=False)  # 其中因「借用避让」而挂的组：释放判据看接手端点自身空闲
     
     health_mode: str = field(default="models")
@@ -3357,7 +3416,7 @@ class APIPool:
         for name, entry in (self._client_profiles or {}).items():
             if not isinstance(entry, dict):
                 continue
-            out.append({"name": name, "builtin": False, "headers": entry.get("headers", {})})
+            out.append({"name": name, "builtin": False, "headers": entry.get("headers", {}), "body_identity": entry.get("body_identity", {})})
         return out
 
     def save_client_profile(self, name, headers):
@@ -3369,37 +3428,66 @@ class APIPool:
         if dropped:
             sys_log(f"客户端伪装：profile '{name}' 提交的保留头 {dropped} 已过滤", "WARN")
         with self._lock:
-            self._client_profiles[name] = {"headers": clean}
+            previous = self._client_profiles.get(name) or {}
+            self._client_profiles[name] = {**previous, "headers": clean}
         sys_log(f"客户端伪装：profile '{name}' 已保存（{len(clean)} 头）", "INFO")
         return name
 
     def sync_client_profile_identity(self, name):
-        """用最近一次 Hermes 真实流量采样更新 profile 的身份字段（策略 b）。
-
-        只覆盖 `_PROFILE_SYNC_IDENTITY_KEYS` 且在采样中存在的键；profile 其余头保持原值。
-        返回 (变更列表, 采样元信息)；无采样或 profile 不存在时抛 ValueError。
-        """
-        sample = get_hermes_identity_sample()
+        """用最近一次客户端请求完整同步 profile 身份头与已知请求体身份字段。"""
+        sample = get_client_identity_sample()
         if not sample.get("available"):
-            raise ValueError("暂无 Hermes 流量采样（需有一条 UA 为 hermes-agent/<ver> 的请求经过池）")
+            raise ValueError("暂无客户端流量采样")
         name = (name or "").strip()
         with self._lock:
             entry = (self._client_profiles or {}).get(name)
-        if entry is None:
-            raise ValueError(f"profile '{name}' 不存在")
-        current = dict((entry or {}).get("headers") or {})
-        new_headers, changes = _profile_identity_sync_diff(current, sample.get("headers") or {})
-        if changes:
-            self.save_client_profile(name, new_headers)
-        sys_log(
-            f"客户端伪装：profile '{name}' 身份同步自最近 Hermes 流量（v{sample.get('version')}，"
-            f"{len(changes)} 项变更）",
-            "INFO",
-        )
+            if entry is None:
+                raise ValueError(f"profile '{name}' 不存在")
+            headers, changes = _profile_identity_sync_diff(entry.get("headers", {}), sample.get("headers", {}))
+            identity = _copy.deepcopy(sample.get("body_identity") or {})
+            old_identity = entry.get("body_identity") or {}
+            if old_identity != identity:
+                changes.append({"header": "body_identity", "old": old_identity, "new": identity})
+            self._client_profiles[name] = {"headers": headers, "body_identity": identity}
+        sys_log(f"客户端伪装：profile '{name}' 同步最新客户端样本（{len(headers)} 头，"
+                f"{len(identity)} 个请求体身份字段）", "INFO")
         return changes, sample
 
+    def _apply_profile_body_identity(self, payload, ep):
+        """在协议桥之后按目标方言替换已知身份，保留业务请求。"""
+        name = str(getattr(ep, "client_profile", "") or "").strip()
+        if not name and not getattr(_client_ctx, "headers", None):
+            name = self._probe_client_profile
+        if not name:
+            return payload
+        # 与请求头同一 profile；缺失配置在出站前由解析器拦截。
+        resolve_outbound_headers(name, self._client_profiles)
+        identity = _sample_body_identity((self._client_profiles.get(name) or {}).get("body_identity"))
+        result = _copy.deepcopy(payload)
+        for key in _PROFILE_BODY_IDENTITY_KEYS:
+            result.pop(key, None)
+        metadata = result.get("metadata")
+        if isinstance(metadata, dict):
+            result["metadata"] = {k: v for k, v in metadata.items() if k not in _PROFILE_METADATA_IDENTITY_KEYS}
+            if not result["metadata"]:
+                result.pop("metadata", None)
+        protocol = getattr(ep, "protocol", "openai")
+        if protocol == "gemini":
+            return result
+        if protocol == "anthropic":
+            user_id = (identity.get("metadata") or {}).get("user_id", identity.get("user"))
+            if user_id is not None:
+                result.setdefault("metadata", {})["user_id"] = user_id
+        else:
+            for key in _PROFILE_BODY_IDENTITY_KEYS:
+                if key in identity:
+                    result[key] = identity[key]
+            if identity.get("metadata"):
+                result.setdefault("metadata", {}).update(identity["metadata"])
+        return result
+
     def delete_client_profile(self, name):
-        """删除 profile；被引用端点在解析时自动降级为透传（WARN）。"""
+        """删除 profile；引用该配置的请求在出站前报告配置缺失。"""
         name = (name or "").strip()
         with self._lock:
             if not self._client_profiles or name not in self._client_profiles:
@@ -3414,6 +3502,7 @@ class APIPool:
             ep = next((item for item in self._endpoints if item.id == ep_id), None)
             if ep is None:
                 raise KeyError("端点不存在")
+            self._guard_pool_outbound(ep)
             connection = {
                 "base_url": ep.base_url,
                 "api_key": ep.api_key,
@@ -3428,7 +3517,7 @@ class APIPool:
         cached = self._models_cache_get(cache_key)
         if cached is not None:
             return cached
-        models = self.fetch_models(**connection)
+        models = self.fetch_models(**connection, endpoint=ep)
         self._models_cache_set(cache_key, models)
         return models
 
@@ -4336,6 +4425,10 @@ class APIPool:
                 ep._defer_until_by_group[new_group] = ep._defer_until_by_group.pop(group)
             else:
                 ep._defer_until_by_group.pop(group, None)
+        if group in ep._recovery_groups:
+            ep._recovery_groups.discard(group)
+            if new_group:
+                ep._recovery_groups.add(new_group)
         if group in ep._defer_borrow_by_group:
             ep._defer_borrow_by_group.discard(group)
             if new_group:
@@ -4390,8 +4483,12 @@ class APIPool:
     def _get_current(self, group):
         return self._current_endpoint_by_group.get(group)
 
-    def _set_current(self, group, ep_id):
+    def _set_current(self, group, ep_id, record_recovery=True):
         previous = self._current_endpoint_by_group.get(group)
+        if record_recovery and previous and previous != ep_id:
+            old = next((e for e in self._endpoints if e.id == previous), None)
+            if old is not None and self._is_in_cooldown(old):
+                old._recovery_groups.add(group)
         if ep_id is None:
             self._current_endpoint_by_group.pop(group, None)
         else:
@@ -4449,7 +4546,7 @@ class APIPool:
         if not owners:
             self._inflight_owner.pop(ep_id, None)
 
-    def _guard_empty_stream(self, gen, ep, group, request_id, route_epoch, empty_retry=None):
+    def _guard_empty_stream(self, gen, ep, group, request_id, route_epoch, empty_retry=None, retry_budget=None):
         """Validate normalized Chat output before DONE; preserve valid non-text completions.
 
         空响应（无正文/工具调用/拒绝的非终止收尾）先按端点重试预算原地重放同一端点，
@@ -4485,8 +4582,13 @@ class APIPool:
         try:
             yield from consume(gen)
             attempt = 0
+            failure_error = ""
             while not state["usable"] and not state["terminal"] and empty_retry is not None:
-                replacement = empty_retry(attempt)
+                try:
+                    replacement = empty_retry(attempt)
+                except EndpointRequestError as exc:
+                    failure_error = str(exc)
+                    break
                 if replacement is None:
                     break
                 attempt += 1
@@ -4494,14 +4596,15 @@ class APIPool:
                 streams.append(replacement)
                 yield from consume(replacement)
             if not state["usable"] and not state["terminal"]:
-                message = "Provider returned an empty response"
-                sys_log(f"[req={request_id}] 端点 '{self._endpoint_log_label(ep, group)}' 空响应确认 "
-                        f"content=0 tool_calls=0 terminal=stop/EOF 原地重试 {attempt} 次", "INFO", group=group)
+                message = failure_error or "Provider returned an empty response"
+                actual_retries = max(0, retry_budget["sent"] - 1) if retry_budget is not None else attempt
+                sys_log(f"[req={request_id}] 端点 '{self._endpoint_log_label(ep, group)}' 空响应重试结束 "
+                        f"原地重试 {actual_retries} 次；最后错误: {message}", "INFO", group=group)
                 if group and not group.startswith("endpoint:"):
                     with self._lock:
                         self._rotate(ep, message, group=group, expected_route_epoch=route_epoch, request_id=request_id)
                 yield b"data: " + json.dumps({"error": {
-                    "message": message, "type": "server_error", "code": "empty_content",
+                    "message": message, "type": "server_error", "code": "upstream_error" if failure_error else "empty_content",
                 }}).encode() + b"\n\n"
             elif state["finish"] is not None:
                 yield state["finish"]
@@ -4798,7 +4901,7 @@ class APIPool:
                 if ep.enabled and ep.in_pool and sub in self._ep_groups(ep):
                     self._reset_endpoint_assertion_state(ep, defer_group=sub)
             self._clear_group_waiting_state(self.MAIN_GROUP)
-            self._set_current(self.MAIN_GROUP, sub)
+            self._set_current(self.MAIN_GROUP, sub, record_recovery=False)
             sys_log(
                 f"手动切换 main → 子组 '{sub}'（整组作为 main 成员，按子组优先级选端点；"
                 f"组内端点按用户断言重置为待验证，main 的延迟回切与回切锁已作废）",
@@ -4940,6 +5043,10 @@ class APIPool:
         defer_group 指定时只清该组的延迟回切；None 清全部组。"""
         if clear_defer:
             self._defer_clear(ep, [defer_group] if defer_group else None)
+            if defer_group:
+                ep._recovery_groups.discard(defer_group)
+            else:
+                ep._recovery_groups.clear()
         ep._cooldown_until = 0
         ep._cooldown_reason = ""
         ep._fail_count = 0
@@ -4967,7 +5074,7 @@ class APIPool:
                     # 手动指定 = 用户主观要求这个端点工作：本组此前的等待意图随之作废，
                     # 指针之外不留持续覆盖（2026-10-30 口径）。
                     self._clear_group_waiting_state(grp)
-                    self._set_current(grp, ep_id)
+                    self._set_current(grp, ep_id, record_recovery=False)
                     sys_log(f"手动切换端点: '{self._endpoint_log_label(ep, grp)}'（按用户断言重置为待验证：清除冷却/上游配额/余额冻结与失败计数；本组延迟回切与回切锁已作废）", "INFO")
                     return True
         return False
@@ -5104,6 +5211,7 @@ class APIPool:
     def _credit_http_json(self, url: str, headers: dict | None = None):
         """积分读数专用出站：显式绕开全局代理（内网直连）+ 硬超时，返回解析后的 JSON。
         只读、零副作用；任何失败都以异常抛给调用方，由调用方决定「保留旧读数」。"""
+        self._guard_pool_outbound(base_url=url, origin_only=True)
         req = urllib.request.Request(url, headers=dict(headers or {}))
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(req, timeout=CREDIT_HTTP_TIMEOUT) as resp:
@@ -5120,6 +5228,8 @@ class APIPool:
                             ("qoder", self._read_qoder_credits)):
             try:
                 out.update(reader())
+            except PoolIdentityUnavailable:
+                out.update({k: v for k, v in prev.items() if v.get("src") == src})
             except Exception as exc:
                 sys_log(f"{src} 积分登记值读取失败: {type(exc).__name__}: {exc}", "WARN")
                 out.update({k: v for k, v in prev.items() if v.get("src") == src})
@@ -5377,8 +5487,8 @@ class APIPool:
             self._current_endpoint_by_group.clear()
 
     def _check_one_health(self, ep):
-        if ep.health_mode == "none":
-            return ep.id, "unknown", -1, "已禁用健康检测"
+        if self._probe_disabled(ep):
+            return ep.id, "skipped", -1, POOL_OUTBOUND_DISABLED_REASON
 
         # 按所在组别自动决定检测模式：池内用chat（验证真实可用），池外用models（零消耗探测）
         # 按次计费的端点强制使用 models 检测，避免产生费用
@@ -5393,15 +5503,15 @@ class APIPool:
                 models = self.fetch_models(
                     ep.base_url, ep.api_key, timeout=10, use_proxy=ep.use_proxy,
                     protocol=ep.protocol, default_headers=ep.default_headers,
-                    extra_headers=ep.extra_headers, client_profile=ep.client_profile,
+                    extra_headers=ep.extra_headers, client_profile=ep.client_profile, endpoint=ep,
                 )
                 latency = int((time.time() - t0) * 1000)
                 if models:
                     return ep.id, "ok", latency, ""
                 else:
                     return ep.id, "bad", latency, "获取模型列表失败"
-            except PoolIdentityUnavailable:
-                return ep.id, "skipped", -1, POOL_IDENTITY_SKIP_REASON
+            except PoolIdentityUnavailable as exc:
+                return ep.id, "skipped", -1, str(exc)
             except Exception as e:
                 return ep.id, "bad", int((time.time() - t0) * 1000), f"Models接口错误: {e}"
                 
@@ -5411,8 +5521,8 @@ class APIPool:
         t0 = time.time()
         try:
             reply, err = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True, is_probe=True)
-        except PoolIdentityUnavailable:
-            return ep.id, "skipped", -1, POOL_IDENTITY_SKIP_REASON
+        except PoolIdentityUnavailable as exc:
+            return ep.id, "skipped", -1, str(exc)
         latency = int((time.time() - t0) * 1000)
         
         if reply is not None and latency <= LATENCY_OK_MAX:
@@ -5428,8 +5538,8 @@ class APIPool:
         t1 = time.time()
         try:
             reply2, err2 = self._try_endpoint(ep, payload, timeout=10, log_usage=False, force_no_retry=True, is_probe=True)
-        except PoolIdentityUnavailable:
-            return ep.id, "skipped", -1, POOL_IDENTITY_SKIP_REASON
+        except PoolIdentityUnavailable as exc:
+            return ep.id, "skipped", -1, str(exc)
         latency2 = int((time.time() - t1) * 1000)
         
         if reply2 is not None and latency2 <= LATENCY_OK_MAX:
@@ -5451,6 +5561,31 @@ class APIPool:
                 for c in content:
                     if c.get("type") == "image_url": return True
         return False
+
+    @staticmethod
+    def _strip_historical_images(messages):
+        """保留最新助手消息之后的图片；历史文字与工具调用结构原样保留。"""
+        boundary = next((i for i in range(len(messages) - 1, -1, -1)
+                         if messages[i].get("role") == "assistant"), -1)
+        if boundary < 0:
+            return messages
+        result = list(messages)
+        removed = 0
+        for i, msg in enumerate(messages[:boundary + 1]):
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            kept = [part for part in content
+                    if not (isinstance(part, dict) and part.get("type") == "image_url")]
+            count = len(content) - len(kept)
+            if count:
+                removed += count
+                # 纯图片历史消息保留位置，避免空 content 被严格上游拒绝。
+                result[i] = {**msg, "content": kept or [{"type": "text", "text": "[历史图片]"}]}
+        if removed:
+            sys_log(f"历史图片已略过：{removed} 张，助手消息边界={boundary}；仅解析本轮新图", "INFO")
+            return result
+        return messages
 
     @staticmethod
     def _normalize_strict400_retries(value):
@@ -5527,6 +5662,9 @@ class APIPool:
         降级策略（2026-09-10 拍板 B）：视觉池无可用成员时本函数静默返回原消息，
         图片原样交给目标端点；降级告警由调用方（chat 拦截处）记录一次。
         """
+        messages = self._strip_historical_images(messages)
+        if not self._has_images(messages):
+            return messages
         vision_eps, vision_group = self._vision_pool_candidates()
         if not vision_eps:
             return messages
@@ -5758,6 +5896,7 @@ class APIPool:
         for ep in self._endpoints:
             ep._defer_until_by_group.pop(group, None)
             ep._defer_borrow_by_group.discard(group)
+            ep._recovery_groups.discard(group)
         # 旧口径留下的持续覆盖（手动锁）一并作废：手动切换只表达「现在用这个端点」。
         self._fallback_lock_until_by_group.pop(group, None)
         self._group_fallback_pending.pop(group, None)
@@ -5947,6 +6086,7 @@ class APIPool:
                 if ep.id == ep_id:
                     ep._cooldown_until = 0
                     self._defer_clear(ep)
+                    ep._recovery_groups.clear()
                     ep._fail_count = 0
                     ep._last_error = ""
                     ep._last_error_ts = 0
@@ -6002,6 +6142,7 @@ class APIPool:
 
     def test_endpoint(self, ep, message="你好", image=None, group=None):
         """在不启用候选轮转的前提下测试主池中的指定端点。"""
+        self._guard_pool_outbound(ep)
         import uuid
         started = time.time()
         request_id = f"test-{uuid.uuid4().hex[:8]}"
@@ -6081,7 +6222,7 @@ class APIPool:
         """后台探活单个端点：通过→清冷却+defer判断+更新各组指针；失败→继续冷却。
 
         2026-08-29 分组池：端点可属多组，指针更新遍历该端点所属各组判断；
-        probe_current_ids 是探活开始时各组指针快照（防竞态）。
+        恢复仅消费故障交接登记，当前指针在恢复决策持锁时读取。
         兼容：传入单个 str 视为 main 组指针快照（旧签名）。
         """
         if isinstance(probe_current_ids, str) or probe_current_ids is None:
@@ -6106,60 +6247,32 @@ class APIPool:
                     ep._cooldown_until = 0
                     ep._cooldown_reason = ""
                     ep._health = "ok"
-                # 端点所属各组逐一评估：当前指针端点决定是否保护自身 cache。
-                # 当前工作端点决定是否保护自身 cache：开启时延迟切走，
-                # 关闭时恢复端点立即回切。恢复端点自己的开关不参与本次判断。
-                pool_active = self._last_pool_activity > now - 300
-                for grp in self._ep_groups(ep):
-                    current_ep = None
-                    current_id = probe_current_ids.get(grp)
-                    if current_id:
-                        current_ep = next((e for e in self._endpoints if e.id == current_id), None)
-                    protect_current_cache = (
-                        current_ep is not None
-                        and current_ep is not ep
-                        and current_ep.deferrable
-                        and pool_active
-                    )
-                    if protect_current_cache:
-                        with self._lock:
-                            # 按组写入：同端点其他组的延迟状态不受本轮影响
-                            # （端点级共享字段曾被后一组的 else 分支覆盖清零）
-                            ep._defer_until_by_group[grp] = now + 300
-                        current_label = self._endpoint_log_label(current_ep, grp) if current_ep else f"[{grp}]无"
-                        sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}；当前端点 '{current_label}' 已开启缓存保护，延迟回切 5 分钟", "INFO")
-                    else:
-                        with self._lock:
-                            ep._defer_until_by_group.pop(grp, None)
-                            # 自动路由：立即回切到刚恢复的端点，兑现"关闭缓存保护=立即回切"。
-                            self._set_current(grp, ep.id)
-                        if current_ep is not None and current_ep is not ep and not current_ep.deferrable:
-                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}；当前端点 '{self._endpoint_log_label(current_ep, grp)}' 未开启缓存保护，立即回切", "INFO")
-                        else:
-                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}，已恢复", "INFO")
-                    # 仅在该组当前端点不存在或已不可用时更新指针；恢复一个端点不应
-                    # 在池仍使用其他健康端点时把路由无故改回 priority 最小端点。
-                    with self._lock:
+                with self._lock:
+                    # 回切资格来自故障交接登记；手动切换在同一把锁下作废登记。
+                    affected_groups = sorted(ep._recovery_groups)
+                    ep._recovery_groups.clear()
+                    pool_active = self._last_pool_activity > now - 300
+                    for grp in affected_groups:
+                        if grp not in self._ep_groups(ep) or self._ep_disabled_in(ep, grp):
+                            continue
                         current_id = self._get_current(grp)
-                        current_ep = next(
-                            (e for e in self._endpoints if e.id == current_id), None
-                        ) if current_id else None
-                        current_unavailable = (
-                            current_ep is None
-                            or not current_ep.enabled
-                            or not current_ep.in_pool
-                            or self._is_in_cooldown(current_ep)
-                            or self._ep_disabled_in(current_ep, grp)
-                        )
-                        if current_unavailable:
-                            group_eps = [e for e in self._endpoints if e.enabled and e.in_pool
-                                         and grp in self._ep_groups(e)
-                                         and not self._ep_disabled_in(e, grp)
-                                         and not self._is_in_cooldown(e)
-]
-                            if group_eps:
-                                best = min(group_eps, key=lambda e: self._ep_priority(e, grp))
-                                self._set_current(grp, best.id)
+                        current_ep = next((e for e in self._endpoints if e.id == current_id), None)
+                        current_available = (current_ep is not None and current_ep.enabled and current_ep.in_pool
+                                             and not self._is_in_cooldown(current_ep)
+                                             and not current_ep._manual_unlock_required
+                                             and not self._ep_disabled_in(current_ep, grp))
+                        if current_available and current_ep is not ep and current_ep.deferrable and pool_active:
+                            ep._defer_until_by_group[grp] = now + 300
+                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}；"
+                                    f"故障交接组当前端点 '{self._endpoint_log_label(current_ep, grp)}' "
+                                    "已开启缓存保护，延迟回切 5 分钟", "INFO")
+                        else:
+                            ep._defer_until_by_group.pop(grp, None)
+                            self._set_current(grp, ep.id)
+                            sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}；"
+                                    "故障交接组已恢复回切", "INFO")
+                    if not affected_groups:
+                        sys_log(f"端点 '{ep.name}' {recovery_reason}；故障交接组=0，仅恢复可用性", "INFO")
             else:
                 with self._lock:
                     ep._fail_count += 1  # 探活失败计入连续失败，驱动阶梯冷却
@@ -6604,6 +6717,10 @@ class APIPool:
             # active 列表中继续重试，但不得让迟到失败覆盖 current。
             if expected_route_epoch is not None and self._get_route_epoch(grp) != expected_route_epoch:
                 return expected_route_epoch
+            previous = self._get_current(grp)
+            if (self._is_in_cooldown(failed_ep) and previous in (None, failed_ep.id)
+                    and not budget_cut):
+                failed_ep._recovery_groups.add(grp)
             if candidates:
                 self._set_current(grp, candidates[0].id)
             else:
@@ -7018,11 +7135,37 @@ class APIPool:
                         total_chars += len(c.get("text", ""))
         return total_chars // 3  # 中英文混合平均
 
+    def _guard_pool_outbound(self, ep=None, base_url="", api_key="", health_mode=None, origin_only=False):
+        """关闭检测只允许客户端业务转发；配置对象与临时连接入口共用此门。"""
+        disabled = health_mode == "none" or (ep is not None and self._probe_disabled(ep))
+        target_url = base_url or getattr(ep, "base_url", "")
+        target_key = api_key or getattr(ep, "api_key", "")
+        with self._lock:
+            configured = ep is not None and any(candidate is ep for candidate in self._endpoints)
+            for candidate in (() if configured else self._endpoints):
+                same = (urlparse(candidate.base_url).netloc == urlparse(target_url).netloc
+                        if origin_only else candidate.base_url.rstrip("/") == target_url.rstrip("/")
+                        and candidate.api_key == target_key)
+                if same and self._probe_disabled(candidate):
+                    disabled = True
+                    ep = candidate
+                    break
+            if disabled:
+                label = getattr(ep, "name", None) or "表单端点"
+                key = (getattr(ep, "id", "") or label, "outbound-disabled")
+                now = time.time()
+                if now - self._identity_skip_log_ts.get(key, 0) >= 600:
+                    self._identity_skip_log_ts[key] = now
+                    sys_log(f"池自身出站已跳过：{label} health_mode=none", "INFO")
+                raise PoolIdentityUnavailable(POOL_OUTBOUND_DISABLED_REASON)
+
     def _pool_identity_headers(self, ep, label=""):
         """池自身出站的出站头（确定性身份，2026-09-12）。
 
         与"有客户端上下文（代理路径）"分支相对：那时按端点 profile 或忠实透传当前请求头。
         解析不到任何确定身份时抛 PoolIdentityUnavailable —— 调用方必须跳过本次出站。"""
+        if not isinstance(ep, str):
+            self._guard_pool_outbound(ep)
         headers, source = resolve_pool_identity(
             ep, self._client_profiles, self._probe_client_profile, label=label,
         )
@@ -7065,12 +7208,7 @@ class APIPool:
         """对单个端点做快速探活，成功返回 True、失败返回 False、无可用身份返回 None（跳过）。统一用 chat ping 检测。"""
         started = time.time()
         if self._probe_disabled(ep):
-            with self._lock:
-                ep._health = "unknown"
-                ep._health_latency_ms = 0
-                ep._health_last_check = started
-                ep._health_error = "已禁用健康检测"
-            return True, ""  # 关闭检测视为可用（正常路径已在调用点跳过，此分支仅兜底）
+            return None, POOL_OUTBOUND_DISABLED_REASON
         # 统一使用 chat ping 探活：models 接口可访问不代表模型可响应
         with self._lock:
             prev_health, prev_health_error = ep._health, ep._health_error
@@ -7142,6 +7280,8 @@ class APIPool:
             "model": ep.model, "messages": loop_messages,
             **(extra_payload or {}),
         }
+        if getattr(ep, "is_vision", True) is False:
+            payload["messages"] = self._strip_historical_images(payload["messages"])
         # 出站私有键隔离（2026-10-20）：`_responses_response_format` 是 chat 入口给
         # Responses 桥接留的私有载体（见 chat/completions 入口对 response_format 的改名）。
         # 非 responses 协议的出站体由 payload 原样序列化，必须在此摘掉，否则严格上游
@@ -7327,6 +7467,14 @@ class APIPool:
         previous_attempt_site_id = None
         while tried < total:
             ep = active[idx]
+            if getattr(_POOL_INITIATED_CTX, "active", False):
+                try:
+                    self._guard_pool_outbound(ep)
+                except PoolIdentityUnavailable as exc:
+                    errors.append(f"{ep.name}: {exc}")
+                    tried += 1
+                    idx = (idx + 1) % total
+                    continue
             # 客户端类错误轮转终止：不冻结路径没有冷却收缩 total，靠请求级已试集合收口。
             if ep.id in client_error_tried:
                 tried += 1
@@ -7915,8 +8063,10 @@ class APIPool:
         self, ep, payload, timeout, log_usage=True, force_no_retry=False,
         is_probe=False, stream_stall_retry_used=False, debug_trace=None,
         pool_group=None, reset_cached_stats=False, request_id=None, request_deadline=None,
-        empty_stream_retry_used=False,
+        empty_stream_retry_used=False, retry_budget=None,
     ):
+        if is_probe or getattr(_POOL_INITIATED_CTX, "active", False) or not getattr(_client_ctx, "headers", None):
+            self._guard_pool_outbound(ep)
         req_t0 = time.time()
         stream_route_epoch = self._get_route_epoch(pool_group) if pool_group else None
         # 推理强度（第1层出站真值，2026-09-27）：payload 已过 _map_reasoning_effort 家族改写，
@@ -8060,9 +8210,15 @@ class APIPool:
             url = ep.base_url.rstrip("/") + "/chat/completions"
             data = json.dumps(payload).encode("utf-8")
             
+        if getattr(ep, "client_profile", "") or (not getattr(_client_ctx, "headers", None) and self._probe_client_profile):
+            data = json.dumps(self._apply_profile_body_identity(json.loads(data), ep), ensure_ascii=False).encode("utf-8")
         is_stream = payload.get("stream", False)
-        retries = 0 if force_no_retry else ep.max_retries
-        for attempt in range(retries + 1):
+        if retry_budget is None:
+            retry_budget = {"limit": 1 + (0 if force_no_retry else ep.max_retries), "sent": 0}
+        retries = retry_budget["limit"] - 1
+        for attempt in range(retry_budget["sent"], retries + 1):
+            if is_probe or getattr(_POOL_INITIATED_CTX, "active", False) or not getattr(_client_ctx, "headers", None):
+                self._guard_pool_outbound(ep)
             req = urllib.request.Request(url, data=data, method="POST")
             req.add_header("Content-Type", "application/json")
             safe_api_key = ep.api_key.encode('ascii', 'ignore').decode('ascii').strip()
@@ -8105,14 +8261,10 @@ class APIPool:
                     if remaining_budget <= 0:
                         return None, _BUDGET_EXHAUSTED_MSG
                     _open_timeout = min(_open_timeout, max(0.1, remaining_budget))
-                if getattr(ep, "use_proxy", True) is False:
-                    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                    resp = opener.open(req, timeout=_open_timeout)
-                else:
-                    resp = urllib.request.urlopen(req, timeout=_open_timeout)
+                retry_budget["sent"] += 1
+                resp = _open_identity_request(req, _open_timeout, getattr(ep, "use_proxy", True))
 
-                # 响应解压（2026-09-10 客户端伪装）：仅当上游声明 Content-Encoding: gzip/deflate 时解压，
-                # 其余（含未知编码）一律透传；解压失败向上抛（按上游失败处理），绝不吐损坏字节。
+                # 按上游 Content-Encoding 解码 JSON/SSE；压缩声明由客户端原值决定。
                 resp = _DecodedResponse(resp)
 
                 if is_stream:
@@ -8191,6 +8343,7 @@ class APIPool:
                         _gate_max_deadline = time.time() + _max_budget if _max_budget > 0 else None
                         _gate_max_lines = 200
                         _first_packet_retry_error = ""
+                        _first_packet_empty_error = ""
                         while True:
                             if _gate_stall_deadline is not None and time.time() > _gate_stall_deadline:
                                 _gate_elapsed_stall = True
@@ -8203,7 +8356,8 @@ class APIPool:
                             line = resp.readline()
                             if not line:
                                 resp.close()
-                                return None, "HTTP 502: upstream stream ended before first business chunk"
+                                _first_packet_empty_error = "HTTP 502: upstream stream ended before first business chunk"
+                                break
                             prefetched_lines.append(line)
                             stripped = line.strip()
                             if not stripped or stripped.startswith(b":"):
@@ -8218,7 +8372,8 @@ class APIPool:
                                 continue
                             if raw_data == b"[DONE]":
                                 resp.close()
-                                return None, "HTTP 502: upstream stream ended before first business chunk"
+                                _first_packet_empty_error = "HTTP 502: upstream stream ended before first business chunk"
+                                break
                             try:
                                 chunk = json.loads(raw_data.decode("utf-8"))
                             except (UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -8228,9 +8383,17 @@ class APIPool:
                             pending_error_event = False
                             if stream_error:
                                 resp.close()
-                                if (ep.retry_on_rate_limit and not force_no_retry and attempt < retries
-                                        and (retry_category := self._classify_retryable_stream_error(stream_error))):
-                                    # retry_on_rate_limit 兼容原配置名，首包覆盖统一分类器的全部可重试类别。
+                                if (not self._classify_capacity_error(stream_error) and any(
+                                    marker in stream_error.lower() for marker in (
+                                        "upstream stream ended before first business chunk", "provider returned an empty response",
+                                    )
+                                )):
+                                    _first_packet_empty_error = f"HTTP 502: upstream stream error: {stream_error}"
+                                    break
+                                retry_category = self._classify_retryable_stream_error(stream_error)
+                                if (not force_no_retry and attempt < retries and retry_category
+                                        and (retry_category != "rate_limit" or ep.retry_on_rate_limit)):
+                                    # 临时风控走常规重试；限流类由端点开关选择是否原地重试。
                                     _first_packet_retry_error = stream_error
                                     break
                                 return None, f"HTTP 502: upstream stream error: {stream_error}"
@@ -8259,6 +8422,17 @@ class APIPool:
                         except Exception:
                             pass
                         return None, f"HTTP 502: upstream stream pre-read failed: {type(e).__name__}: {e}"
+
+                    if _first_packet_empty_error:
+                        if attempt >= retries:
+                            return None, _first_packet_empty_error
+                        delay = self._retry_backoff(attempt)
+                        if request_deadline is not None and time.time() + delay >= request_deadline:
+                            return None, _first_packet_empty_error + "; retry skipped: request budget exhausted"
+                        sys_log(f"{request_tag}端点 '{endpoint_log_label}' 首帧前空流，{delay} 秒后进行第 "
+                                f"{attempt+1}/{retries} 次原端点优先重试", "INFO")
+                        time.sleep(delay)
+                        continue
 
                     if _first_packet_retry_error:
                         retry_delay = self._retry_backoff(attempt, retry_category)
@@ -8814,27 +8988,28 @@ class APIPool:
                     stream = stream_generator()
                     if not is_probe and not empty_stream_retry_used:
                         def _empty_stream_retry(attempt_index, _ep=ep, _payload=payload):
-                            """空响应原地重放：预算 = 端点 max_retries，耗尽才上报（2026-10-08）。"""
-                            if attempt_index >= retries:
+                            """空响应重放使用原请求剩余预算，HTTP 错误与空流共用计数。"""
+                            if retry_budget["sent"] >= retry_budget["limit"]:
                                 return None
-                            delay = 3 * (2 ** attempt_index)
+                            retry_index = retry_budget["sent"] - 1
+                            delay = self._retry_backoff(retry_index)
                             if request_deadline is not None and time.time() + delay >= request_deadline:
                                 sys_log(f"{request_tag}端点 '{endpoint_log_label}' 空响应重试跳过：请求预算不足", "WARN")
                                 return None
                             sys_log(f"{request_tag}端点 '{endpoint_log_label}' 空响应，{delay} 秒后进行第 "
-                                    f"{attempt_index+1}/{retries} 次原端点重试（空响应重放）", "INFO")
+                                    f"{retry_index+1}/{retries} 次原端点重试（空响应重放）", "INFO")
                             time.sleep(delay)
                             retry_stream, retry_error = self._try_endpoint(
-                                _ep, _payload, timeout, log_usage=log_usage, force_no_retry=True,
+                                _ep, _payload, timeout, log_usage=log_usage, force_no_retry=False,
                                 is_probe=False, pool_group=pool_group,
                                 reset_cached_stats=reset_cached_stats, request_id=request_id,
-                                request_deadline=request_deadline, empty_stream_retry_used=True,
+                                request_deadline=request_deadline, empty_stream_retry_used=True, retry_budget=retry_budget,
                             )
                             if retry_error or retry_stream is None:
-                                return None
+                                raise EndpointRequestError(502, retry_error or "Provider returned an empty response")
                             return retry_stream
                         stream = self._guard_empty_stream(stream, ep, pool_group, request_id, stream_route_epoch,
-                                                          empty_retry=_empty_stream_retry)
+                                                          empty_retry=_empty_stream_retry, retry_budget=retry_budget)
                     return stream, ""
                 else:
                     body = json.loads(resp.read().decode("utf-8"))
@@ -9119,7 +9294,8 @@ class APIPool:
                 return None, f"未知错误: {e}"
         return None, "重试次数用尽"
 
-    def fetch_models(self, base_url, api_key, timeout=10, use_proxy=True, protocol="openai", default_headers=None, extra_headers=None, client_profile=""):
+    def fetch_models(self, base_url, api_key, timeout=10, use_proxy=True, protocol="openai", default_headers=None, extra_headers=None, client_profile="", health_mode=None, endpoint=None):
+        self._guard_pool_outbound(ep=endpoint, base_url=base_url, api_key=api_key, health_mode=health_mode)
         url = base_url.rstrip("/") + "/models"
         req = urllib.request.Request(url, method="GET")
         safe_api_key = api_key.encode('ascii', 'ignore').decode('ascii').strip()
@@ -9135,15 +9311,9 @@ class APIPool:
             req.add_header(k, v)
             
         try:
-            if not use_proxy:
-                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                resp = opener.open(req, timeout=timeout)
-            else:
-                resp = urllib.request.urlopen(req, timeout=timeout)
+            resp = _open_identity_request(req, timeout, use_proxy)
 
-            # 响应解压（2026-09-12）：与 _try_endpoint 同源。profile/客户端基线声明
-            # Accept-Encoding: gzip, deflate 后上游会真实压缩，拉模型此前未解压，
-            # 直接 decode 抛 "'utf-8' codec can't decode byte 0x8b"。
+            # 拉模型与代理请求共用响应解码链。
             resp = _DecodedResponse(resp)
 
             with resp:
@@ -9186,8 +9356,12 @@ class APIPool:
                + _chunk(b"IEND", b""))
         return base64.b64encode(png).decode()
 
-    def test_vision(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai", user_agent="", client_profile=""):
-        ep = Endpoint(name="test_vision", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol, default_headers={"User-Agent": user_agent} if user_agent else {}, client_profile=client_profile)
+    def test_vision(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai", user_agent="", client_profile="", health_mode=None):
+        ep = Endpoint(name="test_vision", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol, default_headers={"User-Agent": user_agent} if user_agent else {}, client_profile=client_profile, health_mode=health_mode or "models")
+        try:
+            self._guard_pool_outbound(ep)
+        except PoolIdentityUnavailable as exc:
+            return {"ok": False, "skipped": True, "status": "skipped", "error": str(exc)}
         tiny_png = self._tiny_png_base64()
         payload = {
             "model": model,
@@ -9214,8 +9388,12 @@ class APIPool:
             unsupported = "image" in err.lower() or "vision" in err.lower() or "content" in err.lower() or "400" in err
             return {"ok": not unsupported, "supports_vision": not unsupported, "latency_ms": latency, "reply": "", "error": err}
 
-    def test_model_latency(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai", user_agent="", client_profile=""):
-        ep = Endpoint(name="test_latency", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol, default_headers={"User-Agent": user_agent} if user_agent else {}, client_profile=client_profile)
+    def test_model_latency(self, base_url, api_key, model, timeout=15, use_proxy=True, protocol="openai", user_agent="", client_profile="", health_mode=None):
+        ep = Endpoint(name="test_latency", base_url=base_url, api_key=api_key, model=model, max_retries=0, use_proxy=use_proxy, protocol=protocol, default_headers={"User-Agent": user_agent} if user_agent else {}, client_profile=client_profile, health_mode=health_mode or "models")
+        try:
+            self._guard_pool_outbound(ep)
+        except PoolIdentityUnavailable as exc:
+            return {"ok": False, "skipped": True, "status": "skipped", "error": str(exc)}
         payload = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": self.PROBE_MAX_TOKENS}
         t0 = time.time()
         try:
@@ -9325,6 +9503,8 @@ def _collect_cooldown_state():
         if ep._cooldown_until > now:
             rec["cooldown_until"] = ep._cooldown_until
             rec["cooldown_reason"] = ep._cooldown_reason or ""
+            if ep._recovery_groups:
+                rec["recovery_groups"] = sorted(ep._recovery_groups)
         if ep._manual_unlock_required:
             rec["manual_unlock_required"] = True
         if ep._fail_count > 0:
@@ -9419,28 +9599,29 @@ def load_probe_client_profile():
         return ""
 
 def _sanitize_profile_headers(headers):
-    """过滤 profile 保留头（由 pool 按端点协议管理）；返回 (清洗后 dict, 被过滤头名列表)。"""
+    """保留样本端到端身份头，剥离连接级字段与凭据。"""
+    if not isinstance(headers, dict):
+        raise TypeError("profile headers 必须是对象")
+    skip = set(_PROFILE_SAMPLE_SKIP_HEADERS)
+    for k, v in headers.items():
+        if isinstance(k, str) and k.lower() == "connection" and isinstance(v, str):
+            skip.update(t.strip().lower() for t in v.split(","))
     clean, dropped = {}, []
-    for k, v in (headers or {}).items():
+    seen = set()
+    for k, v in headers.items():
         if not isinstance(k, str) or not isinstance(v, str):
             continue
-        if k.strip().lower() in _PROFILE_RESERVED_HEADERS:
+        name = k.strip()
+        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) or "\r" in v or "\n" in v:
+            raise ValueError("profile 请求头格式无效")
+        if name.lower() in skip:
             dropped.append(k)
             continue
-        clean[k] = v
+        if name.lower() in seen:
+            raise ValueError(f"profile 请求头重复: {name}")
+        seen.add(name.lower())
+        clean[name] = v
     return clean, dropped
-
-def _filter_accept_encoding(headers):
-    """把 Accept-Encoding 收敛到解压链支持的编码；无可用 token 时丢弃该头（不让上游压缩）。"""
-    for k in list(headers):
-        if k.strip().lower() != "accept-encoding":
-            continue
-        keep = [t.strip() for t in str(headers[k]).split(",") if t.strip().lower() in _SUPPORTED_ACCEPT_ENCODINGS]
-        if keep:
-            headers[k] = ", ".join(keep)
-        else:
-            headers.pop(k)
-    return headers
 
 
 def resolve_outbound_headers(profile_name, client_profiles=None, label=""):
@@ -9448,7 +9629,7 @@ def resolve_outbound_headers(profile_name, client_profiles=None, label=""):
 
     profile_name 非空 → 伪装：仅用该 profile 的头（不叠加客户端头，避免混合指纹）；
     为空 → 透传：用客户端真实入站头（探活/测试/拉模型线程无客户端上下文时用客户端基线），
-    客户端无 UA 时回退默认库标识。"""
+    客户端身份值按来源保留，连接与鉴权由池管理。"""
     name = (profile_name or "").strip()
     if name:
         entry = (client_profiles or {}).get(name)
@@ -9456,22 +9637,26 @@ def resolve_outbound_headers(profile_name, client_profiles=None, label=""):
             clean, dropped = _sanitize_profile_headers(entry.get("headers", {}))
             if dropped:
                 sys_log(f"客户端伪装：profile '{name}' 包含保留头 {sorted(dropped)}，已过滤", "WARN")
-            return _filter_accept_encoding(clean)
-        sys_log(f"客户端伪装：{label or '端点'} 引用了未知 profile '{name}'，降级为透传", "WARN")
+            if clean:
+                return clean
+        reason = f"客户端伪装配置不可用: {name}"
+        sys_log(reason, "WARN")
+        raise PoolIdentityUnavailable(reason)
+
     return passthrough_client_headers()
 
 
 def passthrough_client_headers():
-    """透传分支：当前线程客户端头 → 客户端基线；按 skip 表过滤 + Accept-Encoding 收敛。
+    """透传分支：当前线程客户端头 → 客户端基线；保留端到端头原值。
 
     不为缺失的 UA 补任何默认值（2026-09-12：原 `_DEFAULT_OUTBOUND_UA` 编造值已删除）——
     真实客户端没带 UA 就原样转发，由上游自己判。"""
-    headers = {}
-    for k, v in _current_client_headers().items():
-        if k.strip().lower() in _PASSTHROUGH_SKIP_HEADERS:
-            continue
-        headers[k] = v
-    return _filter_accept_encoding(headers)
+    incoming = _current_client_headers()
+    skip = set(_PASSTHROUGH_SKIP_HEADERS)
+    for k, v in incoming.items():
+        if k.strip().lower() == "connection":
+            skip.update(token.strip().lower() for token in v.split(","))
+    return {k: v for k, v in incoming.items() if k.strip().lower() not in skip}
 
 
 def resolve_pool_identity(ep, client_profiles=None, probe_profile="", label=""):
@@ -9712,6 +9897,9 @@ if isinstance(restored_cooldowns, dict):
         if until > _now:
             ep._cooldown_until = until
             ep._cooldown_reason = str(rec.get("cooldown_reason") or "")
+            recovery_groups = rec.get("recovery_groups", [])
+            if isinstance(recovery_groups, list):
+                ep._recovery_groups = {g for g in recovery_groups if isinstance(g, str) and g in pool._ep_groups(ep)}
         if rec.get("manual_unlock_required"):
             ep._manual_unlock_required = True
         try:
@@ -10270,22 +10458,21 @@ def api_handler(method, path, body):
             # 池自身出站（探活/测试/拉模型）的默认身份 profile（2026-09-12）
             "probe_client_profile": getattr(pool, "_probe_client_profile", ""),
             "has_client_baseline": bool(_current_client_headers()),
-            # 最近一次 Hermes 真实流量身份采样（仅内存，供 profile 手动同步；2026-09-13）
-            "hermes_sample": _hermes_sample_meta(),
+            # 最近一次客户端真实请求身份采样（仅内存，供 profile 手动同步）
+            "client_sample": _client_sample_meta(),
         }, False
     if method == "POST" and cp == "/api/client-profiles/sync-identity":
-        # 手动同步：用最近一次 Hermes 真实流量的身份字段更新该 profile（策略 b；2026-09-13）
+        # 手动同步：将最近一次客户端样本写入目标 profile
         try:
             changes, _sample = pool.sync_client_profile_identity(body.get("name", ""))
         except ValueError as e:
             return 400, {"error": str(e)}, False
-        if changes:
-            _sync_to_config()
+        _sync_to_config()
         return 200, {"ok": True, "changes": changes}, False
     if method == "POST" and cp == "/api/client-profiles":
         try:
             name = pool.save_client_profile(body.get("name", ""), body.get("headers", {}))
-        except ValueError as e:
+        except (TypeError, ValueError) as e:
             return 400, {"error": str(e)}, False
         _sync_to_config()
         return 201, {"ok": True, "name": name}, False
@@ -10303,7 +10490,7 @@ def api_handler(method, path, body):
         name = unquote(cp[len("/api/client-profiles/"):]).strip("/")
         try:
             pool.save_client_profile(name, body.get("headers", {}))
-        except ValueError as e:
+        except (TypeError, ValueError) as e:
             return 400, {"error": str(e)}, False
         _sync_to_config()
         return 200, {"ok": True, "name": name}, False
@@ -10405,7 +10592,7 @@ def api_handler(method, path, body):
                 base_url, api_key, use_proxy=body.get("use_proxy", True),
                 protocol=body.get("protocol", "openai"),
                 default_headers=body.get("default_headers", {"User-Agent": body["user_agent"]} if body.get("user_agent") else {}),
-                client_profile=body.get("client_profile", ""),
+                client_profile=body.get("client_profile", ""), health_mode=body.get("health_mode"),
             )
             return 200, {"ok": True, "models": models, "count": len(models)}, False
         except urllib.error.HTTPError as e:
@@ -10414,8 +10601,8 @@ def api_handler(method, path, body):
             except Exception: pass
             return 200, {"ok": False, "error": f"HTTP {e.code}: {err_body}"}, False
         except Exception as e: return 200, {"ok": False, "error": str(e)}, False
-    if method == "POST" and cp == "/api/test-model": return 200, pool.test_model_latency(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai"), user_agent=body.get("user_agent", ""), client_profile=body.get("client_profile", "")), False
-    if method == "POST" and cp == "/api/test-vision": return 200, pool.test_vision(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai"), user_agent=body.get("user_agent", ""), client_profile=body.get("client_profile", "")), False
+    if method == "POST" and cp == "/api/test-model": return 200, pool.test_model_latency(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai"), user_agent=body.get("user_agent", ""), client_profile=body.get("client_profile", ""), health_mode=body.get("health_mode")), False
+    if method == "POST" and cp == "/api/test-vision": return 200, pool.test_vision(body.get("base_url", ""), body.get("api_key", ""), body.get("model", ""), timeout=body.get("timeout", 60), use_proxy=body.get("use_proxy", True), protocol=body.get("protocol", "openai"), user_agent=body.get("user_agent", ""), client_profile=body.get("client_profile", ""), health_mode=body.get("health_mode")), False
     if method == "POST" and cp == "/api/test":
         ep_id = body.get("id", "")
         test_msg = body.get("message", "你好")
@@ -10704,7 +10891,7 @@ class Handler(BaseHTTPRequestHandler):
         # 探活/测试/拉模型复用。流式生成器在本方法内同线程消费，故清理放在 finally。
         proxy_request = self._is_proxy_path()
         if proxy_request:
-            set_client_headers(self.headers, source=self.path)
+            set_client_headers(self.headers, source=self.path, body=body)
         try:
             res = api_handler("POST", self.path, body)
 
@@ -10772,6 +10959,9 @@ def main():
     # 注：滚动清理由 ChatLogger.__init__ 的守护线程负责（启动即执行首次清理），
     #     不在 main() 同步执行——大表 DELETE 会阻塞 server 启动（2026-08-15 实测 63s）
     server = _PoolServer(("0.0.0.0", port), Handler)
+    sys_log("客户端伪装就绪：同步=最近客户端请求；health_mode=none 仅转发客户端业务", "INFO")
+    sys_log(f"客户端身份透传就绪：Accept-Encoding=原值 anthropic-version=客户端优先 "
+            f"decoders=gzip,deflate,br/{brotli.__version__},zstd/{zstandard.__version__}", "INFO")
     print(f"\n  ⚡ {instance_name} 管理面板已启动")
     print(f"  🌐 管理面板访问: http://localhost:{port}")
     print(f"  🔗 客户端 Base URL: http://localhost:{port}/v1")

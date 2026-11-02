@@ -1,14 +1,7 @@
-"""客户端伪装 Client Profile（2026-09-10，2026-09-11 改为两模式透明网关）。
+"""客户端身份出站契约。
 
-契约：
-- client_profile 为具体名字 → 伪装：出站头集合 == 该 profile 头集（不叠加客户端头，避免混合指纹）
-- client_profile 为空 → 透传：入站头全量复制（连接级/池托管头除外）
-- 合并优先级：客户端特征/profile < default_headers < extra_headers
-- Accept-Encoding 收敛到解压链支持的编码（剔除 br/zstd）
-- 未知 profile 名降级为透传 + WARN，不 500
-- profile 保留头（Host/Content-Length/Authorization/x-api-key/anthropic-version）被过滤
-- profile 全部存在配置文件里，可编辑/覆盖/删除（含 hermes）
-- 探活/拉模型线程无客户端上下文 → 复用客户端基线
+透传与伪装均保留安全端到端头原值；profile 为伪装身份唯一来源。
+缺失或空 profile 在出站前报错。连接与凭据由池管理，端点自定义头拥有最终覆盖权。
 """
 
 import importlib.util
@@ -100,7 +93,7 @@ class ClientProfileTests(unittest.TestCase):
             return FakeResponse()
 
         def run():
-            with mock.patch.object(module.urllib.request, "urlopen", side_effect=fake_urlopen):
+            with mock.patch.object(module, "_open_identity_request", side_effect=lambda request, timeout, use_proxy: fake_urlopen(request, timeout)):
                 module.clear_client_headers() if in_probe_thread else None
                 result, error = pool._try_endpoint(
                     endpoint,
@@ -213,13 +206,12 @@ class ClientProfileTests(unittest.TestCase):
 
     # ── 降级与保护 ──
 
-    def test_unknown_profile_falls_back_to_passthrough(self):
-        h = self._capture_outbound_headers(
-            self._endpoint(client_profile="no-such"),
-            client_headers={"User-Agent": "hermes-agent/0.21.0", "X-Stainless-Lang": "python"},
-        )
-        self.assertEqual(h.get("user-agent"), "hermes-agent/0.21.0")
-        self.assertEqual(h.get("x-stainless-lang"), "python")
+    def test_unknown_profile_stops_outbound(self):
+        with self.assertRaises(self.module.PoolIdentityUnavailable):
+            self._capture_outbound_headers(
+                self._endpoint(client_profile="missing"),
+                client_headers={"User-Agent": "actual-client/1"},
+            )
 
     def test_sanitize_filters_reserved_headers(self):
         module = self.module
@@ -230,9 +222,9 @@ class ClientProfileTests(unittest.TestCase):
         })
         self.assertEqual(
             sorted(dropped),
-            ["Authorization", "Content-Length", "Host", "anthropic-version", "x-api-key"],
+            ["Authorization", "Content-Length", "Host", "x-api-key"],
         )
-        self.assertEqual(clean, {"User-Agent": "x", "Accept": "application/json"})
+        self.assertEqual(clean, {"User-Agent": "x", "Accept": "application/json", "anthropic-version": "2023-06-01"})
 
     def test_profile_reserved_header_never_reaches_wire(self):
         h = self._capture_outbound_headers(
@@ -244,19 +236,19 @@ class ClientProfileTests(unittest.TestCase):
 
     # ── Accept-Encoding 收敛 ──
 
-    def test_accept_encoding_filtered_on_passthrough(self):
+    def test_accept_encoding_preserved_on_passthrough(self):
         h = self._capture_outbound_headers(
             self._endpoint(),
             client_headers={"User-Agent": "curl/8.5.0", "Accept-Encoding": "gzip, deflate, br, zstd"},
         )
-        self.assertEqual(h.get("accept-encoding"), "gzip, deflate")
+        self.assertEqual(h.get("accept-encoding"), "gzip, deflate, br, zstd")
 
     def test_accept_encoding_filtered_on_profile(self):
         h = self._capture_outbound_headers(
             self._endpoint(client_profile="p"),
             profiles={"p": {"headers": {"User-Agent": "p/1.0", "Accept-Encoding": "br"}}},
         )
-        self.assertNotIn("accept-encoding", h)
+        self.assertEqual(h.get("accept-encoding"), "br")
 
     # ── 探活/测试/拉模型复用客户端基线 ──
 

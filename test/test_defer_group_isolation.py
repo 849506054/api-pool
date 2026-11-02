@@ -64,6 +64,7 @@ class DeferGroupIsolationTests(unittest.TestCase):
         self.pool = self.module.APIPool([self.x, self.m, self.d])
         self.pool._probe_endpoint = lambda ep: (True, "")
         self.pool._last_pool_activity = time.time()
+        self.x._recovery_groups.update({"main", "pool-ds"})  # 两组已因 X 故障交接
 
     # ── 核心回归：一组写入不被另一组覆盖 ──────────────────────────────
     def test_protected_group_keeps_defer_while_other_group_clears(self):

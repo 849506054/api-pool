@@ -920,7 +920,7 @@ function renderEndpoints(eps){
     else if(ep.in_cooldown)b+=`<span class="badge badge-cooldown">⏳${fmtCdSec(ep.cooldown_remaining)}</span>`;
     if(ep.is_deferred)b+=`<span class="badge badge-deferred" title="当前工作端点已开启缓存保护，恢复端点延迟回切，剩余 ${fmtTime(ep.defer_remaining)}">⏸延迟回切 ${fmtTime(ep.defer_remaining)}</span>`;
     if(ep.use_proxy)b+=`<span class="badge badge-priority" title="随系统代理转发请求">🌐代理</span>`;
-    if(ep.health_mode==='none')b+=`<span class="badge" style="background:rgba(255,255,255,.05);color:var(--text-dim)" title="已关闭后台健康监测">🔕免扰</span>`;
+    if(ep.health_mode==='none')b+=`<span class="badge" style="background:rgba(255,255,255,.05);color:var(--text-dim)" title="仅转发客户端请求，池自身出站已关闭">🔕免扰</span>`;
     else if(ep.health_mode==='models')b+=`<span class="badge" style="background:rgba(50,215,75,.1);color:var(--green)" title="零成本 Models 探针">☘️无感测</span>`;
     if(ep.billing_mode==='pay_per_use')b+=`<span class="badge" style="background:rgba(255,159,10,.15);color:#ff9f0a" title="按次计费，健康检查使用零成本探针">💰按次</span>`;
     const last=ep.last_success?timeAgo(ep.last_success):'—';
@@ -1715,7 +1715,7 @@ async function fetchModels(){
   const up=document.getElementById('fProxy').value==='true',pt=document.getElementById('fProtocol').value||'openai',ua=document.getElementById('fUserAgent').value.trim(),cp=document.getElementById('fClientProfile').value;
   if(!u||!k){toast('填写 URL 和 Key','error');return;}
   const b=document.getElementById('fetchModelsBtn');b.disabled=true;b.innerHTML='⏳';
-  try{const r=await api('POST','/api/fetch-models',{base_url:u,api_key:k,use_proxy:up,protocol:pt,user_agent:ua,client_profile:cp});
+  try{const r=await api('POST','/api/fetch-models',{base_url:u,api_key:k,use_proxy:up,protocol:pt,user_agent:ua,client_profile:cp,health_mode:document.getElementById('fHealthMode').value});
     if(r.ok&&r.models?.length){allModels=r.models;selectedModels=new Set();latencyResults={};visionResults={};modelPage=1;renderModelBrowser();toast(`${r.count} 个模型`,'success');}
     else{document.getElementById('modelBrowser').innerHTML=`<div style="padding:10px;color:var(--red);font-size:12px">❌ ${esc(r.error||'无模型')}</div>`;document.getElementById('modelBrowser').style.display='block';}
   }catch(e){toast('请求失败','error');}
@@ -1802,7 +1802,7 @@ async function testSelectedLatency(){
   if(!u||!k){toast('填写 URL 和 Key','error');return;}
   if(!selectedModels.size){toast('勾选模型','error');return;}
   const ms=[...selectedModels];toast(`测试 ${ms.length} 个...`,'info');
-  for(const mid of ms){latencyResults[mid]={status:'bad',latency_ms:0};filterModels();try{latencyResults[mid]=await api('POST','/api/test-model',{base_url:u,api_key:k,model:mid,use_proxy:up,protocol:pt,user_agent:ua,client_profile:cp});}catch(e){latencyResults[mid]={status:'bad',latency_ms:0};}filterModels();}
+  for(const mid of ms){latencyResults[mid]={status:'bad',latency_ms:0};filterModels();try{latencyResults[mid]=await api('POST','/api/test-model',{base_url:u,api_key:k,model:mid,use_proxy:up,protocol:pt,user_agent:ua,client_profile:cp,health_mode:document.getElementById('fHealthMode').value});}catch(e){latencyResults[mid]={status:'bad',latency_ms:0};}filterModels();}
   toast(`✅${Object.values(latencyResults).filter(r=>r.ok).length}/${ms.length}`,'success');
 }
 
@@ -1813,7 +1813,7 @@ async function testSelectedVision(){
   if(!selectedModels.size){toast('勾选模型','error');return;}
   const ms=[...selectedModels];toast(`检测 ${ms.length} 个多模态...`,'info');
   let vis=0;
-  for(const mid of ms){visionResults[mid]={supports_vision:false};filterModels();try{const r=await api('POST','/api/test-vision',{base_url:u,api_key:k,model:mid,use_proxy:up,protocol:pt,user_agent:ua,client_profile:cp});visionResults[mid]=r;if(r.supports_vision)vis++;}catch(e){visionResults[mid]={supports_vision:false};}filterModels();}
+  for(const mid of ms){visionResults[mid]={supports_vision:false};filterModels();try{const r=await api('POST','/api/test-vision',{base_url:u,api_key:k,model:mid,use_proxy:up,protocol:pt,user_agent:ua,client_profile:cp,health_mode:document.getElementById('fHealthMode').value});visionResults[mid]=r;if(r.supports_vision)vis++;}catch(e){visionResults[mid]={supports_vision:false};}filterModels();}
   toast(`多模态: ${vis}/${ms.length} 支持`,'success');
 }
 
@@ -1841,7 +1841,7 @@ function closeModal(){document.getElementById('modal').classList.remove('show');
 let clientProfiles=[];
 let probeClientProfile='';      // 池自身出站身份（探活/测试/拉模型；2026-09-12）
 let hasClientBaseline=false;    // 当前是否有真实客户端指纹基线
-let hermesSample={available:false};    // 最近一次 Hermes 真实流量身份采样（内存，供 profile 手动同步；2026-09-13）
+let clientSample={available:false};    // 最近一次 Hermes 真实流量身份采样（内存，供 profile 手动同步；2026-09-13）
 // profile 版本标识：从 User-Agent 提取 `<name>/<version>`，如 hermes-agent/0.21.0 → "Hermes 0.21.0"
 function profileVersion(headers){
   const h=headers||{};
@@ -1870,7 +1870,7 @@ async function loadClientProfiles(){
   clientProfiles=r.profiles;
   probeClientProfile=r.probe_client_profile||'';
   hasClientBaseline=!!r.has_client_baseline;
-  hermesSample=r.hermes_sample||{available:false};
+  clientSample=r.client_sample||{available:false};
   const sel=document.getElementById('fClientProfile');
   if(!sel)return;
   const cur=sel.value;
@@ -1891,17 +1891,17 @@ function closeProfileManager(){
   if(o)o.remove();
 }
 function renderProfileManager(){
-  const syncTitle=hermesSample.available
-    ? `用最近一次 Hermes 流量（v${esc(hermesSample.version)}${hermesSample.source?` · ${esc(hermesSample.source)}`:''}）更新该 profile 的身份字段`
-    : '暂无 Hermes 流量采样：需有一条 UA 为 hermes-agent/<ver> 的请求经过池';
+  const syncTitle=clientSample.available
+    ? `用最近一次客户端请求（${esc(clientSample.user_agent||clientSample.version||'未声明 UA')}${clientSample.source?` · ${esc(clientSample.source)}`:''}）更新该 profile 的身份字段`
+    : '暂无客户端流量采样：先让目标客户端发一条真实请求经过池';
   const rows=clientProfiles.map(p=>{
     const v=profileVersion(p.headers);
     return `<div class="pf-row">
       <span class="pf-name">${esc(p.name)}</span>
       ${v?`<span class="pf-ver">${esc(v)}</span>`:''}
-      <span class="pf-meta">${Object.keys(p.headers||{}).length} 头</span>
+      <span class="pf-meta">${Object.keys(p.headers||{}).length} 头${Object.keys(p.body_identity||{}).length?` · ${Object.keys(p.body_identity).length} 类身份字段`:""}</span>
       <span class="pf-act">
-        <button class="btn btn-ghost btn-sm" onclick="syncProfileIdentity('${esc(p.name)}')" title="${syncTitle}" ${hermesSample.available?'':'disabled'}>🔄</button>
+        <button class="btn btn-ghost btn-sm" onclick="syncProfileIdentity('${esc(p.name)}')" title="${syncTitle}" ${clientSample.available?'':'disabled'}>🔄</button>
         <button class="btn btn-ghost btn-sm" onclick="editClientProfile('${esc(p.name)}')" title="编辑">✏️</button>
         <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteClientProfile('${esc(p.name)}')" title="删除">🗑</button>
       </span>
@@ -1909,7 +1909,7 @@ function renderProfileManager(){
   }).join('');
   profileOverlay().innerHTML=`<div class="modal" style="width:560px">
     <h2>🎭 客户端伪装</h2>
-    <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">伪装=出站请求头改为该 profile 的配置，模拟其他客户端；端点「客户端伪装」留空=透传当前客户端。保存立即生效。</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">伪装=使用该 profile 的身份头和已同步的请求体身份字段；端点「客户端伪装」留空=透传当前客户端。保存立即生效。</div>
     <div class="pf-sec">池自身出站身份（探活 / 🧪测试 / 拉模型）</div>
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
       <select class="btn btn-ghost btn-sm" style="flex:1" onchange="setProbeClientProfile(this.value)">
@@ -1917,8 +1917,8 @@ function renderProfileManager(){
         ${clientProfiles.map(p=>`<option value="${escAttr(p.name)}" ${probeClientProfile===p.name?'selected':''}>${esc(profileOptionLabel(p))}</option>`).join('')}
       </select>
     </div>
-    <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">这类请求没有客户端上下文，身份按「端点客户端伪装 → 此处设置 → 最近一次真实客户端指纹」解析；三者都没有时**跳过本次出站**（不编造身份）。${hasClientBaseline?'当前有客户端基线':'⚠ 当前无客户端基线（重启后还没有真实请求）'}</div>
-    <div class="pf-sec">已有 profile（🔄 = 用最近 Hermes 流量的身份字段更新该 profile）</div>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">仅对开启检测的端点生效；关闭检测的端点只转发客户端业务请求。其余端点身份按「端点客户端伪装 → 此处设置 → 最近一次真实客户端指纹」解析；三者都没有时**跳过本次出站**（不编造身份）。${hasClientBaseline?'当前有客户端基线':'⚠ 当前无客户端基线（重启后还没有真实请求）'}</div>
+    <div class="pf-sec">已有 profile（🔄 = 同步最近客户端请求的身份头与身份字段）</div>
     <div style="display:flex;flex-direction:column;gap:6px;max-height:240px;overflow:auto">${rows||'<div class="pf-empty">暂无 profile</div>'}</div>
     <div class="form-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
       <button class="btn btn-ghost" onclick="closeProfileManager()">关闭</button>
@@ -1933,11 +1933,11 @@ async function setProbeClientProfile(v){
   renderProfileManager();
 }
 async function syncProfileIdentity(name){
-  // 手动同步（策略 b）：只用最近一次 Hermes 真实流量的身份字段更新该 profile，其余头保持原值
+  // 复用最近一次真实请求样本，同步完整身份头和已知请求体身份字段
   const r=await api('POST','/api/client-profiles/sync-identity',{name});
   if(!r||r.error){toast((r&&r.error)||'同步失败','error');return;}
   const ch=r.changes||[];
-  if(!ch.length){toast(`${name} 身份已是最近 Hermes 流量值（无变更）`,'success');return;}
+  if(!ch.length){toast(`${name} 身份已是最近客户端请求值（无变更）`,'success');return;}
   toast(`${name} 已更新 ${ch.length} 项：${ch.map(c=>c.header).join('、')}`,'success');
   await loadClientProfiles();
   renderProfileManager();
@@ -1952,7 +1952,7 @@ function renderProfileForm(editName){
   const v=editing?profileVersion(p.headers):'';
   profileOverlay().innerHTML=`<div class="modal" style="width:560px">
     <h2>${editing?'✏️ 编辑 profile':'➕ 新建 profile'}</h2>
-    <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">每行一个请求头（<code style="font-family:monospace">Header-Name: value</code>）。改客户端版本号=改这里的 User-Agent 行。保留头（Host/Content-Length/Authorization/x-api-key/anthropic-version）保存时自动过滤。</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">每行一个请求头（<code style="font-family:monospace">Header-Name: value</code>）。改客户端版本号=改这里的 User-Agent 行。保留头（Host/Content-Length/Authorization/x-api-key/x-goog-api-key/连接头）保存时自动过滤。</div>
     ${editing&&v?`<div style="font-size:12px;margin-bottom:12px">当前标识：<span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35)">🎭 ${esc(v)}</span></div>`:''}
     <div class="form-group"><label>名称</label><input type="text" id="pmName" value="${esc(editing?editName:'')}" placeholder="英文，如 hermes、codex-tui" ${editing?'disabled':''}></div>
     <div class="form-group"><label>请求头</label><textarea id="pmHeaders" placeholder="User-Agent: hermes-agent/0.21.0&#10;Accept: application/json">${esc(editing?profileHeadersToText(p.headers):'')}</textarea></div>
@@ -1985,7 +1985,7 @@ async function saveProfileForm(editName){
   renderProfileManager();
 }
 async function deleteClientProfile(name){
-  if(!confirm(`删除 profile「${name}」？引用它的端点将自动降级为透传。`))return;
+  if(!confirm(`删除 profile「${name}」？引用它的端点将暂停出站，直到重新选择有效配置。`))return;
   const r=await api('DELETE','/api/client-profiles/'+encodeURIComponent(name));
   if(!r||r.error){toast((r&&r.error)||'删除失败','error');return;}
   toast('已删除 '+name,'success');
