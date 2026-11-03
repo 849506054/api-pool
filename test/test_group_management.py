@@ -252,8 +252,8 @@ class GroupManagementTests(unittest.TestCase):
             raw = module.load_group_defs_config()
             pool2 = self.make_pool(module, [])
             pool2._load_group_defs(raw)
-            self.assertEqual(pool2._group_defs["bg"], {"type": "mixed", "model": "api-pool-bg"})
-            self.assertEqual(pool2._group_defs["ds"], {"type": "dedicated", "model": "deepseek-v4-flash"})
+            self.assertEqual(pool2._group_defs["bg"], {"type": "mixed", "model": "api-pool-bg", "priority_by_group": {}})
+            self.assertEqual(pool2._group_defs["ds"], {"type": "dedicated", "model": "deepseek-v4-flash", "priority_by_group": {}})
             self.assertEqual(pool2._group_defs["main"]["model"], "api-pool")
 
     def test_group_rest_crud_persists_each_state(self):
@@ -268,7 +268,7 @@ class GroupManagementTests(unittest.TestCase):
             with open(module.CONFIG_FILE, encoding="utf-8") as handle:
                 saved = json.load(handle)
             self.assertIn(
-                {"name": "bg", "type": "mixed", "model": "api-pool-bg"},
+                {"name": "bg", "type": "mixed", "model": "api-pool-bg", "priority_by_group": {}},
                 saved["pool_group_defs"],
             )
 
@@ -305,7 +305,7 @@ class GroupManagementTests(unittest.TestCase):
 
             restarted = load_module(tmp_path)
             endpoint = next(ep for ep in restarted.pool._endpoints if ep.id == "b1")
-            self.assertEqual(restarted.pool._group_defs["bg"], {"type": "mixed", "model": "api-pool-bg"})
+            self.assertEqual(restarted.pool._group_defs["bg"], {"type": "mixed", "model": "api-pool-bg", "priority_by_group": {}})
             self.assertEqual(endpoint.priority_by_group["bg"], 1)
             self.assertEqual(restarted.pool._get_current("bg"), "b1")
             self.assertEqual(restarted.pool._get_persisted("bg"), "b1")

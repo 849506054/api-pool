@@ -29,6 +29,8 @@ MODULE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "api_pool
 
 def load_module(tmp_path):
     previous_cwd = os.getcwd()
+    previous_db_dir = os.environ.get("API_POOL_DB_DIR")
+    os.environ["API_POOL_DB_DIR"] = str(tmp_path)
     os.chdir(tmp_path)
     try:
         name = f"api_pool_joinmain_test_{os.getpid()}_{id(threading.current_thread())}"
@@ -38,11 +40,16 @@ def load_module(tmp_path):
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
+        module.APIPool._credit_view = lambda self, ep: None
         module.__dict__["CONFIG_FILE"] = os.path.join(tmp_path, "api_config.json")
         module.__dict__["RUNTIME_STATE_FILE"] = os.path.join(tmp_path, "api_runtime_state.json")
         return module
     finally:
         os.chdir(previous_cwd)
+        if previous_db_dir is None:
+            os.environ.pop("API_POOL_DB_DIR", None)
+        else:
+            os.environ["API_POOL_DB_DIR"] = previous_db_dir
 
 
 class GroupJoinMainTests(unittest.TestCase):
@@ -79,7 +86,7 @@ class GroupJoinMainTests(unittest.TestCase):
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
             pool = self.make_pool(module, [m1, b1],
-                                  {"bg": {"type": "mixed", "model": "bg"}})
+                                  {"bg": {"type": "dedicated", "model": "bg"}})
             ok, _ = pool.set_main_priority("bg", None)
             self.assertTrue(ok)
             # main 原生最大名次=1 → 默认末位=2
@@ -89,7 +96,7 @@ class GroupJoinMainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
-            pool = self.make_pool(module, [b1], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [b1], {"bg": {"type": "dedicated", "model": "bg"}})
             # 统一轴 insert-at-position：轴上只有 bg 一个条目，名次 3 越界 → clamp 到 1
             self.assertTrue(pool.set_main_priority("bg", 3)[0])
             self.assertEqual(pool._joined_subgroups(), {"bg": 1})
@@ -103,7 +110,7 @@ class GroupJoinMainTests(unittest.TestCase):
             module = load_module(tmp_path)
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
-            pool = self.make_pool(module, [m1, b1], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [m1, b1], {"bg": {"type": "dedicated", "model": "bg"}})
             # 轴：[m1(#1)]，bg 插到名次 1 → m1 被挤到 #2
             self.assertTrue(pool.set_main_priority("bg", 1)[0])
             self.assertEqual(pool._joined_subgroups(), {"bg": 1})
@@ -125,7 +132,7 @@ class GroupJoinMainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
-            pool = self.make_pool(module, [b1], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [b1], {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 2)
             self.assertTrue(pool.leave_main("bg")[0])
             self.assertEqual(pool._joined_subgroups(), {})
@@ -141,7 +148,7 @@ class GroupJoinMainTests(unittest.TestCase):
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             m2 = self.endpoint(module, "m2", 2, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
-            pool = self.make_pool(module, [m1, m2, b1], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [m1, m2, b1], {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 3)
             # 轴上：m1(#1) m2(#2) bg(#3)
             slots = pool._main_axis_slots()
@@ -158,7 +165,7 @@ class GroupJoinMainTests(unittest.TestCase):
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             m2 = self.endpoint(module, "m2", 2, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
-            pool = self.make_pool(module, [m1, m2, b1], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [m1, m2, b1], {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 2)  # 轴：m1(#1) bg(#2) m2(#3)
             # 把 m2 插到名次 1 → m2 #1，其余顺延：m1→#2，bg→#3
             pool.set_group_priority("m2", "main", 1)
@@ -176,7 +183,7 @@ class GroupJoinMainTests(unittest.TestCase):
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             m2 = self.endpoint(module, "m2", 2, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
-            pool = self.make_pool(module, [m1, m2, b1], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [m1, m2, b1], {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", None)  # 末位 #3
             self.assertEqual(pool._joined_subgroups()["bg"], 3)
             # bg 插到名次 1 → m1→#2, m2→#3
@@ -193,7 +200,7 @@ class GroupJoinMainTests(unittest.TestCase):
             m2 = self.endpoint(module, "m2", 2, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
             b2 = self.endpoint(module, "b2", 2, "ds", groups=["bg"])
-            pool = self.make_pool(module, [m1, m2, b1, b2], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [m1, m2, b1, b2], {"bg": {"type": "dedicated", "model": "bg"}})
             native = sum(1 for e in pool._endpoints if e.in_pool and "main" in pool._ep_groups(e))
             pool.set_main_priority("bg", None)
             expected = native + len(pool._joined_subgroups())
@@ -214,7 +221,7 @@ class GroupJoinMainTests(unittest.TestCase):
             b1 = self.endpoint(module, "b1", 2, "ds", groups=["bg"])
             b2 = self.endpoint(module, "b2", 1, "ds", groups=["bg"])
             pool = self.make_pool(module, [m1, m2, b1, b2],
-                                  {"bg": {"type": "mixed", "model": "bg"}})
+                                  {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 3)  # bg 段名次 3（排在 m1=1, m2=2 之后）
             cands, starved = pool._group_sticky_candidates("main")
             self.assertFalse(starved)
@@ -228,8 +235,8 @@ class GroupJoinMainTests(unittest.TestCase):
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
             c1 = self.endpoint(module, "c1", 1, "gpt", groups=["gpt"])
             pool = self.make_pool(module, [m1, b1, c1],
-                                  {"bg": {"type": "mixed", "model": "bg"},
-                                   "gpt": {"type": "mixed", "model": "gpt"}})
+                                  {"bg": {"type": "dedicated", "model": "bg"},
+                                   "gpt": {"type": "dedicated", "model": "gpt"}})
             pool.set_main_priority("gpt", 2)
             pool.set_main_priority("bg", 3)
             cands, _ = pool._group_sticky_candidates("main")
@@ -243,7 +250,7 @@ class GroupJoinMainTests(unittest.TestCase):
             shared = self.endpoint(module, "shared", 1, "ds", groups=["main", "bg"])
             b1 = self.endpoint(module, "b1", 2, "ds", groups=["bg"])
             pool = self.make_pool(module, [shared, b1],
-                                  {"bg": {"type": "mixed", "model": "bg"}})
+                                  {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 5)
             cands, _ = pool._group_sticky_candidates("main")
             ids = [e.id for e in cands]
@@ -257,7 +264,7 @@ class GroupJoinMainTests(unittest.TestCase):
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
             pool = self.make_pool(module, [m1, b1],
-                                  {"bg": {"type": "mixed", "model": "bg"}})
+                                  {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 2)  # bg 段名次 2（在 m1 之后）
             # 正常：两者都在候选，m1 领先（名次1），b1 其后（名次2）
             self.assertEqual([e.id for e in pool._group_sticky_candidates("main")[0]], ["m1", "b1"])
@@ -275,7 +282,7 @@ class GroupJoinMainTests(unittest.TestCase):
             b1 = self.endpoint(module, "b1", 2, "ds", groups=["bg"])
             b2 = self.endpoint(module, "b2", 1, "ds", groups=["bg"])
             pool = self.make_pool(module, [m1, b1, b2],
-                                  {"bg": {"type": "mixed", "model": "bg"}})
+                                  {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 2)
             self.assertTrue(pool.switch_main_to_subgroup("bg")[0])
             # main 指针=子组名
@@ -298,7 +305,7 @@ class GroupJoinMainTests(unittest.TestCase):
             module = load_module(tmp_path)
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
             b2 = self.endpoint(module, "b2", 2, "ds", groups=["bg"])
-            pool = self.make_pool(module, [b1, b2], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [b1, b2], {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 1)
             pool.switch_main_to_subgroup("bg")
             # 子组自身当前指向 b2 → main 跟随 b2
@@ -322,7 +329,7 @@ class GroupJoinMainTests(unittest.TestCase):
             module = load_module(tmp_path)
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
-            pool = self.make_pool(module, [m1, b1], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [m1, b1], {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 2)
             pool.switch_main_to_subgroup("bg")
             self.assertEqual(pool._get_current("main"), "bg")
@@ -335,7 +342,7 @@ class GroupJoinMainTests(unittest.TestCase):
             module = load_module(tmp_path)
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
-            pool = self.make_pool(module, [b1, m1], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [b1, m1], {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 2)
             pool.switch_main_to_subgroup("bg")
             ok, newname = pool.update_group("bg", {"name": "bg2"})
@@ -352,7 +359,7 @@ class GroupJoinMainTests(unittest.TestCase):
             module = load_module(tmp_path)
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
-            pool = self.make_pool(module, [m1, b1], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [m1, b1], {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 2)
             pool.switch_main_to_subgroup("bg")
             # 落盘 main→bg
@@ -378,7 +385,7 @@ class GroupJoinMainTests(unittest.TestCase):
                          "api_key": "t", "model": "ds", "in_pool": True, "pool_groups": ["bg"]},
                     ],
                     "pool_group_defs": [
-                        {"name": "bg", "type": "mixed", "model": "bg", "main_priority": 2},
+                        {"name": "bg", "type": "dedicated", "model": "bg", "main_priority": 2},
                     ],
                 }, f)
             # 2) 运行态：main 指针 = 子组成员端点 id（旧格式残留）
@@ -401,7 +408,7 @@ class GroupJoinMainTests(unittest.TestCase):
             module = load_module(tmp_path)
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
             b2 = self.endpoint(module, "b2", 2, "ds", groups=["bg"])
-            pool = self.make_pool(module, [b1, b2], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [b1, b2], {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 2)
             # 有可用端点 → 0
             self.assertEqual(pool._group_all_frozen_remaining("bg"), 0)
@@ -437,7 +444,7 @@ class GroupJoinMainTests(unittest.TestCase):
             module = load_module(tmp_path)
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
-            pool = self.make_pool(module, [m1, b1], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [m1, b1], {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 2)
             b1._cooldown_until = time.time() + 600
             b1._fail_count = 3
@@ -454,7 +461,7 @@ class GroupJoinMainTests(unittest.TestCase):
             module = load_module(tmp_path)
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
-            pool = self.make_pool(module, [m1, b1], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [m1, b1], {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 2)
             ok, _ = pool.switch_main_to_subgroup("bg")
             self.assertTrue(ok)
@@ -483,11 +490,11 @@ class GroupJoinMainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
-            pool = self.make_pool(module, [b1], {"bg": {"type": "mixed", "model": "bg"}})
+            pool = self.make_pool(module, [b1], {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 4)
             # 模拟落盘/重载 defs
             defs = [{"name": "main", "type": "mixed", "model": "api-pool"},
-                    {"name": "bg", "type": "mixed", "model": "bg", "main_priority": 4}]
+                    {"name": "bg", "type": "dedicated", "model": "bg", "main_priority": 4}]
             pool2 = module.APIPool([self.endpoint(module, "b1", 1, "ds", groups=["bg"])])
             pool2._load_group_defs(defs)
             self.assertEqual(pool2._joined_subgroups(), {"bg": 4})
@@ -506,7 +513,7 @@ class GroupJoinMainTests(unittest.TestCase):
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
             m9 = self.endpoint(module, "m9", 9, "ds-fallback")
             pool = self.make_pool(module, [m1, b1, m9],
-                                  {"bg": {"type": "mixed", "model": "bg"}})
+                                  {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 2)   # bg 占名次 2，m9 名次 9
             self.assertTrue(pool.switch_main_to_subgroup("bg")[0])
             # 子组可用：main 有效目标 = 子组名（下钻自动跟随）
@@ -529,7 +536,7 @@ class GroupJoinMainTests(unittest.TestCase):
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
             pool = self.make_pool(module, [m1, b1],
-                                  {"bg": {"type": "mixed", "model": "bg"}})
+                                  {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 2)
             self.assertTrue(pool.switch_main_to_subgroup("bg")[0])
             b1._cooldown_until = _t.time() + 999
@@ -549,8 +556,8 @@ class GroupJoinMainTests(unittest.TestCase):
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
             b2 = self.endpoint(module, "b2", 1, "ds2", groups=["bg2"])
             pool = self.make_pool(module, [m1, b1, b2],
-                                  {"bg": {"type": "mixed", "model": "bg"},
-                                   "bg2": {"type": "mixed", "model": "bg2"}})
+                                  {"bg": {"type": "dedicated", "model": "bg"},
+                                   "bg2": {"type": "dedicated", "model": "bg2"}})
             pool.set_main_priority("bg", 2)
             pool.set_main_priority("bg2", 3)
             self.assertTrue(pool.switch_main_to_subgroup("bg")[0])
@@ -572,7 +579,7 @@ class GroupJoinMainTests(unittest.TestCase):
             module = load_module(tmp_path)
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
             pool = self.make_pool(module, [b1],
-                                  {"bg": {"type": "mixed", "model": "bg"}})
+                                  {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 1)
             # 模拟 main 自动选中该成员（指针=端点 id，非子组名）
             pool._set_current("main", "b1")
@@ -590,7 +597,7 @@ class GroupJoinMainTests(unittest.TestCase):
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
             pool = self.make_pool(module, [m1, b1],
-                                  {"bg": {"type": "mixed", "model": "bg"}})
+                                  {"bg": {"type": "dedicated", "model": "bg"}})
             pool.set_main_priority("bg", 2)
             pool._set_current("main", "m1")
             self.assertIsNone(pool._main_serving_subgroup())
@@ -612,7 +619,7 @@ class GroupJoinMainTests(unittest.TestCase):
             c1 = self.endpoint(module, "c1", 1, "ds", groups=["cline"])
             c4 = self.endpoint(module, "c4", 4, "ds", groups=["cline"])
             pool = self.make_pool(module, [c1, c4],
-                                  {"cline": {"type": "mixed", "model": "cline"}})
+                                  {"cline": {"type": "dedicated", "model": "cline"}})
             pool.set_main_priority("cline", 1)
             self.assertTrue(pool.switch_main_to_subgroup("cline")[0])
             pool._set_current("cline", "c1")    # 子组自身陈旧手动指针
@@ -647,8 +654,8 @@ class GroupJoinMainTests(unittest.TestCase):
             c1 = self.endpoint(module, "c1", 1, "ds", groups=["cline"])
             c4 = self.endpoint(module, "c4", 4, "ds", groups=["cline"])
             pool = self.make_pool(module, [m1, b1, c1, c4],
-                                  {"bg": {"type": "mixed", "model": "bg"},
-                                   "cline": {"type": "mixed", "model": "cline"}})
+                                  {"bg": {"type": "dedicated", "model": "bg"},
+                                   "cline": {"type": "dedicated", "model": "cline"}})
             pool.set_main_priority("cline", 1)
             pool.set_main_priority("bg", 2)
             pool._set_current("main", "m1")      # main 用原生端点
@@ -698,7 +705,7 @@ class GroupJoinMainTests(unittest.TestCase):
             m1 = self.endpoint(module, "m1", 1, "glm-5.3")
             c4 = self.endpoint(module, "c4", 1, "ds", groups=["cline"])
             pool = self.make_pool(module, [m1, c4],
-                                  {"cline": {"type": "mixed", "model": "cline"}})
+                                  {"cline": {"type": "dedicated", "model": "cline"}})
             pool.set_main_priority("cline", 2)
             pool._set_current("main", "m1")
             m1._cooldown_until = _t.time() + 999
@@ -767,7 +774,7 @@ class GroupJoinMainTests(unittest.TestCase):
             native = self.endpoint(module, "justwoker", 4, "opus", groups=["main"])
             native.priority_by_group = {"main": 4}
             pool = self.make_pool(module, [g_hi, g_lo, native],
-                                  {"cline": {"type": "mixed", "model": "cline"}})
+                                  {"cline": {"type": "dedicated", "model": "cline"}})
             pool.set_main_priority("cline", 1)  # 子组整体排 main 首位
 
             # 初始候选：子组两成员钉在 main_priority=1 段（段内按 cline 优先级：ds#1 在 gemini#7 前），
@@ -797,7 +804,7 @@ class GroupJoinMainTests(unittest.TestCase):
             native = self.endpoint(module, "justwoker", 4, "opus", groups=["main"])
             native.priority_by_group = {"main": 4}
             pool = self.make_pool(module, [g_hi, g_lo, native],
-                                  {"cline": {"type": "mixed", "model": "cline"}})
+                                  {"cline": {"type": "dedicated", "model": "cline"}})
             pool.set_main_priority("cline", 1)
 
             # 两个子组成员都冷却 → 子组整段从候选消失，只剩原生 justwoker
@@ -827,8 +834,8 @@ class GroupJoinMainTests(unittest.TestCase):
             native = self.endpoint(module, "native", 5, "m", groups=["main"])
             native.priority_by_group = {"main": 5}
             pool = self.make_pool(module, [a_hi, a_lo, b1, native],
-                                  {"ga": {"type": "mixed", "model": "ga"},
-                                   "gb": {"type": "mixed", "model": "gb"}})
+                                  {"ga": {"type": "dedicated", "model": "ga"},
+                                   "gb": {"type": "dedicated", "model": "gb"}})
             pool.set_main_priority("ga", 1)
             pool.set_main_priority("gb", 2)
 
@@ -872,7 +879,7 @@ class GroupJoinMainTests(unittest.TestCase):
             d = self.endpoint(module, "D", 4, "m", groups=["main"])
             d.priority_by_group = {"main": 4}
             pool = self.make_pool(module, [a, b1, b2, b3, c, d],
-                                  {"B": {"type": "mixed", "model": "B"}})
+                                  {"B": {"type": "dedicated", "model": "B"}})
             pool.set_main_priority("B", 2)  # 轴：A#1, B#2, C#3, D#4
 
             # 1) A 故障 → 下一个是 B 段首（b1），且 B 内顺序 b1<b2<b3
@@ -922,7 +929,7 @@ class GroupJoinMainTests(unittest.TestCase):
             b2 = self.endpoint(module, "b2", 2, "ds", groups=["cline"])
             b2.priority_by_group = {"main": 2, "cline": 2}
             pool = self.make_pool(module, [b1, b2],
-                                  {"cline": {"type": "mixed", "model": "cline"}})
+                                  {"cline": {"type": "dedicated", "model": "cline"}})
             pool.set_main_priority("cline", 1)
             # main 当前端点 = b1（子组成员为 main 服务中）
             pool._set_current("main", b1.id)
@@ -938,7 +945,7 @@ class GroupJoinMainTests(unittest.TestCase):
             b2 = self.endpoint(module, "b2", 2, "ds", groups=["cline"])
             b2.priority_by_group = {"main": 2, "cline": 2}
             pool = self.make_pool(module, [b1, b2],
-                                  {"cline": {"type": "mixed", "model": "cline"}})
+                                  {"cline": {"type": "dedicated", "model": "cline"}})
             pool.set_main_priority("cline", 1)
             # 子组自身指针从未写过（历史缺陷）→ 仍应回退到 top 可用成员，不是 None
             self.assertEqual(pool._resolve_subgroup_current("cline"), b1.id)
@@ -953,7 +960,7 @@ class GroupJoinMainTests(unittest.TestCase):
             b1 = self.endpoint(module, "b1", 2, "ds", groups=["cline"])
             b1.priority_by_group = {"main": 2, "cline": 1}
             pool = self.make_pool(module, [b1],
-                                  {"cline": {"type": "mixed", "model": "cline"}})
+                                  {"cline": {"type": "dedicated", "model": "cline"}})
             pool.set_main_priority("cline", 1)
             entries = pool._joined_subgroup_chain_entries(time.time())
             self.assertEqual(len(entries), 1)
@@ -969,7 +976,7 @@ class GroupJoinMainTests(unittest.TestCase):
             b_lo = self.endpoint(module, "b-lo", 2, "ds", groups=["cline"])
             b_lo.priority_by_group = {"main": 2, "cline": 2}
             pool = self.make_pool(module, [b_hi, b_lo],
-                                  {"cline": {"type": "mixed", "model": "cline"}})
+                                  {"cline": {"type": "dedicated", "model": "cline"}})
             pool.set_main_priority("cline", 1)
             pool._try_endpoint = self.ok_try
             # 第一次成功走 b-hi（子组 top）

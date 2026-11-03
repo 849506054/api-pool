@@ -3665,33 +3665,19 @@ class APIPool:
             return replacement, created, pointer_moved
 
     def _renumber_pool_priorities(self):
-        """对每组内端点分配该组独立的连续优先级（2026-08-29 分组隔离）。
+        """Each parent's native endpoints and child slots share a continuous axis."""
+        for group in self._all_group_names():
+            self._renumber_group_axis(group)
 
-        每组独立 1..N：跨组端点在不同组可有不同排序；main 组值镜像到全局
-        priority 字段（兼容旧 config 格式与 prio99 兜底语义）。
-
-        main 组另含已加入子组（2026-09-27）：子组与原生端点共享同一条 main
-        优先级轴，作为正式条目一起重排 → 名次唯一且连续（子组占 1 个名次）。
-        """
-        for grp in self._all_group_names():
-            group_eps = sorted(
-                (ep for ep in self._endpoints if ep.in_pool and grp in self._ep_groups(ep)),
-                key=lambda e: self._ep_priority(e, grp),
-            )
-            if grp == self.MAIN_GROUP:
-                # 统一轴：原生端点 + 已加入子组按当前名次排序后整体重编号
-                slots = [("ep", ep, self._ep_priority(ep, self.MAIN_GROUP)) for ep in group_eps]
-                for sub_name, mp in self._joined_subgroups().items():
-                    slots.append(("sub", sub_name, mp))
-                slots.sort(key=lambda s: s[2])
-                for i, (kind, obj, _p) in enumerate(slots):
-                    if kind == "ep":
-                        self._set_ep_priority(obj, grp, i + 1)
-                    else:
-                        self._group_defs[obj]["main_priority"] = i + 1
-                continue
-            for i, ep in enumerate(group_eps):
-                self._set_ep_priority(ep, grp, i + 1)
+    def _renumber_group_axis(self, group):
+        for rank, (kind, obj, _) in enumerate(self._group_axis_slots(group), 1):
+            if kind == "ep":
+                self._set_ep_priority(obj, group, rank)
+            else:
+                gd = self._group_defs[obj]
+                gd["priority_by_group"] = self._membership_priorities(gd)
+                gd["priority_by_group"][group] = rank
+                gd.pop("main_priority", None)
 
     def set_group_priority(self, ep_id, group, new_priority):
         """组内优先级 insert-at-position（2026-08-29 分组隔离）：只影响该组。
@@ -3702,13 +3688,13 @@ class APIPool:
         """
         with self._lock:
             for ep in self._endpoints:
-                if ep.id != ep_id or not ep.in_pool:
+                if ep.id != ep_id or not ep.in_pool or group not in self._ep_groups(ep):
                     continue
-                if group == self.MAIN_GROUP and self._joined_subgroups():
+                if self._joined_subgroups(group):
                     # 统一轴 insert 内部已整体重编号（唯一连续）；末尾的
                     # _renumber_pool_priorities 会以当前名次为键重排，与刚插入的
                     # 位置冲突（并列名次排序不稳定）→ 此处直接返回，跳过 renumber。
-                    self._set_main_axis_priority(ep, None, new_priority)
+                    self._set_group_axis_priority(group, ep, None, new_priority)
                     self._endpoints.sort(key=lambda e: e.priority)
                     return
                 members = sorted(
@@ -3727,28 +3713,29 @@ class APIPool:
                     elif old < op <= new_priority:
                         self._set_ep_priority(other, group, op - 1)
                 break
-            self._renumber_pool_priorities()
+            self._renumber_group_axis(group)
             self._endpoints.sort(key=lambda e: e.priority)
 
     def _main_axis_slots(self):
-        """main 优先级轴全部条目（原生端点 + 已加入子组），按当前名次排序。
+        return self._group_axis_slots(self.MAIN_GROUP)
 
-        返回 [(kind, obj, prio)]：kind='ep' → obj 为 Endpoint；'sub' → obj 为子组 def dict。
-        """
-        eps = [ep for ep in self._endpoints if ep.in_pool and self.MAIN_GROUP in self._ep_groups(ep)]
-        slots = [("ep", ep, self._ep_priority(ep, self.MAIN_GROUP)) for ep in eps]
-        for sub_name, mp in self._joined_subgroups().items():
-            slots.append(("sub", sub_name, mp))
-        slots.sort(key=lambda s: s[2])
-        return slots
+    def _group_axis_slots(self, group):
+        """Ordered native endpoints and dedicated-child slots for one parent."""
+        slots = [("ep", ep, self._ep_priority(ep, group)) for ep in self._endpoints
+                 if ep.in_pool and group in self._ep_groups(ep)]
+        slots.extend(("sub", sub, rank) for sub, rank in self._joined_subgroups(group).items())
+        return sorted(slots, key=lambda slot: slot[2])
 
     def _set_main_axis_priority(self, ep, sub_name, new_priority):
-        """main 统一优先级轴 insert-at-position（2026-09-27）。
+        self._set_group_axis_priority(self.MAIN_GROUP, ep, sub_name, new_priority)
+
+    def _set_group_axis_priority(self, group, ep, sub_name, new_priority):
+        """父组统一优先级轴 insert-at-position。
 
         被移动对象（ep 或子组名二者其一）插到名次 new_priority，其余条目按序
         位移后整体重编号 → 名次唯一连续。端点与子组互为邻居，挤开的是同一批对象。
         """
-        slots = self._main_axis_slots()
+        slots = self._group_axis_slots(group)
         moving_kind = "ep" if ep is not None else "sub"
         # 用值相等而非 is：子组名是字符串（跨调用不保证驻留），Endpoint 用对象相等
         if moving_kind == "ep":
@@ -3760,9 +3747,12 @@ class APIPool:
         ordered = rest[:new_priority - 1] + [(moving_kind, ep if ep is not None else sub_name, 0)] + rest[new_priority - 1:]
         for i, (kind, obj, _p) in enumerate(ordered):
             if kind == "ep":
-                self._set_ep_priority(obj, self.MAIN_GROUP, i + 1)
+                self._set_ep_priority(obj, group, i + 1)
             else:
-                self._group_defs[obj]["main_priority"] = i + 1
+                gd = self._group_defs[obj]
+                gd["priority_by_group"] = self._membership_priorities(gd)
+                gd["priority_by_group"][group] = i + 1
+                gd.pop("main_priority", None)
 
 
     # ══════════════ 分组池路由基础设施（2026-08-29 spec）══════════════
@@ -3964,33 +3954,29 @@ class APIPool:
         self._rotate_group_once(group)
 
     def _rotate_group_once(self, group):
-        """把组当前端点按组内优先级推进到下一名（循环）；成员不足 2 不轮换。
-
-        手动切换是那一刻的用户动作：组配了轮换就按配置继续推进，两者不冲突。
-        """
+        """Advance one available parent slot; a dedicated child counts once."""
         with self._lock:
             cur = self._get_current(group)
-            if group == self.MAIN_GROUP and cur and cur in self._joined_subgroups():
-                return  # 「整组」指针优先于轮换（2026-09-27 手动切子组整体语义）
             cands, _ = self._group_sticky_candidates(group)
-            sel = set(self._group_rotate_members(group))
-            if sel:
-                # 选择性轮换（2026-10-06）：只在选中成员之间推进；选中集当前全不可用则本轮不动
-                cands = [e for e in cands if e.id in sel]
-                if not cands:
-                    return
-            elif len(cands) < 2:
+            selected = set(self._group_rotate_members(group))
+            cands.sort(key=lambda ep: self._candidate_sort_key(ep, group))
+            slots = []
+            for ep in cands:
+                sub = self._axis_subgroup(ep, group)
+                slot = sub or ep.id
+                if selected and not ({ep.id, slot, f"subgroup:{group}:{sub}"} & selected):
+                    continue
+                if slot not in slots:
+                    slots.append(slot)
+            if not slots or (not selected and len(slots) < 2):
                 return
-            cands.sort(key=lambda e: self._candidate_sort_key(e, group))
-            ids = [e.id for e in cands]
-            pos = ids.index(cur) if cur in ids else -1
-            nxt = cands[(pos + 1) % len(cands)]
-            if nxt.id == cur:
-                return
-            prev_name = next((e.name for e in cands if e.id == cur), "-")
-            # 轮换要落到实处（_set_current 推进 route epoch，在途旧请求的成功回调不会覆盖本次决策）
-            self._set_current(group, nxt.id)
-            sys_log(f"组 '{group}' 端点轮换 '{prev_name}' → '{nxt.name}'", "INFO", group=group)
+            cur_ep = next((ep for ep in cands if ep.id == cur), None)
+            current_slot = (self._axis_subgroup(cur_ep, group) or cur) if cur_ep else cur
+            pos = slots.index(current_slot) if current_slot in slots else -1
+            nxt = slots[(pos + 1) % len(slots)]
+            if nxt != cur:
+                self._set_current(group, nxt)
+                sys_log(f"组 '{group}' 成员轮换 '{cur or '-'}' → '{nxt}'", "INFO", group=group)
 
     GROUP_LOG_LEVELS = ("all", "error", "live", "silent")
 
@@ -4144,14 +4130,17 @@ class APIPool:
                 rmem = self._loaded_group_rotate_members(d)
                 if rmem:
                     entry["rotate_members"] = rmem
-                # 加入 main 的名次（2026-09-27）：int>0 恢复，其余忽略
-                try:
-                    mp = int(d.get("main_priority") or 0)
-                except (TypeError, ValueError):
-                    mp = 0
-                if mp > 0:
-                    entry["main_priority"] = mp
+                entry["priority_by_group"] = self._membership_priorities(d)
+                if gtype == "mixed" and entry["priority_by_group"]:
+                    raise ValueError(f"组 '{name}' 为 mixed；整组成员必须为专用 dedicated 组")
                 self._group_defs[name] = entry
+        # Parent definitions may occur after their children in the persisted list.
+        for name, gd in self._group_defs.items():
+            gd["priority_by_group"] = {
+                group: rank for group, rank in self._membership_priorities(gd).items()
+                if self._valid_membership(name, group) and type(rank) is int and rank > 0
+            }
+            gd.pop("main_priority", None)
         return self._group_defs
 
     def _derive_group_defs(self):
@@ -4257,6 +4246,9 @@ class APIPool:
 
             if not self._valid_group_type(new_type):
                 return False, "分组类型必须为 mixed 或 dedicated"
+            if new_type != old["type"] and (
+                    self._membership_priorities(old) or self._joined_subgroups(name)):
+                return False, "该组存在整组成员关系，请先移出后再修改类型"
             if name == self.MAIN_GROUP:
                 if new_name != self.MAIN_GROUP or new_type != "mixed":
                     return False, "main 组名称与类型不可修改（仅可改选择器）"
@@ -4332,6 +4324,13 @@ class APIPool:
                     self._group_fallback_lock_until[new_name] = self._group_fallback_lock_until.pop(name)
                 if name in self._group_fallback_pending:
                     self._group_fallback_pending[new_name] = self._group_fallback_pending.pop(name)
+                for gd in self._group_defs.values():
+                    self._retire_group_key(gd, name, new_name)
+                for parent in self._all_group_names():
+                    for getter, setter in ((self._get_current, self._set_current),
+                                           (self._get_persisted, self._set_persisted)):
+                        if getter(parent) == name:
+                            setter(parent, new_name)
                 del self._group_defs[name]
 
             self._group_defs[new_name] = {"type": new_type, "model": eff_model}
@@ -4345,12 +4344,7 @@ class APIPool:
                 self._group_defs[new_name]["rotate_requests"] = new_req
             if new_rmem:
                 self._group_defs[new_name]["rotate_members"] = new_rmem
-            # 加入 main 名次跟随改名（2026-09-27）；main 指针若指向旧子组名同步改名
-            if old.get("main_priority"):
-                self._group_defs[new_name]["main_priority"] = old["main_priority"]
-                if new_name != name:
-                    if self._get_current(self.MAIN_GROUP) == name:
-                        self._set_current(self.MAIN_GROUP, new_name)
+            self._group_defs[new_name]["priority_by_group"] = self._membership_priorities(old)
             # 空闲借用仅配置时显示（main 组更新走 _set_group_idle_seconds 专属日志，此处恒为子组路径）
             idle_seg = f"，空闲借用 {new_idle} 秒" if new_idle else ""
             sys_log(f"更新分组 '{name}'→'{new_name}'（{new_type}，选择器 {eff_model}，上下文 {'%s tokens' % format(new_ck, ',') if new_ck else '未声明'}{idle_seg}，日志 {new_lvl}，轮换 {('每 %s 次请求' % new_req) if new_req else '不轮换'}{'，轮换成员 ' + str(len(new_rmem)) + ' 个' if new_rmem else ''}）", "INFO", group=name)
@@ -4365,6 +4359,7 @@ class APIPool:
                 return False, f"'{name}' 为系统内置组，不可删除"
             if name not in self._group_defs and name not in self._all_group_names():
                 return False, f"组 '{name}' 不存在"
+            affected_parents = list(self._membership_priorities(self._group_defs.get(name, {})))
             # 逐成员移出（复用组感知移除语义）
             for ep in list(self._endpoints):
                 if ep.in_pool and name in self._ep_groups(ep):
@@ -4372,6 +4367,8 @@ class APIPool:
             # 组名成历史：清掉所有端点上以该组名为键的残留状态（成员已在上面逐个移出）
             for ep in self._endpoints:
                 self._retire_group_key(ep, name)
+            for gd in self._group_defs.values():
+                self._retire_group_key(gd, name)
             self._group_defs.pop(name, None)
             for state in (self._current_endpoint_by_group,
                           self._persisted_endpoint_by_group, self._fallback_lock_until_by_group,
@@ -4380,9 +4377,13 @@ class APIPool:
                 state.pop(name, None)
             self._group_fallback_lock_until.pop(name, None)
             self._group_fallback_pending.pop(name, None)
-            # 删的是已加入 main 的子组：清 main 指向该子组名的指针（2026-09-27）
-            if self._get_current(self.MAIN_GROUP) == name:
-                self._set_current(self.MAIN_GROUP, None)
+            for parent in self._all_group_names():
+                for getter, setter in ((self._get_current, self._set_current),
+                                       (self._get_persisted, self._set_persisted)):
+                    if getter(parent) == name:
+                        setter(parent, None)
+            for parent in affected_parents:
+                self._renumber_group_axis(parent)
             sys_log(f"删除分组 '{name}'（成员已移出）", "INFO", group=name)
             return True, "deleted"
 
@@ -4413,6 +4414,14 @@ class APIPool:
         新增此类以组名为键的字段必须挂到这里，否则改名或退组会留下孤儿键
         （2026-10-06 改组名丢名次事故的收口点）。
         """
+        if isinstance(ep, dict):
+            pbg = ep.setdefault("priority_by_group", self._membership_priorities(ep))
+            if group in pbg:
+                rank = pbg.pop(group)
+                if new_group:
+                    pbg[new_group] = rank
+            ep.pop("main_priority", None)
+            return
         pbg = ep.priority_by_group
         if pbg and group in pbg:
             if new_group:
@@ -4498,7 +4507,14 @@ class APIPool:
         else:
             self._current_endpoint_by_group[group] = ep_id
         if previous != ep_id:
-            self._route_epoch_by_group[group] = self._route_epoch_by_group.get(group, 0) + 1
+            self._invalidate_route(group)
+            # In-flight child attempts also belong to parents with another or no pointer.
+            for parent, rank in self._membership_priorities(self._group_defs.get(group, {})).items():
+                if self._valid_membership(group, parent) and type(rank) is int and rank > 0:
+                    self._invalidate_route(parent)
+
+    def _invalidate_route(self, group):
+        self._route_epoch_by_group[group] = self._get_route_epoch(group) + 1
 
     def _get_route_epoch(self, group):
         return self._route_epoch_by_group.get(group, 0)
@@ -4652,7 +4668,10 @@ class APIPool:
         """
         if group == self.MAIN_GROUP or self._group_defs.get(group, {}).get("type") == "dedicated":
             return False
-        if ep.id != self._get_current(self.MAIN_GROUP):
+        main_current = self._get_current(self.MAIN_GROUP)
+        if main_current in self._joined_subgroups():
+            main_current = self._resolve_subgroup_current(main_current)
+        if ep.id != main_current:
             return False
         return not self._ep_idle_ready(ep)
 
@@ -4680,19 +4699,33 @@ class APIPool:
         if group:
             ep._last_activity_by_group[group] = ts if ts is not None else time.time()
 
-    # ── 子组整组加入 main（2026-09-27）──
-    # 子组 def 的 main_priority（int>0）= 已作为 main 成员参与、占 main 优先级轴该名次；
-    # 无/0 = 未加入。子组整组作为 main 的一个成员参与业务（相当于 apipool 内切 model），
-    # 优先级/互斥/冷却等全部沿用子组自身，整组内全挂才在 main 序列继续向后 fallback。
-    def _joined_subgroups(self):
-        """已加入 main 的子组 → main_priority，按 (main_priority, 组名) 升序（确定性梯队顺序）。"""
+    # Dedicated children occupy one slot on each joined mixed parent's axis.
+    # Membership ranks live on the child definition; endpoint ranks stay local.
+    def _membership_priorities(self, gd):
+        """Canonical map is authoritative, including an explicitly empty map."""
+        if "priority_by_group" in gd:
+            raw = gd["priority_by_group"]
+            return dict(raw) if isinstance(raw, dict) else {}
+        legacy = gd.get("main_priority")
+        try:
+            rank = int(legacy) if not isinstance(legacy, (bool, float)) else 0
+        except (TypeError, ValueError):
+            rank = 0
+        return {self.MAIN_GROUP: rank} if rank > 0 else {}
+
+    def _valid_membership(self, sub, group):
+        return (sub != group and self.VISION_GROUP not in (sub, group)
+                and self._group_defs.get(sub, {}).get("type") == "dedicated"
+                and self._group_defs.get(group, {}).get("type") == "mixed")
+
+    def _joined_subgroups(self, group=None):
+        """Dedicated children joined to a mixed parent, in membership order."""
+        group = group or self.MAIN_GROUP
         out = {}
         for name, gd in self._group_defs.items():
-            if name in (self.MAIN_GROUP, self.VISION_GROUP):
-                continue
-            mp = gd.get("main_priority")
-            if isinstance(mp, int) and mp > 0:
-                out[name] = mp
+            rank = self._membership_priorities(gd).get(group)
+            if self._valid_membership(name, group) and type(rank) is int and rank > 0:
+                out[name] = rank
         return dict(sorted(out.items(), key=lambda kv: (kv[1], kv[0])))
 
     def _subgroup_raw_available(self, sub):
@@ -4716,40 +4749,29 @@ class APIPool:
         return members
 
     def _next_main_priority(self):
-        """加入 main 的默认名次 = 现有 main 优先级轴（原生端点 + 已加入子组）最大值 + 1（末位）。"""
-        used = [self._ep_priority(ep, self.MAIN_GROUP) for ep in self._endpoints
-                if self.MAIN_GROUP in self._ep_groups(ep) and ep.in_pool]
-        used += list(self._joined_subgroups().values())
-        return (max(used) + 1) if used else 1
+        return self._next_group_priority(self.MAIN_GROUP)
+
+    def _next_group_priority(self, group):
+        return max((rank for _, _, rank in self._group_axis_slots(group)), default=0) + 1
 
     def _main_candidate_sort_key(self, ep):
-        """main 候选统一优先级轴排序键：
-        - 原生 main 端点 → (该端点 main 优先级, 0, 0)
-        - 借来的子组成员 → (子组 main_priority, 1, 该端点在子组内优先级)
-        同名次时原生端点优先（次键 0<1）；跨多个已加入子组的端点取名次最靠前的一份。"""
-        if self.MAIN_GROUP in self._ep_groups(ep):
-            return (self._ep_priority(ep, self.MAIN_GROUP), 0, 0)
-        best = None
-        for sub, mp in self._joined_subgroups().items():
-            if sub in self._ep_groups(ep):
-                key = (mp, 1, self._ep_priority(ep, sub))
-                if best is None or key < best:
-                    best = key
-        return best if best is not None else (10 ** 9, 2, ep.priority)
+        return self._parent_candidate_sort_key(ep, self.MAIN_GROUP)
+
+    def _parent_candidate_sort_key(self, ep, group):
+        if group in self._ep_groups(ep):
+            return (self._ep_priority(ep, group), 0, 0)
+        sub = self._axis_subgroup(ep, group)
+        if sub is not None:
+            return (self._joined_subgroups(group)[sub], 1, self._ep_priority(ep, sub))
+        return (10 ** 9, 2, ep.priority)
 
     def _candidate_sort_key(self, ep, group):
-        """组内候选排序键的唯一出口。
-
-        main 组：子组作为整体钉在其 main_priority 名次上（_main_candidate_sort_key），
-        借来的子组成员绝不按各自 pbg['main'] 散落——否则同组兄弟会被别的原生
-        名次插队，故障后 fallback 跳出子组（2026-09-27 修）。
-        非 main 组：逐字节沿用旧口径 (组内优先级, 全局优先级)，零回归。
-        """
-        if group == self.MAIN_GROUP:
-            return self._main_candidate_sort_key(ep)
+        """A child occupies one parent rank; its members retain their own order."""
+        if group == self.MAIN_GROUP or self._joined_subgroups(group):
+            return self._parent_candidate_sort_key(ep, group)
         return (self._ep_priority(ep, group), ep.priority)
 
-    def _resolve_subgroup_current(self, sub):
+    def _resolve_subgroup_current(self, sub, group=None):
         """子组作为 main 名次服务时，下钻到该子组当前应使用的成员端点。
 
         口径（2026-09-27 Bug 2/5 修）：候选用 _subgroup_raw_available（真实可用，不受
@@ -4758,6 +4780,11 @@ class APIPool:
         优先沿用子组自身 sticky 指针（仍可用则保持粘性），否则按子组优先级取 top；无可用→None。
         """
         cands = self._subgroup_raw_available(sub)
+        if group is not None:
+            cands = [ep for ep in cands if not self._ep_disabled_in(ep, group)
+                     and not self._is_ep_sticky_elsewhere(ep, group)
+                     and not self._is_ep_inflight_elsewhere(ep, group)
+                     and self._axis_subgroup(ep, group) == sub]
         if not cands:
             return None
         sub_cur = self._get_current(sub)
@@ -4766,42 +4793,23 @@ class APIPool:
         return cands[0].id
 
     def _display_pointer_id(self, grp):
-        """展示口径「组当前端点 id」唯一来源（2026-10-04 收口）。
-
-        成员卡片（list_endpoints 的 is_current/current_groups、get_active_chain 成员行）
-        此前成员行读裸指针，而组卡片/聚合链子组条目走 _resolve_subgroup_current
-        下钻：同一个组出现两个「当前端点」答案——子组自身指针指向的成员进入冷却后
-        无人清理，面板显示 Cline-ds4.1f，实际在跑 Cline4-ds4.1f（2026-10-04 生产）。
-        口径与组卡片一致：已加入 main 的子组一律走 _resolve_subgroup_current（main 借用期间
-        也报真实当前成员），main 走 _main_pointer_target 下钻，其他组保持裸指针。
-        """
-        if grp == self.MAIN_GROUP:
-            ptr = self._main_pointer_target()
-            if ptr and ptr in self._joined_subgroups():
-                return self._resolve_subgroup_current(ptr)
+        """Member rows and group summaries share one resolved endpoint identity."""
+        if grp == self.MAIN_GROUP or self._joined_subgroups(grp):
+            ptr = self._group_pointer_target(grp)
+            if ptr in self._joined_subgroups(grp):
+                return self._resolve_subgroup_current(ptr, grp)
             return self._fallback_if_unroutable(grp, ptr)
-        if grp in self._joined_subgroups():
-            # 已加入 main 的子组：与组卡片/聚合链子组条目同源下钻——main 借用期间子组自身
-            # 指针可能尚未回写，直接取真实当前成员；组内全不可用 → None（与组卡片一致）。
+        if self._membership_priorities(self._group_defs.get(grp, {})):
             return self._resolve_subgroup_current(grp)
         return self._fallback_if_unroutable(grp, self._get_current(grp))
 
     def _ep_routable_in_group(self, ep, grp):
-        """该端点此刻是否仍可被该组路由：enabled + in_pool + 非冷却 + 非维护锁定 + 仍属该组。
-
-        main 组含已加入子组的成员（统一优先级轴），成员资格按「原生 main ∪ 已加入子组」判定。
-        """
-        if (not ep.enabled) or (not ep.in_pool) or ep._manual_unlock_required:
+        if (not ep.enabled or not ep.in_pool or ep._manual_unlock_required
+                or self._is_in_cooldown(ep) or self._ep_disabled_in(ep, grp)):
             return False
-        if self._is_in_cooldown(ep) or self._ep_disabled_in(ep, grp):
-            return False
-        if grp == self.MAIN_GROUP:
-            # 整组加入 main 的名次沿用子组自身状态：子组内停用的成员不算 main 可用成员
-            return self.MAIN_GROUP in self._ep_groups(ep) or any(
-                sub in self._ep_groups(ep) and not self._ep_disabled_in(ep, sub)
-                for sub in self._joined_subgroups()
-            )
-        return grp in self._ep_groups(ep)
+        member = grp in self._ep_groups(ep) or self._axis_subgroup(ep, grp) is not None
+        return (member and not self._is_ep_sticky_elsewhere(ep, grp)
+                and not self._is_ep_inflight_elsewhere(ep, grp))
 
     def _fallback_if_unroutable(self, grp, ptr):
         """指针目标已不可路由（冷却/锁定/禁用/已移出该组）→ 回落该组真实可用首位。
@@ -4821,53 +4829,29 @@ class APIPool:
         return cands[0].id if cands else ptr
 
     def _main_pointer_target(self):
-        """main 当前应指向的目标（端点 id / 子组名 / None）。
+        return self._group_pointer_target(self.MAIN_GROUP)
 
-        手动切到子组整体时：子组有可用端点 → 保持子组名（下钻自动跟随）；
-        子组整体不可用（全冷却/挂）→ 手动意图已无法满足，回落到 main 候选首位
-        （= 路由实际会用的下一个优先级可用端点）。
-
-        2026-09-27 修：原来这里返回 None，导致 chain/groups 的 current_endpoint
-        显示空——用户看不到整组冻结 fallback 后当前实际在用的端点。路由本身
-        （chat 里 current_id 解析）一直是正确回落的，只有展示口径漏了。
-
-        Bug 5 后（2026-09-27）：main 粘在子组名次时 current 指针存的就是子组名。
-        指针统一处理：指向子组 → 组内可用则保持子组名，
-        全冻结则回落 main 候选首位。
-        """
-        pointer = self._get_current(self.MAIN_GROUP)
-        if pointer in self._joined_subgroups():
-            if self._resolve_subgroup_current(pointer) is None:
-                cands, _ = self._group_sticky_candidates(self.MAIN_GROUP)
+    def _group_pointer_target(self, group):
+        """Keep a healthy child pointer; otherwise display the parent fallback."""
+        pointer = self._get_current(group)
+        if pointer in self._joined_subgroups(group):
+            if self._resolve_subgroup_current(pointer, group) is None:
+                cands, _ = self._group_sticky_candidates(group)
                 return cands[0].id if cands else None
-            return pointer
         return pointer
 
     def _main_serving_subgroup(self):
-        """main 当前实际正在服务的**子组名**（None = 正在用原生端点或空）。
+        return self._group_serving_subgroup(self.MAIN_GROUP)
 
-        main 指针有两种形态都算「该子组正在服务」：
-          1. 指针值是子组名（手动整组切入，下钻自动跟随）；
-          2. 指针值是**该子组的成员端点 id**（main 候选里子组名次靠前时直接
-             选中其成员，指针存端点 id 而非子组名）。
-
-        第 2 条是池列表「● 当前」徽标/高亮框的唯一判据来源——漏掉它会让
-        「main 正通过 workbuddy 的成员服务」在 UI 上完全没有当前标识。
-        """
-        target = self._main_pointer_target()
+    def _group_serving_subgroup(self, group):
+        target = self._display_pointer_id(group)
         if not target:
             return None
-        joined = self._joined_subgroups()
-        if target in joined:
-            return target
+        pointer = self._group_pointer_target(group)
+        if pointer in self._joined_subgroups(group):
+            return pointer
         ep = next((e for e in self._endpoints if e.id == target), None)
-        if ep is None:
-            return None
-        groups = self._ep_groups(ep)
-        for sub in joined:
-            if sub in groups:
-                return sub
-        return None
+        return self._axis_subgroup(ep, group) if ep else None
 
     def _group_all_frozen_remaining(self, grp):
         """整组无可用端点时的最短剩余冻结秒数（2026-09-27）。
@@ -4900,142 +4884,99 @@ class APIPool:
         return max(0, int(min(remainings)))
 
     def switch_main_to_subgroup(self, sub):
-        """手动把 main 切到一个已加入子组整体（口径A）：main 当前指针指向子组名，
-        每次请求由子组按自身优先级+可用性选端点。
+        return self.switch_group_to_subgroup(sub, self.MAIN_GROUP)
 
-        子组整组被当作一个端点使用，所以这里与手动切换普通端点同构：
-        - 用户断言该子组现在可用 → 组内每个端点清掉观测态（冷却/失败计数/上次错误/
-          手动解冻标记），健康置回 unknown，由真实请求重新分类；因此组内全在冷却时
-          也允许切换，不再拒绝；
-        - main 组此前的等待意图（各端点上的延迟回切、组级回切锁/待回切）作废；
-        - 只写当前指针，不写持续覆盖的手动状态；子组成员、优先级、子组自身指针不变。
-        """
+    def switch_group_to_subgroup(self, sub, group):
+        """Select the child slot; the child retains its shared endpoint pointer."""
         with self._lock:
-            if sub not in self._joined_subgroups():
-                return False, f"子组 '{sub}' 未加入 main"
+            if sub not in self._joined_subgroups(group):
+                return False, f"子组 '{sub}' 未加入 '{group}'"
             for ep in self._endpoints:
                 if ep.enabled and ep.in_pool and sub in self._ep_groups(ep):
                     self._reset_endpoint_assertion_state(ep, defer_group=sub)
-            self._clear_group_waiting_state(self.MAIN_GROUP)
-            self._set_current(self.MAIN_GROUP, sub, record_recovery=False)
-            sys_log(
-                f"手动切换 main → 子组 '{sub}'（整组作为 main 成员，按子组优先级选端点；"
-                f"组内端点按用户断言重置为待验证，main 的延迟回切与回切锁已作废）",
-                "INFO", group=sub,
-            )
+            self._clear_group_waiting_state(group)
+            self._group_fallback_lock_until.pop(group, None)
+            self._set_current(group, sub, record_recovery=False)
+            sys_log(f"手动切换 '{group}' → 子组 '{sub}'", "INFO", group=group)
             return True, sub
 
     def set_main_priority(self, sub, priority):
-        """加入/调序：把子组作为 main 轴正式条目定位到名次（priority=None → 末位）。
+        return self.set_subgroup_priority(sub, self.MAIN_GROUP, priority)
 
-        走统一轴的 insert-at-position（_set_main_axis_priority）：其余端点与子组
-        一起位移后整体重编号 → 名次唯一连续，与端点改序完全同构。返回 (ok, message)。
-        """
+    def set_subgroup_priority(self, sub, group, priority=None):
+        """Join/reorder one parent axis; omitted priority is an idempotent append."""
         with self._lock:
-            if sub in (self.MAIN_GROUP, self.VISION_GROUP):
-                return False, f"'{sub}' 为系统内置组，不可加入 main"
-            gd = self._group_defs.get(sub)
-            if gd is None:
-                return False, f"子组 '{sub}' 不存在"
-            joined = gd.get("main_priority")
-            if priority is None:
-                # 加入：先占末位（保证 _main_axis_slots 能拿到它），再走 insert 归位
-                gd["main_priority"] = self._next_main_priority()
-                sys_log(f"子组 '{sub}' 加入 main，占优先级 #{gd['main_priority']}", "INFO", group=sub)
+            if not self._valid_membership(sub, group):
+                return False, "整组加入要求普通 mixed 父组与专用 dedicated 子组，且排除 vision 和自身"
+            if priority is not None and (type(priority) is not int or priority <= 0):
+                return False, "优先级必须为正整数"
+            gd = self._group_defs[sub]
+            ranks = self._membership_priorities(gd)
+            gd["priority_by_group"] = ranks
+            gd.pop("main_priority", None)
+            if priority is None and group in ranks:
                 return True, sub
-            try:
-                priority = int(priority)
-            except (TypeError, ValueError):
-                return False, "main 优先级必须为正整数"
-            if priority <= 0:
-                return False, "main 优先级必须为正整数（移出请用 leave_main）"
-            if joined is None:
-                # 未加入却显式给了名次：视为加入并定位
-                gd["main_priority"] = self._next_main_priority()
-            # insert-at-position 内部已整体重编号（唯一连续），不再重复 renumber
-            # （renumber 会以当前名次为键重排，与刚插入的位置冲突导致错位）
-            self._set_main_axis_priority(None, sub, priority)
-            sys_log(f"子组 '{sub}' main 优先级调整为 #{self._group_defs[sub]['main_priority']}", "INFO", group=sub)
+            if group not in ranks:
+                ranks[group] = self._next_group_priority(group)
+            self._set_group_axis_priority(group, None, sub, priority or ranks[group])
+            self._invalidate_route(group)
+            rank = gd["priority_by_group"][group]
+            sys_log(f"子组 '{sub}' 加入 '{group}'，优先级 #{rank}", "INFO", group=group)
             return True, sub
 
     def leave_main(self, sub):
-        """移出 main：清子组 main_priority；若 main 手动/当前指针正指向该子组则一并清除。"""
+        return self.leave_group(sub, self.MAIN_GROUP)
+
+    def leave_group(self, sub, group):
+        """Remove only this membership and its parent pointer, then close ranks."""
         with self._lock:
             gd = self._group_defs.get(sub)
-            if gd is None:
-                return False, f"子组 '{sub}' 不存在"
-            if gd.pop("main_priority", None) is None:
-                return False, f"子组 '{sub}' 未加入 main"
-            if self._get_current(self.MAIN_GROUP) == sub:
-                self._set_current(self.MAIN_GROUP, None)
-            sys_log(f"子组 '{sub}' 已移出 main", "INFO", group=sub)
+            if gd is None or group not in self._membership_priorities(gd):
+                return False, f"子组 '{sub}' 未加入 '{group}'"
+            owned_ids = {ep.id for ep in self._endpoints if self._axis_subgroup(ep, group) == sub}
+            ranks = self._membership_priorities(gd)
+            ranks.pop(group)
+            gd["priority_by_group"] = ranks
+            gd.pop("main_priority", None)
+            self._invalidate_route(group)
+            for getter, setter in ((self._get_current, self._set_current),
+                                   (self._get_persisted, self._set_persisted)):
+                if getter(group) == sub or getter(group) in owned_ids:
+                    setter(group, None)
+            self._renumber_group_axis(group)
             return True, sub
 
     def _group_sticky_candidates(self, group):
-        """组内可用端点：main 无跨组约束；子组避让 main 当前/手动工作端点与其在途占用。
-
-        main 工作端点空闲满窗口时不再被剔除（2026-09-18 需求 1，见 _is_ep_sticky_elsewhere）。
-        main 组另含各已加入子组的成员（2026-09-27），统一按 main 优先级轴排序（整组占一个名次）。
-        """
-        base = [ep for ep in self._endpoints if ep.enabled and ep.in_pool
-                and group in self._ep_groups(ep)
-                and not self._ep_disabled_in(ep, group)
-                and not ep._manual_unlock_required
-                and not self._is_in_cooldown(ep)
-]
+        """Use the parent occupancy policy after expanding dedicated-child slots."""
+        base = self._subgroup_raw_available(group)
+        joined = self._joined_subgroups(group)
+        # Reserve native identities even when disabled in this parent.
+        seen = {ep.id for ep in self._endpoints
+                if ep.in_pool and group in self._ep_groups(ep)}
+        for sub in joined:
+            for ep in self._subgroup_raw_available(sub):
+                if ep.id not in seen and not self._ep_disabled_in(ep, group):
+                    seen.add(ep.id)
+                    base.append(ep)
+        if joined:
+            base.sort(key=lambda ep: self._candidate_sort_key(ep, group))
         if group == self.MAIN_GROUP:
-            joined = self._joined_subgroups()
-            if not joined:
-                # 零回归：无子组加入时逐字节等同旧行为（可能 base 为空）
-                return (base, False) if base else ([], False)
-            seen = {ep.id for ep in base}
-            for sub in joined:
-                for ep in self._endpoints:
-                    if (ep.id not in seen and ep.enabled and ep.in_pool
-                            and sub in self._ep_groups(ep)
-                            # 整组加入 main 时沿用子组自身状态：子组内停用的成员不进 main 该名次
-                            and not self._ep_disabled_in(ep, sub)
-                            and not ep._manual_unlock_required
-                            and not self._is_in_cooldown(ep)):
-                        seen.add(ep.id)
-                        base.append(ep)
-            if not base:
-                return [], False
-            base.sort(key=self._main_candidate_sort_key)
             return base, False
-        if not base:
-            return [], False
         free = []
         for ep in base:
             if self._is_ep_sticky_elsewhere(ep, group):
-                # main 占用中：本次剔除。挂「延迟回切」的前提是本组当班在这个端点
-                # （组指针正指向它）——被 main 抢占、由组内其他端点接手，等接手端点
-                # 跑完再回来。本组指针不在它上面时只是一次绕开，没有交接可回迁；
-                # 此时挂 defer 会在释放时把该组顶到这个端点上（连手动锁一起清），
-                # 手动钉住的整点组每小时都会被顶掉一次（2026-10-30）。
-                # 前置条件：main 配了空闲窗口（否则=始终避让的旧行为）；配了轮换的组
-                # 不挂（轮换是组内循环意图，回切会与之互相拉锯）。
                 if (self._group_idle_seconds(self.MAIN_GROUP)
                         and not self._group_rotate_requests(group)
                         and group in self._groups_pointing_at(ep.id)):
-                    # 挂上的那一刻留一行：谁占用了它、哪个组让位、窗口多长。
-                    # 已在延迟期内不重复打（每次请求都会走到这里）。
                     if ep._defer_until_by_group.get(group, 0) <= time.time():
-                        owner = self._get_current(self.MAIN_GROUP)
-                        sys_log(
-                            f"端点 '{self._endpoint_log_label(ep, group)}' 被 main 占用"
-                            f"（main 当前端点 '{owner or '无'}'），组 '{group}' 挂延迟回切 300s（借用避让）",
-                            "INFO",
-                        )
+                        sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 被 main 占用，"
+                                f"组 '{group}' 挂延迟回切 300s（借用避让）", "INFO")
                     ep._defer_until_by_group[group] = time.time() + 300
-                    ep._defer_borrow_by_group.add(group)  # 借用避让型：判据=接手端点自身空闲
+                    ep._defer_borrow_by_group.add(group)
                 continue
-            if self._is_ep_inflight_elsewhere(ep, group):
-                continue
-            free.append(ep)
-        if free:
-            return free, False
-        return [], False
+            if not self._is_ep_inflight_elsewhere(ep, group):
+                free.append(ep)
+        return free, False
 
     def _vision_pool_candidates(self):
         """图片解析的候选来源 = 系统内置图片解析池（VISION_GROUP）的可用端点。
@@ -5358,23 +5299,19 @@ class APIPool:
         hit = self._credit_cache.get(ep.api_key[:12])
         return dict(hit) if hit else None
 
-    def _joined_subgroup_chain_entries(self, now):
-        """已加入 main 的子组 → 聚合链条目（2026-09-27）。
+    def _joined_subgroup_chain_entries(self, now, group=None):
+        """Endpoint-shaped child slots with a unique parent/child identity.
 
-        聚合链 main 视图此前只列原生端点，已加入的子组完全不可见——与
-        main 列表（子组作为 main 一等成员参与轮转）不一致。这里按 main
-        优先级轴把子组补成链条目，字段对齐端点形态，前端 renderChain 不必
-        为子组开特例分支。
-
-        子组条目用 `is_subgroup_entry` 标记，`name` 为子组名（大写由前端
-        渲染），`model` 为该组当前端点模型（只读展示）。
+        Availability reflects the shared child's physical health. Current-group
+        markers reflect routing eligibility under the owning parent's policy.
         """
+        if group is None:
+            return [entry for parent in self._all_group_names()
+                    for entry in self._joined_subgroup_chain_entries(now, parent)]
         out = []
-        # 「正在为 main 服务」的判据收在 _main_serving_subgroup 一处，与
-        # /api/chain 的 current_subgroup（池列表「● 当前」徽标/高亮框来源）
-        # 同源，避免两份判据漂移。
-        _serving_sub = self._main_serving_subgroup()
-        for sub, mp in self._joined_subgroups().items():
+        # Parent summaries and slot rows share the same current-child resolver.
+        _serving_sub = self._group_serving_subgroup(group)
+        for sub, mp in self._joined_subgroups(group).items():
             cands = self._subgroup_raw_available(sub)
             # 当前成员收口到 _resolve_subgroup_current（与 main 卡片/池面板同源）：
             # 子组自身 sticky 指针（仍可用则保持）否则 top 可用；无可用→None（Bug 2/3 修）。
@@ -5398,17 +5335,17 @@ class APIPool:
             if frozen_remaining > 0:
                 worst_health = "bad"
             out.append({
+                "id": f"subgroup:{group}:{sub}",
+                "subgroup": sub,
                 "is_subgroup_entry": True,
                 "name": sub,
                 "model": (cur_ep.model if cur_ep else (cands[0].model if cands else "—")),
                 "priority": mp,
-                "priority_by_group": {self.MAIN_GROUP: mp},
+                "priority_by_group": {group: mp},
                 "is_current": _serving_sub == sub,
-                "current_groups": [self.MAIN_GROUP] if _serving_sub == sub else [],
-                # 只属于 main 轴（Bug 4 修）：子组条目是「子组作为 main 名次」的代表，
-                # 只该在 main 过滤视图出现。若带上 sub，会泄漏进子组自身过滤视图，
-                # 且按 main_priority 错误排序（子组视图应只显示成员端点本身）。
-                "pool_groups": [self.MAIN_GROUP],
+                "current_groups": [group] if _serving_sub == sub else [],
+                # Only the owning parent displays this synthetic slot.
+                "pool_groups": [group],
                 "fail_count": 0,
                 "in_cooldown": frozen_remaining > 0,
                 "cooldown_remaining": frozen_remaining,
@@ -6416,8 +6353,8 @@ class APIPool:
         （2026-09-27 修）。非 main 组：沿用 _failover_endpoints 窄过滤，零回归。
         返回已按 _candidate_sort_key 排序的列表。
         """
-        if group == self.MAIN_GROUP:
-            active, _ = self._group_sticky_candidates(self.MAIN_GROUP)
+        if group == self.MAIN_GROUP or self._joined_subgroups(group):
+            active, _ = self._group_sticky_candidates(group)
         else:
             active = [e for e in self._failover_endpoints() if group in self._ep_groups(e)
                       and not self._ep_disabled_in(e, group)]
@@ -6425,19 +6362,14 @@ class APIPool:
         return active
 
     def _main_axis_subgroup(self, ep):
-        """借入 main 的端点在 main 轴上归属的子组名（None=原生 main 端点或未借入）。
+        return self._axis_subgroup(ep, self.MAIN_GROUP)
 
-        与 _main_candidate_sort_key 同口径：端点跨多个已加入子组时，取
-        main_priority 最小的那个（= 它在 main 轴上被排到的名次的归属）。
-        原生 main 端点（字面 groups 含 main）不属于任何借入子组，返回 None。
-        """
-        if self.MAIN_GROUP in self._ep_groups(ep):
+    def _axis_subgroup(self, ep, group):
+        """Native membership wins; otherwise use the first eligible child slot."""
+        if group in self._ep_groups(ep):
             return None
-        best_sub, best_mp = None, None
-        for sub, mp in self._joined_subgroups().items():
-            if sub in self._ep_groups(ep) and (best_mp is None or mp < best_mp):
-                best_sub, best_mp = sub, mp
-        return best_sub
+        return next((sub for sub in self._joined_subgroups(group)
+                     if sub in self._ep_groups(ep) and not self._ep_disabled_in(ep, sub)), None)
 
     def _ordered_failover_candidates(self, failed_ep, active, exclude=None, group=None):
         """Return available endpoints in ring order.
@@ -6464,6 +6396,23 @@ class APIPool:
                     and not self._is_in_cooldown(ep)
                     and not self._is_manually_locked(ep))
 
+        def _child_sticky_first(ring):
+            candidates = [ep for ep in ring if _avail(ep)]
+            failed_sub = self._axis_subgroup(failed_ep, grp)
+            ordered = []
+            while candidates:
+                first = candidates.pop(0)
+                sub = self._axis_subgroup(first, grp)
+                segment = [first]
+                while candidates and sub is not None and self._axis_subgroup(candidates[0], grp) == sub:
+                    segment.append(candidates.pop(0))
+                if sub is not None and sub != failed_sub:
+                    sticky = self._resolve_subgroup_current(sub, grp)
+                    pos = next((i for i, ep in enumerate(segment) if ep.id == sticky), 0)
+                    segment = segment[pos:] + segment[:pos]
+                ordered.extend(segment)
+            return ordered
+
         pool = sorted(
             (ep for ep in self._endpoints if ep.enabled and ep.in_pool),
             key=lambda ep: self._candidate_sort_key(ep, grp),
@@ -6472,20 +6421,23 @@ class APIPool:
             return []
 
         # main 组 + 失败端点属于某已加入子组 → 两级 ring：子组内先耗尽再回主链。
-        if grp == self.MAIN_GROUP:
-            sub = self._main_axis_subgroup(failed_ep)
+        if self._joined_subgroups(grp):
+            sub = self._axis_subgroup(failed_ep, grp)
             if sub is not None:
                 # pool 已按 main 轴排序，同子组成员在 (main_priority, 1, 子组优先级)
                 # 段内天然按子组优先级升序连续排列。
-                members = [ep for ep in pool if self._main_axis_subgroup(ep) == sub]
-                rest = [ep for ep in pool if self._main_axis_subgroup(ep) != sub]
+                members = [ep for ep in pool if self._axis_subgroup(ep, grp) == sub]
+                rest = [ep for ep in pool if self._axis_subgroup(ep, grp) != sub]
+                rank = self._joined_subgroups(grp)[sub]
+                rest = ([ep for ep in rest if self._candidate_sort_key(ep, grp)[0] > rank]
+                        + [ep for ep in rest if self._candidate_sort_key(ep, grp)[0] <= rank])
                 try:
                     fi = next(i for i, ep in enumerate(members) if ep is failed_ep)
                     sub_ring = members[fi + 1:] + members[:fi]
                 except StopIteration:
                     sub_ring = members
                 ring = sub_ring + rest
-                return [ep for ep in ring if _avail(ep)]
+                return _child_sticky_first(ring)
 
         # 全局 ring：非 main 组，或失败端点是原生 main 端点。
         try:
@@ -6497,7 +6449,7 @@ class APIPool:
         else:
             ring = pool
 
-        return [ep for ep in ring if _avail(ep)]
+        return _child_sticky_first(ring)
 
     @staticmethod
     def _is_manually_locked(ep):
@@ -6735,7 +6687,11 @@ class APIPool:
                     and not budget_cut):
                 failed_ep._recovery_groups.add(grp)
             if candidates:
-                self._set_current(grp, candidates[0].id)
+                next_ep = candidates[0]
+                sub = self._axis_subgroup(next_ep, grp)
+                if sub is not None:
+                    self._set_current(sub, next_ep.id)
+                self._set_current(grp, sub or next_ep.id)
             else:
                 self._set_current(grp, None)
             return self._get_route_epoch(grp)
@@ -6772,26 +6728,14 @@ class APIPool:
                 or self._get_route_epoch(grp) == expected_route_epoch
             )
             if route_is_current:
-                # 手动切到子组整体（2026-09-27 口径A）：main 的 current 存的是子组名，
-                # 本次请求只是下钻解析出具体端点执行——不得把指针回写成端点 id，否则
-                # 下一次请求就丢失「切到子组」的意图、自动跳回 main 原生端点。
-                keep_subgroup_pointer = (
-                    grp == self.MAIN_GROUP
-                    and self._get_current(grp) in self._joined_subgroups()
-                )
-                # 子组作为 main 名次服务（2026-09-27 Bug 5）：main 粘在「子组」这一名次，
-                # 子组维护自身当前成员的粘性。否则 main 指针在子组成员 id 之间横跳
-                # （并发下互相覆盖），或成功后跳回原生端点、丢失子组归属。
-                axis_sub = self._main_axis_subgroup(ep) if grp == self.MAIN_GROUP else None
+                axis_sub = self._axis_subgroup(ep, grp)
                 if axis_sub is not None:
-                    # 子组内部 sticky：记住这次成功的成员，下次下钻优先复用。
                     self._set_current(axis_sub, ep.id)
-                    # main 粘在子组名（下钻由 _resolve_subgroup_current 复用上面的成员）。
-                    if not keep_subgroup_pointer:
-                        self._set_current(grp, axis_sub)
-                elif not keep_subgroup_pointer:
+                    self._set_current(grp, axis_sub)
+                else:
                     self._set_current(grp, ep.id)
-        self._count_rotate_request(grp)  # 成功请求计一次，达阈值推进组内下一名
+            if route_is_current:
+                self._count_rotate_request(grp)  # 同一 route epoch 内计数并推进名次
 
     def _rewrite_tool_call_ids(self, messages, prefix):
         """确定性重写 tool_call id：原 id → 前缀+md5 后缀，保持 assistant/tool 配对。
@@ -7470,14 +7414,21 @@ class APIPool:
         current_id = self._get_current(group)
         # 2026-09-27：main 手动/当前指针可能是「已加入子组名」（口径A 手动切到子组整体）。
         # 命中子组名则下钻到该子组当前应用端点（子组当前端点变化自动跟随），无可用端点则忽略。
-        if group == self.MAIN_GROUP and current_id and current_id in self._joined_subgroups():
-            current_id = self._resolve_subgroup_current(current_id)
+        if current_id and current_id in self._joined_subgroups(group):
+            current_id = self._resolve_subgroup_current(current_id, group)
         if current_id:
             current_ep = next((ep for ep in active if ep.id == current_id), None)
             if current_ep is not None:
                 active.remove(current_ep)
                 active.insert(0, current_ep)
 
+        if active:
+            sub = self._axis_subgroup(active[0], group)
+            sticky = self._resolve_subgroup_current(sub, group) if sub else None
+            chosen = next((ep for ep in active if ep.id == sticky), None)
+            if chosen is not None:
+                active.remove(chosen)
+                active.insert(0, chosen)
         idx = 0
         previous_attempt_site_id = None
         image_parse_completed = False
@@ -9826,7 +9777,7 @@ if isinstance(restored_groups, dict):
             continue
         # main 指针可能是「已加入子组名」（2026-09-27 口径A 手动切到子组整体）：直接恢复，
         # 具体端点由路由时下钻决定；子组必须仍处于已加入状态，否则视为残留。
-        if grp == pool.MAIN_GROUP and ep_id in pool._joined_subgroups():
+        if ep_id in pool._joined_subgroups(grp):
             pool._set_current(grp, ep_id)
             pool._set_persisted(grp, ep_id)
             continue
@@ -9835,21 +9786,15 @@ if isinstance(restored_groups, dict):
         # 这类端点不属于 main 原生成员，通用校验会判「不存在」并 WARN 忽略 → 重启丢失
         # 之前使用的子组端点。恢复为所属子组名：语义等同「main 切到该子组」，且该子组
         # 自身的当前指针同样持久化，下钻后仍解析到同一个端点。
-        if grp == pool.MAIN_GROUP:
-            owner_sub = next(
-                (
-                    sub for sub in pool._joined_subgroups()
-                    if any(
-                        ep.id == ep_id and sub in pool._ep_groups(ep)
-                        for ep in pool._endpoints
-                    )
-                ),
-                None,
-            )
-            if owner_sub is not None:
-                pool._set_current(grp, owner_sub)
-                pool._set_persisted(grp, owner_sub)
-                continue
+        restored_member = next((ep for ep in pool._endpoints if ep.id == ep_id), None)
+        owner_sub = pool._axis_subgroup(restored_member, grp) if restored_member else None
+        if owner_sub is not None:
+            pool._set_current(grp, owner_sub)
+            pool._set_persisted(grp, owner_sub)
+            if owner_sub not in restored_groups:
+                pool._set_current(owner_sub, ep_id)
+                pool._set_persisted(owner_sub, ep_id)
+            continue
         restored_endpoint = next(
             (
                 ep for ep in pool._endpoints
@@ -10191,7 +10136,7 @@ def api_handler(method, path, body):
             # main 子组下钻、子组下钻与不可路由指针回落；命中形态二（指针=子组成员端点 id）
             # 时也要给出子组名，否则池列表的「● 当前」徽标/高亮框不显示。
             cur = pool._display_pointer_id(grp)
-            cur_sub = pool._main_serving_subgroup() if grp == pool.MAIN_GROUP else None
+            cur_sub = pool._group_serving_subgroup(grp)
             cur_ep = next((e for e in pool._endpoints if e.id == cur), None)
             _fb_until = pool._group_fallback_lock_until.get(grp, 0)
             group_summary[grp] = {
@@ -10206,7 +10151,7 @@ def api_handler(method, path, body):
                 "fallback_lock_remaining": max(0, int(_fb_until - time.time())) if _fb_until else 0,
                 # 待回切（锁已期满、尚无该组请求回组试探，UI 显示 ⏸待回切，点击立即切回）
                 "fallback_return_pending": bool(pool._group_fallback_pending.get(grp)),
-                "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)) + (len(pool._joined_subgroups()) if grp == pool.MAIN_GROUP else 0),
+                "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)) + len(pool._joined_subgroups(grp)),
                 "is_vision": grp == pool.VISION_GROUP,
                 # 图片解析池可用成员数（调度候选口径，与 _vision_pool_candidates 一致）
                 "available": len(pool._vision_pool_candidates()[0]) if grp == pool.VISION_GROUP else 0,
@@ -10233,11 +10178,13 @@ def api_handler(method, path, body):
                 "rotate_requests": pool._group_defs.get(grp, {}).get("rotate_requests") or 0,
                 "rotate_members": pool._group_defs.get(grp, {}).get("rotate_members") or [],
                 "is_vision": grp == pool.VISION_GROUP,
-                "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)) + (len(pool._joined_subgroups()) if grp == pool.MAIN_GROUP else 0),
+                "members": sum(1 for e in pool._endpoints if e.in_pool and grp in pool._ep_groups(e)) + len(pool._joined_subgroups(grp)),
                 "current_endpoint": cur_ep.name if cur_ep else None,
                 "is_main": grp == pool.MAIN_GROUP,
                 # 加入 main 状态（2026-09-27）：main_priority>0 = 已作为 main 成员参与
-                "main_priority": pool._group_defs.get(grp, {}).get("main_priority", 0) or 0,
+                "main_priority": pool._membership_priorities(gd).get(pool.MAIN_GROUP, 0),
+                "priority_by_group": pool._membership_priorities(gd),
+                "current_subgroup": pool._group_serving_subgroup(grp),
                 # 整组冻结最短剩余秒数（>0 = 组内无可用端点且全部冷却中）
                 "all_frozen_remaining": pool._group_all_frozen_remaining(grp),
             })
@@ -10284,6 +10231,8 @@ def api_handler(method, path, body):
         if not ok:
             return 400, {"error": msg}, False
         _sync_to_config()
+        if msg not in (gname, "无变更") and not _retire_runtime_group(gname, msg):
+            return 500, {"error": "运行态指针持久化失败"}, False
         return 200, {"ok": True, "name": msg}, False
     if method == "DELETE" and cp.startswith("/api/groups/"):
         gname = unquote(cp[len("/api/groups/"):])
@@ -10291,8 +10240,45 @@ def api_handler(method, path, body):
         if not ok:
             return 400, {"error": msg}, False
         _sync_to_config()
+        if not _retire_runtime_group(gname):
+            return 500, {"error": "运行态指针持久化失败"}, False
         return 200, {"ok": True}, False
-    # 子组整组加入 main / 调序 / 移出 / 手动切到子组整体（2026-09-27）
+    # Membership actions are scoped to the parent supplied in the body.
+    if method == "POST" and cp.startswith("/api/groups/") and cp.rsplit("/", 1)[-1] in (
+            "join-group", "leave-group", "switch-group"):
+        action = cp.rsplit("/", 1)[-1]
+        child = unquote(cp[len("/api/groups/"):-(len(action) + 1)]).strip("/")
+        parent = body.get("group")
+        if not isinstance(parent, str) or not parent.strip():
+            return 400, {"error": "需要 group 父组名"}, False
+        parent = parent.strip()
+        if action == "join-group":
+            if "priority" in body and (type(body["priority"]) is not int or body["priority"] <= 0):
+                return 400, {"error": "优先级必须为正整数"}, False
+            ok, msg = pool.set_subgroup_priority(child, parent, body.get("priority"))
+        elif action == "leave-group":
+            ok, msg = pool.leave_group(child, parent)
+        else:
+            ok, msg = pool.switch_group_to_subgroup(child, parent)
+        if not ok:
+            return 400, {"error": msg}, False
+        if action != "switch-group":
+            _sync_to_config()
+        if action != "join-group":
+            state = load_runtime_state() or {}
+            groups_state = dict(state.get("groups") or {})
+            current = pool._get_current(parent)
+            if current is None:
+                groups_state.pop(parent, None)
+            else:
+                groups_state[parent] = current
+            if not save_runtime_state_groups(groups_state, replace_groups=True,
+                                             cooldowns=_collect_cooldown_state(),
+                                             fallback=_collect_fallback_state()):
+                return 500, {"error": "运行态指针持久化失败"}, False
+            pool._set_persisted(parent, current)
+        return 200, {"ok": True, "name": msg, "group": parent}, False
+    # Main aliases retain the same parent-scoped implementation.
     if method == "POST" and cp.startswith("/api/groups/") and cp.endswith("/join-main"):
         gname = unquote(cp[len("/api/groups/"):-len("/join-main")]).strip("/")
         prio = body.get("main_priority")
@@ -10743,6 +10729,24 @@ def _endpoint_config_record(ep: Endpoint) -> dict:
     return record
 
 
+def _retire_runtime_group(name, new_name=None):
+    """Keep persisted group keys and child-name pointers aligned with group CRUD."""
+    state = load_runtime_state() or {}
+    groups = dict(state.get("groups") or {})
+    if name in groups:
+        pointer = groups.pop(name)
+        if new_name:
+            groups[new_name] = pointer
+    for parent, pointer in list(groups.items()):
+        if pointer == name:
+            if new_name:
+                groups[parent] = new_name
+            else:
+                groups.pop(parent)
+    return save_runtime_state_groups(groups, replace_groups=True,
+                                     fallback=_collect_fallback_state())
+
+
 def _sync_to_config():
     # 组管理（2026-08-30）：组实体定义随配置持久化（dict → list 有序形态，main 恒在首位）
     defs_list = [{"name": pool.MAIN_GROUP, **pool._group_defs[pool.MAIN_GROUP]}]
@@ -10759,10 +10763,11 @@ def _sync_to_config():
                 entry["rotate_requests"] = gd["rotate_requests"]
             if gd.get("rotate_members"):
                 entry["rotate_members"] = gd["rotate_members"]
-            if gd.get("main_priority"):
-                entry["main_priority"] = gd["main_priority"]
+            entry["priority_by_group"] = pool._membership_priorities(gd)
             defs_list.append(entry)
     for entry in defs_list:
+        entry["priority_by_group"] = pool._membership_priorities(entry)
+        entry.pop("main_priority", None)
         entry.pop("rotate_minutes", None)  # 旧分钟制键（2026-10-05 起按请求次数）：清空不迁移
     with pool._lock:
         endpoints = [_endpoint_config_record(ep) for ep in pool._endpoints]

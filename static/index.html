@@ -109,7 +109,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',system-u
 .ep-item.current{border-color:var(--green);background:var(--green-dim)}
 .ep-item.in-cooldown{border-color:var(--yellow);background:var(--yellow-dim)}
 .ep-item.in-pool{background:rgba(0,122,255,.08)}
-/* 子组条目（2026-09-27）：整组作为 main 成员参与，紫色左边框与普通端点区分 */
+/* 子组条目：整组作为普通父组成员参与，紫色左边框与普通端点区分 */
 .ep-item.in-pool.subgroup-entry{border-left:3px solid var(--accent)}
 .ep-item.has-error{border-color:var(--red);background:var(--red-dim)}
 .ep-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;gap:6px;flex-wrap:wrap}
@@ -956,6 +956,18 @@ const GROUP_ICONS={main:'🏊',vision:'👁️'};
 const groupIcon=(g)=>GROUP_ICONS[g]||'';
 const groupRank=(g)=>g==='main'?0:(GROUP_ICONS[g]?1:2);
 const sortGroups=(list)=>list.sort((a,b)=>groupRank(a)-groupRank(b));
+// 专用子组的成员关系按父组保存；空映射表示当前没有父组。
+function subgroupMemberships(g){
+  return g.priority_by_group!==undefined?g.priority_by_group:((g.main_priority>0)?{main:g.main_priority}:{});
+}
+function canJoinGroup(g){return !!g.name&&g.name!=='main'&&g.name!=='vision'&&!g.is_main&&!g.is_vision&&g.type==='dedicated';}
+function isMixedParent(g){return !!g.name&&g.name!=='vision'&&!g.is_vision&&(g.type||'mixed')==='mixed';}
+function joinedSubgroups(parent){
+  const defs=window._groupDefs||[];
+  const pg=defs.find(g=>g.name===parent)||{name:parent,type:'mixed'};
+  if(!isMixedParent(pg))return [];
+  return defs.filter(g=>canJoinGroup(g)&&(subgroupMemberships(g)||{})[parent]>0);
+}
 function setPoolGroupFilter(g){
   poolGroupFilter=g;
   // 分组切换只改变当前视图，复用最近一次后台快照，不重新请求三个状态接口。
@@ -978,10 +990,9 @@ function renderPoolList(eps){
   const poolEps=eps.filter(e=>e.in_pool).sort((a,b)=>a.priority-b.priority);
   const el=document.getElementById('poolList');
   const cnt=document.getElementById('poolCount');
-  if(cnt)cnt.textContent=poolEps.length+' 个成员';
-  if(!poolEps.length){el.innerHTML='<div class="empty">聚合池为空，从左侧添加端点</div>';return;}
   const groupsInfo=window._poolGroups||{};
   const groupDefs=window._groupDefs||[];
+  if(!poolEps.length&&!groupDefs.length){if(cnt)cnt.textContent='0 个成员';el.innerHTML='<div class="empty">聚合池为空，从左侧添加端点</div>';return;}
   const groupsOf=(e)=>((e.pool_groups&&e.pool_groups.length)?e.pool_groups:['main']);
   const groups=['main'];
   for(const gd of groupDefs) if(gd.name&&gd.name!=='main'&&!groups.includes(gd.name)) groups.push(gd.name);
@@ -990,7 +1001,11 @@ function renderPoolList(eps){
   }
   sortGroups(groups);
   const multiGroup=groups.length>1||groups[0]!=='main';
+  if(!groups.includes(poolGroupFilter))poolGroupFilter='main';
   const displayGroup=multiGroup?poolGroupFilter:'main';
+  const groupEps=poolEps.filter(e=>groupsOf(e).includes(displayGroup));
+  const joined=joinedSubgroups(displayGroup);
+  if(cnt)cnt.textContent=(groupEps.length+joined.length)+' 个成员';
   // 模型目录预热（2026-10-01）：只为「当前可见分组」的卡片预热，且只在渲染时跑一次
   // （renderPoolList 由签名去重后的 refresh 或本地切组触发）。iOS 原生 select 打开时
   // 选项必须已就绪（快照问题），故对真正会被点开的卡片保留预热。
@@ -1006,15 +1021,9 @@ function renderPoolList(eps){
     if(epErr(ep))cls+=' has-error';
     if(ep.in_pool)cls+=' in-pool';
     const prioOf=(e)=>((e.priority_by_group&&e.priority_by_group[displayGroup]!==undefined)?e.priority_by_group[displayGroup]:e.priority);
-    const groupEps=poolEps.filter(e=>groupsOf(e).includes(displayGroup));
-    // 可选名次上限 = 统一优先级轴长度（main 视图含已加入子组，各占 1 个名次），
-    // 与子组条目下拉、后端 1..N 编号口径一致；非 main 视图维持纯端点口径。
-    let maxP=Math.max(groupEps.length, Math.max(...groupEps.map(e=>prioOf(e))));
-    if(displayGroup==='main'){
-      const joinedN=(window._groupDefs||[]).filter(g=>g.name&&g.name!=='main'&&g.name!=='vision'&&g.main_priority>0).length;
-      if(joinedN) maxP=Math.max(groupEps.length+joinedN, ...groupEps.map(e=>prioOf(e)),
-        ...(window._groupDefs||[]).filter(g=>g.main_priority>0).map(g=>g.main_priority));
-    }
+    // 本组原生端点与子组共用一个优先级轴，每个子组占一个名次。
+    const maxP=Math.max(groupEps.length+joined.length, ...groupEps.map(e=>prioOf(e)),
+      ...joined.map(g=>subgroupMemberships(g)[displayGroup]));
     let options='';
     for(let p=1;p<=maxP;p++) options+=`<option value="${p}" ${p===prioOf(ep)?'selected':''}>#${p}</option>`;
     // 选择性轮换（2026-10-06）：本组 rotate_members 选中的端点在卡片上打标
@@ -1053,27 +1062,22 @@ function renderPoolList(eps){
     el.innerHTML=poolEps.map(cardOf).join('');
     return;
   }
-  if(!groups.includes(poolGroupFilter)) poolGroupFilter='main';
   const pbgOf=(e,g)=>((e.priority_by_group&&e.priority_by_group[g]!==undefined)?e.priority_by_group[g]:e.priority);
   const members=poolEps.filter(e=>groupsOf(e).includes(poolGroupFilter)).sort((a,b)=>pbgOf(a,poolGroupFilter)-pbgOf(b,poolGroupFilter));
   const info=groupsInfo[poolGroupFilter]||{};
   const barHtml=groups.map(gr=>{
     const gi=groupsInfo[gr]||{};
-    let memN=poolEps.filter(e=>groupsOf(e).includes(gr)).length;
-    // main 组：已加入子组各算 1 个成员（与后端统一优先级轴、聚合条目口径一致）
-    if(gr==='main'){
-      memN+=(window._groupDefs||[]).filter(g=>g.name&&g.name!=='main'&&g.name!=='vision'&&g.main_priority>0).length;
-    }
-    const icon=groupIcon(gr);
+    const memN=poolEps.filter(e=>groupsOf(e).includes(gr)).length+joinedSubgroups(gr).length;
     const gDef=(window._groupDefs||[]).find(x=>x.name===gr)||{};
+    const icon=groupIcon(gr)||(gDef.type==='dedicated'?'🎯 ':'');
     const selTip=gDef.model&&gDef.model!==gr?` · 选择器：${esc(gDef.model)}`:'';
-    const typeTip=gDef.type==='dedicated'?' · 专用型（绑定 '+esc(gDef.model)+'）':'';
-    const tip=`当前端点：${gi.current_endpoint?esc(gi.current_endpoint):'无'}${gi.fallback_lock_remaining>0?' · 整组 fallback 借道 main':(gi.fallback_return_pending?' · 整组 fallback 回切锁已期满，待回切':'')}${selTip}${typeTip}`;
+    const typeTip=gDef.type==='dedicated'?' · 专用组 · 绑定模型：'+esc(gDef.model):'';
+    const tip=`当前端点：${esc(gi.current_endpoint_name||gi.current_endpoint||'无')}${gi.fallback_lock_remaining>0?' · 整组 fallback 借道 main':(gi.fallback_return_pending?' · 整组 fallback 回切锁已期满，待回切':'')}${selTip}${typeTip}`;
     return `<button class="filter-btn ${gr===poolGroupFilter?'active':''}" onclick="setPoolGroupFilter('${esc(gr)}')" title="${tip}">${icon}${esc(gr)} ${memN}</button>`;
   }).join('');
   const statusHtml=`<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;margin:2px 0 10px">
     <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
-      <span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="该组当前端点">● ${info.current_endpoint?esc(info.current_endpoint):'无'}</span>
+      <span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="该组当前端点">● ${esc(info.current_endpoint_name||info.current_endpoint||'无')}</span>
       ${info.fallback_lock_remaining>0?`<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px;cursor:pointer" title="整组 fallback，请求借道 main（剩余 ${fmtTime(info.fallback_lock_remaining)}）· 点击立即切回：清回切锁 + 该组端点按用户断言重置" onclick="clearGroupFallback('${esc(poolGroupFilter)}')">↩main</span>`:(info.fallback_return_pending?`<span class="badge badge-deferred" style="font-size:10px;padding:1px 6px;cursor:pointer" title="整组 fallback 回切锁已期满，延迟回切待发生（下一个请求才回本组）· 点击立即切回：清回切锁 + 该组端点按用户断言重置" onclick="clearGroupFallback('${esc(poolGroupFilter)}')">⏸待回切</span>`:'')}
     </div>
     <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin-left:auto">
@@ -1081,81 +1085,77 @@ function renderPoolList(eps){
     <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:10px" title="编辑分组属性（类型、选择器）" onclick="editPoolGroup('${esc(poolGroupFilter)}')">编辑分组</button>
     </div>
   </div>`;
-  el.innerHTML=`<div class="filter-bar" style="margin-bottom:8px">${barHtml}</div>`+statusHtml+mergedMainRows(poolGroupFilter,members,cardOf,groupsInfo);
+  el.innerHTML=`<div class="filter-bar" style="margin-bottom:8px">${barHtml}</div>`+statusHtml+mergedGroupRows(poolGroupFilter,members,cardOf,groupsInfo);
 }
 
-// main 视图：已加入子组条目与普通端点按同一条 main 优先级轴混排（子组占 1 个名次，
-// 与后端统一轴口径一致），不再无条件前置。非 main 视图只渲染端点。
-function mergedMainRows(displayGroup,members,cardOf,groupsInfo){
-  if(displayGroup!=='main')return members.map(cardOf).join('');
-  const joined=(window._groupDefs||[]).filter(g=>g.name&&g.name!=='main'&&g.name!=='vision'&&g.main_priority>0);
+// 普通父组的原生端点与已加入子组按本组优先级混排。
+function mergedGroupRows(displayGroup,members,cardOf,groupsInfo){
+  const joined=joinedSubgroups(displayGroup);
   if(!joined.length)return members.map(cardOf).join('');
-  const pbgOf=(e)=>((e.priority_by_group&&e.priority_by_group.main!==undefined)?e.priority_by_group.main:e.priority);
-  // 统一轴名次上限：与端点下拉同一口径（原生端点数 + 已加入子组数，并兼顾现有最大名次）
+  const pbgOf=(e)=>((e.priority_by_group&&e.priority_by_group[displayGroup]!==undefined)?e.priority_by_group[displayGroup]:e.priority);
   const maxP=Math.max(members.length+joined.length,
-    ...members.map(e=>pbgOf(e)), ...joined.map(g=>g.main_priority));
+    ...members.map(e=>pbgOf(e)), ...joined.map(g=>subgroupMemberships(g)[displayGroup]));
   const rows=members.map(e=>({prio:pbgOf(e),html:cardOf(e)}));
-  for(const g of joined) rows.push({prio:g.main_priority,html:joinedSubgroupCard(g,groupsInfo,maxP)});
+  for(const g of joined) rows.push({prio:subgroupMemberships(g)[displayGroup],html:joinedSubgroupCard(g,groupsInfo,maxP,displayGroup)});
   rows.sort((a,b)=>a.prio-b.prio);
   return rows.map(r=>r.html).join('');
 }
 
-// 已加入 main 的子组：在 main 列表里聚合为单条目。复用普通端点条目的完整结构与样式，
-// 仅去掉不适用的控件（模型选择/测试/暂停），用大写+紫色组名与普通端点区分（不加额外徽标）。
-// 保留：#N main 优先级下拉（改 main_priority）、⚡手动切到子组整体、✏️编辑（切子组视图）、📤移出 main。
-function joinedSubgroupCard(g,groupsInfo,maxP){
-  const mainInfo=groupsInfo['main']||{};
+// 子组聚合卡复用 ep-item 结构，以大写紫色名称区分；操作均以当前父组为范围。
+function joinedSubgroupCard(g,groupsInfo,maxP,parent){
+  const parentInfo=groupsInfo[parent]||{};
   const gi=groupsInfo[g.name]||{};
-  const hit=mainInfo.current_subgroup===g.name;  // main 当前正命中该子组
-  // 整组冻结（2026-09-27）：组内无可用端点且全部冷却中 → 该子组条目在 main 中
-  // 等同冻结，不参与 main 轮转；冻结时长取组内最短剩余冻结端点。
+  const hit=parentInfo.current_subgroup===g.name;
+  const priority=subgroupMemberships(g)[parent];
+  const childArg=escAttr(JSON.stringify(g.name)),parentArg=escAttr(JSON.stringify(parent));
+  // 整组冻结时长取组内最早恢复的端点。
   const frozenSec=(gi.all_frozen_remaining||0)|0;
   const frozen=frozenSec>0;
   let cls='ep-item in-pool subgroup-entry';
   if(hit)cls+=' current';
   if(frozen)cls+=' in-cooldown';
-  const cur=gi.current_endpoint?esc(gi.current_endpoint):'—';
+  const cur=esc(gi.current_endpoint_name||gi.current_endpoint||'—');
   let options='';
-  for(let p=1;p<=maxP;p++) options+=`<option value="${p}" ${p===g.main_priority?'selected':''}>#${p}</option>`;
+  for(let p=1;p<=maxP;p++) options+=`<option value="${p}" ${p===priority?'selected':''}>#${p}</option>`;
   return `<div class="${cls}" style="display:flex;flex-direction:column;gap:6px;padding:10px 12px">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
       <div style="display:flex;align-items:center;gap:6px;min-width:0">
-        <span class="badge badge-priority">#${g.main_priority}</span>
+        <span class="badge badge-priority">#${priority}</span>
         <span style="font-weight:700;font-size:13px;letter-spacing:.5px;color:#a5b4fc;text-transform:uppercase;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(g.name)}</span>
         ${wkmCreditBadge((window._poolGroups||{})[g.name]&&window._poolGroups[g.name].current_credit)}
       </div>
       <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
-        ${hit?`<span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="main 当前正使用该子组的端点：${cur}">● 当前</span>`:''}
-        ${frozen?`<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px" title="组内端点全部冻结，整组不参与 main 轮转；剩余时间取组内最早恢复的端点">⏳${fmtCdSec(frozenSec)}</span>`:''}
+        ${hit?`<span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="${escAttr(parent)} 当前正使用该子组的端点：${cur}">● 当前</span>`:''}
+        ${frozen?`<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px" title="组内端点全部冻结，整组等待最早恢复的端点">⏳${fmtCdSec(frozenSec)}</span>`:''}
       </div>
     </div>
     <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
-      <span style="font-size:12px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0" title="${frozen?'组内端点全部冻结，main 轮转会跳过该子组；剩余时间取组内最早恢复的端点':'该子组当前端点（整组作为 main 成员参与，按子组自身优先级选端点）'}">当前端点：${frozen?'—（整组冻结）':cur}</span>
+      <span style="font-size:12px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0" title="${frozen?'组内端点全部冻结，整组等待最早恢复的端点':`该子组当前端点（整组作为 ${escAttr(parent)} 成员参与，按子组自身优先级选端点）`}">当前端点：${frozen?'—（整组冻结）':cur}</span>
       <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
-        <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setMainPriority('${esc(g.name)}', this.value);this.blur()" title="修改该子组在 main 优先级轴上的名次">${options}</select>
-        <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="编辑该子组（切到子组视图）" onclick="setPoolGroupFilter('${esc(g.name)}')">✏️</button>
-        ${(!hit&&!frozen)?`<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="手动切到该子组整体（main 按子组优先级选端点，子组当前端点变化自动跟随）" onclick="switchMainToSubgroup('${esc(g.name)}')">⚡</button>`:''}
-        <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="移出 main（该子组不再作为 main 成员参与）" onclick="leaveMain('${esc(g.name)}')">📤</button>
+        <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setSubgroupPriority(${childArg}, this.value, ${parentArg});this.blur()" title="修改该子组在 ${escAttr(parent)} 优先级轴上的名次">${options}</select>
+        <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="编辑该子组（切到子组视图）" onclick="setPoolGroupFilter(${childArg})">✏️</button>
+        ${(!hit&&!frozen)?`<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="手动切到该子组整体（${escAttr(parent)} 跟随子组当前端点）" onclick="switchGroupToSubgroup(${childArg}, ${parentArg})">⚡</button>`:''}
+        <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="移出 ${escAttr(parent)}（保留子组及其其他成员关系）" onclick="leaveGroup(${childArg}, ${parentArg})">📤</button>
       </div>
     </div>
   </div>`;
 }
-async function setMainPriority(name,newPrio){
-  newPrio=parseInt(newPrio);
-  if(!newPrio||newPrio<1)return;
-  const r=await api('POST',`/api/groups/${encodeURIComponent(name)}/join-main`,{main_priority:newPrio});
-  if(r.ok){toast('✅ main 优先级已更新','success');refresh();}
+async function setSubgroupPriority(name,newPrio,group){
+  newPrio=Number(newPrio);
+  if(!Number.isInteger(newPrio)||newPrio<1)return;
+  const r=await api('POST',`/api/groups/${encodeURIComponent(name)}/join-group`,{group,priority:newPrio});
+  if(r.ok){toast(`✅ ${group} 优先级已更新`,'success');await refresh();}
   else{toast(r.error||'更新失败','error');}
 }
-async function switchMainToSubgroup(name){
-  const r=await api('POST',`/api/groups/${encodeURIComponent(name)}/switch-main`,{});
-  if(r.ok){toast(`已切到子组「${name.toUpperCase()}」`,'success');refresh();}
+async function switchGroupToSubgroup(name,group){
+  const r=await api('POST',`/api/groups/${encodeURIComponent(name)}/switch-group`,{group});
+  if(r.ok){toast(`已切到子组「${name.toUpperCase()}」`,'success');await refresh();}
   else{toast(r.error||'切换失败','error');}
 }
-async function leaveMain(name){
-  if(!confirm(`将子组「${name}」移出 main？移出后它不再作为 main 成员参与业务。`))return;
-  const r=await api('POST',`/api/groups/${encodeURIComponent(name)}/leave-main`,{});
-  if(r.ok){toast('已移出 main','success');refresh();}
+async function leaveGroup(name,group){
+  if(!confirm(`将子组「${name}」移出 ${group}？子组自身及其他成员关系保留。`))return;
+  const r=await api('POST',`/api/groups/${encodeURIComponent(name)}/leave-group`,{group});
+  if(r.ok){toast(`已移出 ${group}`,'success');await refresh();}
   else{toast(r.error||'移出失败','error');}
 }
 
@@ -1264,19 +1264,22 @@ function openGroupModal(editName){
   // 参与轮换的成员（2026-10-06）：默认折叠；点摘要才向后端查询组内成员并列出勾选（不勾 = 全体参与）
   const gmSel=new Set(Array.isArray(g.rotate_members)?g.rotate_members:[]);
   const gmSummary=`参与轮换的成员：${gmSel.size?`已选 ${gmSel.size} 个`:'全部'}`;
+  const joinTargets=(window._groupDefs||[]).filter(isMixedParent);
+  const memberships=subgroupMemberships(g)||{};
+  const allJoined=joinTargets.every(pg=>memberships[pg.name]>0);
   const overlay=document.createElement('div');
   overlay.className='modal-overlay show';
   overlay.id='groupEditOverlay';
   overlay.innerHTML=`<div class="modal" style="width:420px">
     <h2>${editing?'✏️':'➕'} ${title}</h2>
     <div style="display:flex;flex-direction:column;gap:12px">
-      <div class="form-group"><label>分组名称</label><input type="text" id="gName" value="${esc(g.name)}" placeholder="如 bg、deepseek-v4-flash" ${nameDisabled}></div>
+      <div class="form-group"><label>分组名称</label><input type="text" id="gName" value="${escAttr(g.name)}" placeholder="如 bg、deepseek-v4-flash" ${nameDisabled}></div>
       <div class="form-group"><label title="mixed=任意模型端点可入组；dedicated=专用模型池（绑定模型名对外暴露，成员入组由人工按规范判断）">分组类型</label>
-        <select id="gType" ${typeDisabled} onchange="document.getElementById('gModelLabel').textContent=this.value==='dedicated'?'绑定模型（真实模型名，兼作选择器）':'选择器（Hermes 侧配置的 model 名）'">
+        <select id="gType" ${typeDisabled} onchange="document.getElementById('gModelLabel').textContent=this.value==='dedicated'?'绑定模型（真实模型名，兼作选择器）':'选择器（Hermes 侧配置的 model 名）';const join=document.getElementById('gJoinGroupField');if(join)join.hidden=this.value!=='dedicated'">
           <option value="mixed" ${g.type!=='dedicated'?'selected':''}>混合型（mixed）</option>
           <option value="dedicated" ${g.type==='dedicated'?'selected':''}>专用型（dedicated）</option>
         </select></div>
-      <div class="form-group"><label id="gModelLabel">${modelLabel}</label><input type="text" id="gModel" value="${esc(g.model||'')}" placeholder="${g.type==='dedicated'?'如 deepseek-v4-flash':'缺省=组名'}"></div>
+      <div class="form-group"><label id="gModelLabel">${modelLabel}</label><input type="text" id="gModel" value="${escAttr(g.model||'')}" placeholder="${g.type==='dedicated'?'如 deepseek-v4-flash':'缺省=组名'}"></div>
       <div class="form-group"><label title="本组对外声明的上下文窗口（tokens，可写 1048576 / 1M / 512K）。Hermes 经 GET /v1/models 的 context_length 读取；留空或 0 = 不声明，由 Hermes 侧自行决定">上下文长度 (tokens)</label>
         <input type="text" id="gContext" list="gContextPresets" value="${g.context_tokens||''}" placeholder="留空/0 = 不声明，如 1048576 / 1M / 512K">
         <datalist id="gContextPresets">
@@ -1309,17 +1312,17 @@ function openGroupModal(editName){
         <input type="number" id="gIdle" min="0" max="86400" value="${g.idle_seconds||''}" placeholder="0=关闭，如 600">
         <div style="font-size:11px;color:var(--text-dim)">${idleHint}</div>
       </div>`:''}
-      ${(editing&&!builtin)?`<div class="form-group"><label title="选「是」后本子组整组作为 main 的一个成员参与业务（相当于 apipool 内切 model）：在 main 优先级轴占一个名次（默认追加末位，之后在 main 列表用 #N 下拉调整，与端点一致），段内沿用子组自身优先级；整组内全部端点故障后才在 main 序列继续向后 fallback">加入 main 组</label>
-        <select id="gJoinMain">
-          <option value="false" ${g.main_priority>0?'':'selected'}>否</option>
-          <option value="true" ${g.main_priority>0?'selected':''}>是（整组作为 main 成员参与）</option>
+      ${(editing&&canJoinGroup(g))?`<div class="form-group" id="gJoinGroupField"><label title="每次选择一个普通组，保存后整组加入并追加到末位；名次在目标组列表用 #N 调整，移出使用该组聚合条目的 📤 按钮">加入目标组</label>
+        <select id="gJoinGroup" ${allJoined?'disabled':''}>
+          <option value="" selected>${allJoined?'已加入全部可选组':'选择目标组'}</option>
+          ${joinTargets.map(pg=>`<option value="${escAttr(pg.name)}" ${memberships[pg.name]>0?'disabled':''}>${esc(pg.name)}${memberships[pg.name]>0?'（已在组内）':''}</option>`).join('')}
         </select></div>`:''}
       ${builtin?`<div style="font-size:11px;color:var(--text-dim)">${esc(g.name)} 为系统内置组：名称/类型/选择器均锁定</div>`:''}
-      ${editing&&!builtin?`<button class="btn btn-ghost" style="color:var(--red);justify-content:flex-start" onclick="deletePoolGroup('${esc(g.name)}')">🗑 删除该分组（成员移出）</button>`:''}
+      ${editing&&!builtin?`<button class="btn btn-ghost" style="color:var(--red);justify-content:flex-start" onclick="deletePoolGroup(${escAttr(JSON.stringify(g.name))})">🗑 删除该分组（成员移出）</button>`:''}
     </div>
     <div class="form-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
       <button class="btn btn-ghost" onclick="closeGroupModal()">取消</button>
-      <button class="btn" id="gSaveBtn" onclick="savePoolGroup(${editing?`'${esc(g.name)}'`:'null'})">${editing?'保存':'创建'}</button>
+      <button class="btn" id="gSaveBtn" onclick="savePoolGroup(${editing?escAttr(JSON.stringify(g.name)):'null'})">${editing?'保存':'创建'}</button>
     </div>
   </div>`;
   document.body.appendChild(overlay);
@@ -1375,6 +1378,11 @@ function parseCtxTokens(raw){
 async function savePoolGroup(editName){
   const name=document.getElementById('gName').value.trim();
   const type=document.getElementById('gType').value;
+  const joinSelect=document.getElementById('gJoinGroup');
+  const originalGroup=(window._groupDefs||[]).find(g=>g.name===editName);
+  const joinTarget=(editName&&originalGroup&&canJoinGroup(originalGroup)&&type==='dedicated'&&joinSelect&&!joinSelect.disabled)?joinSelect.value:'';
+  const joinGroup=(window._groupDefs||[]).find(g=>g.name===joinTarget&&isMixedParent(g));
+  const shouldJoin=!!joinGroup&&!((subgroupMemberships(originalGroup)||{})[joinTarget]>0);
   const model=document.getElementById('gModel').value.trim();
   const context_tokens=parseCtxTokens(document.getElementById('gContext').value);
   const log_level=document.getElementById('gLogLevel')?document.getElementById('gLogLevel').value:'all';
@@ -1403,22 +1411,18 @@ async function savePoolGroup(editName){
       r=await api('POST','/api/groups',{name,type,model,context_tokens,idle_seconds,log_level,rotate_requests,rotate_members});
     }
     if(r.ok){
-      // 加入/移出 main（2026-09-27）：仅编辑既有子组时处理（新建不含该控件）
-      if(editName&&!(document.getElementById('gName')&&document.getElementById('gName').disabled)){
-        const jm=document.getElementById('gJoinMain');
-        if(jm){
-          const finalName=(r.name&&typeof r.name==='string')?r.name:name; // 改名后用新名
-          if(jm.value==='true'){
-            // 加入默认追加末位（不传 main_priority）；名次在 main 列表用 #N 下拉调整（与端点一致）
-            await api('POST',`/api/groups/${encodeURIComponent(finalName)}/join-main`,{});
-          }else{
-            // 仅当原本已加入才调 leave（避免对未加入组报错 toast）
-            const wasJoined=(window._groupDefs||[]).find(x=>x.name===editName&&x.main_priority>0);
-            if(wasJoined) await api('POST',`/api/groups/${encodeURIComponent(finalName)}/leave-main`,{});
-          }
-        }
+      // 先保存组属性，再向单个目标组追加；改名后使用后端返回的新名。
+      let joinError='';
+      if(shouldJoin){
+        const finalName=(r.name&&typeof r.name==='string')?r.name:name;
+        try{
+          const jr=await api('POST',`/api/groups/${encodeURIComponent(finalName)}/join-group`,{group:joinTarget});
+          if(!jr.ok)joinError=jr.error||'加入失败';
+        }catch(e){joinError=e.message||'请求失败';}
       }
-      toast(editName?'✅ 分组已更新':'✅ 分组已创建','success');closeGroupModal();refresh();refreshLogViews();
+      if(joinError)toast(`分组已保存，加入 ${joinTarget} 失败：${joinError}`,'error');
+      else toast(editName?'✅ 分组已更新':'✅ 分组已创建','success');
+      closeGroupModal();await refresh();refreshLogViews();
     }
     else{toast(r.error||'操作失败','error');if(btn){btn.disabled=false;btn.textContent=editName?'保存':'创建';}}
   }catch(e){
@@ -1463,11 +1467,11 @@ function renderChain(chain){
         const info=gs[g]||{};
         const memN=chain.filter(it=>chainGroupsOf(it).includes(g)).length;
         const icon=groupIcon(g);
-        const tip=`当前端点：${info.current_endpoint?esc(info.current_endpoint):'无'}${info.fallback_lock_remaining>0?' · 整组 fallback 借道 main':(info.fallback_return_pending?' · 整组 fallback 回切锁已期满，待回切':'')}`;
+        const tip=`当前端点：${esc(info.current_endpoint_name||info.current_endpoint||'无')}${info.fallback_lock_remaining>0?' · 整组 fallback 借道 main':(info.fallback_return_pending?' · 整组 fallback 回切锁已期满，待回切':'')}`;
         return `<button class="filter-btn ${g===chainGroupFilter?'active':''}" onclick="setChainGroupFilter('${esc(g)}')" title="${tip}">${icon}${esc(g)} ${memN}</button>`;
       }).join('')+`</div>`+
       `<div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin:2px 0 10px">
-        <span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="该组当前端点">● ${gs[chainGroupFilter]&&gs[chainGroupFilter].current_endpoint?esc(gs[chainGroupFilter].current_endpoint):'无'}</span>
+        <span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="该组当前端点">● ${esc((gs[chainGroupFilter]||{}).current_endpoint_name||(gs[chainGroupFilter]||{}).current_endpoint||'无')}</span>
         ${(gs[chainGroupFilter]&&gs[chainGroupFilter].fallback_lock_remaining>0)?`<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px;cursor:pointer" title="整组 fallback，请求借道 main（剩余 ${fmtTime(gs[chainGroupFilter].fallback_lock_remaining)}）· 点击立即切回：清回切锁 + 该组端点按用户断言重置" onclick="clearGroupFallback('${esc(chainGroupFilter)}')">↩main</span>`:((gs[chainGroupFilter]&&gs[chainGroupFilter].fallback_return_pending)?`<span class="badge badge-deferred" style="font-size:10px;padding:1px 6px;cursor:pointer" title="整组 fallback 回切锁已期满，延迟回切待发生（下一个请求才回本组）· 点击立即切回：清回切锁 + 该组端点按用户断言重置" onclick="clearGroupFallback('${esc(chainGroupFilter)}')">⏸待回切</span>`:'')}
       </div>`;
     } else { gEl.innerHTML=''; }
@@ -1477,12 +1481,14 @@ function renderChain(chain){
   el.innerHTML=chain.map((it,i)=>{
     // 分组隔离：仅本组当前端点高亮；其他组的当前端点显示组名 badge 不高亮
     const cg=it.current_groups||[];
-    const isCurHere=it.is_current&&cg.includes(chainGroupFilter);
-    // 子组级条目（2026-09-27）：整组作为 main 一等成员，组名大写+紫色与普通端点区分
     const isSub=!!it.is_subgroup_entry;
+    const isCurHere=isSub
+      ?(gs[chainGroupFilter]||{}).current_subgroup===it.subgroup&&!it.in_cooldown
+      :it.is_current&&cg.includes(chainGroupFilter);
+    // 子组级条目按 pool_groups 归属当前父组，名称保持大写紫色。
     const vis = (it.is_vision !== false) ? '<span class="badge" style="background:rgba(0,122,255,.15);color:#0a84ff" title="支持原生视觉">👁️视觉</span>' : '';
     const nameHtml=isSub
-      ?`<span style="color:#a5b4fc;font-weight:700;letter-spacing:.5px">${esc(String(it.name).toUpperCase())}</span> <span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:9px;padding:1px 5px" title="子组整体作为 main 成员参与（组内端点数 ${it.subgroup_member_count||0}，可用 ${it.subgroup_available_count||0}）">子组</span>`
+      ?`<span style="color:#a5b4fc;font-weight:700;letter-spacing:.5px">${esc(String(it.subgroup||it.name).toUpperCase())}</span> <span class="badge" style="background:rgba(136,132,216,.15);color:#a5b4fc;border:1px solid rgba(136,132,216,.35);font-size:9px;padding:1px 5px" title="子组整体作为 ${escAttr(chainGroupFilter)} 成员参与（组内端点数 ${it.subgroup_member_count||0}，可用 ${it.subgroup_available_count||0}）">子组</span>`
       :esc(it.name);
     const modelLine=isSub
       ?`<div class="model">当前端点模型：${esc(it.model)} ${vis}</div>`
