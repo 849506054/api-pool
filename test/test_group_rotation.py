@@ -234,17 +234,40 @@ class GroupRotationTests(unittest.TestCase):
             pool._rotate_group_once("bg")
             self.assertEqual(pool._get_current("bg"), "b1")   # 不落回 b1 之外的全体成员
 
-    def test_rotate_members_single_selection_converges(self):
-        """只选 1 个成员：下一次轮换切到它并停住（已在其上则无动作）。"""
+    def test_rotate_members_single_selection_preserves_current(self):
+        """Only a selected current member can actively rotate."""
         with tempfile.TemporaryDirectory() as tmp:
             m = load_module(tmp)
             pool, _ = self.pool_with_bg(m)
             pool._set_group_rotate_members("bg", ["b3"])
             pool._set_current("bg", "b1")
             pool._rotate_group_once("bg")
-            self.assertEqual(pool._get_current("bg"), "b3")
+            self.assertEqual(pool._get_current("bg"), "b1")
+            pool._set_current("bg", "b3")
             pool._rotate_group_once("bg")
             self.assertEqual(pool._get_current("bg"), "b3")
+
+    def test_unselected_current_stays_after_success_threshold(self):
+        """Fallback traffic reaches the threshold while its pointer stays put."""
+        with tempfile.TemporaryDirectory() as tmp:
+            m = load_module(tmp)
+            pool, eps = self.pool_with_bg(m)
+            pool._set_group_rotate_members("bg", ["b1", "b2"])
+            pool._set_group_rotate_requests("bg", 10)
+            pool._set_current("bg", "b3")
+            epoch = pool._get_route_epoch("bg")
+            pool._rotate_counts["bg"] = 3
+            for _ in range(7):
+                pool._on_success(eps[2], group="bg", expected_route_epoch=epoch)
+                self.assertEqual(pool._get_current("bg"), "b3")
+                self.assertEqual(pool._get_route_epoch("bg"), epoch)
+            self.assertEqual(pool._rotate_counts["bg"], 0)
+            pool._rotate_group_once("bg")
+            self.assertEqual(pool._get_current("bg"), "b3")
+            pool._set_current("bg", "b1")
+            pool._rotate_counts["bg"] = 9
+            pool._on_success(eps[0], group="bg", expected_route_epoch=pool._get_route_epoch("bg"))
+            self.assertEqual(pool._get_current("bg"), "b2")
 
     def test_rotate_members_normalization(self):
         with tempfile.TemporaryDirectory() as tmp:

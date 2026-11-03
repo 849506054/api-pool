@@ -6,7 +6,7 @@ const src=fs.readFileSync(candidates.find(p=>fs.existsSync(p)),'utf8');
 function assert(cond,msg){ if(!cond){ console.error('FAIL: '+msg); process.exit(1);} }
 
 // 1) 控件与轮换次数同行；成员选择默认折叠、点击才查询
-assert(/<div style="display:flex;gap:8px;align-items:flex-start">\s*\n\s*<input type="number" id="gRotate"[^>]*>\s*\n\s*<details class="gm-dd" id="gRotateMembersBox" ontoggle="gmLoadMembers\(this\)">/.test(src), '轮换次数与成员折叠选择器同行');
+assert(/<div style="display:flex;gap:8px;align-items:flex-start">\s*\n\s*<input type="number" id="gRotate"[^>]*>\s*\n\s*<details class="gm-dd" id="gRotateMembersBox"[^>]* ontoggle="gmLoadMembers\(this\)">/.test(src), '轮换次数与成员折叠选择器同行');
 assert(/<summary id="gRotateMembersSum" title="点击查询组内成员并勾选；不勾选 = 全部成员参与">\$\{gmSummary\}<\/summary>/.test(src), '摘要即查询入口');
 assert(/<div class="gm-list" id="gRotateMembers" onchange="gmUpdateSummary\(\)"><\/div>/.test(src), '列表默认不预渲染（点击查询后填充）');
 assert(!/<details[^>]*\sopen/.test(src), '默认折叠，不自动展开');
@@ -43,4 +43,24 @@ assert(!/gm-popover|gm-dropdown|createPortal/.test(src), '不使用自定义浮�
 // 8) 选中成员在池卡打标
 assert(/const rotating=\(gRotSel\.rotate_requests>0\)&&\(gRotSel\.rotate_members\|\|\[\]\)\.includes\(ep\.id\);/.test(src), '池卡按本组 rotate_members 判定');
 assert(/🔄 轮换<\/span>/.test(src), '选中成员卡片带轮换徽标');
+// Initial state and live input changes share the enabled-state rule.
+const vm=require('node:vm');
+const gmSummaryLine=src.split('\n').find(line=>line.includes('const gmSummary='));
+for(const [rotate_requests,selected,expected] of [[0,[], '未启用'],[0,['a'], '未启用'],[10,[], '全部'],[10,['a'], '已选 1 个']]){
+  const context={g:{rotate_requests},gmSel:new Set(selected)};
+  vm.runInNewContext(gmSummaryLine+'; result=gmSummary;',context);
+  assert(context.result==='参与轮换的成员：'+expected,'initial rotation summary: '+expected);
+}
+const sum={textContent:''}, input={value:'0'};
+let checked=2;
+const box={dataset:{loaded:'',selectedCount:'2'},querySelectorAll:s=>Array.from({length:s.includes(':checked')?checked:3},()=>({}))};
+const nodes={gRotateMembersBox:box,gRotateMembersSum:sum,gRotate:input};
+const context={document:{getElementById:id=>nodes[id]}};
+vm.runInNewContext(src.match(/function gmUpdateSummary\(\)\{[\s\S]*?\n\}/)[0],context);
+for(const [value,loaded,n,expected] of [['0','',2,'未启用'],['10','',2,'已选 2 个'],['','1',2,'未启用'],['10','1',1,'已选 1 个'],['10','1',0,'全部'],['0','1',0,'未启用']]){
+  input.value=value;box.dataset.loaded=loaded;checked=n;context.gmUpdateSummary();
+  assert(sum.textContent==='参与轮换的成员：'+expected,'live rotation summary: '+expected);
+}
+assert(/id="gRotate"[^>]*oninput="gmUpdateSummary\(\)"/.test(src),'rotation input updates summary');
+assert(box.dataset.selectedCount==='2','stored selection preserved');
 console.log('OK: 组内选择性轮换前端自检通过');

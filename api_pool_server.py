@@ -3972,6 +3972,8 @@ class APIPool:
                 return
             cur_ep = next((ep for ep in cands if ep.id == cur), None)
             current_slot = (self._axis_subgroup(cur_ep, group) or cur) if cur_ep else cur
+            if selected and current_slot not in slots:
+                return
             pos = slots.index(current_slot) if current_slot in slots else -1
             nxt = slots[(pos + 1) % len(slots)]
             if nxt != cur:
@@ -8242,16 +8244,25 @@ class APIPool:
                         if not isinstance(chunk, dict):
                             return "invalid stream error event" if event_error else ""
                         error = chunk.get("error")
+                        response = chunk.get("response")
+                        if error is None and isinstance(response, dict):
+                            error = response.get("error")
                         error_type = ""
+                        error_code = ""
                         message = ""
                         if isinstance(error, dict):
                             error_type = str(error.get("type") or "")
+                            error_code = str(error.get("code") or "")
                             message = str(error.get("message") or error.get("detail") or "")
                         elif error is not None:
                             message = str(error)
                         chunk_type = str(chunk.get("type") or "")
                         if event_error or chunk_type == "error" or error is not None or error_type == "upstream_error":
-                            detail = ": ".join(part for part in (error_type or chunk_type, message) if part)
+                            # Responses errors may carry their details on the event itself.
+                            error_code = error_code or str(chunk.get("code") or "")
+                            message = message or str(chunk.get("message") or "")
+                            parts = (error_type or chunk_type, error_code, message)
+                            detail = ": ".join(dict.fromkeys(part for part in parts if part))
                             return detail or "upstream stream error"
                         return ""
 

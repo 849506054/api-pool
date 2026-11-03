@@ -293,6 +293,63 @@ class RetryOnRateLimitTests(unittest.TestCase):
                 self.assertEqual(len(calls), 1, suffix)
                 self.assertIn(suffix, error)
 
+    def test_responses_error_details_reach_existing_retry_policy(self):
+        """SSE envelopes retain details before retry classification."""
+        temporary = ("Your resource has been temporarily blocked because we detected "
+                     "behavior that may violate our content policy.")
+        cases = [
+            ("legacy", {"error": {"type": "upstream_error", "message": "provider failure"}},
+             True, 1, "upstream_error: provider failure"),
+            ("top_message", {"type": "error", "message": "exceeded rate limit"},
+             True, 3, "error: exceeded rate limit"),
+            ("top_code", {"type": "error", "code": "too_many_requests", "message": "slow down"},
+             True, 3, "error: too_many_requests: slow down"),
+            ("rate_switch_off", {"type": "error", "code": "too_many_requests", "message": "slow down"},
+             False, 1, "error: too_many_requests: slow down"),
+            ("response_error", {"type": "response.failed", "response": {
+                "error": {"code": "too_many_requests", "message": "slow down"}}},
+             True, 3, "response.failed: too_many_requests: slow down"),
+            ("response_capacity", {"type": "response.failed", "response": {
+                "error": {"code": "insufficient_quota", "message": "quota exceeded"}}},
+             True, 1, "response.failed: insufficient_quota: quota exceeded"),
+            ("temporary_policy", {"type": "error", "code": "forbidden", "message": temporary},
+             False, 3, "error: forbidden: " + temporary),
+            ("bare", {"type": "error"}, True, 1, "error"),
+            ("duplicate_code", {"error": {"type": "too_many_requests", "code": "too_many_requests",
+                                           "message": "slow down"}},
+             True, 3, "too_many_requests: slow down"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            payload = {"model": "m", "messages": [], "stream": True}
+            for name, chunk, enabled, expected_calls, expected_detail in cases:
+                with self.subTest(name=name):
+                    frame = b"data: " + json.dumps(chunk).encode() + b"\n\n"
+                    responses = []
+
+                    def responder(_index, frame=frame, responses=responses):
+                        response = FakeStreamResponse([frame])
+                        responses.append(response)
+                        return response
+
+                    ep = self._endpoint(module, protocol="responses", max_retries=2,
+                                        retry_on_rate_limit=enabled)
+                    result, error, calls = self._run(module, ep, payload, responder)
+                    self.assertIsNone(result)
+                    self.assertEqual(error, "HTTP 502: upstream stream error: " + expected_detail)
+                    self.assertEqual(len(calls), expected_calls)
+                    self.assertTrue(all(response.closed for response in responses))
+
+            # A normal response's message metadata is not an error event.
+            chunk = {"type": "response.output_text.delta", "delta": "OK", "message": "metadata"}
+            frame = b"data: " + json.dumps(chunk).encode() + b"\n\n"
+            normal_ep = self._endpoint(module, protocol="responses", max_retries=2)
+            result, error, calls = self._run(module, normal_ep, payload, lambda _i: FakeStreamResponse([frame]))
+            self.assertEqual(error, "")
+            self.assertIsNotNone(result)
+            self.assertEqual(len(calls), 1)
+            result.close()
+
     def test_retryable_stream_error_categories(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
@@ -319,11 +376,20 @@ class RetryOnRateLimitTests(unittest.TestCase):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 calls.append(body)
                 if len(calls) % 2:
-                    data = stream_error_frame("forbidden", "Your resource has been temporarily blocked because "
-                                              "we detected behavior that may violate our content policy.")
+                    if ep.protocol == "responses":
+                        error = {"code": "forbidden", "message": "Your resource has been temporarily blocked because "
+                                 "we detected behavior that may violate our content policy."}
+                        frame = ({"type": "error", **error} if len(calls) % 4 == 1 else
+                                 {"type": "response.failed", "response": {"error": error}})
+                        data = b"data: " + json.dumps(frame).encode() + b"\n\n"
+                    else:
+                        data = stream_error_frame("forbidden", "Your resource has been temporarily blocked because "
+                                                  "we detected behavior that may violate our content policy.")
                 else:
                     chunk = {"model": "m", "choices": [{"index": 0, "delta": {"content": "RETRY_OK"},
                                                         "finish_reason": None}]}
+                    if ep.protocol == "responses":
+                        chunk = {"type": "response.output_text.delta", "delta": "RETRY_OK"}
                     data = b"data: " + json.dumps(chunk).encode() + b"\n\ndata: [DONE]\n\n"
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -345,11 +411,14 @@ class RetryOnRateLimitTests(unittest.TestCase):
             for thread in threads:
                 thread.start()
             try:
-                for path, body in (
-                    ("/v1/chat/completions", {"model": "api-pool", "messages": [{"role": "user", "content": "ping"}]}),
-                    ("/v1/responses", {"model": "api-pool", "input": "ping"}),
+                for protocol, path, body in (
+                    ("openai", "/v1/chat/completions", {"model": "api-pool", "messages": [{"role": "user", "content": "ping"}]}),
+                    ("openai", "/v1/responses", {"model": "api-pool", "input": "ping"}),
+                    ("responses", "/v1/chat/completions", {"model": "api-pool", "messages": [{"role": "user", "content": "ping"}]}),
+                    ("responses", "/v1/responses", {"model": "api-pool", "input": "ping"}),
                 ):
-                    with self.subTest(path=path):
+                    ep.protocol = protocol
+                    with self.subTest(protocol=protocol, path=path):
                         request = urllib.request.Request(
                             f"http://127.0.0.1:{proxy.server_port}{path}",
                             data=json.dumps(dict(body, stream=True)).encode(),
@@ -364,9 +433,9 @@ class RetryOnRateLimitTests(unittest.TestCase):
                         self.assertEqual(module.pool._get_persisted("main"), ep.id)
                         self.assertEqual(ep._cooldown_until, 0)
                         self.assertEqual(ep._fail_count, 0)
-                self.assertEqual(len(calls), 4)
-                self.assertEqual(calls[0], calls[1])
-                self.assertEqual(calls[2], calls[3])
+                self.assertEqual(len(calls), 8)
+                for index in range(0, len(calls), 2):
+                    self.assertEqual(calls[index], calls[index + 1])
                 logs = module.sys_logger.get_logs_since(0)
                 self.assertTrue(any("temporary_policy_block" in str(row) for row in logs))
             finally:

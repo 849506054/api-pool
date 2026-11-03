@@ -1263,7 +1263,7 @@ function openGroupModal(editName){
     :'未启用：子组始终避让 main 的当前/手动端点。启用建议 ≥ 300 秒（留空或 0 = 关闭）';
   // 参与轮换的成员（2026-10-06）：默认折叠；点摘要才向后端查询组内成员并列出勾选（不勾 = 全体参与）
   const gmSel=new Set(Array.isArray(g.rotate_members)?g.rotate_members:[]);
-  const gmSummary=`参与轮换的成员：${gmSel.size?`已选 ${gmSel.size} 个`:'全部'}`;
+  const gmSummary=`参与轮换的成员：${g.rotate_requests>0?(gmSel.size?`已选 ${gmSel.size} 个`:'全部'):'未启用'}`;
   const joinTargets=(window._groupDefs||[]).filter(isMixedParent);
   const memberships=subgroupMemberships(g)||{};
   const allJoined=joinTargets.every(pg=>memberships[pg.name]>0);
@@ -1301,8 +1301,8 @@ function openGroupModal(editName){
         </select></div>
       <div class="form-group"><label title="组内端点轮换（成功请求次数）：>0 时每成功 N 次请求把本组当前端点按组内优先级自动推进到下一名（循环）；0/留空=不轮换。手动切换是那一刻的动作，组配了轮换就按配置继续推进，两者不冲突">端点轮换 (每 N 次请求)</label>
         <div style="display:flex;gap:8px;align-items:flex-start">
-          <input type="number" id="gRotate" min="0" max="100000" value="${g.rotate_requests||''}" placeholder="0=不轮换" style="flex:1 1 auto;min-width:0">
-          <details class="gm-dd" id="gRotateMembersBox" ontoggle="gmLoadMembers(this)">
+          <input type="number" id="gRotate" oninput="gmUpdateSummary()" min="0" max="100000" value="${g.rotate_requests||''}" placeholder="0=不轮换" style="flex:1 1 auto;min-width:0">
+          <details class="gm-dd" id="gRotateMembersBox" data-selected-count="${gmSel.size}" ontoggle="gmLoadMembers(this)">
             <summary id="gRotateMembersSum" title="点击查询组内成员并勾选；不勾选 = 全部成员参与">${gmSummary}</summary>
             <div class="gm-list" id="gRotateMembers" onchange="gmUpdateSummary()"></div>
           </details>
@@ -1336,6 +1336,15 @@ function gmUpdateSummary(){
   const box=document.getElementById('gRotateMembersBox');
   const sum=document.getElementById('gRotateMembersSum');
   if(!box||!sum)return;
+  if(!(Number((document.getElementById('gRotate')||{}).value)>0)){
+    sum.textContent='参与轮换的成员：未启用';
+    return;
+  }
+  if(box.dataset.loaded!=='1'){
+    const selected=Number(box.dataset.selectedCount)||0;
+    sum.textContent=`参与轮换的成员：${selected?`已选 ${selected} 个`:'全部'}`;
+    return;
+  }
   const boxes=box.querySelectorAll('.gm-list input[type=checkbox]');
   const sel=box.querySelectorAll('.gm-list input[type=checkbox]:checked').length;
   sum.textContent=boxes.length?`参与轮换的成员：${sel?`已选 ${sel} 个`:'全部'}`:'参与轮换的成员：组内暂无成员';
