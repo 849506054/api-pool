@@ -42,14 +42,15 @@ class RetryBackoffTests(unittest.TestCase):
             module = load_module(tmp_path)
             self.assertEqual(module.APIPool._retry_backoff(0, "rate_limit"), 3)
             self.assertEqual(module.APIPool._retry_backoff(2, "rate_limit"), 12)
-            self.assertEqual(module.APIPool._retry_backoff(3, "rate_limit"), 20)
-            self.assertEqual(module.APIPool._retry_backoff(9, "rate_limit"), 20)
+            self.assertEqual(module.APIPool._retry_backoff(3, "rate_limit"), 24)
+            self.assertEqual(module.APIPool._retry_backoff(9, "rate_limit"), 24)
 
-    def test_other_categories_keep_exponential_backoff(self):
+    def test_all_categories_share_capped_backoff(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
-            self.assertEqual(module.APIPool._retry_backoff(4, "temporary_policy_block"), 48)
-            self.assertEqual(module.APIPool._retry_backoff(7, None), 384)
+            self.assertEqual(module.APIPool._retry_backoff(4, "temporary_policy_block"), 24)
+            self.assertEqual(module.APIPool._retry_backoff(7, None), 24)
+            self.assertEqual(module.APIPool._retry_backoff(3), 24)
 
 
 class BudgetCutRotationTests(unittest.TestCase):

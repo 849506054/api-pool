@@ -1086,9 +1086,9 @@ class TokenTracker:
 token_tracker = TokenTracker()
 
 CONFIG_FILE = "api_config.json"
-# 限流类原端点重试的退避封顶（秒）：3s 起步翻倍，到顶后固定间隔；
+# 原端点重试的退避封顶（秒）：3s 起步翻倍，到顶后固定间隔；所有重试通道共用，
 # 重试次数仍按端点配置的 max_retries，两个值互不影响。
-RATE_LIMIT_RETRY_CAP_SECONDS = 20
+RETRY_BACKOFF_CAP_SECONDS = 24
 
 # 对话日志滚动清理后台配置（顶层键 `log_retention`，无前端 UI 入口，直接改 api_config.json）：
 #   {"log_retention": {"days": 7, "cleanup_at": "03:00"}}
@@ -6597,16 +6597,15 @@ class APIPool:
 
     @staticmethod
     def _retry_backoff(attempt, category=None):
-        """原端点重试退避：3s 起步翻倍；限流类按 RATE_LIMIT_RETRY_CAP_SECONDS 封顶。
+        """原端点重试退避：3s 起步翻倍，所有类别统一按 RETRY_BACKOFF_CAP_SECONDS 封顶。
 
-        限流按窗口恢复，指数翻到几百秒只是把端点重试预算耗在等待上
+        不封顶时指数翻到几百秒只是把端点重试预算耗在等待上
         （10 次 × 3·2^n 光等待就要 3069s，超过 530s 请求预算），
-        封顶后预算内才走得完。重试次数仍由端点配置的 max_retries 决定。
+        封顶后 10 次共 189s 走得完。重试次数仍由端点配置的 max_retries 决定。
+        category 保留给调用方标注错误类别，不改变退避曲线。
         """
         delay = 3 * (2 ** attempt)
-        if category == "rate_limit":
-            delay = min(delay, RATE_LIMIT_RETRY_CAP_SECONDS)
-        return delay
+        return min(delay, RETRY_BACKOFF_CAP_SECONDS)
 
     def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False, group=None,
                 expected_route_epoch=None, request_id=None, budget_cut=False):
@@ -8373,7 +8372,7 @@ class APIPool:
                         if attempt < retries:
                             if debug_trace is not None:
                                 debug_trace.append({"endpoint": ep.name, "result": "retry", "attempt": attempt + 1, "kind": "stream_first_packet_timeout"})
-                            retry_delay = 3 * (2 ** attempt)
+                            retry_delay = self._retry_backoff(attempt)
                             if request_deadline is not None and time.time() + retry_delay >= request_deadline:
                                 return None, f"stream first packet timeout ({_first_pkt_timeout}s; retry skipped: request budget exhausted)"
                             sys_log(f"{request_tag}端点 '{endpoint_log_label}' {retry_delay} 秒后进行第 {attempt+1}/{retries} 次原端点重试（流式首条数据超时）", "INFO")
@@ -9006,7 +9005,7 @@ class APIPool:
                             if _g_visible and any(p in _g_visible for p in FAKE_SUCCESS_PATTERNS):
                                 sys_log(f"端点 '{endpoint_log_label}' 假成功（内容匹配拒绝模式）", "WARNING")
                                 if attempt < retries:
-                                    retry_delay = 3 * (2 ** attempt)
+                                    retry_delay = self._retry_backoff(attempt)
                                     if request_deadline is None or time.time() + retry_delay < request_deadline:
                                         sys_log(f"{request_tag}端点 '{endpoint_log_label}' {retry_delay} 秒后进行第 {attempt+1}/{retries} 次原端点重试（假成功）", "INFO")
                                         time.sleep(retry_delay)
@@ -9158,7 +9157,7 @@ class APIPool:
                             if _content_text and any(p in _content_text for p in FAKE_SUCCESS_PATTERNS):
                                 sys_log(f"端点 '{endpoint_log_label}' 假成功（内容匹配拒绝模式）", "WARNING")
                                 if attempt < retries:
-                                    retry_delay = 3 * (2 ** attempt)
+                                    retry_delay = self._retry_backoff(attempt)
                                     if request_deadline is None or time.time() + retry_delay < request_deadline:
                                         sys_log(f"{request_tag}端点 '{endpoint_log_label}' {retry_delay} 秒后进行第 {attempt+1}/{retries} 次原端点重试（假成功）", "INFO")
                                         time.sleep(retry_delay)
@@ -9218,7 +9217,7 @@ class APIPool:
                     if attempt < retries:
                         if debug_trace is not None:
                             debug_trace.append({"endpoint": ep.name, "result": "retry", "attempt": attempt + 1, "kind": f"http_{e.code}"})
-                        retry_delay = 3 * (2 ** attempt)
+                        retry_delay = self._retry_backoff(attempt)
                         if request_deadline is not None and time.time() + retry_delay >= request_deadline:
                             return None, msg + "; retry skipped: request budget exhausted"
                         sys_log(f"{request_tag}端点 '{endpoint_log_label}' {retry_delay} 秒后进行第 {attempt+1}/{retries} 次原端点重试（HTTP {e.code}）", "INFO")
@@ -9241,7 +9240,7 @@ class APIPool:
                     # 饿死；在重放前止损，避免健康端点重复计算/计费。
                     if ep._last_success_ts > 0 and time.time() - ep._last_success_ts < ep.timeout:
                         return None, msg + "; recent endpoint success, retry skipped"
-                    retry_delay = 3 * (2 ** attempt)
+                    retry_delay = self._retry_backoff(attempt)
                     if request_deadline is not None and time.time() + retry_delay >= request_deadline:
                         return None, msg + "; retry skipped: request budget exhausted"
                     risk = "，请求可能已提交，存在重复计算风险" if any(
