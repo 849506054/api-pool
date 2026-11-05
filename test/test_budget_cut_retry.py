@@ -54,24 +54,25 @@ class RetryBackoffTests(unittest.TestCase):
 
 
 class BudgetCutRotationTests(unittest.TestCase):
-    def test_budget_cut_rotation_does_not_freeze_but_switches(self):
+    def test_budget_cut_rotation_freezes_and_switches(self):
+        """预算截断跟普通失败一样记账并冻结（2026-11-04 改口径）."""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             pool, first, second = build_pool(module)
 
             pool._rotate(
                 first,
-                "HTTP 502: upstream stream error: too_many_requests"
+                "连接/超时错误: The read operation timed out"
                 "; retry skipped: request budget exhausted",
                 budget_cut=True,
             )
 
-            self.assertEqual(first._cooldown_until, 0)
-            self.assertEqual(first._fail_count, 0)
-            self.assertEqual(first._manual_unlock_required, False)
+            self.assertGreater(first._cooldown_until, 0)
+            self.assertEqual(first._fail_count, 1)
             self.assertEqual(pool._current_endpoint_id, second.id)
 
-    def test_budget_cut_skips_capacity_freeze(self):
+    def test_budget_cut_capacity_error_still_freezes(self):
+        """预算截断不再绕过容量类冻结：配额不足照旧按容量冷却."""
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)
             pool, first, _second = build_pool(module)
@@ -82,8 +83,7 @@ class BudgetCutRotationTests(unittest.TestCase):
                 budget_cut=True,
             )
 
-            self.assertEqual(first._cooldown_until, 0)
-            self.assertFalse(first._manual_unlock_required)
+            self.assertGreater(first._cooldown_until, 0)
 
     def test_plain_failure_still_freezes(self):
         with tempfile.TemporaryDirectory() as tmp_path:

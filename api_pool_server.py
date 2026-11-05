@@ -6623,31 +6623,25 @@ class APIPool:
                 "WARN",
             )
             return self._get_route_epoch(grp)
+        failed_ep._fail_count += 1
+        failed_ep._total_failures += 1
+        failed_ep._last_error = error_msg
+        failed_ep._last_error_ts = time.time()
+        self._mark_group_activity(failed_ep, grp)
         if budget_cut:
-            # 请求预算截断：重试被 530s 预算挡下、根本没发出去，不是端点故障。
-            # 不冻结、不计 fail_count，但仍按组内顺序切到下一个候选——
-            # 本请求还剩预算时，换候选比冻死一个健康端点更有价值。
-            failed_ep._last_error = error_msg
-            failed_ep._last_error_ts = time.time()
+            # 预算截断（2026-11-04 改口径）：上一次出站尝试是真失败（超时/停流/5xx），
+            # 只是重试放不进 530s 预算才停。照常记失败并冻结——只轮转不冻结会让它一直
+            # 留在候选里，每次都吃光整个预算（实测 9 分 13 秒）。
             sys_log(
                 f"{request_tag}端点 '{self._endpoint_log_label(failed_ep, grp)}' "
-                f"重试被请求预算截断（非端点故障，不冻结），组内继续轮转",
+                f"重试被请求预算截断且本次出站失败，按端点故障记账并冻结",
                 "WARN",
             )
-        else:
-            failed_ep._fail_count += 1
-            failed_ep._total_failures += 1
-            failed_ep._last_error = error_msg
-            failed_ep._last_error_ts = time.time()
-            self._mark_group_activity(failed_ep, grp)
+        elif request_id is None:
             # chat() 已带同一 request_id 记录过本次失败；直接调用 _rotate
             # （探活/测试等）才在这里补日志，避免同一错误重复两行。
-            if request_id is None:
-                sys_log(f"{request_tag}端点 '{self._endpoint_log_label(failed_ep, grp)}' 请求失败: {error_msg}", "ERROR")
-        if budget_cut:
-            capacity_kind, capacity_seconds = "", None
-        else:
-            capacity_kind, capacity_seconds = self._set_capacity_cooldown(failed_ep, error_msg)
+            sys_log(f"{request_tag}端点 '{self._endpoint_log_label(failed_ep, grp)}' 请求失败: {error_msg}", "ERROR")
+        capacity_kind, capacity_seconds = self._set_capacity_cooldown(failed_ep, error_msg)
         if capacity_kind == "balance_insufficient":
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 余额不足，已冻结，仅支持手动解冻", "WARN")
         elif capacity_kind == "sensitive_words":
@@ -6668,8 +6662,6 @@ class APIPool:
             # → 单请求饿死，非端点故障；不冻结、不切换当前端点。
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 活跃(窗口内有成功)，判定单请求饿死，不冻结不切换", "WARN")
             return self._get_route_epoch(grp)
-        elif budget_cut:
-            pass  # 预算截断已在上面记观测态，不冻结，直接进组内轮转
         else:
             self._set_cooldown(failed_ep)
             # 抖动+阶梯后实际窗口为 cooldown_minutes×[80%,120%]×连续失败次数，日志展示真实值
@@ -6684,8 +6676,7 @@ class APIPool:
             if expected_route_epoch is not None and self._get_route_epoch(grp) != expected_route_epoch:
                 return expected_route_epoch
             previous = self._get_current(grp)
-            if (self._is_in_cooldown(failed_ep) and previous in (None, failed_ep.id)
-                    and not budget_cut):
+            if self._is_in_cooldown(failed_ep) and previous in (None, failed_ep.id):
                 failed_ep._recovery_groups.add(grp)
             if candidates:
                 next_ep = candidates[0]
