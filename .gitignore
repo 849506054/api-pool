@@ -16,6 +16,8 @@ token_stats.db
 token_stats.db-journal
 chat_logs.db
 chat_logs.db-journal
+chat_logs.db-shm
+chat_logs.db-wal
 
 # 临时脚本
 test_suite.py
