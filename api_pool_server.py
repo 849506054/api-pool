@@ -3268,16 +3268,9 @@ class APIPool:
                 if ep.id == ep_id:
                     ep.in_pool = in_pool
                     # 入池同时指定组（2026-08-29 分组池）：?groups=main,bg 形式
-                    # 入池组 = 本次显式选中的组（2026-11-05）：选哪个就在哪个，不再叠加旧组
                     if in_pool and groups is not None:
-                        previous_groups = list(self._ep_groups(ep))
-                        ep.pool_groups = self._sanitize_groups(groups)
-                        for grp in previous_groups:
-                            if grp in ep.pool_groups:
-                                continue
-                            self._retire_group_key(ep, grp)  # 退出的组：状态一并作废
-                            if self._current_endpoint_by_group.get(grp) == ep_id:
-                                self._set_current(grp, None)
+                        sanitized = self._sanitize_groups(groups)
+                        ep.pool_groups = sanitized or [self.MAIN_GROUP]
                     elif in_pool and not ep.pool_groups:
                         ep.pool_groups = [self.MAIN_GROUP]
                     if in_pool:
@@ -10414,8 +10407,6 @@ def api_handler(method, path, body):
                 if kv.startswith("groups="):
                     qs_groups = [g for g in unquote(kv[7:]).split(",") if g.strip()]
                     break
-        if parsed.query and "groups=" in parsed.query and not qs_groups:
-            return 400, {"error": "需要至少一个组"}, False
         pool.set_pool(ep_id, True, groups=qs_groups); _sync_to_config()
         return 200, {"ok": True}, False
     if method == "DELETE" and cp.startswith("/api/pool/"):

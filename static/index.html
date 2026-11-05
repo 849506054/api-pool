@@ -1570,8 +1570,8 @@ async function joinPoolGroup(id,g){
   const cur=(ep&&ep.pool_groups&&ep.pool_groups.length)?ep.pool_groups:[];
   // 仅当端点已在池且属于该组时才拦截；in_pool=False 时组配置只是残留，直接入池
   if(ep&&ep.in_pool&&cur.includes(g)){toast('该端点已在组 '+g+' 中','info');closeJoinPoolModal();return;}
-  // 选哪个组就只进哪个组：不携带旧组，避免同时落在 main 或其他组
-  await api('POST',`/api/pool/${encodeURIComponent(id)}?groups=${encodeURIComponent(g)}`);
+  const groups=cur.includes(g)?cur:[...cur,g]; // 保留已有组，追加本次选择
+  await api('POST',`/api/pool/${encodeURIComponent(id)}?groups=${encodeURIComponent(groups.join(','))}`);
   closeJoinPoolModal();
   toast(`✅ 已加入组：${g}`,'success');
   refresh();
