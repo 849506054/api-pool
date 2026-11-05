@@ -5919,9 +5919,19 @@ class APIPool:
         if any(marker in text for marker in balance_markers):
             return "balance_insufficient"
 
+        # 额度耗尽（qoder 112 / pricingUrl 那一类）：账号没钱了，重试无效。
+        # 池侧处置是 24 小时内不再探活这个端点——短冷却只会让它反复被选中、反复 502，
+        # 而额度不会在几十分钟内回来。
+        quota_out_markers = (
+            "额度耗尽", "额度已用尽", "额度不足",
+            "quota_exhausted", "quota exhausted", "quota has been exhausted",
+            "credit exhausted", "no remaining credit",
+        )
+        if any(marker in text for marker in quota_out_markers):
+            return "quota_out"
+
         quota_markers = (
-            "配额不足", "配额已用尽", "配额耗尽", "quota exceeded", "quota exhausted",
-            "quota has been exhausted",
+            "配额不足", "配额已用尽", "配额耗尽", "quota exceeded",
             "insufficient quota", "usage limit exceeded", "usage limit reached",
             "daily limit exceeded", "daily limit reached", "monthly limit exceeded",
             "monthly limit reached", "token quota exceeded", "请求配额已用尽",
@@ -5993,6 +6003,17 @@ class APIPool:
             ep._health = "bad"
             ep._health_error = "余额不足，仅支持手动解冻"
             return kind, None
+        if kind == "quota_out":
+            # 额度耗尽：24 小时内不再探活（冷却到期才探），期间不进候选。
+            seconds = self._parse_quota_cooldown_seconds(error_msg)
+            if seconds is None:
+                seconds = 24 * 60 * 60
+            ep._manual_unlock_required = False
+            ep._cooldown_until = time.time() + seconds
+            ep._cooldown_reason = kind
+            ep._health = "bad"
+            ep._health_error = f"上游额度耗尽（112），{seconds // 3600} 小时后重新探活"
+            return kind, seconds
         if kind == "sensitive_words":
             ep._manual_unlock_required = True
             ep._cooldown_until = 0
@@ -6110,6 +6131,9 @@ class APIPool:
             test_label = self._endpoint_log_label(ep, group)
             if capacity_kind == "balance_insufficient":
                 sys_log(f"端点 '{test_label}' 测试失败，余额不足，已冻结，仅支持手动解冻", "WARN")
+            elif capacity_kind == "quota_out":
+                detail = f"{capacity_seconds // 3600} 小时" if capacity_seconds else "24 小时"
+                sys_log(f"端点 '{test_label}' 测试失败，上游额度耗尽，{detail}内不再探活", "WARN")
             elif capacity_kind == "quota_exceeded":
                 detail = f"{capacity_seconds} 秒" if capacity_seconds is not None else "默认 5 小时"
                 sys_log(f"端点 '{test_label}' 测试失败，配额不足，冻结 {detail}", "WARN")
@@ -6257,6 +6281,9 @@ class APIPool:
                     capacity_kind, capacity_seconds = self._set_capacity_cooldown(ep, probe_error or "探活失败")
                 if capacity_kind == "balance_insufficient":
                     sys_log(f"端点 '{self._endpoint_log_label(ep, self._ep_groups(ep)[0])}' 后台探活发现余额不足，已冻结，仅支持手动解冻", "WARN")
+                elif capacity_kind == "quota_out":
+                    detail = f"{capacity_seconds // 3600} 小时" if capacity_seconds else "24 小时"
+                    sys_log(f"端点 '{self._endpoint_log_label(ep, self._ep_groups(ep)[0])}' 后台探活发现上游额度耗尽，{detail}内不再探活", "WARN")
                 elif capacity_kind == "quota_exceeded":
                     detail = f"{capacity_seconds} 秒" if capacity_seconds is not None else "默认 5 小时"
                     sys_log(f"端点 '{self._endpoint_log_label(ep, self._ep_groups(ep)[0])}' 后台探活发现配额不足，冻结 {detail}", "WARN")
@@ -6670,6 +6697,9 @@ class APIPool:
         capacity_kind, capacity_seconds = self._set_capacity_cooldown(failed_ep, error_msg)
         if capacity_kind == "balance_insufficient":
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 余额不足，已冻结，仅支持手动解冻", "WARN")
+        elif capacity_kind == "quota_out":
+            detail = f"{capacity_seconds // 3600} 小时" if capacity_seconds else "24 小时"
+            sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 上游额度耗尽，{detail}内不再探活", "WARN")
         elif capacity_kind == "sensitive_words":
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 命中上游敏感词拦截，已冻结，仅支持手动解冻", "WARN")
         elif capacity_kind == "quota_exceeded":
