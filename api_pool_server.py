@@ -5200,7 +5200,7 @@ class APIPool:
         """wkm：三个只读管理接口取登记值（只读 API Token 鉴权，零本地文件、
         零上游查询）。快照给 uid→积分，api/keys 给 key 级 realm/额度，
         api/accounts 给 uid→realm。**任一处失败即整体失败**——宁可保留旧读数，
-        也不发布 realm 归属不全（全部落回 cn）的错数字。"""
+        也不发布归属信息不全的错数字。"""
         if not WKM_API_TOKEN:
             credit_warn_once("wkm-token-missing",
                              "未配置 WKM_API_TOKEN，WorkBuddy 积分徽标不可用（只读令牌见 api-pool2 部署说明）")
@@ -5211,15 +5211,39 @@ class APIPool:
         accounts = self._credit_http_json(WKM_API_BASE + "/api/accounts", auth)
         realm_of: dict[str, str] = {}
         rows = accounts.get("accounts") if isinstance(accounts, dict) else accounts
+        disabled_uids: set[str] = set()
         for a in rows or []:
             uid = str(a.get("uid") or "")
+            if not uid:
+                continue
+            # 停用的号不进汇总，三种停用态都算：面板临时禁用（文件改名 .disabled →
+            # `disabled_by_panel`）、上游按错误分类自动禁（`disabled`）、运维手动摘（
+            # `manual_disabled`）。它们仍然出现在 /api/accounts 里，只是不再被调度。
+            if a.get("disabled_by_panel") or a.get("disabled") or a.get("manual_disabled"):
+                disabled_uids.add(uid)
+                continue
             r = str(a.get("realm") or "")
-            if uid and r:
+            if r:
                 realm_of[uid] = r
         realm_sum: dict[str, float] = {}
+        # 快照是 manager 侧的余额留痕，只写不删：号从账号列表里消失后那条登记值还在。
+        # 因此按当前账号列表（api/accounts）取交集，认不出归属的行跳过不计数——
+        # 归属默认值会把删掉的号也算进某个域，实测虚高一档（36981 vs 9229）。
+        unknown: list[str] = []
         for row in (snap or {}).get("accounts") or []:
-            r = realm_of.get(str(row.get("uid") or ""), "cn")
+            uid = str(row.get("uid") or "")
+            r = realm_of.get(uid)
+            if r is None:
+                if uid not in disabled_uids:
+                    unknown.append(uid)
+                continue
             realm_sum[r] = realm_sum.get(r, 0.0) + float(row.get("credits") or 0)
+        if unknown or disabled_uids:
+            credit_warn_once(
+                "wkm-snapshot-filtered",
+                f"wkm 积分汇总已跳过：历史登记 {len(unknown)} 行（uid 不在当前账号列表）、"
+                f"停用中 {len(disabled_uids)} 个号；本次只计 {len(realm_of)} 个在册且启用账号的登记值"
+                + (f"；样例 uid={unknown[:3]}" if unknown else ""))
         now = time.time()
         out: dict[str, dict] = {}
         for k in key_rows if isinstance(key_rows, list) else []:
