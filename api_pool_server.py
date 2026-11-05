@@ -7691,120 +7691,140 @@ class APIPool:
                         "WARN",
                     )
             # _try_endpoint 内部已按 max_retries 重试完毕，直接冻结+轮转
+            # 失败处置全程不持池锁：这里的探活/并发探活是真实网络 I/O，探活线程（_check_one_health）
+            # 自身也要拿池锁（_guard_pool_outbound/_rotate 等）。持锁 join 会与此互等成死锁
+            # （2026-11-05 04:00 DNS 抖动触发，整池冻结）。锁内只做状态判定，改状态的
+            # _rotate/_release_inflight 各自内部加锁。
+            # 端点级活跃判定（2026-08-14）：超时类错误但端点在 timeout 窗口内
+            # 有成功响应 → 单请求饿死（并发挤压），非端点故障 → 不冻结仅轮转。
+            # 窗口=端点自己的 timeout 配置（如 Opencode 60s/Tokenrhythm 90s）。
+            skip_cooldown = False
+            if "连接/超时错误" in error and ep._last_success_ts > 0:
+                since_success = time.time() - ep._last_success_ts
+                if since_success < ep.timeout:
+                    skip_cooldown = True
+                    sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 超时失败但 {since_success:.0f}s 前有成功响应（<timeout {ep.timeout}s），判定单请求饿死，不冻结", "WARN")
+            # 客户端类错误（400/404/413/422）：仍是端点级失败，走正常冷却流程
+            # （fail_count 记账、按 cooldown_minutes 冻结、到期探活回迁）；本请求内
+            # 不重复试同一端点、候选不探活（小探活包不带畸形 body，探活必过无信息量）。
+            client_error = self._classify_client_error(error)
+            if client_error and not role_downgraded and self._has_developer_role(messages):
+                if self._is_role_reject_error(error):
+                    role_downgraded = True
+                    sys_log(f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 拒绝 developer 角色，后续候选降级为 system 重试", "WARN")
+            # 请求预算截断（下一次重试根本发不出去）不是端点故障：
+            # 不冻结、不计失败，但仍按组内顺序轮转，剩余预算内换候选答完。
+            budget_cut = "; retry skipped: request budget exhausted" in error
+            request_route_epoch = self._rotate(
+                ep, error, skip_cooldown=skip_cooldown,
+                group=group,
+                expected_route_epoch=request_route_epoch,
+                request_id=request_id,
+                budget_cut=budget_cut,
+            )
             with self._lock:
-                # 端点级活跃判定（2026-08-14）：超时类错误但端点在 timeout 窗口内
-                # 有成功响应 → 单请求饿死（并发挤压），非端点故障 → 不冻结仅轮转。
-                # 窗口=端点自己的 timeout 配置（如 Opencode 60s/Tokenrhythm 90s）。
-                skip_cooldown = False
-                if "连接/超时错误" in error and ep._last_success_ts > 0:
-                    since_success = time.time() - ep._last_success_ts
-                    if since_success < ep.timeout:
-                        skip_cooldown = True
-                        sys_log(f"端点 '{self._endpoint_log_label(ep, group)}' 超时失败但 {since_success:.0f}s 前有成功响应（<timeout {ep.timeout}s），判定单请求饿死，不冻结", "WARN")
-                # 客户端类错误（400/404/413/422）：仍是端点级失败，走正常冷却流程
-                # （fail_count 记账、按 cooldown_minutes 冻结、到期探活回迁）；本请求内
-                # 不重复试同一端点、候选不探活（小探活包不带畸形 body，探活必过无信息量）。
-                client_error = self._classify_client_error(error)
-                if client_error and not role_downgraded and self._has_developer_role(messages):
-                    if self._is_role_reject_error(error):
-                        role_downgraded = True
-                        sys_log(f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 拒绝 developer 角色，后续候选降级为 system 重试", "WARN")
-                # 请求预算截断（下一次重试根本发不出去）不是端点故障：
-                # 不冻结、不计失败，但仍按组内顺序轮转，剩余预算内换候选答完。
-                budget_cut = "; retry skipped: request budget exhausted" in error
-                request_route_epoch = self._rotate(
-                    ep, error, skip_cooldown=skip_cooldown,
-                    group=group,
-                    expected_route_epoch=request_route_epoch,
-                    request_id=request_id,
-                    budget_cut=budget_cut,
+                self._release_inflight(ep.id, group)
+            if client_error:
+                client_error_tried.add(ep.id)
+            if skip_cooldown:
+                # 单请求饿死不是 API Pool 的端点故障。不要探活或切换到
+                # 其他模型；交回 Hermes，由其现有请求重试机制善后。
+                # 退出语义只到「本请求失败」为止：标记后跳过下方组级 fallback，
+                # 否则整组落 main 会连模型一起换掉（2026-10-20 实战暴露）。
+                starvation_handback = True
+                sys_log(
+                    f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' "
+                    f"单请求饿死，交回调用方重试（不跨组、不换模型）",
+                    "INFO", group=group,
                 )
-                with self._lock:
-                    self._release_inflight(ep.id, group)
-                if client_error:
-                    client_error_tried.add(ep.id)
-                if skip_cooldown:
-                    # 单请求饿死不是 API Pool 的端点故障。不要探活或切换到
-                    # 其他模型；交回 Hermes，由其现有请求重试机制善后。
-                    # 退出语义只到「本请求失败」为止：标记后跳过下方组级 fallback，
-                    # 否则整组落 main 会连模型一起换掉（2026-10-20 实战暴露）。
-                    starvation_handback = True
-                    sys_log(
-                        f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' "
-                        f"单请求饿死，交回调用方重试（不跨组、不换模型）",
-                        "INFO", group=group,
-                    )
-                    break
-                active = self._failover_active(group)
-                total = len(active)
-                if total == 0:
-                    break
-                tried = 0  # 轮转后重置尝试计数，用刷新后的 total 重新计算
-                # 从失败端点之后的环形顺序选择候选（同模型优先分桶已移除，纯优先级顺延）。
-                candidates = self._ordered_failover_candidates(ep, active, group=group)
-                if client_error:
-                    # 本请求内已试过的端点不再重试：同类错误原地复读没有信息量，
-                    # 端点本身已由冷却排除，这里兜住同一请求内的重复尝试。
-                    candidates = [e for e in candidates if e.id not in client_error_tried]
-                next_ep = candidates[0] if candidates else None
-                if next_ep is not None:
-                    idx = active.index(next_ep)
-                if next_ep is None:
-                    for i, e in enumerate(active):
-                        if e is ep:
-                            idx = (i + 1) % len(active)
-                            break
-                else:
-                    if gateway_error or client_error:
-                        # 网关错误：跳过候选探活直接重试（探活小请求无法鉴别网关故障）
-                        # 客户端类错误：探活必然通过（小请求不带畸形 payload），无信息量，直接轮转
-                        sys_log(f"跳过候选端点 '{self._endpoint_log_label(next_ep, group)}' 探活直接重试", "INFO")
-                        continue
-                    # 预算见底就不再探活：探活要 2-10s，探完也发不出请求
-                    if request_deadline is not None and time.time() >= request_deadline:
-                        sys_log(f"{request_tag}请求预算已耗尽，跳过候选端点探活，停止轮转", "WARN")
-                        budget_exhausted = True
-                        errors.append(f"请求预算 {self._FALLBACK_DEADLINE_SECONDS}s 已耗尽，停止轮转")
+                break
+            active = self._failover_active(group)
+            total = len(active)
+            if total == 0:
+                break
+            tried = 0  # 轮转后重置尝试计数，用刷新后的 total 重新计算
+            # 从失败端点之后的环形顺序选择候选（同模型优先分桶已移除，纯优先级顺延）。
+            candidates = self._ordered_failover_candidates(ep, active, group=group)
+            if client_error:
+                # 本请求内已试过的端点不再重试：同类错误原地复读没有信息量，
+                # 端点本身已由冷却排除，这里兜住同一请求内的重复尝试。
+                candidates = [e for e in candidates if e.id not in client_error_tried]
+            next_ep = candidates[0] if candidates else None
+            if next_ep is not None:
+                idx = active.index(next_ep)
+            if next_ep is None:
+                for i, e in enumerate(active):
+                    if e is ep:
+                        idx = (i + 1) % len(active)
                         break
-                    # 关闭检测的候选端点无探活可言：不发 ping，直接发起真实请求
-                    if self._probe_disabled(next_ep):
-                        sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' 已关闭检测，直接重试", "INFO")
-                        continue
-                    # 对候选端点做探活
-                    sys_log(f"对候选端点 '{self._endpoint_log_label(next_ep, group)}' 进行探活...", "INFO")
-                    probe_ok, probe_error = self._probe_endpoint(next_ep)
-                    if probe_ok is None:
-                        # 无可用身份：探活无信息量（同网关错误处理），跳过探活直接用它试一次
-                        sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' {POOL_IDENTITY_SKIP_REASON}，跳过探活直接重试", "WARN")
-                        continue
-                    if probe_ok:
-                        sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' 探活通过，准备重试请求", "INFO")
-                        continue  # 探活通过，回到循环顶部用 next_ep 发起实际请求
-                    else:
-                        sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' 探活失败，跳过", "WARN")
-                        self._rotate(next_ep, probe_error or "探活失败", probe_failed=True, group=group)
-                        # 下一级探活也失败 → 并发探活剩余所有候选端点。
-                        # 用 _check_one_health（含 Attempt 2 重试，最坏 20s）做参考性探测；
-                        # 两阶段等待：11s 内返回结果的端点直接按优先级使用，最多等 21s。
-                        remaining = [e for e in candidates if e is not next_ep]
-                        if remaining:
-                            # 关闭检测的候选无探活可言：按优先级顺序直接用
-                            probe_off = next((e for e in remaining if self._probe_disabled(e)), None)
-                            if probe_off is not None:
-                                sys_log(f"候选端点 '{probe_off.name}' 已关闭检测，直接使用", "INFO")
-                                idx = active.index(probe_off)
-                                continue
-                            sys_log(f"并发探活剩余 {len(remaining)} 个候选端点...", "INFO")
-                            probe_results = {}
-                            chosen = None
-                            _deadline11 = time.time() + 11
-                            _deadline21 = time.time() + 21
-                            with ThreadPoolExecutor(max_workers=min(len(remaining), 10)) as _pool:
-                                _futures = {_pool.submit(self._check_one_health, e): e for e in remaining}
-                                _pending = set(_futures)
-                                # 阶段1：11s 内谁先返回结果，按优先级取第一个通过的立即使用
-                                while _pending and time.time() < _deadline11:
-                                    _done, _pending = wait(_pending, timeout=max(0.1, _deadline11 - time.time()))
+            else:
+                if gateway_error or client_error:
+                    # 网关错误：跳过候选探活直接重试（探活小请求无法鉴别网关故障）
+                    # 客户端类错误：探活必然通过（小请求不带畸形 payload），无信息量，直接轮转
+                    sys_log(f"跳过候选端点 '{self._endpoint_log_label(next_ep, group)}' 探活直接重试", "INFO")
+                    continue
+                # 预算见底就不再探活：探活要 2-10s，探完也发不出请求
+                if request_deadline is not None and time.time() >= request_deadline:
+                    sys_log(f"{request_tag}请求预算已耗尽，跳过候选端点探活，停止轮转", "WARN")
+                    budget_exhausted = True
+                    errors.append(f"请求预算 {self._FALLBACK_DEADLINE_SECONDS}s 已耗尽，停止轮转")
+                    break
+                # 关闭检测的候选端点无探活可言：不发 ping，直接发起真实请求
+                if self._probe_disabled(next_ep):
+                    sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' 已关闭检测，直接重试", "INFO")
+                    continue
+                # 对候选端点做探活
+                sys_log(f"对候选端点 '{self._endpoint_log_label(next_ep, group)}' 进行探活...", "INFO")
+                probe_ok, probe_error = self._probe_endpoint(next_ep)
+                if probe_ok is None:
+                    # 无可用身份：探活无信息量（同网关错误处理），跳过探活直接用它试一次
+                    sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' {POOL_IDENTITY_SKIP_REASON}，跳过探活直接重试", "WARN")
+                    continue
+                if probe_ok:
+                    sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' 探活通过，准备重试请求", "INFO")
+                    continue  # 探活通过，回到循环顶部用 next_ep 发起实际请求
+                else:
+                    sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' 探活失败，跳过", "WARN")
+                    self._rotate(next_ep, probe_error or "探活失败", probe_failed=True, group=group)
+                    # 下一级探活也失败 → 并发探活剩余所有候选端点。
+                    # 用 _check_one_health（含 Attempt 2 重试，最坏 20s）做参考性探测；
+                    # 两阶段等待：11s 内返回结果的端点直接按优先级使用，最多等 21s。
+                    remaining = [e for e in candidates if e is not next_ep]
+                    if remaining:
+                        # 关闭检测的候选无探活可言：按优先级顺序直接用
+                        probe_off = next((e for e in remaining if self._probe_disabled(e)), None)
+                        if probe_off is not None:
+                            sys_log(f"候选端点 '{probe_off.name}' 已关闭检测，直接使用", "INFO")
+                            idx = active.index(probe_off)
+                            continue
+                        sys_log(f"并发探活剩余 {len(remaining)} 个候选端点...", "INFO")
+                        probe_results = {}
+                        chosen = None
+                        _deadline11 = time.time() + 11
+                        _deadline21 = time.time() + 21
+                        with ThreadPoolExecutor(max_workers=min(len(remaining), 10)) as _pool:
+                            _futures = {_pool.submit(self._check_one_health, e): e for e in remaining}
+                            _pending = set(_futures)
+                            # 阶段1：11s 内谁先返回结果，按优先级取第一个通过的立即使用
+                            while _pending and time.time() < _deadline11:
+                                _done, _pending = wait(_pending, timeout=max(0.1, _deadline11 - time.time()))
+                                for _fut in _done:
+                                    _e = _futures[_fut]
+                                    try:
+                                        _eid, _health, _lat, _err = _fut.result()
+                                        probe_results[_e.id] = _health
+                                    except Exception:
+                                        probe_results[_e.id] = "bad"
+                                for _e in remaining:
+                                    if probe_results.get(_e.id) in ("ok", "slow") and _e is not ep:
+                                        chosen = _e
+                                        break
+                                if chosen is not None:
+                                    break
+                            # 阶段2：11s 内没有可用端点，继续等剩余结果，最多到 21s
+                            if chosen is None:
+                                while _pending and time.time() < _deadline21:
+                                    _done, _pending = wait(_pending, timeout=max(0.1, _deadline21 - time.time()))
                                     for _fut in _done:
                                         _e = _futures[_fut]
                                         try:
@@ -7812,61 +7832,44 @@ class APIPool:
                                             probe_results[_e.id] = _health
                                         except Exception:
                                             probe_results[_e.id] = "bad"
-                                    for _e in remaining:
-                                        if probe_results.get(_e.id) in ("ok", "slow") and _e is not ep:
-                                            chosen = _e
-                                            break
-                                    if chosen is not None:
+                                for _e in remaining:
+                                    if probe_results.get(_e.id) in ("ok", "slow") and _e is not ep:
+                                        chosen = _e
                                         break
-                                # 阶段2：11s 内没有可用端点，继续等剩余结果，最多到 21s
-                                if chosen is None:
-                                    while _pending and time.time() < _deadline21:
-                                        _done, _pending = wait(_pending, timeout=max(0.1, _deadline21 - time.time()))
-                                        for _fut in _done:
-                                            _e = _futures[_fut]
-                                            try:
-                                                _eid, _health, _lat, _err = _fut.result()
-                                                probe_results[_e.id] = _health
-                                            except Exception:
-                                                probe_results[_e.id] = "bad"
-                                    for _e in remaining:
-                                        if probe_results.get(_e.id) in ("ok", "slow") and _e is not ep:
-                                            chosen = _e
-                                            break
-                            if chosen is not None:
-                                sys_log(f"候选端点 '{chosen.name}' 并发探活通过，准备重试请求", "INFO")
-                                idx = active.index(chosen)
-                                # 其余探活失败的端点标记短冷却，避免后续轮转再撞上
-                                for e in remaining:
-                                    # Only an explicit completed failure is evidence
-                                    # for cooldown. Missing results mean the probe
-                                    # exceeded the observation window, not that it failed.
-                                    if e is not chosen and probe_results.get(e.id) == "bad" and not self._is_in_cooldown(e):
-                                        self._rotate(e, "并发探活失败", probe_failed=True, group=group)
-                                continue
-                            else:
-                                # 全部探活失败：全部短冷却，回到循环顶部走 fallback 兜底
-                                sys_log(f"剩余候选端点全部探活失败", "WARN")
-                                for e in remaining:
-                                    if probe_results.get(e.id) == "bad" and not self._is_in_cooldown(e):
-                                        self._rotate(e, "并发探活失败", probe_failed=True, group=group)
-                                active = self._failover_active(group)
-                                total = len(active)
-                                if total == 0:
-                                    break
-                                candidates = self._ordered_failover_candidates(
-                                    ep, active, exclude=(next_ep,), group=group
-                                )
-                                next_ep2 = candidates[0] if candidates else None
-                                if next_ep2 is not None:
-                                    idx = active.index(next_ep2)
-                                if next_ep2 is None:
-                                    # 没有更多候选了，尝试任何非当前端点
-                                    for i, e in enumerate(active):
-                                        if e is ep:
-                                            idx = (i + 1) % len(active)
-                                            break
-                tried += 1
+                        if chosen is not None:
+                            sys_log(f"候选端点 '{chosen.name}' 并发探活通过，准备重试请求", "INFO")
+                            idx = active.index(chosen)
+                            # 其余探活失败的端点标记短冷却，避免后续轮转再撞上
+                            for e in remaining:
+                                # Only an explicit completed failure is evidence
+                                # for cooldown. Missing results mean the probe
+                                # exceeded the observation window, not that it failed.
+                                if e is not chosen and probe_results.get(e.id) == "bad" and not self._is_in_cooldown(e):
+                                    self._rotate(e, "并发探活失败", probe_failed=True, group=group)
+                            continue
+                        else:
+                            # 全部探活失败：全部短冷却，回到循环顶部走 fallback 兜底
+                            sys_log(f"剩余候选端点全部探活失败", "WARN")
+                            for e in remaining:
+                                if probe_results.get(e.id) == "bad" and not self._is_in_cooldown(e):
+                                    self._rotate(e, "并发探活失败", probe_failed=True, group=group)
+                            active = self._failover_active(group)
+                            total = len(active)
+                            if total == 0:
+                                break
+                            candidates = self._ordered_failover_candidates(
+                                ep, active, exclude=(next_ep,), group=group
+                            )
+                            next_ep2 = candidates[0] if candidates else None
+                            if next_ep2 is not None:
+                                idx = active.index(next_ep2)
+                            if next_ep2 is None:
+                                # 没有更多候选了，尝试任何非当前端点
+                                for i, e in enumerate(active):
+                                    if e is ep:
+                                        idx = (i + 1) % len(active)
+                                        break
+            tried += 1
         # bg → main 轮转耗尽兜底（触发点 2）：bg 组内轮转完仍失败 → 追加 main 组一轮；
         # 再失败才报 AllEndpointsFailed 交 Hermes。530s 预算跨组共享不翻倍（剩余预算内执行）。
         # 仅当请求原生属于非 main 组且尚未 fallback 过（入口触发点 1 会改写 group）。
