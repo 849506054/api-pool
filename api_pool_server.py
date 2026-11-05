@@ -3647,8 +3647,10 @@ class APIPool:
             if remaining:
                 source.pool_groups = remaining
             else:
+                # 换模型后原端点退出最后一个组：出池即清空归属，
+                # 不留 main 残值（2026-11-05：残值会让下次加入子组时被一起带进 main）
                 source.in_pool = False
-                source.pool_groups = [self.MAIN_GROUP]
+                source.pool_groups = []
 
             # 先重新编号，再恢复源端点在当前组的位置，避免影响同组其他成员次序。
             self._renumber_pool_priorities()

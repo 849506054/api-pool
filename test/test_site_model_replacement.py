@@ -126,6 +126,18 @@ class SiteModelReplacementTests(unittest.TestCase):
         self.assertEqual(self.pool._get_current("bg"), replacement.id)
         self.assertEqual(self.pool._get_persisted("bg"), replacement.id)
 
+    def test_replaced_source_leaving_last_group_keeps_no_group_residue(self):
+        """换模型后原端点若退出最后一个组，pool_groups 必须为空。
+
+        残留 ['main'] 会让端点下次被加入子组时把 main 一起带上（2026-11-05 现场）。
+        """
+        source = self.endpoint("only", "model-a", groups=["bg"], priority=1,
+                               priority_by_group={"bg": 1})
+        self.pool._derive_group_defs()
+        self.pool.replace_group_model("bg", source.id, "model-b")
+        self.assertFalse(source.in_pool)
+        self.assertEqual(source.pool_groups, [])
+
     def test_matching_prefers_connection_then_enabled_cooldown_priority_and_config_order(self):
         source = self.endpoint("source", "model-a")
         wrong_connection = self.endpoint(

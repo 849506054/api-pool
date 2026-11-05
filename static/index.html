@@ -1540,7 +1540,8 @@ function openJoinPoolModal(id,name){
   for(const gd of (window._groupDefs||[])) if(gd.name&&gd.name!=='main'&&!groups.includes(gd.name)) groups.push(gd.name);
   for(const g of Object.keys(gs)) if(g!=='main'&&!groups.includes(g)) groups.push(g);
   const ep=(window._allEps||[]).find(e=>e.id===id);
-  const cur=(ep&&ep.pool_groups&&ep.pool_groups.length)?ep.pool_groups:[];
+  // 只认在池端点的归属；已出池的 pool_groups 是残留，不参与本次加入
+  const cur=(ep&&ep.in_pool&&ep.pool_groups&&ep.pool_groups.length)?ep.pool_groups:[];
   const rows=groups.map(g=>`
     <div onclick="joinPoolGroup('${id}','${esc(g)}')" style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;cursor:pointer;font-size:13px;transition:all .12s" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
       <span>${g==='main'?'🏊':''}</span>
@@ -1567,7 +1568,7 @@ function closeJoinPoolModal(){
 }
 async function joinPoolGroup(id,g){
   const ep=(window._allEps||[]).find(e=>e.id===id);
-  const cur=(ep&&ep.pool_groups&&ep.pool_groups.length)?ep.pool_groups:[];
+  const cur=(ep&&ep.in_pool&&ep.pool_groups&&ep.pool_groups.length)?ep.pool_groups:[];
   // 仅当端点已在池且属于该组时才拦截；in_pool=False 时组配置只是残留，直接入池
   if(ep&&ep.in_pool&&cur.includes(g)){toast('该端点已在组 '+g+' 中','info');closeJoinPoolModal();return;}
   const groups=cur.includes(g)?cur:[...cur,g]; // 保留已有组，追加本次选择
