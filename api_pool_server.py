@@ -6518,12 +6518,15 @@ class APIPool:
 
     @staticmethod
     def _classify_client_error(error_msg):
-        """客户端类错误识别（轮转不记账，upstream-borrow 设计改动二）。
+        """客户端类错误识别（请求形状类 400/404/413/422）。
 
         判定：HTTP 状态码 ∈ {400, 404, 413, 422} 且不含瞬态/配额字样，
         且不含已被内部 workaround 消化的标记（temperature/top_p 自动剥离
         后的重试在 _try_endpoint 内部完成，到达这里的都是二次失败或特例外）。
-        这类失败是请求形状问题，不是端点健康问题：好端点也会拒绝畸形请求。
+        命中只决定「本请求内怎么轮转」——已试端点不再重试、候选跳过探活
+        （小探活包不带畸形 body，探活必过无信息量）。记账仍按端点级失败走：
+        fail_count + total_failures 照增，按端点 cooldown_minutes 冻结、
+        指针交棒、到期探活回迁，见 chat() 里「客户端类错误…走正常冷却流程」段。
         """
         text = str(error_msg or "")
         if not text.startswith("HTTP "):
@@ -7436,7 +7439,7 @@ class APIPool:
         if not active:
             raise ValueError("没有可用的 API 端点")
         errors = []
-        client_error_tried = set()  # 本请求内已因客户端类错误轮转过的端点（防不冻结路径死循环）
+        client_error_tried = set()  # 本请求内已因客户端类错误轮转过的端点（同类错误原地复读没有信息量）
         budget_exhausted = False  # 轮转预算已耗尽：停止轮转，端点状态一律不动
         role_downgraded = False  # 已因角色不兼容 400 触发 developer→system 降级（每请求一次）
         # 严格校验 400 的请求级重试预算（2026-09-12 定案：上限 1）：唯一一次重试就是
@@ -7490,7 +7493,7 @@ class APIPool:
                     tried += 1
                     idx = (idx + 1) % total
                     continue
-            # 客户端类错误轮转终止：不冻结路径没有冷却收缩 total，靠请求级已试集合收口。
+            # 客户端类错误换端点：本请求内已试过的端点直接跳过（冷却之外的请求级收口）。
             if ep.id in client_error_tried:
                 tried += 1
                 idx = (idx + 1) % total
@@ -7692,7 +7695,7 @@ class APIPool:
             # 避免"探活通过→重试超时"空转。超时/连接错误仍走探活（瞬态防误杀）。
             gateway_error = any(f"HTTP {c}" in error for c in ("502", "503", "504"))
             # DeepSeek thinking 严格校验 400（2026-09-10，V4.1-Flash 起观测）：同端点重试
-            # 一次。放在冻结/轮转之前：这两类错误是客户端类（不冻结、不计账），且证据显示
+            # 一次。放在冻结/轮转之前：重试用尽后照常按端点故障记账冻结，但证据显示
             # 相邻请求在同一端点上时通时不通 —— 先原地重试比直接换成别的模型代价小。
             # 2026-09-11 收口：删除原第 2 次「显式关闭 thinking」重试。该 400 校验的是
             # 历史消息形态（旧轮 assistant 的 " " 占位 reasoning_content），请求级
@@ -7768,8 +7771,9 @@ class APIPool:
                 if self._is_role_reject_error(error):
                     role_downgraded = True
                     sys_log(f"{request_tag}端点 '{self._endpoint_log_label(ep, group)}' 拒绝 developer 角色，后续候选降级为 system 重试", "WARN")
-            # 请求预算截断（下一次重试根本发不出去）不是端点故障：
-            # 不冻结、不计失败，但仍按组内顺序轮转，剩余预算内换候选答完。
+            # 请求预算截断（上一次出站尝试真失败，只是重试已放不进 530s 预算）：
+            # 已出站那次失败照常记失败并按端点冻结（只轮转不冻结会次次吃光整个预算）；
+            # 预算只约束「尚未出站」的重试，那类放弃不记失败、不动端点状态。
             budget_cut = "; retry skipped: request budget exhausted" in error
             request_route_epoch = self._rotate(
                 ep, error, skip_cooldown=skip_cooldown,
