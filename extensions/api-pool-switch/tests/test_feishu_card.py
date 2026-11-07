@@ -56,6 +56,7 @@ class FakeAdapter:
         self.texts = []
         self.operator_authorized = operator_authorized
         self.operators_seen = []
+        self.operator_contexts_seen = []
 
     async def _feishu_send_with_retry(self, *, chat_id, msg_type, payload, reply_to, metadata):
         self.cards.append((chat_id, msg_type, json.loads(payload)))
@@ -67,8 +68,11 @@ class FakeAdapter:
     async def send(self, chat_id, content, **kwargs):
         self.texts.append((chat_id, content))
 
-    def _is_interactive_operator_authorized(self, open_id):
+    def _is_interactive_operator_authorized(
+        self, open_id, *, user_id="", union_id="", chat_id="",
+    ):
         self.operators_seen.append(open_id)
+        self.operator_contexts_seen.append((user_id, union_id, chat_id))
         return self.operator_authorized
 
 
@@ -236,6 +240,34 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(result["action"], "skip")
         self.assertEqual(self.adapter.operators_seen, ["ou_from_callback"])
         self.assertEqual(self.adapter.cards[0][2]["header"]["title"]["content"], "端点切换 · main")
+
+    def test_paired_callback_passes_full_identity_and_opens_menu(self):
+        raw = SimpleNamespace(event=SimpleNamespace(
+            operator=SimpleNamespace(
+                open_id="ou_callback", user_id="tenant_user", union_id="on_callback",
+            ),
+            context=SimpleNamespace(open_chat_id="oc_test"),
+        ))
+        seen = []
+
+        def pairing_gate(open_id, *, user_id="", union_id="", chat_id=""):
+            seen.append((open_id, user_id, union_id, chat_id))
+            return user_id == "tenant_user" and chat_id == "oc_test"
+
+        self.adapter._is_interactive_operator_authorized = pairing_gate
+        result = self._run_event(FakeEvent(
+            '/card button {"apipool": "group:main"}', raw_message=raw,
+        ))
+        self.assertEqual(result["reason"], "api-pool feishu card action handled")
+        self.assertEqual(seen, [("ou_callback", "tenant_user", "on_callback", "oc_test")])
+        self.assertEqual(self.adapter.cards[0][2]["header"]["title"]["content"],
+                         "端点切换 · main")
+        raw.event.operator.user_id = "unpaired_user"
+        rejected = self._run_event(FakeEvent(
+            '/card button {"apipool": "group:main"}', raw_message=raw,
+        ))
+        self.assertIn("unauthorized", rejected["reason"])
+        self.assertEqual(len(self.adapter.cards), 1)
 
     def test_click_operator_falls_back_to_source_user_id(self):
         self._run('/card button {"apipool": "group:main"}')

@@ -818,17 +818,24 @@ def _feishu_operator_open_id(event: Any, source: Any) -> str:
 
 
 def _feishu_operator_authorized(adapter: Any, event: Any, source: Any) -> bool:
-    """卡片点击授权 —— 用适配器自家卡片按钮的口径（_is_interactive_operator_authorized）。
-
-    卡片点击是适配器合成的 COMMAND 事件，其 source 的 chat_type 被标成 group，
-    gateway 的授权判定对这类事件一律判否（真实 DM 的授权不适用），所以不能用
-    ``gateway._is_user_authorized``；适配器对 approval / update-prompt 卡片点击
-    用的就是这个操作人口径。适配器缺该接口时一律拒绝（fail closed）。
-    """
+    """Use the adapter's card-operator gate with the callback's complete identity."""
     check = getattr(adapter, "_is_interactive_operator_authorized", None)
     if not callable(check):
         return False
-    return bool(check(_feishu_operator_open_id(event, source)))
+    raw = getattr(event, "raw_message", None)
+    operator = getattr(getattr(raw, "event", None), "operator", None)
+    user_id = str(getattr(operator, "user_id", "") or getattr(source, "user_id", "") or "")
+    union_id = str(getattr(operator, "union_id", "") or getattr(source, "user_id_alt", "") or "")
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    authorized = bool(check(
+        _feishu_operator_open_id(event, source),
+        user_id=user_id, union_id=union_id, chat_id=chat_id,
+    ))
+    logger.info(
+        "api-pool feishu operator gate: has_user_id=%s has_union_id=%s has_chat_id=%s authorized=%s",
+        bool(user_id), bool(union_id), bool(chat_id), authorized,
+    )
+    return authorized
 
 
 def _feishu_dispatch(event: Any, gateway: Any, source: Any) -> dict | None:

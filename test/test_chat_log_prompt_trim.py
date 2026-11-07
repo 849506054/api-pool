@@ -30,9 +30,8 @@ class PromptTrimTests(unittest.TestCase):
         self.m = load_module()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.logger = self.m.ChatLogger()
-        self.logger.db_path = os.path.join(self.tmp.name, "chat_logs.db")
-        self.logger._init_db()
+        with mock.patch.object(threading.Thread, "start"):
+            self.logger = self.m.ChatLogger(db_path=os.path.join(self.tmp.name, "chat_logs.db"))
 
     def insert(self, prompt, hours_ago):
         stamp = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).strftime("%Y-%m-%d %H:%M:%S")
@@ -83,6 +82,69 @@ class PromptTrimTests(unittest.TestCase):
         self.assertEqual(short[1], "S" * 5000)
 
         self.assertEqual(self.logger.trim_old_prompts(), 0, "重复执行必须幂等")
+
+    def test_new_log_writes_while_trim_candidates_are_read(self):
+        """A slow scan of old prompts must leave both write locks available."""
+        self.insert("X" * 30000, hours_ago=48)
+        reading = threading.Event()
+        release = threading.Event()
+        written = threading.Event()
+        original_connect = self.logger._connect
+        trims = []
+
+        def connect(*args, **kwargs):
+            conn = original_connect(*args, **kwargs)
+
+            def trace(sql):
+                # Pause the old UPDATE or the new candidate SELECT at the same
+                # slow-read boundary, while a real SQLite insert runs alongside.
+                if ("SELECT id" in sql and "prompt_trimmed" in sql
+                        and threading.current_thread().name == "trim-test"):
+                    reading.set()
+                    release.wait(3)
+
+            conn.set_trace_callback(trace)
+            return conn
+
+        def write():
+            self.logger.add_log("live", "m", "new", "ok", 1, 1, "main")
+            self.logger._write_batch([self.logger._log_queue.get_nowait()])
+            written.set()
+
+        with mock.patch.object(self.logger, "_connect", side_effect=connect):
+            trimmer = threading.Thread(
+                target=lambda: trims.append(self.logger.trim_old_prompts()), name="trim-test")
+            writer = threading.Thread(target=write)
+            trimmer.start()
+            try:
+                self.assertTrue(reading.wait(2), "trim did not reach its candidate read")
+                writer.start()
+                self.assertTrue(written.wait(1), "old-prompt scan blocked a new log insert")
+                self.assertFalse(release.is_set(), "writer only ran after the scan ended")
+            finally:
+                release.set()
+                trimmer.join(4)
+                if writer.ident is not None:
+                    writer.join(4)
+        self.assertFalse(trimmer.is_alive())
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(trims, [1])
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_queued_log_keeps_event_time_after_delayed_insert(self):
+        event_time = datetime(2026, 11, 7, 13, 2, 48, tzinfo=timezone.utc)
+        with mock.patch.object(self.m.time, "time", return_value=event_time.timestamp()):
+            self.logger.add_log("live", "m", "p", "c", 102435, 12831, "telegram")
+        # SQLite's current clock is intentionally different at flush time.
+        self.logger._write_batch([self.logger._log_queue.get_nowait()])
+        conn = self.logger._connect()
+        try:
+            row = conn.execute(
+                "SELECT timestamp, pool_group, total_tokens, latency_ms FROM chat_logs"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row, ("2026-11-07 13:02:48", "telegram", 102435, 12831))
 
     def test_trim_is_batched_and_resumable(self):
         """单次调用受批数上限约束：积压分多次调用清完，不出现一次性重写整库。"""

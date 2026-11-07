@@ -1238,28 +1238,40 @@ class ChatLogger:
         marker = f"\n\n…[已截断：仅保留首尾预览，全文窗口 {self.FULL_PROMPT_HOURS} 小时]…\n\n"
         total = 0
         for _ in range(self.TRIM_MAX_BATCHES):
-            with self._lock:
+            try:
+                # 正文筛选和预览生成走 WAL 读连接，慢盘扫描期间允许新日志写入。
+                conn = self._connect()
                 try:
-                    conn = self._connect()
-                    c = conn.cursor()
-                    c.execute(
-                        "UPDATE chat_logs SET prompt = substr(prompt, 1, ?) || ? || substr(prompt, -?), "
-                        "prompt_trimmed = 1 WHERE id IN ("
-                        "SELECT id FROM chat_logs WHERE COALESCE(prompt_trimmed, 0) = 0 "
-                        "AND length(prompt) > ? AND timestamp < datetime('now', ?) LIMIT ?)",
+                    rows = conn.execute(
+                        "SELECT id, substr(prompt, 1, ?) || ? || substr(prompt, -?) "
+                        "FROM chat_logs WHERE COALESCE(prompt_trimmed, 0) = 0 "
+                        "AND length(prompt) > ? AND timestamp < datetime('now', ?) LIMIT ?",
                         (self.PREVIEW_HEAD, marker, self.PREVIEW_TAIL, self.TRIM_MIN_CHARS,
                          f"-{self.FULL_PROMPT_HOURS} hours", self.TRIM_BATCH_ROWS),
-                    )
-                    trimmed = c.rowcount
-                    conn.commit()
+                    ).fetchall()
+                finally:
                     conn.close()
-                except Exception as e:
-                    sys_log(f"对话日志 prompt 截断失败: {e}", "ERROR")
-                    return total
-            total += trimmed
-            if trimmed < self.TRIM_BATCH_ROWS:
+                # 复用日志写入批大小，按主键更新已读出的预览；每批提交后让出写锁。
+                for start in range(0, len(rows), self.BATCH_SIZE):
+                    with self._lock:
+                        conn = self._connect()
+                        try:
+                            c = conn.executemany(
+                                "UPDATE chat_logs SET prompt = ?, prompt_trimmed = 1 "
+                                "WHERE id = ? AND COALESCE(prompt_trimmed, 0) = 0",
+                                [(preview, row_id) for row_id, preview
+                                 in rows[start:start + self.BATCH_SIZE]],
+                            )
+                            conn.commit()
+                            total += c.rowcount
+                        finally:
+                            conn.close()
+                    time.sleep(self.TRIM_SLEEP_SECONDS)
+            except Exception as e:
+                sys_log(f"对话日志 prompt 截断失败: {e}", "ERROR")
+                return total
+            if len(rows) < self.TRIM_BATCH_ROWS:
                 break
-            time.sleep(self.TRIM_SLEEP_SECONDS)
         if total > 0:
             sys_log(f"对话日志 prompt 截断: {total} 条超过 {self.FULL_PROMPT_HOURS} 小时的行保留首尾预览")
         return total
@@ -1321,7 +1333,8 @@ class ChatLogger:
     def add_log(self, endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group=None, prompt_tokens=None, cached_tokens=None, reasoning_tokens=None, reasoning_effort=None, reasoning_detected=None):
         if pool_group and pool_group.startswith("endpoint:"):
             pool_group = "apipool"
-        row = (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time()))
+        row = (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected, timestamp)
         try:
             self._log_queue.put_nowait(row)
         except queue.Full:
@@ -1345,7 +1358,7 @@ class ChatLogger:
                 conn = self._connect()
                 c = conn.cursor()
                 c.executemany(
-                    "INSERT INTO chat_logs (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO chat_logs (endpoint_name, model, prompt, completion, total_tokens, latency_ms, pool_group, prompt_tokens, cached_tokens, reasoning_tokens, reasoning_effort, reasoning_detected, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     batch,
                 )
                 conn.commit()
@@ -3088,6 +3101,7 @@ class Endpoint:
     _cooldown_reason: str = field(default="", repr=False)
     _manual_unlock_required: bool = field(default=False, repr=False)
     _defer_until_by_group: dict[str, float] = field(default_factory=dict, repr=False)  # 延迟回迁到期时间（按组）；该组在此期间不主动回迁到此端点
+    _recovery_slots: dict[str, str] = field(default_factory=dict, repr=False)
     _recovery_groups: set[str] = field(default_factory=set, repr=False)  # 因本端点冷却实际交接过的组
     _defer_borrow_by_group: set[str] = field(default_factory=set, repr=False)  # 其中因「借用避让」而挂的组：释放判据看接手端点自身空闲
     
@@ -4446,6 +4460,18 @@ class APIPool:
             ep._recovery_groups.discard(group)
             if new_group:
                 ep._recovery_groups.add(new_group)
+        if group in ep._recovery_slots:
+            slot = ep._recovery_slots.pop(group)
+            if new_group:
+                ep._recovery_slots[new_group] = new_group if slot == group else slot
+        for parent, slot in list(ep._recovery_slots.items()):
+            if slot == group:
+                if new_group:
+                    ep._recovery_slots[parent] = new_group
+                else:
+                    ep._recovery_slots.pop(parent, None)
+                    ep._recovery_groups.discard(parent)
+                    ep._defer_until_by_group.pop(parent, None)
         if group in ep._defer_borrow_by_group:
             ep._defer_borrow_by_group.discard(group)
             if new_group:
@@ -4506,6 +4532,7 @@ class APIPool:
             old = next((e for e in self._endpoints if e.id == previous), None)
             if old is not None and self._is_in_cooldown(old):
                 old._recovery_groups.add(group)
+                old._recovery_slots.setdefault(group, self._axis_subgroup(old, group) or previous)
         if ep_id is None:
             self._current_endpoint_by_group.pop(group, None)
         else:
@@ -4570,7 +4597,8 @@ class APIPool:
         if not owners:
             self._inflight_owner.pop(ep_id, None)
 
-    def _guard_empty_stream(self, gen, ep, group, request_id, route_epoch, empty_retry=None, retry_budget=None):
+    def _guard_empty_stream(self, gen, ep, group, request_id, route_epoch, empty_retry=None, retry_budget=None,
+                            route_slot=None):
         """Validate normalized Chat output before DONE; preserve valid non-text completions.
 
         空响应（无正文/工具调用/拒绝的非终止收尾）先按端点重试预算原地重放同一端点，
@@ -4626,7 +4654,8 @@ class APIPool:
                         f"原地重试 {actual_retries} 次；最后错误: {message}", "INFO", group=group)
                 if group and not group.startswith("endpoint:"):
                     with self._lock:
-                        self._rotate(ep, message, group=group, expected_route_epoch=route_epoch, request_id=request_id)
+                        self._rotate(ep, message, group=group, expected_route_epoch=route_epoch,
+                                     request_id=request_id, route_slot=route_slot)
                 yield b"data: " + json.dumps({"error": {
                     "message": message, "type": "server_error", "code": "upstream_error" if failure_error else "empty_content",
                 }}).encode() + b"\n\n"
@@ -4787,8 +4816,7 @@ class APIPool:
         if group is not None:
             cands = [ep for ep in cands if not self._ep_disabled_in(ep, group)
                      and not self._is_ep_sticky_elsewhere(ep, group)
-                     and not self._is_ep_inflight_elsewhere(ep, group)
-                     and self._axis_subgroup(ep, group) == sub]
+                     and not self._is_ep_inflight_elsewhere(ep, group)]
         if not cands:
             return None
         sub_cur = self._get_current(sub)
@@ -4841,7 +4869,8 @@ class APIPool:
         if pointer in self._joined_subgroups(group):
             if self._resolve_subgroup_current(pointer, group) is None:
                 cands, _ = self._group_sticky_candidates(group)
-                return cands[0].id if cands else None
+                routes = self._parent_slot_routes(group, cands, pointer)
+                return routes[0][0] if routes else None
         return pointer
 
     def _main_serving_subgroup(self):
@@ -4951,10 +4980,10 @@ class APIPool:
             return True, sub
 
     def _group_sticky_candidates(self, group):
-        """Use the parent occupancy policy after expanding dedicated-child slots."""
+        """Physical availability union; parent slot order is resolved by _parent_slot_routes."""
         base = self._subgroup_raw_available(group)
         joined = self._joined_subgroups(group)
-        # Reserve native identities even when disabled in this parent.
+        # One physical availability record per endpoint; routes retain their own slot identity.
         seen = {ep.id for ep in self._endpoints
                 if ep.in_pool and group in self._ep_groups(ep)}
         for sub in joined:
@@ -5006,8 +5035,10 @@ class APIPool:
             self._defer_clear(ep, [defer_group] if defer_group else None)
             if defer_group:
                 ep._recovery_groups.discard(defer_group)
+                ep._recovery_slots.pop(defer_group, None)
             else:
                 ep._recovery_groups.clear()
+                ep._recovery_slots.clear()
         ep._cooldown_until = 0
         ep._cooldown_reason = ""
         ep._fail_count = 0
@@ -5856,6 +5887,9 @@ class APIPool:
 
     def _defer_clear(self, ep, groups=None):
         """清除延迟回切：groups=None 清全部组；否则只清指定组。"""
+        for grp in list(ep._recovery_slots) if groups is None else groups:
+            if grp not in ep._recovery_groups:
+                ep._recovery_slots.pop(grp, None)
         if groups is None:
             ep._defer_until_by_group.clear()
             ep._defer_borrow_by_group.clear()
@@ -5875,6 +5909,7 @@ class APIPool:
             ep._defer_until_by_group.pop(group, None)
             ep._defer_borrow_by_group.discard(group)
             ep._recovery_groups.discard(group)
+            ep._recovery_slots.pop(group, None)
         # 旧口径留下的持续覆盖（手动锁）一并作废：手动切换只表达「现在用这个端点」。
         self._fallback_lock_until_by_group.pop(group, None)
         self._group_fallback_pending.pop(group, None)
@@ -6086,6 +6121,7 @@ class APIPool:
                     ep._cooldown_until = 0
                     self._defer_clear(ep)
                     ep._recovery_groups.clear()
+                    ep._recovery_slots.clear()
                     ep._fail_count = 0
                     ep._last_error = ""
                     ep._last_error_ts = 0
@@ -6255,8 +6291,13 @@ class APIPool:
                     ep._recovery_groups.clear()
                     pool_active = self._last_pool_activity > now - 300
                     for grp in affected_groups:
-                        sub = self._axis_subgroup(ep, grp)
-                        if (grp not in self._ep_groups(ep) and sub is None) or self._ep_disabled_in(ep, grp):
+                        slot = ep._recovery_slots.get(grp, self._axis_subgroup(ep, grp) or ep.id)
+                        sub = slot if slot in self._joined_subgroups(grp) else None
+                        if ((slot != ep.id and (sub is None or sub not in self._ep_groups(ep)
+                                              or self._ep_disabled_in(ep, sub)))
+                                or (grp not in self._ep_groups(ep) and sub is None)
+                                or self._ep_disabled_in(ep, grp)):
+                            ep._recovery_slots.pop(grp, None)
                             continue
                         current_id = self._get_current(grp)
                         if current_id in self._joined_subgroups(grp):
@@ -6276,6 +6317,7 @@ class APIPool:
                             if sub is not None:
                                 self._set_current(sub, ep.id)
                             self._set_current(grp, sub or ep.id)
+                            ep._recovery_slots.pop(grp, None)
                             sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}；"
                                     f"故障交接组已恢复回切（组={grp} 子组={sub or '-'} "
                                     f"目标={sub or ep.id} 池活跃={pool_active}）", "INFO")
@@ -6383,8 +6425,17 @@ class APIPool:
                 for grp in self._all_group_names():
                     group_eps = [e for e, g in released if g == grp]
                     if group_eps:
-                        best = min(group_eps, key=lambda e: self._candidate_sort_key(e, grp))
-                        sub = self._axis_subgroup(best, grp)
+                        ranks = {obj.id if kind == "ep" else obj: rank
+                                 for kind, obj, rank in self._group_axis_slots(grp)}
+                        best = min(group_eps, key=lambda e: ranks.get(
+                            e._recovery_slots.get(grp, self._axis_subgroup(e, grp) or e.id), 10 ** 9))
+                        slot = best._recovery_slots.get(grp, self._axis_subgroup(best, grp) or best.id)
+                        for ep in group_eps:
+                            ep._recovery_slots.pop(grp, None)
+                        sub = slot if slot in self._joined_subgroups(grp) else None
+                        if slot != best.id and (sub is None or sub not in self._ep_groups(best)
+                                                or self._ep_disabled_in(best, sub)):
+                            continue
                         if sub is not None:
                             self._set_current(sub, best.id)
                         self._set_current(grp, sub or best.id)
@@ -6437,7 +6488,55 @@ class APIPool:
         return next((sub for sub in self._joined_subgroups(group)
                      if sub in self._ep_groups(ep) and not self._ep_disabled_in(ep, sub)), None)
 
-    def _ordered_failover_candidates(self, failed_ep, active, exclude=None, group=None):
+    def _route_slot(self, ep, group):
+        """Resolve legacy callers against the selected parent slot before membership."""
+        current = self._get_current(group)
+        if (current in self._joined_subgroups(group) and current in self._ep_groups(ep)
+                and not self._ep_disabled_in(ep, current)):
+            return current
+        return self._axis_subgroup(ep, group) or ep.id
+
+    def _parent_slot_routes(self, group, active, slot_id=None, failed_ep=None, exclude=None):
+        """Walk the parent axis, then each whole child ring; dedup after slot order."""
+        slots = self._group_axis_slots(group)
+        pos = next((i for i, (kind, obj, _) in enumerate(slots)
+                    if (obj.id if kind == "ep" else obj) == slot_id), -1)
+        if pos >= 0:
+            # Include the current child first so it is exhausted before advancing.
+            slots = slots[pos:] + slots[:pos]
+        active_ids = {ep.id for ep in active}
+        seen = {ep.id for ep in (exclude or ())}
+        if failed_ep is not None:
+            seen.add(failed_ep.id)
+        routes = []
+        for kind, obj, _ in slots:
+            slot = obj.id if kind == "ep" else obj
+            if kind == "ep":
+                members = [obj]
+            else:
+                members = sorted(
+                    (ep for ep in self._endpoints if ep.in_pool and obj in self._ep_groups(ep)
+                     and not self._ep_disabled_in(ep, obj)),
+                    key=lambda ep: (self._ep_priority(ep, obj), ep.priority),
+                )
+                anchor = (failed_ep.id if failed_ep is not None and slot == slot_id
+                          else self._resolve_subgroup_current(obj, group))
+                start = next((i for i, ep in enumerate(members) if ep.id == anchor), -1)
+                if start >= 0:
+                    if failed_ep is not None and slot == slot_id:
+                        start += 1
+                    members = members[start:] + members[:start]
+            for ep in members:
+                if (ep.id in seen or ep.id not in active_ids
+                        or self._ep_disabled_in(ep, group) or not ep.enabled
+                        or self._is_in_cooldown(ep) or self._is_manually_locked(ep)):
+                    continue
+                seen.add(ep.id)
+                routes.append((slot, ep))
+        return routes
+
+    def _ordered_failover_candidates(self, failed_ep, active, exclude=None, group=None,
+                                     route_slot=None, route_slots=None):
         """Return available endpoints in ring order.
 
         Ring order is calculated from the complete in-pool priority order instead
@@ -6452,6 +6551,13 @@ class APIPool:
         下一个原生名次，把同组排在前面的兄弟甩到环尾 → 违反「组内先耗尽」。
         """
         grp = group or self.MAIN_GROUP
+        if self._joined_subgroups(grp):
+            routes = self._parent_slot_routes(
+                grp, active, route_slot or self._route_slot(failed_ep, grp), failed_ep, exclude,
+            )
+            if route_slots is not None:
+                route_slots.update((ep.id, slot) for slot, ep in routes)
+            return [ep for _, ep in routes]
         excluded_ids = {ep.id for ep in (exclude or ())}
         active_ids = {ep.id for ep in active}
 
@@ -6462,23 +6568,6 @@ class APIPool:
                     and not self._is_in_cooldown(ep)
                     and not self._is_manually_locked(ep))
 
-        def _child_sticky_first(ring):
-            candidates = [ep for ep in ring if _avail(ep)]
-            failed_sub = self._axis_subgroup(failed_ep, grp)
-            ordered = []
-            while candidates:
-                first = candidates.pop(0)
-                sub = self._axis_subgroup(first, grp)
-                segment = [first]
-                while candidates and sub is not None and self._axis_subgroup(candidates[0], grp) == sub:
-                    segment.append(candidates.pop(0))
-                if sub is not None and sub != failed_sub:
-                    sticky = self._resolve_subgroup_current(sub, grp)
-                    pos = next((i for i, ep in enumerate(segment) if ep.id == sticky), 0)
-                    segment = segment[pos:] + segment[:pos]
-                ordered.extend(segment)
-            return ordered
-
         pool = sorted(
             (ep for ep in self._endpoints if ep.enabled and ep.in_pool),
             key=lambda ep: self._candidate_sort_key(ep, grp),
@@ -6486,26 +6575,7 @@ class APIPool:
         if not pool:
             return []
 
-        # main 组 + 失败端点属于某已加入子组 → 两级 ring：子组内先耗尽再回主链。
-        if self._joined_subgroups(grp):
-            sub = self._axis_subgroup(failed_ep, grp)
-            if sub is not None:
-                # pool 已按 main 轴排序，同子组成员在 (main_priority, 1, 子组优先级)
-                # 段内天然按子组优先级升序连续排列。
-                members = [ep for ep in pool if self._axis_subgroup(ep, grp) == sub]
-                rest = [ep for ep in pool if self._axis_subgroup(ep, grp) != sub]
-                rank = self._joined_subgroups(grp)[sub]
-                rest = ([ep for ep in rest if self._candidate_sort_key(ep, grp)[0] > rank]
-                        + [ep for ep in rest if self._candidate_sort_key(ep, grp)[0] <= rank])
-                try:
-                    fi = next(i for i, ep in enumerate(members) if ep is failed_ep)
-                    sub_ring = members[fi + 1:] + members[:fi]
-                except StopIteration:
-                    sub_ring = members
-                ring = sub_ring + rest
-                return _child_sticky_first(ring)
-
-        # 全局 ring：非 main 组，或失败端点是原生 main 端点。
+        # Plain endpoint groups retain their single priority ring.
         try:
             failed_index = next(i for i, ep in enumerate(pool) if ep is failed_ep)
         except StopIteration:
@@ -6515,7 +6585,7 @@ class APIPool:
         else:
             ring = pool
 
-        return _child_sticky_first(ring)
+        return [ep for ep in ring if _avail(ep)]
 
     @staticmethod
     def _is_manually_locked(ep):
@@ -6675,7 +6745,7 @@ class APIPool:
         return min(delay, RETRY_BACKOFF_CAP_SECONDS)
 
     def _rotate(self, failed_ep, error_msg, probe_failed=False, skip_cooldown=False, group=None,
-                expected_route_epoch=None, request_id=None, budget_cut=False):
+                expected_route_epoch=None, request_id=None, budget_cut=False, route_slot=None):
         grp = group or self.MAIN_GROUP
         request_tag = f"[req={request_id}] " if request_id else ""
         if getattr(_POOL_INITIATED_CTX, "active", False):
@@ -6739,31 +6809,36 @@ class APIPool:
             sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 触发冷却机制，下次可用时间在 {actual:.1f} 分钟后（连续第 {int(failed_ep._fail_count)} 次）", "WARN")
         # 分组池：轮转切换限定在失败请求所属组内（含 bg 组 fallback 逻辑见 chat()）。
         active = self._failover_active(grp)
-        candidates = self._ordered_failover_candidates(failed_ep, active, group=grp)
+        route_slot = route_slot or self._route_slot(failed_ep, grp)
+        next_slots = {}
+        candidates = self._ordered_failover_candidates(
+            failed_ep, active, group=grp, route_slot=route_slot, route_slots=next_slots,
+        )
         with self._lock:
             # 请求启动后若已有更新的路由决策，保留该决策；本请求仍可在局部
             # active 列表中继续重试，但不得让迟到失败覆盖 current。
             if expected_route_epoch is not None and self._get_route_epoch(grp) != expected_route_epoch:
                 return expected_route_epoch
             previous = self._get_current(grp)
-            failed_sub = self._axis_subgroup(failed_ep, grp)
+            failed_sub = route_slot if route_slot in self._joined_subgroups(grp) else None
             if self._is_in_cooldown(failed_ep) and (previous in (None, failed_ep.id)
                                                   or (failed_sub is not None and previous == failed_sub)):
                 failed_ep._recovery_groups.add(grp)
+                failed_ep._recovery_slots[grp] = route_slot
                 if failed_sub is not None:
                     sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 已登记故障回切；"
                             f"父组={grp} 子组={failed_sub} 原指针={previous}", "INFO")
             if candidates:
                 next_ep = candidates[0]
-                sub = self._axis_subgroup(next_ep, grp)
-                if sub is not None:
-                    self._set_current(sub, next_ep.id)
-                self._set_current(grp, sub or next_ep.id)
+                slot = next_slots.get(next_ep.id, next_ep.id)
+                if slot in self._joined_subgroups(grp):
+                    self._set_current(slot, next_ep.id)
+                self._set_current(grp, slot)
             else:
                 self._set_current(grp, None)
             return self._get_route_epoch(grp)
 
-    def _on_success(self, ep, result=None, clear_defer=True, group=None, expected_route_epoch=None):
+    def _on_success(self, ep, result=None, clear_defer=True, group=None, expected_route_epoch=None, route_slot=None):
         grp = group or self.MAIN_GROUP
         now = time.time()
         self._last_pool_activity = now  # 记录池活跃时间（用于 defer 判断）
@@ -6795,12 +6870,10 @@ class APIPool:
                 or self._get_route_epoch(grp) == expected_route_epoch
             )
             if route_is_current:
-                axis_sub = self._axis_subgroup(ep, grp)
-                if axis_sub is not None:
-                    self._set_current(axis_sub, ep.id)
-                    self._set_current(grp, axis_sub)
-                else:
-                    self._set_current(grp, ep.id)
+                slot = route_slot or self._route_slot(ep, grp)
+                if slot in self._joined_subgroups(grp):
+                    self._set_current(slot, ep.id)
+                self._set_current(grp, slot)
             if route_is_current:
                 self._count_rotate_request(grp)  # 同一 route epoch 内计数并推进名次
 
@@ -7475,32 +7548,26 @@ class APIPool:
         active.sort(key=lambda e: self._candidate_sort_key(e, group))
         messages = self._repair_tool_history(messages)
 
-        # 当前端点保持粘性：无明确故障/手动切换/恢复回迁时，后续请求继续使用
-        # 最近成功或故障转移选中的端点，而不是每次回到最高优先级端点。
-        # 分组池：粘性指针按组读取（fallback 到 main 后读 main 组指针）。
+        # Request-local slot context survives physical membership overlap and late callbacks.
+        route_slots = {}
+        attempted_ids = set()
         current_id = self._get_current(group)
-        # 2026-09-27：main 手动/当前指针可能是「已加入子组名」（口径A 手动切到子组整体）。
-        # 命中子组名则下钻到该子组当前应用端点（子组当前端点变化自动跟随），无可用端点则忽略。
-        if current_id and current_id in self._joined_subgroups(group):
-            current_id = self._resolve_subgroup_current(current_id, group)
-        if current_id:
+        if self._joined_subgroups(group):
+            routes = self._parent_slot_routes(group, active, current_id)
+            active = [ep for _, ep in routes]
+            route_slots = {ep.id: slot for slot, ep in routes}
+            total = len(active)
+        else:
             current_ep = next((ep for ep in active if ep.id == current_id), None)
             if current_ep is not None:
                 active.remove(current_ep)
                 active.insert(0, current_ep)
-
-        if active:
-            sub = self._axis_subgroup(active[0], group)
-            sticky = self._resolve_subgroup_current(sub, group) if sub else None
-            chosen = next((ep for ep in active if ep.id == sticky), None)
-            if chosen is not None:
-                active.remove(chosen)
-                active.insert(0, chosen)
         idx = 0
         previous_attempt_site_id = None
         image_parse_completed = False
         while tried < total:
             ep = active[idx]
+            route_slot = route_slots.get(ep.id, ep.id)
             if getattr(_POOL_INITIATED_CTX, "active", False):
                 try:
                     self._guard_pool_outbound(ep)
@@ -7510,7 +7577,7 @@ class APIPool:
                     idx = (idx + 1) % total
                     continue
             # 客户端类错误换端点：本请求内已试过的端点直接跳过（冷却之外的请求级收口）。
-            if ep.id in client_error_tried:
+            if ep.id in client_error_tried or (route_slots and ep.id in attempted_ids):
                 tried += 1
                 idx = (idx + 1) % total
                 continue
@@ -7606,6 +7673,7 @@ class APIPool:
                     ep, payload, ep_timeout, force_no_retry=force_no_retry,
                     pool_group=group, reset_cached_stats=reset_cached_stats,
                     request_id=request_id, request_deadline=request_deadline,
+                    **({"route_slot": route_slot} if route_slots else {}),
                 )
             else:
                 result, error = self._try_endpoint(
@@ -7617,6 +7685,7 @@ class APIPool:
                     pool_group=group,
                     reset_cached_stats=reset_cached_stats,
                     request_id=request_id, request_deadline=request_deadline,
+                    **({"route_slot": route_slot} if route_slots else {}),
                 )
             previous_attempt_site_id = ep.site_id
             if debug_trace is not None:
@@ -7644,7 +7713,7 @@ class APIPool:
                 with self._lock:
                     self._on_success(
                         ep, result, clear_defer=defer_at_request > 0, group=group,
-                        expected_route_epoch=request_route_epoch,
+                        expected_route_epoch=request_route_epoch, route_slot=route_slot,
                     )
                     # 终极兜底成功 → 滑动刷新锁定窗口（5 分钟无新请求视为任务结束）
                     if getattr(ep, "priority", 0) == 99 and group == self.MAIN_GROUP:
@@ -7791,12 +7860,13 @@ class APIPool:
             # 已出站那次失败照常记失败并按端点冻结（只轮转不冻结会次次吃光整个预算）；
             # 预算只约束「尚未出站」的重试，那类放弃不记失败、不动端点状态。
             budget_cut = "; retry skipped: request budget exhausted" in error
+            attempted_ids.add(ep.id)
             request_route_epoch = self._rotate(
                 ep, error, skip_cooldown=skip_cooldown,
                 group=group,
                 expected_route_epoch=request_route_epoch,
                 request_id=request_id,
-                budget_cut=budget_cut,
+                budget_cut=budget_cut, route_slot=route_slot,
             )
             with self._lock:
                 self._release_inflight(ep.id, group)
@@ -7820,7 +7890,15 @@ class APIPool:
                 break
             tried = 0  # 轮转后重置尝试计数，用刷新后的 total 重新计算
             # 从失败端点之后的环形顺序选择候选（同模型优先分桶已移除，纯优先级顺延）。
-            candidates = self._ordered_failover_candidates(ep, active, group=group)
+            candidates = self._ordered_failover_candidates(
+                ep, active, group=group, route_slot=route_slot, route_slots=route_slots,
+            )
+            if self._joined_subgroups(group):
+                candidates = [e for e in candidates if e.id not in attempted_ids]
+                active = candidates
+                total = len(active)
+                if not total:
+                    break
             if client_error:
                 # 本请求内已试过的端点不再重试：同类错误原地复读没有信息量，
                 # 端点本身已由冷却排除，这里兜住同一请求内的重复尝试。
@@ -7861,7 +7939,10 @@ class APIPool:
                     continue  # 探活通过，回到循环顶部用 next_ep 发起实际请求
                 else:
                     sys_log(f"候选端点 '{self._endpoint_log_label(next_ep, group)}' 探活失败，跳过", "WARN")
-                    self._rotate(next_ep, probe_error or "探活失败", probe_failed=True, group=group)
+                    request_route_epoch = self._rotate(
+                        next_ep, probe_error or "探活失败", probe_failed=True, group=group,
+                        route_slot=route_slots.get(next_ep.id), expected_route_epoch=request_route_epoch,
+                    )
                     # 下一级探活也失败 → 并发探活剩余所有候选端点。
                     # 用 _check_one_health（含 Attempt 2 重试，最坏 20s）做参考性探测；
                     # 两阶段等待：11s 内返回结果的端点直接按优先级使用，最多等 21s。
@@ -7921,20 +8002,27 @@ class APIPool:
                                 # for cooldown. Missing results mean the probe
                                 # exceeded the observation window, not that it failed.
                                 if e is not chosen and probe_results.get(e.id) == "bad" and not self._is_in_cooldown(e):
-                                    self._rotate(e, "并发探活失败", probe_failed=True, group=group)
+                                    request_route_epoch = self._rotate(
+                                        e, "并发探活失败", probe_failed=True, group=group,
+                                        route_slot=route_slots.get(e.id), expected_route_epoch=request_route_epoch,
+                                    )
                             continue
                         else:
                             # 全部探活失败：全部短冷却，回到循环顶部走 fallback 兜底
                             sys_log(f"剩余候选端点全部探活失败", "WARN")
                             for e in remaining:
                                 if probe_results.get(e.id) == "bad" and not self._is_in_cooldown(e):
-                                    self._rotate(e, "并发探活失败", probe_failed=True, group=group)
+                                    request_route_epoch = self._rotate(
+                                        e, "并发探活失败", probe_failed=True, group=group,
+                                        route_slot=route_slots.get(e.id), expected_route_epoch=request_route_epoch,
+                                    )
                             active = self._failover_active(group)
                             total = len(active)
                             if total == 0:
                                 break
                             candidates = self._ordered_failover_candidates(
-                                ep, active, exclude=(next_ep,), group=group
+                                ep, active, exclude=(next_ep,), group=group,
+                                route_slot=route_slot, route_slots=route_slots,
                             )
                             next_ep2 = candidates[0] if candidates else None
                             if next_ep2 is not None:
@@ -8073,7 +8161,7 @@ class APIPool:
         self, ep, payload, timeout, log_usage=True, force_no_retry=False,
         is_probe=False, stream_stall_retry_used=False, debug_trace=None,
         pool_group=None, reset_cached_stats=False, request_id=None, request_deadline=None,
-        empty_stream_retry_used=False, retry_budget=None,
+        empty_stream_retry_used=False, retry_budget=None, route_slot=None,
     ):
         if is_probe or getattr(_POOL_INITIATED_CTX, "active", False) or not getattr(_client_ctx, "headers", None):
             self._guard_pool_outbound(ep)
@@ -9037,12 +9125,14 @@ class APIPool:
                                 is_probe=False, pool_group=pool_group,
                                 reset_cached_stats=reset_cached_stats, request_id=request_id,
                                 request_deadline=request_deadline, empty_stream_retry_used=True, retry_budget=retry_budget,
+                                route_slot=route_slot,
                             )
                             if retry_error or retry_stream is None:
                                 raise EndpointRequestError(502, retry_error or "Provider returned an empty response")
                             return retry_stream
                         stream = self._guard_empty_stream(stream, ep, pool_group, request_id, stream_route_epoch,
-                                                          empty_retry=_empty_stream_retry, retry_budget=retry_budget)
+                                                          empty_retry=_empty_stream_retry, retry_budget=retry_budget,
+                                                          route_slot=route_slot)
                     return stream, ""
                 else:
                     body = json.loads(resp.read().decode("utf-8"))
@@ -9541,6 +9631,8 @@ def _collect_cooldown_state():
             rec["cooldown_reason"] = ep._cooldown_reason or ""
             if ep._recovery_groups:
                 rec["recovery_groups"] = sorted(ep._recovery_groups)
+                rec["recovery_slots"] = {g: slot for g, slot in ep._recovery_slots.items()
+                                         if g in ep._recovery_groups}
         if ep._manual_unlock_required:
             rec["manual_unlock_required"] = True
         if ep._fail_count > 0:
@@ -9934,6 +10026,14 @@ if isinstance(restored_cooldowns, dict):
                     and (g in pool._ep_groups(ep) or pool._axis_subgroup(ep, g) is not None)
                     and not pool._ep_disabled_in(ep, g)
                 }
+                slots = rec.get("recovery_slots", {})
+                if isinstance(slots, dict):
+                    ep._recovery_slots = {
+                        g: slot for g, slot in slots.items() if g in ep._recovery_groups
+                        and isinstance(slot, str)
+                        and (slot == ep.id or (slot in pool._joined_subgroups(g)
+                             and slot in pool._ep_groups(ep) and not pool._ep_disabled_in(ep, slot)))
+                    }
         if rec.get("manual_unlock_required"):
             ep._manual_unlock_required = True
         try:

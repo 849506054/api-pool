@@ -20,6 +20,10 @@
 
 ## 🎯 里程碑
 
+- [x] **[P1] 父轴名次成为路由单位：故障按名次下走、回切回到名次（2026-11-07 20:53 已部署）** — 症状：父组里的端点失败后轮转跳回首级端点而不是按名次往下走；同一物理端点同时属两个专用子组时，路由分不清当前处在哪个名次。根因：候选按物理端点平铺（`_subgroup_raw_available` 用 `_axis_subgroup(ep, group) == sub` 过滤）、`_rotate` 只带组名不带名次 → 失败点在哪一档的信息丢失，回切登记也只记端点。修法：新增 `_parent_slot_routes(group, active, slot_id, failed_ep, exclude)`——以父轴名次（原生端点各一档 + 已加入子组整档）为 walk 单位，从失败所在名次起按名次顺序走完再回绕；名次内的子组从其内部当前位置继续，组内耗尽才进下一个名次；同一端点按名次顺序只出现一次。`Endpoint._recovery_slots[父组]=名次` 与 `_recovery_groups` 同生命周期（交接 `setdefault`、组改属/移出/`_defer_clear`/手动切换/冷却快照恢复同步维护）；`_guard_empty_stream` 把 `route_slot` 透传给 `_rotate`；`_group_sticky_candidates` 改为物理可用并集（去掉按子组过滤），名次顺序交给新函数。文件：`api_pool_server.py`、`test/test_parent_slot_failover.py`（新增 19 例）、`test/test_group_join_main.py`（main 全冻回落断言按新口径改写）。验证：宿主部署文件隔离实跑 19 + 46 例全绿；部署后端 md5 `a98e90cf` 与工作区逐字节一致，20:53 重启完成。判据 → `api-pool-management/references/subgroup-join-main-contract.md` §14。
+
+- [x] **[P1] 对话日志不再被整点清理堵住、时间戳在入队时定（2026-11-07 21:27 已部署）** — 症状：实时日志正常滚动，对话日志停更好几分钟后一次涌入一批，且时间列是落库时间不是请求结束时间。根因：`ChatLogger.trim_old_prompts()` 在 `self._lock` 内跑整批候选 UPDATE（机械盘大行慢扫数分钟），写线程被堵 → 队列积压；`timestamp` 走 SQLite 默认值。修法：候选（id + 预览）用 WAL 读连接在锁外选出；更新按 `BATCH_SIZE` 分批 `executemany`、每批提交后 `TRIM_SLEEP_SECONDS` 让锁，`prompt_trimmed` 条件保幂等可续跑；`add_log()` 入队时按 `time.time()` 定时间戳并显式写列。文件：`api_pool_server.py`、`test/test_chat_log_prompt_trim.py`（+2 例：慢扫描期间插入不被堵、延迟落库保留事件时间）。验证：宿主隔离实跑 5 例全绿；21:27 重启后两条真实请求落库，其中一条 21:27:36 结束并同秒写入、页面接口读到。未覆盖：线上完整清理周期的表现待自然样本观察。判据 → `api-pool-management/references/chat-log-write-path-2026-11-07.md`。
+
 - [x] **[P2] 原端点重试退避统一 24s 封顶（2026-11-04 已部署验证）** — 退避曲线全通道统一为 3/6/12/24/24…：空响应重放、首帧前空流、流式首包超时、假成功、HTTP 5xx、连接超时此前走裸 `3·2ⁿ`（第 4 次起 24/48/96s，10 次等待撞满 530s 预算走不完），现全部收进 `_retry_backoff`，常量改名 `RETRY_BACKOFF_CAP_SECONDS = 24`，限流类与其他类别同曲线；次数仍按端点 `max_retries`。文件：`api_pool_server.py`、`test/test_budget_cut_retry.py`。验证：定向 57 项通过（退避 5、空响应 8、限流 13、视觉历史 31），ruff 新增 0；14:31:58 重启 active，宿主部署文件（md5 `fac698c1…`、SHA-256 `11a3b19e…`）隔离复跑退避序列 `[3,6,12,24,24,24,24]` 两类别一致。备份 `/opt/data/backups/api-pool2/backoff-cap-20261104-1432/`，代码提交 `34e1a2f`。判据 → `api-pool-management/references/rate-limit-retry-switch-2026-09-20.md`。
 
 - [x] Dedicated groups can join multiple ordinary mixed groups (2026-11-03, deployed and accepted). Each parent keeps its own membership rank and current selection; children share their internal endpoint selection. Memberships use `priority_by_group`, with legacy `main_priority` restored as the main rank. Join, reorder, leave and child switches invalidate the affected route epochs, including a parent's first in-flight request. Vision remains a separate system group. The editor offers one target at a time and disables joined targets. Pool-management buttons mark dedicated groups with 🎯 and show the bound model on hover. The two concurrency regressions and focused UI checks passed; deployment preserved all group definitions, endpoint assignments, ranks and pointers. The user accepted the interface. Backend SHA-256 `7ee12247…`; final page `a5e590db…`. Evidence: `workspace/records/group-membership-20261103/`.
@@ -130,6 +134,8 @@
 
 | 日期 | 决策 | 理由 |
 |------|------|------|
+| 2026-11-07 | 父轴名次是路由单位，物理端点只是名次内成员 | 同一端点可同时属多个专用子组，按端点平铺会抹掉名次信息、失败后跳回首级；回切必须回到原名次 |
+| 2026-11-07 | 对话日志时间戳在入队时定，清理扫描移出写锁 | 刷新不一致源于清理占写锁；延迟落库的时间列仍须是请求结束时刻 |
 | 2026-10-27 | 对话日志列表查询加覆盖索引 | 列表页虽不取正文，回表仍要读 50 条正文级大行；机械盘冷读 128~690ms → 3~226ms |
 | 2026-10-27 | 列表 total 缓存 10s，写入时按批增量维护 | 每页重扫计数索引冷读约 0.6s；按批 `pool_group` 维护后页数仍准确，写入后不必等 TTL |
 | 2026-10-20 | 端点落盘字段由 `Endpoint` 数据类推导 | 手写清单两次漏字段（thinking_disabled、reasoning_effort_map），配置项应进数据类即落盘 |

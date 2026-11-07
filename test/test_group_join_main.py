@@ -520,12 +520,12 @@ class GroupJoinMainTests(unittest.TestCase):
             self.assertEqual(pool._main_pointer_target(), "bg")
             # 子组整组冻结：main 有效目标必须回落到下一个可用端点，而不是 None
             b1._cooldown_until = _t.time() + 999
-            self.assertEqual(pool._main_pointer_target(), "m1")
-            # 名次 1 的 m1 也冻结 → 继续回落到 m9
-            m1._cooldown_until = _t.time() + 999
             self.assertEqual(pool._main_pointer_target(), "m9")
-            # 全冻 → 无候选，才允许 None
+            # 先走父轴后续名次，末尾也冻结才绕回 m1
             m9._cooldown_until = _t.time() + 999
+            self.assertEqual(pool._main_pointer_target(), "m1")
+            # 全冻 → 无候选，才允许 None
+            m1._cooldown_until = _t.time() + 999
             self.assertIsNone(pool._main_pointer_target())
 
     def test_chain_marks_fallback_endpoint_current_for_main(self):

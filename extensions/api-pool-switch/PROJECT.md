@@ -21,7 +21,7 @@
 - [x] v1.3.0 — 组选择器通过 API Pool `/api/pool/switch` 结构化接口切换（group + endpoint_id）
 - [x] v1.4.0 — 飞书全卡片化：裸 `/endpoint` 发菜单卡片（池组 → 端点逐级按钮），`switch` / `check` / `health` 发结果卡片（标题配色随结果）；按钮点击由适配器转成 `/card` 合成命令回到插件处理
 - [x] 整组条目适配 — 菜单合并普通端点与 `/api/chain` 整组条目，按父组优先级混排；整组切换复用 `switch-group` 接口。2026-11-07 用户用 Telegram 插件切至 `pool-gpt6a` 后切回 `pool-gpt6.1s`，插件日志、池日志、当前展示与持久化指针一致。单测与隔离 HTTP 验证已通过；飞书本轮新增整组功能覆盖到自动化回调测试。
-- [ ] 无活跃开发计划（已稳定，仅 API Pool 接口变更时需同步）
+- [x] 卡片操作人授权透传完整身份（2026-11-07）— `_feishu_operator_authorized` 把操作人 `open_id` 与 `user_id` / `union_id` / `chat_id` 一并交给适配器 `_is_interactive_operator_authorized` 判定（适配器改 kwargs 口径后只传 open_id 匹配不到操作人），并记一条 `has_user_id/has_union_id/has_chat_id/authorized` 日志；适配器缺该接口仍 fail closed。回归 `tests/test_feishu_card.py` 19 例通过，运行副本与源码逐字节一致。
 
 ## 📝 决策日志
 
@@ -34,6 +34,7 @@
 | 2026-09-06 | 组感知切换改为 API Pool 项目扩展 | API Pool 提供 `/api/pool/switch`，插件只提交 `group + endpoint_id`；组归属、可切换条件、运行态持久化和结果响应由 API Pool 统一负责。插件源码与测试纳入 `api-pool2/extensions/api-pool-switch/`，生产加载目录由该扩展同步。 |
 | 2026-10-06 | 飞书菜单走插件自建卡片，不改 Hermes 适配器 | 飞书适配器没有 `send_choice_picker`，但会把卡片按钮点击转成 `/card button {...}` 合成命令。插件复用适配器已连接的发送通道（`_feishu_send_with_retry` + `_finalize_send_result`，fry-cards 同款），并在 `pre_gateway_dispatch` 按 `apipool` 键认领点击，避免侵入 Hermes 源码。 |
 | 2026-10-06 | 卡片点击授权改用适配器操作人口径 | 合成事件的 source 被适配器标成 `chat_type=group`（`_dispatch_synthetic_event` 硬编码 `event_chat_type="group"`），`gateway._is_user_authorized` 对它一律判否 → 点击后无反应。改用适配器自家卡片按钮同款判定 `_is_interactive_operator_authorized(操作人 open_id)`；适配器缺该接口时拒绝（fail closed）。与 fry-cards 修 approval 卡片点击被组策略误拒的处置同源。 |
+| 2026-11-07 | 卡片点击授权传完整操作人身份 | 适配器判定接口改 kwargs 口径，只传 open_id 匹配不到操作人 → 点击静默无反应；透传 `user_id` / `union_id` / `chat_id` 并留一条授权日志，接口缺失仍 fail closed |
 | 2026-11-07 | 菜单共用普通端点与父组整组条目，按条目类型选择切换接口 | 组级条目由 `/api/chain` 提供；回调保留父组身份，整组切换调用现有 `/api/groups/<子组>/switch-group`，归属校验与持久化继续由池负责。 |
 
 ## 📌 活跃事项
