@@ -66,6 +66,31 @@ def _api_post(path: str, body: dict | None = None) -> Any:
 # ── Group / endpoint data shaping ────────────────────────────────────
 
 
+def _fetch_switch_entries() -> list[dict]:
+    """普通端点与父组所属的整组条目组成同一份切换菜单数据。"""
+    endpoints = _api_get("/api/endpoints")
+    chain_data = _api_get("/api/chain")
+    chain = chain_data.get("chain") if isinstance(chain_data, dict) else None
+    if not isinstance(endpoints, list) or not isinstance(chain, list):
+        raise TypeError("API Pool 端点或聚合链响应格式异常")
+    slots = [entry for entry in chain if entry.get("is_subgroup_entry")]
+    slot_current_groups = {
+        group for slot in slots for group in (slot.get("current_groups") or [])
+    }
+    # 父组当前项由整组条目承载；子组自己的端点当前标记继续保留。
+    entries = [
+        {**ep, "current_groups": [
+            group for group in (ep.get("current_groups") or [])
+            if group not in slot_current_groups
+        ]}
+        for ep in endpoints
+    ]
+    entries.extend(slots)
+    logger.info("api-pool switch entries: endpoints=%d subgroup_slots=%d current_slot_groups=%s",
+                len(endpoints), len(slots), sorted(slot_current_groups))
+    return entries
+
+
 def _ep_group_priority(ep: dict, group: str) -> int:
     """端点在组内的排序键：组内优先级 > 全局 priority。"""
     pbg = ep.get("priority_by_group") or {}
@@ -228,7 +253,8 @@ def _endpoint_choices(group: str, endpoints: list[dict]) -> list[dict]:
         name = ep["name"]
         is_current = _group_is_current(ep, group)
         frozen = _health_badge(ep) != ""
-        label = name + (" 🔴" if frozen and not is_current else "")
+        label = ("🗂 " if ep.get("is_subgroup_entry") else "") + name
+        label += " 🔴" if frozen and not is_current else ""
 
         item = {
             "label": label,
@@ -329,7 +355,7 @@ async def _open_group_menu(context: dict, endpoints: list[dict], names: list[str
 async def _open_endpoint_menu(context: dict, group: str) -> str | None:
     """第二级：选组内端点（按组内优先级）。"""
     try:
-        endpoints = await asyncio.to_thread(_api_get, "/api/endpoints")
+        endpoints = await asyncio.to_thread(_fetch_switch_entries)
     except urllib.error.URLError as e:
         return f"❌ Cannot reach API Pool: {e.reason}"
     except Exception as e:
@@ -347,7 +373,7 @@ async def _open_endpoint_menu(context: dict, group: str) -> str | None:
 
 async def _fetch_pool_state() -> tuple[list[dict], list[dict]]:
     """实时拉取端点与池组定义。"""
-    endpoints = await asyncio.to_thread(_api_get, "/api/endpoints")
+    endpoints = await asyncio.to_thread(_fetch_switch_entries)
     groups_data = await asyncio.to_thread(_api_get, "/api/groups")
     groups = groups_data.get("groups", []) if isinstance(groups_data, dict) else (groups_data or [])
     return endpoints, groups
@@ -380,15 +406,26 @@ async def _run_endpoint_menu(context: dict) -> str | None:
 
 
 async def _do_switch(group: str, ep_id: str) -> str:
-    """切换组内端点，返回结果文案。"""
+    """按条目身份调用普通端点或父组整组切换接口。"""
     try:
-        result = await asyncio.to_thread(
-            _api_post,
-            "/api/pool/switch",
-            {"group": group, "endpoint_id": ep_id},
-        )
+        if ep_id.startswith("subgroup:"):
+            parts = ep_id.split(":", 2)
+            if len(parts) != 3 or parts[1] != group or not parts[2]:
+                return "❌ 无效的组级端点选择"
+            child = parts[2]
+            path = f"/api/groups/{quote(child, safe='')}/switch-group"
+            body = {"group": group}
+        else:
+            child = None
+            path = "/api/pool/switch"
+            body = {"group": group, "endpoint_id": ep_id}
+        logger.info("api-pool switch request: group=%s entry=%s path=%s", group, ep_id, path)
+        result = await asyncio.to_thread(_api_post, path, body)
         if not result.get("ok"):
             return f"❌ 切换失败: `{result}`"
+        logger.info("api-pool switch completed: group=%s entry=%s", group, ep_id)
+        if child is not None:
+            return f"✅ 已切换组 `{result.get('group', group)}` → 🗂 **{result.get('name', child)}**（整组）"
         return (
             f"✅ 已切换组 `{result.get('group', group)}` → "
             f"**{result.get('endpoint_name', ep_id)}** "
@@ -560,7 +597,7 @@ async def _feishu_card_action(value: str, adapter: Any, chat_id: str) -> None:
     if value.startswith("group:"):
         group = value[len("group:"):]
         try:
-            endpoints = await asyncio.to_thread(_api_get, "/api/endpoints")
+            endpoints = await asyncio.to_thread(_fetch_switch_entries)
         except Exception as exc:  # noqa: BLE001 - plugin boundary
             await _feishu_reply(adapter, chat_id, f"❌ 无法连接 API Pool: {exc}")
             return
@@ -644,7 +681,7 @@ async def handle_endpoint(raw_args: str, context: Any = None) -> str | None:
     if not cmd:
         # gateway 分发不传 context 时（非 Telegram hook 路径），构造纯文本回退
         try:
-            endpoints = await asyncio.to_thread(_api_get, "/api/endpoints")
+            endpoints = await asyncio.to_thread(_fetch_switch_entries)
             groups_data = await asyncio.to_thread(_api_get, "/api/groups")
             groups = groups_data.get("groups", []) if isinstance(groups_data, dict) else (groups_data or [])
         except urllib.error.URLError as e:
@@ -657,7 +694,7 @@ async def handle_endpoint(raw_args: str, context: Any = None) -> str | None:
     if cmd == "switch" and len(args) >= 2:
         target_name = " ".join(args[1:]).strip()
         try:
-            all_eps = _api_get("/api/endpoints")
+            all_eps = await asyncio.to_thread(_fetch_switch_entries)
             target = next((e for e in all_eps if e["name"].lower() == target_name.lower()), None)
             if not target:
                 target = next(
@@ -673,14 +710,7 @@ async def handle_endpoint(raw_args: str, context: Any = None) -> str | None:
             # 分组池：切到端点所属的池组（多组时优先 main）
             groups = target.get("pool_groups") or []
             group = "main" if "main" in groups else (groups[0] if groups else "main")
-            ep_id = target["id"]
-            result = _api_post(f"/api/switch-endpoint/{ep_id}?group={quote(group, safe='')}")
-
-            if result.get("ok"):
-                model = target.get("model", "?")
-                return f"✅ Switched → **{target['name']}** (`{model}`) 组: `{group}`"
-            else:
-                return f"❌ Switch returned: `{result}`"
+            return await _do_switch(group, target["id"])
 
         except urllib.error.URLError as e:
             return f"❌ Cannot reach API Pool: {e.reason}"

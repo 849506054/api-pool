@@ -20,7 +20,7 @@ LIVE = "--live" in sys.argv
 
 
 def live_endpoints():
-    return mod._api_get("/api/endpoints")
+    return mod._fetch_switch_entries()
 
 
 def live_groups():
@@ -118,6 +118,95 @@ class ChoiceBuildTests(unittest.TestCase):
     def test_health_badge(self):
         self.assertEqual(mod._health_badge(SAMPLE_EPS[2]), " 🔴")  # disabled
         self.assertEqual(mod._health_badge(SAMPLE_EPS[0]), "")  # ok
+
+
+class SubgroupSlotTests(unittest.TestCase):
+    def test_subgroup_slot_menu_and_switch_contract(self):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        child = "pool gpt/子组"
+        slot = {"id": f"subgroup:telegram:{child}", "name": child,
+                "subgroup": child, "is_subgroup_entry": True, "in_pool": True,
+                "pool_groups": ["telegram"], "priority": 1,
+                "priority_by_group": {"telegram": 1},
+                "current_groups": ["telegram"], "model": "m1", "health": "ok"}
+        physical = {**SAMPLE_EPS[0], "pool_groups": ["telegram", child],
+                    "priority_by_group": {"telegram": 2, child: 1},
+                    "current_groups": ["telegram", child]}
+        endpoints = [physical]
+        groups = {"groups": [{"name": "telegram", "members": 2},
+                             {"name": child, "members": 1}]}
+        reads, writes, pickers, cards, replies = [], [], [], [], []
+
+        def get(path):
+            reads.append(path)
+            return {"/api/endpoints": endpoints,
+                    "/api/chain": {"chain": [{"name": "physical row"}, slot]},
+                    "/api/groups": groups}[path]
+
+        def post(path, body):
+            writes.append((path, body))
+            return {"ok": True, "name": child, "group": body["group"]}
+
+        async def picker(**kwargs):
+            pickers.append(kwargs)
+            return SimpleNamespace(success=True)
+
+        async def card_send(**kwargs):
+            import json
+            cards.append(json.loads(kwargs["payload"]))
+            return {"code": 0}
+
+        async def send(chat_id, text, **kwargs):
+            replies.append(text)
+
+        adapter = SimpleNamespace(send_choice_picker=picker,
+                                  _feishu_send_with_retry=card_send,
+                                  _finalize_send_result=lambda *args: SimpleNamespace(success=True),
+                                  send=send)
+        source = SimpleNamespace(chat_id="slot-test")
+        context = {"adapter": adapter, "source": source, "chat_id": source.chat_id}
+        value = f"ep:telegram:{slot['id']}"
+
+        async def run():
+            entries, group_defs = await mod._fetch_pool_state()
+            self.assertEqual(reads, ["/api/endpoints", "/api/chain", "/api/groups"])
+            self.assertEqual(len(entries), 2)
+            members = mod._group_members(entries, "telegram")
+            self.assertEqual([e["id"] for e in members], [slot["id"], physical["id"]])
+            self.assertFalse(mod._group_is_current(entries[0], "telegram"))
+            self.assertTrue(mod._group_is_current(entries[0], child))
+            self.assertEqual(endpoints[0]["current_groups"], ["telegram", child])
+            self.assertEqual(mod._group_members(entries, child), [entries[0]])
+            self.assertIn(child, mod._fmt_group_overview(group_defs, entries))
+            await mod._open_endpoint_menu(context, "telegram")
+            first = pickers[-1]["choices"][0]
+            self.assertEqual(first["value"], value)
+            self.assertTrue(first["is_current"])
+            self.assertEqual(first["label"], f"🗂 {child}")
+            await mod._feishu_card_action("group:telegram", adapter, source.chat_id)
+            button = next(e["actions"][0] for e in cards[-1]["elements"] if e["tag"] == "action")
+            self.assertEqual(button["value"]["apipool"], value)
+            self.assertEqual(button["type"], "primary")
+            self.assertIn("整组", await mod._on_choice_selected(source.chat_id, value))
+            await mod._feishu_card_action(value, adapter, source.chat_id)
+            self.assertIn("整组", replies[-1])
+            self.assertIn("整组", await mod.handle_endpoint(f"switch {child}"))
+            expected = ("/api/groups/pool%20gpt%2F%E5%AD%90%E7%BB%84/switch-group",
+                        {"group": "telegram"})
+            self.assertEqual(writes, [expected] * 3)
+            self.assertIn("无效", await mod._do_switch("main", slot["id"]))
+            self.assertEqual(len(writes), 3)
+
+        with patch.object(mod, "_api_get", side_effect=get), patch.object(mod, "_api_post", side_effect=post):
+            try:
+                asyncio.run(run())
+            finally:
+                mod._PICKER_CTX.pop(source.chat_id, None)
+        with patch.object(mod, "_api_get", side_effect=[endpoints, {"groups": {}}]), self.assertRaises(TypeError):
+            mod._fetch_switch_entries()
 
 
 class LiveContractTests(unittest.TestCase):

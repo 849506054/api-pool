@@ -157,7 +157,8 @@ class DispatchTests(unittest.TestCase):
         self.gateway = FakeGateway(self.adapter)
         self._orig_get = mod._api_get
         self._orig_post = mod._api_post
-        mod._api_get = lambda path: EPS if "endpoints" in path else GROUPS
+        mod._api_get = lambda path: {"/api/endpoints": EPS, "/api/groups": GROUPS,
+                                           "/api/chain": {"chain": []}}[path]
 
     def tearDown(self):
         mod._api_get = self._orig_get
