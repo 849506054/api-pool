@@ -6255,9 +6255,12 @@ class APIPool:
                     ep._recovery_groups.clear()
                     pool_active = self._last_pool_activity > now - 300
                     for grp in affected_groups:
-                        if grp not in self._ep_groups(ep) or self._ep_disabled_in(ep, grp):
+                        sub = self._axis_subgroup(ep, grp)
+                        if (grp not in self._ep_groups(ep) and sub is None) or self._ep_disabled_in(ep, grp):
                             continue
                         current_id = self._get_current(grp)
+                        if current_id in self._joined_subgroups(grp):
+                            current_id = self._resolve_subgroup_current(current_id, grp)
                         current_ep = next((e for e in self._endpoints if e.id == current_id), None)
                         current_available = (current_ep is not None and current_ep.enabled and current_ep.in_pool
                                              and not self._is_in_cooldown(current_ep)
@@ -6270,9 +6273,12 @@ class APIPool:
                                     "已开启缓存保护，延迟回切 5 分钟", "INFO")
                         else:
                             ep._defer_until_by_group.pop(grp, None)
-                            self._set_current(grp, ep.id)
+                            if sub is not None:
+                                self._set_current(sub, ep.id)
+                            self._set_current(grp, sub or ep.id)
                             sys_log(f"端点 '{self._endpoint_log_label(ep, grp)}' {recovery_reason}；"
-                                    "故障交接组已恢复回切", "INFO")
+                                    f"故障交接组已恢复回切（组={grp} 子组={sub or '-'} "
+                                    f"目标={sub or ep.id} 池活跃={pool_active}）", "INFO")
                     if not affected_groups:
                         sys_log(f"端点 '{ep.name}' {recovery_reason}；故障交接组=0，仅恢复可用性", "INFO")
             else:
@@ -6310,8 +6316,10 @@ class APIPool:
             now = time.time()
         with self._lock:
             current_by_group = {
-                grp: self._current_endpoint_by_group.get(grp)
+                grp: (self._resolve_subgroup_current(ptr, grp)
+                      if ptr in self._joined_subgroups(grp) else ptr)
                 for grp in self._all_group_names()
+                for ptr in [self._get_current(grp)]
             }
             released = []  # [(ep, grp)]
             current_eps = {
@@ -6375,8 +6383,11 @@ class APIPool:
                 for grp in self._all_group_names():
                     group_eps = [e for e, g in released if g == grp]
                     if group_eps:
-                        best = min(group_eps, key=lambda e: self._ep_priority(e, grp))
-                        self._set_current(grp, best.id)
+                        best = min(group_eps, key=lambda e: self._candidate_sort_key(e, grp))
+                        sub = self._axis_subgroup(best, grp)
+                        if sub is not None:
+                            self._set_current(sub, best.id)
+                        self._set_current(grp, sub or best.id)
     def _failover_endpoints(self):
         """Return failover-eligible endpoints, including deferred recoveries.
 
@@ -6735,8 +6746,13 @@ class APIPool:
             if expected_route_epoch is not None and self._get_route_epoch(grp) != expected_route_epoch:
                 return expected_route_epoch
             previous = self._get_current(grp)
-            if self._is_in_cooldown(failed_ep) and previous in (None, failed_ep.id):
+            failed_sub = self._axis_subgroup(failed_ep, grp)
+            if self._is_in_cooldown(failed_ep) and (previous in (None, failed_ep.id)
+                                                  or (failed_sub is not None and previous == failed_sub)):
                 failed_ep._recovery_groups.add(grp)
+                if failed_sub is not None:
+                    sys_log(f"端点 '{self._endpoint_log_label(failed_ep, grp)}' 已登记故障回切；"
+                            f"父组={grp} 子组={failed_sub} 原指针={previous}", "INFO")
             if candidates:
                 next_ep = candidates[0]
                 sub = self._axis_subgroup(next_ep, grp)
@@ -9913,7 +9929,11 @@ if isinstance(restored_cooldowns, dict):
             ep._cooldown_reason = str(rec.get("cooldown_reason") or "")
             recovery_groups = rec.get("recovery_groups", [])
             if isinstance(recovery_groups, list):
-                ep._recovery_groups = {g for g in recovery_groups if isinstance(g, str) and g in pool._ep_groups(ep)}
+                ep._recovery_groups = {
+                    g for g in recovery_groups if isinstance(g, str)
+                    and (g in pool._ep_groups(ep) or pool._axis_subgroup(ep, g) is not None)
+                    and not pool._ep_disabled_in(ep, g)
+                }
         if rec.get("manual_unlock_required"):
             ep._manual_unlock_required = True
         try:

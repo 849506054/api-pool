@@ -215,8 +215,8 @@ class RetryRecoveryTests(unittest.TestCase):
         self.assertEqual(self.p._get_current("main"), "b")
 
     def test_manual_subgroup_switch_cancels_cooled_endpoint_return(self):
-        self.p.create_group("work", "mixed", "api-work")
-        self.p._group_defs["work"]["main_priority"] = 3
+        self.p.create_group("work", "dedicated", "api-work")
+        self.p._group_defs["work"]["priority_by_group"] = {"main": 3}
         member = self.ep("worker", ["work"])
         self.p.add_endpoint(member)
         self.a._cooldown_until = time.time() + 60
@@ -260,6 +260,96 @@ class RetryRecoveryTests(unittest.TestCase):
         self.p._on_success(self.a, group="main", expected_route_epoch=0)
         self.assertIn("main", self.a._recovery_groups)
         self.assertEqual(self.p._get_current("main"), "b")
+
+    def test_borrowed_child_recovery_lifecycle(self):
+        for mode in ("direct", "siblings", "protected", "other-child", "manual", "restart", "detached"):
+            with self.subTest(mode=mode):
+                restored = self.ep("restored", ["child"])
+                restored.deferrable = False
+                fallback = self.ep("fallback", ["telegram"])
+                fallback.deferrable = mode == "protected"
+                sibling = self.ep("sibling", ["child"])
+                sibling.deferrable = False
+                other = self.ep("other", ["other-child"])
+                other.deferrable = True
+                self.p = self.m.APIPool([restored, fallback, other] + ([sibling] if mode == "siblings" else []))
+                self.m.pool = self.p
+                self.p._load_group_defs([
+                    {"name": "telegram", "type": "mixed", "model": "pool-telegram"},
+                    {"name": "unrelated", "type": "mixed", "model": "pool-unrelated"},
+                    {"name": "child", "type": "dedicated", "model": "child-model",
+                     "priority_by_group": {"telegram": 1, "unrelated": 1}},
+                    {"name": "other-child", "type": "dedicated", "model": "other-model",
+                     "priority_by_group": {"telegram": 3}},
+                ])
+                restored.priority_by_group = {"child": 1}
+                sibling.priority_by_group = {"child": 2}
+                fallback.priority_by_group = {"telegram": 2}
+                self.p._set_current("child", restored.id)
+                self.p._set_current("telegram", "child")
+                self.p._set_current("unrelated", "child")
+                self.p._last_pool_activity = time.time()
+                self.p._rotate(restored, "HTTP 400: content-blocked", group="telegram")
+                self.assertIn("telegram", restored._recovery_groups)
+                self.assertNotIn("unrelated", restored._recovery_groups)
+                if mode == "siblings":
+                    self.p._rotate(sibling, "HTTP 400: content-blocked", group="telegram")
+                    self.assertIn("telegram", sibling._recovery_groups)
+                self.assertEqual(self.p._get_current("telegram"), fallback.id)
+                if mode == "other-child":
+                    self.p._set_current("other-child", other.id)
+                    self.p._set_current("telegram", "other-child")
+                if mode == "manual":
+                    self.p.switch_to_endpoint(fallback.id, group="telegram")
+                if mode == "detached":
+                    self.p._group_defs["child"]["priority_by_group"].pop("telegram")
+                if mode == "restart":
+                    self.m._sync_to_config()
+                    self.m.save_runtime_state_groups(dict(self.p._current_endpoint_by_group),
+                                                    cooldowns=self.m._collect_cooldown_state())
+                    spec = importlib.util.spec_from_file_location("borrowed_recovery_restarted", SOURCE)
+                    assert spec is not None and spec.loader is not None
+                    restarted = importlib.util.module_from_spec(spec)
+                    sys.modules[spec.name] = restarted
+                    try:
+                        with mock.patch.object(threading.Thread, "start"):
+                            spec.loader.exec_module(restarted)
+                        self.p = restarted.pool
+                        restored = self.p.get_endpoint("restored")
+                        self.assertIn("telegram", restored._recovery_groups)
+                    finally:
+                        Path("api_config.json").unlink(missing_ok=True)
+                        Path("api_runtime_state.json").unlink(missing_ok=True)
+                restored._cooldown_until = time.time() - 1
+                self.p._last_pool_activity = time.time()
+                with mock.patch.object(self.m, "sys_log") as log:
+                    self.p._background_probe(restored)
+                if mode in ("protected", "other-child"):
+                    target = "other-child" if mode == "other-child" else fallback.id
+                    self.assertEqual(self.p._get_current("telegram"), target)
+                    self.assertIn("telegram", restored._defer_until_by_group)
+                    self.p._reconcile_deferred()
+                    self.assertEqual(self.p._get_current("telegram"), target)
+                    self.p._last_pool_activity = time.time() - 301
+                    self.p._reconcile_deferred()
+                if mode in ("manual", "detached"):
+                    self.assertEqual(self.p._get_current("telegram"), fallback.id)
+                    continue
+                self.assertEqual(self.p._get_current("telegram"), "child")
+                self.assertEqual(self.p._get_current("child"), restored.id)
+                self.assertEqual(self.p._get_current("unrelated"), "child")
+                if mode not in ("protected", "other-child", "restart"):
+                    self.assertTrue(any("[telegram]restored" in str(call) and "恢复回切" in str(call)
+                                        for call in log.call_args_list))
+                self.sequence[:] = ["ok"]
+                if mode == "restart":
+                    self.p.__class__.chat.__globals__["set_client_headers"]({"User-Agent": "retry-recovery-sample/1"})
+                    self.addCleanup(self.p.__class__.chat.__globals__["clear_client_headers"])
+                result = self.p.chat([{"role": "user", "content": "borrowed recovery golden"}],
+                                     model="pool-telegram", extra_payload={"stream": True})
+                self.assertIn(b"business-ok", b"".join(result))
+                self.assertEqual(self.p._get_current("telegram"), "child")
+                self.assertEqual(self.p._get_current("child"), restored.id)
 
     def test_retire_group_moves_recovery_ownership(self):
         self.a._recovery_groups.add("feishu")
