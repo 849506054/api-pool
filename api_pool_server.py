@@ -23,6 +23,8 @@ import hashlib
 import base64
 import struct
 import zlib
+import gzip
+from functools import lru_cache
 import brotli
 import zstandard
 import itertools
@@ -11108,6 +11110,33 @@ GUI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 GUI_FILE = os.path.join(GUI_DIR, "index.html")
 _gui_html_cache = None
 _gui_html_mtime = 0
+_UI_GZIP_MIN_BYTES = 1024
+
+
+def _ui_accepts_gzip(headers):
+    """Honor an explicit gzip quality before the wildcard preference."""
+    qualities = {}
+    for item in headers.get("Accept-Encoding", "").lower().split(","):
+        parts = [part.strip() for part in item.split(";")]
+        quality = 1.0
+        for parameter in parts[1:]:
+            if parameter.startswith("q="):
+                try:
+                    quality = float(parameter[2:])
+                except ValueError:
+                    quality = 0.0
+        qualities[parts[0]] = quality if 0 <= quality <= 1 else 0.0
+    return qualities.get("gzip", qualities.get("*", 0)) > 0
+
+
+@lru_cache(maxsize=2)
+def _ui_html_representation(html):
+    """Reuse encoded/compressed bytes until the existing mtime loader changes HTML."""
+    body = html.encode("utf-8")
+    etag = 'W/"' + hashlib.sha256(body).hexdigest() + '"'
+    compressed = gzip.compress(body, compresslevel=6, mtime=0)
+    return body, compressed, etag
+
 
 # 请求特征 DEBUG 日志开关（2026-08-15）：默认关闭。
 # 开启方式：
@@ -11145,8 +11174,21 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, code, data):
         try:
             body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            ui_get = self.command == "GET" and self.path.startswith("/api/")
+            compressed = None
+            if ui_get and len(body) >= _UI_GZIP_MIN_BYTES and _ui_accepts_gzip(self.headers):
+                candidate = gzip.compress(body, compresslevel=6, mtime=0)
+                if len(candidate) < len(body):
+                    compressed = candidate
+            if compressed is not None:
+                body = compressed
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            if ui_get:
+                self.send_header("Vary", "Accept-Encoding")
+                self.send_header("Cache-Control", "no-store")
+            if compressed is not None:
+                self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -11155,14 +11197,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_html(self, html):
         try:
-            body = html.encode("utf-8")
-            self.send_response(200)
+            raw, compressed, etag = _ui_html_representation(html)
+            validators = [value.strip() for value in self.headers.get("If-None-Match", "").split(",")]
+            not_modified = any(value == "*" or value.removeprefix("W/") == etag.removeprefix("W/")
+                               for value in validators)
+            use_gzip = (len(raw) >= _UI_GZIP_MIN_BYTES and len(compressed) < len(raw)
+                        and _ui_accepts_gzip(self.headers))
+            body = compressed if use_gzip else raw
+            self.send_response(304 if not_modified else 200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            # no-cache：允许浏览器缓存但每次回源校验（配合 mtime 热更新，前端改动普通刷新即见）
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, no-cache")
+            self.send_header("ETag", etag)
+            self.send_header("Vary", "Accept-Encoding")
+            if not not_modified:
+                if use_gzip:
+                    self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if not not_modified:
+                self.wfile.write(body)
         except ConnectionError:
             pass
 

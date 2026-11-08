@@ -20,6 +20,8 @@
 
 ## 🎯 里程碑
 
+- [x] **页面传输压缩与缓存校验（2026-11-08 已部署生产并验收）** — HTML gzip + ETag 条件 GET；管理 GET JSON 压缩且保持实时读取。首次页面正文 207,319 → 56,749 字节，未变页面校验返回 304/正文 0；状态三接口样本 117,288 → 11,498 字节。八项定向测试通过，页面热更新、模型响应和 SSE 字节契约保持；用户确认手机数据流量操作与内网体感接近。生产后端 SHA-256 `32064fefc9c99ecba5f5d0009bb7df4aa9e7820235559680d9fb5b5a62a90cd3`，页面 `831f631bbc31eb203055dde214f9a09e647f7d71a60adf723c0b3fdf05cef6c5`。证据 `workspace/records/ui-http-transfer-20261108/`；机制与验证入口见 api-pool-management `references/ui-http-transfer.md`。
+
 - [x] **[P1] 父轴名次成为路由单位：故障按名次下走、回切回到名次（2026-11-07 20:53 已部署）** — 症状：父组里的端点失败后轮转跳回首级端点而不是按名次往下走；同一物理端点同时属两个专用子组时，路由分不清当前处在哪个名次。根因：候选按物理端点平铺（`_subgroup_raw_available` 用 `_axis_subgroup(ep, group) == sub` 过滤）、`_rotate` 只带组名不带名次 → 失败点在哪一档的信息丢失，回切登记也只记端点。修法：新增 `_parent_slot_routes(group, active, slot_id, failed_ep, exclude)`——以父轴名次（原生端点各一档 + 已加入子组整档）为 walk 单位，从失败所在名次起按名次顺序走完再回绕；名次内的子组从其内部当前位置继续，组内耗尽才进下一个名次；同一端点按名次顺序只出现一次。`Endpoint._recovery_slots[父组]=名次` 与 `_recovery_groups` 同生命周期（交接 `setdefault`、组改属/移出/`_defer_clear`/手动切换/冷却快照恢复同步维护）；`_guard_empty_stream` 把 `route_slot` 透传给 `_rotate`；`_group_sticky_candidates` 改为物理可用并集（去掉按子组过滤），名次顺序交给新函数。文件：`api_pool_server.py`、`test/test_parent_slot_failover.py`（新增 19 例）、`test/test_group_join_main.py`（main 全冻回落断言按新口径改写）。验证：宿主部署文件隔离实跑 19 + 46 例全绿；部署后端 md5 `a98e90cf` 与工作区逐字节一致，20:53 重启完成。判据 → `api-pool-management/references/subgroup-join-main-contract.md` §14。
 
 - [x] **[P1] 对话日志不再被整点清理堵住、时间戳在入队时定（2026-11-07 21:27 已部署）** — 症状：实时日志正常滚动，对话日志停更好几分钟后一次涌入一批，且时间列是落库时间不是请求结束时间。根因：`ChatLogger.trim_old_prompts()` 在 `self._lock` 内跑整批候选 UPDATE（机械盘大行慢扫数分钟），写线程被堵 → 队列积压；`timestamp` 走 SQLite 默认值。修法：候选（id + 预览）用 WAL 读连接在锁外选出；更新按 `BATCH_SIZE` 分批 `executemany`、每批提交后 `TRIM_SLEEP_SECONDS` 让锁，`prompt_trimmed` 条件保幂等可续跑；`add_log()` 入队时按 `time.time()` 定时间戳并显式写列。文件：`api_pool_server.py`、`test/test_chat_log_prompt_trim.py`（+2 例：慢扫描期间插入不被堵、延迟落库保留事件时间）。验证：宿主隔离实跑 5 例全绿；21:27 重启后两条真实请求落库，其中一条 21:27:36 结束并同秒写入、页面接口读到。未覆盖：线上完整清理周期的表现待自然样本观察。判据 → `api-pool-management/references/chat-log-write-path-2026-11-07.md`。
@@ -135,6 +137,7 @@
 
 | 日期 | 决策 | 理由 |
 |------|------|------|
+| 2026-11-08 | 页面 gzip + ETag 校验；管理 GET JSON 压缩并使用 no-store | 首次加载与状态轮询传输量明显下降；页面普通刷新可获取热更新，模型 API 和 SSE 沿用原传输契约；手机流量实测验收通过 |
 | 2026-11-08 | 请求凭据脱敏做成全局开关 + 页面入口，单向替换不还原 | 凭据改由 `/opt/data/.env` 承载、本地工具执行时取值，模型只拿变量名；不需要代号映射与回灌，也不用把凭据发进聊天 |
 | 2026-11-08 | 脱敏落在每次 send 前的出站副本，日志与原始 payload 不动 | 入口内容过滤改的是请求本体且同体进日志；日志只存本地、对外读取本身也过池 |
 | 2026-11-08 | 扫描规则按「明确标签 + 凭据格式」判定，普通取值默认值按普通值保留 | 整类把 `getenv` 默认值当凭据会把 `int(os.getenv("TIMEOUT", "30"))` 改成 Placeholder 而崩；只有外层赋值名/环境键是凭据字段或字面量自身命中凭据格式才替换 |
