@@ -40,6 +40,8 @@ from collections import deque
 import copy as _copy
 import types as _types
 
+from credential_redaction import CredentialRedactionError, redact_body
+
 # 敏感字过滤私有配置文件（仅 API Pool 进程读取，Hermes 不可见）
 CONTENT_FILTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content_filter.json")
 
@@ -2272,6 +2274,9 @@ def _responses_stream_generator(upstream_gen, body, meta=None, model="api-pool-a
                 parsed = {"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": (parsed.get("response") or {}).get("usage")}
             if parsed.get("error"):
                 error = parsed["error"]
+                local_status, local_body, _ = _credential_redaction_error_response()
+                if error == {**local_body["error"], "status": local_status}:
+                    raise CredentialRedactionError()
                 raise RuntimeError(error.get("message", "Upstream stream error") if isinstance(error, dict) else str(error))
             choices = parsed.get("choices") or []
             if choices:
@@ -2476,7 +2481,11 @@ def _responses_stream_generator(upstream_gen, body, meta=None, model="api-pool-a
         if on_complete:
             on_complete(completed_response)
     except Exception as e:
-        error_obj = {"message": str(e), "type": "server_error", "param": None, "code": None}
+        if isinstance(e, CredentialRedactionError):
+            local_status, local_body, _ = _credential_redaction_error_response()
+            error_obj = {**local_body["error"], "param": None, "status": local_status}
+        else:
+            error_obj = {"message": str(e), "type": "server_error", "param": None, "code": None}
         failed_response = _responses_response_object(
             body, final_text,
             usage=_responses_usage_from_chat_usage(final_usage),
@@ -4662,6 +4671,9 @@ class APIPool:
             elif state["finish"] is not None:
                 yield state["finish"]
             yield done
+        except CredentialRedactionError:
+            yield _credential_redaction_error_frame()
+            yield done
         finally:
             for stream in streams:
                 close = getattr(stream, "close", None)
@@ -5712,6 +5724,8 @@ class APIPool:
                                         pool_group=vision_group, request_id=request_id,
                                         request_deadline=deadline,
                                     )
+                                except CredentialRedactionError:
+                                    raise
                                 except Exception as exc:  # noqa: BLE001 — preserve the original image on provider failures
                                     reply, error = None, str(exc)
                                 if not error:
@@ -7642,10 +7656,15 @@ class APIPool:
             # 逐图兼容预处理完成后，所有目标共用上下文检查、重试及轮转。
             if getattr(ep, "is_vision", True) is False and self._has_images(payload["messages"]):
                 image_stats = {}
-                payload["messages"] = self._translate_images_sync(
-                    payload["messages"], active, group,
-                    request_id=request_id, request_deadline=request_deadline, stats=image_stats,
-                )
+                try:
+                    payload["messages"] = self._translate_images_sync(
+                        payload["messages"], active, group,
+                        request_id=request_id, request_deadline=request_deadline, stats=image_stats,
+                    )
+                except CredentialRedactionError:
+                    with self._lock:
+                        self._release_inflight(ep.id, group)
+                    raise
                 loop_messages = payload["messages"]
                 if image_stats.get("parsed") and not image_stats.get("unresolved"):
                     image_parse_completed = True
@@ -7668,25 +7687,30 @@ class APIPool:
                 self._should_reset_cached_stats(group, ep.site_id)
                 or (previous_attempt_site_id is not None and previous_attempt_site_id != ep.site_id)
             )
-            if debug_trace is None:
-                result, error = self._try_endpoint(
-                    ep, payload, ep_timeout, force_no_retry=force_no_retry,
-                    pool_group=group, reset_cached_stats=reset_cached_stats,
-                    request_id=request_id, request_deadline=request_deadline,
-                    **({"route_slot": route_slot} if route_slots else {}),
-                )
-            else:
-                result, error = self._try_endpoint(
-                    ep,
-                    payload,
-                    ep_timeout,
-                    force_no_retry=force_no_retry,
-                    debug_trace=debug_trace,
-                    pool_group=group,
-                    reset_cached_stats=reset_cached_stats,
-                    request_id=request_id, request_deadline=request_deadline,
-                    **({"route_slot": route_slot} if route_slots else {}),
-                )
+            try:
+                if debug_trace is None:
+                    result, error = self._try_endpoint(
+                        ep, payload, ep_timeout, force_no_retry=force_no_retry,
+                        pool_group=group, reset_cached_stats=reset_cached_stats,
+                        request_id=request_id, request_deadline=request_deadline,
+                        **({"route_slot": route_slot} if route_slots else {}),
+                    )
+                else:
+                    result, error = self._try_endpoint(
+                        ep,
+                        payload,
+                        ep_timeout,
+                        force_no_retry=force_no_retry,
+                        debug_trace=debug_trace,
+                        pool_group=group,
+                        reset_cached_stats=reset_cached_stats,
+                        request_id=request_id, request_deadline=request_deadline,
+                        **({"route_slot": route_slot} if route_slots else {}),
+                    )
+            except CredentialRedactionError:
+                with self._lock:
+                    self._release_inflight(ep.id, group)
+                raise
             previous_attempt_site_id = ep.site_id
             if debug_trace is not None:
                 if result is not None:
@@ -8373,6 +8397,9 @@ class APIPool:
                     if remaining_budget <= 0:
                         return None, _BUDGET_EXHAUSTED_MSG
                     _open_timeout = min(_open_timeout, max(0.1, remaining_budget))
+                # Read the hot switch for every actual send, including replay/fallback.
+                # Scanning is request-local and outside the routing lock.
+                req.data = _credential_redacted_data(data)
                 retry_budget["sent"] += 1
                 resp = _open_identity_request(req, _open_timeout, getattr(ep, "use_proxy", True))
 
@@ -9085,6 +9112,8 @@ class APIPool:
                         except socket.timeout:
                             yield from _timeout_abort(f"流式无新数据停滞（连续 {stall_timeout}s）")
                             return
+                        except CredentialRedactionError:
+                            raise
                         except Exception as e:
                             # 2026-08-15: 原逻辑静默吞掉流内所有异常——23:58:26 假死请求
                             # "收到后无任何日志"的直接原因。区分客户端断开(常见噪音)与上游异常(需记录)。
@@ -9326,6 +9355,8 @@ class APIPool:
                         return body, ""
                     
                     
+            except CredentialRedactionError:
+                raise
             except urllib.error.HTTPError as e:
                 if _DEBUG_LOGGING:
                     sys_log(
@@ -9535,7 +9566,8 @@ class APIPool:
             return {"ok": False, "status": "bad", "latency_ms": latency, "reply": "", "error": err}
 
 RUNTIME_STATE_FILE = "api_runtime_state.json"
-_config_lock = threading.Lock()
+_config_lock = threading.RLock()
+_credential_redaction_enabled = None  # None blocks sending until configuration is valid.
 _runtime_state_lock = threading.Lock()
 
 
@@ -9818,10 +9850,6 @@ def load_group_defs_config():
         return None
 
 def save_config(endpoints_data, group_defs=None, client_profiles=None, probe_client_profile=None, log_retention=None):
-    tmp_file = os.path.join(
-        os.path.dirname(os.path.abspath(CONFIG_FILE)),
-        f".{os.path.basename(CONFIG_FILE)}.tmp",
-    )
     payload: dict = {"api_endpoints": endpoints_data}
     # 组管理（2026-08-30）：仅显式传入时写入（None=保持不落盘，旧配置首次编辑前零迁移）
     if group_defs is not None:
@@ -9835,19 +9863,109 @@ def save_config(endpoints_data, group_defs=None, client_profiles=None, probe_cli
     # 日志滚动清理后台配置（2026-09-19）：None=不落盘
     if log_retention is not None:
         payload["log_retention"] = log_retention
+    with _config_lock:
+        # Preserve the independently managed switch inside the same write transaction.
+        current = _read_credential_config_document()
+        if "credential_redaction" in current:
+            _validate_credential_redaction(current["credential_redaction"])
+            payload["credential_redaction"] = current["credential_redaction"]
+        _write_config_document(payload)
+
+
+def _write_config_document(payload):
+    """Atomic replacement; caller holds _config_lock through publication."""
+    tmp_file = os.path.join(os.path.dirname(os.path.abspath(CONFIG_FILE)),
+                            f".{os.path.basename(CONFIG_FILE)}.tmp")
     try:
-        with _config_lock:
-            with open(tmp_file, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_file, CONFIG_FILE)
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, CONFIG_FILE)
     except OSError:
         try:
             os.unlink(tmp_file)
         except OSError:
             pass
         raise
+
+
+def _read_credential_config_document():
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            document = json.load(f)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(document, dict):
+        raise TypeError("API Pool configuration must be an object")
+    return document
+
+
+def _validate_credential_redaction(section):
+    if (not isinstance(section, dict) or set(section) != {"enabled"}
+            or type(section["enabled"]) is not bool):
+        raise ValueError("credential_redaction requires a boolean enabled field")
+    return section["enabled"]
+
+
+def load_credential_redaction():
+    global _credential_redaction_enabled
+    with _config_lock:
+        try:
+            document = _read_credential_config_document()
+            enabled = _validate_credential_redaction(document.get("credential_redaction", {"enabled": False}))
+        except (OSError, ValueError, TypeError):
+            _credential_redaction_enabled = None
+            raise CredentialRedactionError() from None
+        _credential_redaction_enabled = enabled
+        return {"credential_redaction": {"enabled": enabled}}
+
+
+def get_credential_redaction():
+    with _config_lock:
+        enabled = _credential_redaction_enabled
+    if type(enabled) is not bool:
+        raise CredentialRedactionError()
+    return {"credential_redaction": {"enabled": enabled}}
+
+
+def save_credential_redaction(body):
+    global _credential_redaction_enabled
+    if not isinstance(body, dict) or set(body) != {"credential_redaction"}:
+        raise ValueError("credential_redaction must be the only top-level field")
+    enabled = _validate_credential_redaction(body["credential_redaction"])
+    with _config_lock:
+        document = _read_credential_config_document()
+        document["credential_redaction"] = {"enabled": enabled}
+        _write_config_document(document)
+        _credential_redaction_enabled = enabled
+    return {"credential_redaction": {"enabled": enabled}}
+
+
+def _credential_redacted_data(data):
+    try:
+        while True:
+            enabled = get_credential_redaction()["credential_redaction"]["enabled"]
+            clean = (json.dumps(redact_body(json.loads(data)), ensure_ascii=False).encode("utf-8")
+                     if enabled else data)
+            if enabled == get_credential_redaction()["credential_redaction"]["enabled"]:
+                return clean
+    except Exception:  # noqa: BLE001 — every scanner failure must stop outgoing plaintext
+        # Exception text may contain the original value. Expose a fixed local error only.
+        raise CredentialRedactionError() from None
+
+
+def _credential_redaction_error_response():
+    return 503, {"error": {"message": str(CredentialRedactionError()),
+                           "type": "service_unavailable", "code": "credential_redaction_failed"}}, False
+
+
+def _credential_redaction_error_frame():
+    # Once SSE headers have been sent, communicate the same 503 as a terminal event.
+    body = _credential_redaction_error_response()[1]
+    body["error"]["status"] = 503
+    return b"data: " + json.dumps(body).encode() + b"\n\n"
+
 
 def save_content_filter_config(section):
     """原子写 content_filter.json + 热重载；结构无效时回滚旧配置（2026-09-11）。
@@ -9915,6 +10033,10 @@ def ensure_config():
     if not os.path.exists(CONFIG_FILE): save_config([])
 
 ensure_config()
+try:
+    load_credential_redaction()
+except CredentialRedactionError:
+    sys_log("API Pool credential redaction configuration invalid; model requests blocked", "ERROR")
 
 pool = APIPool()
 for ep_data in load_config():
@@ -10233,6 +10355,8 @@ def api_handler(method, path, body):
             # response["model"] = "api-pool-aggregated"
             return 200, response, False
             
+        except CredentialRedactionError:
+            return _credential_redaction_error_response()
         except EndpointRequestError as e:
             return e.status, {"error": {"message": str(e), "type": "invalid_request_error" if e.status < 500 else "server_error"}}, False
         except AllEndpointsFailed as e:
@@ -10244,6 +10368,23 @@ def api_handler(method, path, body):
         qs = dict(q.split("=") for q in parsed.query.split("&") if "=" in q) if parsed.query else {}
         last_id = int(qs.get("since", 0))
         return 200, sys_logger.get_logs_since(last_id), False
+
+    if cp == "/api/credential-redaction" and method in ("GET", "PUT"):
+        if method == "GET":
+            try:
+                return 200, get_credential_redaction(), False
+            except CredentialRedactionError:
+                return _credential_redaction_error_response()
+        try:
+            if not isinstance(body, dict) or set(body) != {"credential_redaction"}:
+                raise ValueError("Invalid request shape")
+            _validate_credential_redaction(body["credential_redaction"])
+        except ValueError:
+            return 400, {"error": "Expected credential_redaction with boolean enabled"}, False
+        try:
+            return 200, save_credential_redaction(body), False
+        except (OSError, ValueError, TypeError):
+            return 500, {"error": "Credential redaction configuration could not be saved"}, False
 
     if method == "GET" and cp == "/api/debug":
         return 200, {"debug_enabled": _DEBUG_LOGGING}, False
@@ -10893,6 +11034,8 @@ def _handle_responses(body, endpoint_id=None):
         )
         maybe_store(response_obj)
         return 200, response_obj, False
+    except CredentialRedactionError:
+        return _credential_redaction_error_response()
     except EndpointRequestError as e:
         return e.status, {"error": {"message": str(e), "type": "invalid_request_error" if e.status < 500 else "server_error"}}, False
     except AllEndpointsFailed as e:

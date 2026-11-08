@@ -426,6 +426,7 @@ select option { background: var(--bg); color: var(--text); }
   </div>
   <div class="header-actions" id="poolActions">
     <button class="btn btn-ghost" onclick="openContentFilterManager()">🛡 敏感词过滤</button>
+    <button class="btn btn-ghost" onclick="openCredentialRedactionManager()">请求脱敏</button>
     <button class="btn btn-ghost" onclick="runHealthCheck()">🩺 健康检测</button>
     <button class="btn btn-ghost" onclick="resetPool()">🔄 重置</button>
     <button class="btn btn-primary" onclick="openAddModal()">＋ 添加端点</button>
@@ -2007,6 +2008,83 @@ async function deleteClientProfile(name){
   toast('已删除 '+name,'success');
   await loadClientProfiles();
   renderProfileManager();
+}
+
+// ── 请求凭据脱敏 ──
+let credentialRedactionLoading=false,credentialRedactionSaving=false;
+function credentialRedactionEnabled(result){
+  if(!result||result.ok===false||result.error)throw new Error(result?.error||'请求失败');
+  const enabled=result.credential_redaction?.enabled;
+  if(typeof enabled!=='boolean')throw new Error('接口未返回有效开关状态');
+  return enabled;
+}
+async function openCredentialRedactionManager(){
+  if(credentialRedactionLoading||credentialRedactionSaving||document.getElementById('credentialRedactionOverlay'))return;
+  credentialRedactionLoading=true;
+  try{
+    const result=await api('GET','/api/credential-redaction');
+    renderCredentialRedactionManager(credentialRedactionEnabled(result));
+  }catch(err){
+    toast('加载失败：'+(err?.message||'请重试'),'error');
+  }finally{
+    credentialRedactionLoading=false;
+  }
+}
+function renderCredentialRedactionManager(enabled){
+  const overlay=document.createElement('div');
+  overlay.className='modal-overlay show';overlay.id='credentialRedactionOverlay';
+  overlay.innerHTML=`<div class="modal">
+    <h2>请求凭据脱敏</h2>
+    <div class="form-group" style="font-size:12px;color:var(--text-dim);line-height:1.6">
+      发往模型前，单向替换请求体中识别到的账号、密码、API Key 等凭据。本地日志保持原样。<br>
+      保存后全局生效：下一次出站（含重试、换端点）使用新设置，已发出的请求照常完成。<br>
+      本地工具从 .env 取值使用。缺少标签的裸值、图片中的凭据可能漏识别。
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label for="credentialRedactionEnabled">开启（全局）</label>
+        <select id="credentialRedactionEnabled">
+          <option value="false"${enabled?'':' selected'}>否</option>
+          <option value="true"${enabled?' selected':''}>是</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-ghost" id="credentialRedactionClose" onclick="closeCredentialRedactionManager()">关闭</button>
+      <button class="btn btn-primary" id="credentialRedactionSave" onclick="saveCredentialRedaction()">保存</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+}
+function closeCredentialRedactionManager(){
+  if(credentialRedactionSaving)return;
+  const overlay=document.getElementById('credentialRedactionOverlay');
+  if(overlay)overlay.remove();
+}
+async function saveCredentialRedaction(){
+  if(credentialRedactionSaving)return;
+  const overlay=document.getElementById('credentialRedactionOverlay');
+  const select=document.getElementById('credentialRedactionEnabled');
+  const save=document.getElementById('credentialRedactionSave');
+  const close=document.getElementById('credentialRedactionClose');
+  if(!overlay||!select||!save||!close)return;
+  const enabled=select.value==='true';
+  credentialRedactionSaving=true;
+  select.disabled=save.disabled=close.disabled=true;
+  save.textContent='保存中…';
+  try{
+    const result=await api('PUT','/api/credential-redaction',{credential_redaction:{enabled}});
+    const saved=credentialRedactionEnabled(result);
+    select.value=String(saved);
+    toast(`请求凭据脱敏${saved?'已开启':'已关闭'}，下一次出站生效`,'success');
+    overlay.remove();
+  }catch(err){
+    toast('保存失败：'+(err?.message||'请重试'),'error');
+  }finally{
+    credentialRedactionSaving=false;
+    select.disabled=save.disabled=close.disabled=false;
+    save.textContent='保存';
+  }
 }
 
 // ── 敏感词过滤管理（2026-09-11）──
