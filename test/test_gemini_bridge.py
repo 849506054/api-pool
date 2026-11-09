@@ -104,6 +104,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="t5-gemini-")
     previous_cwd = os.getcwd()
     os.chdir(tmp)
+    os.environ["API_POOL_DB_DIR"] = tmp
     srv = None
     try:
         module = load_module()

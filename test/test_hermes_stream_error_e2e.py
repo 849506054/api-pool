@@ -104,6 +104,9 @@ class HermesAgentStub:
     def _capture_credits(self, *_args, **_kwargs):
         pass
 
+    def _capture_nous_model_switch(self, *_args, **_kwargs):
+        pass
+
     def _check_openrouter_cache_status(self, *_args, **_kwargs):
         pass
 

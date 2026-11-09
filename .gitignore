@@ -36,3 +36,6 @@ pending/
 # Local workspace artifacts: snapshots, experiments, records, tools, and repository clones
 workspace/
 responses_store.db
+
+# 测试入口给 Hermes 运行时准备的 3.14 依赖（run.sh 自动生成）
+.test-deps-py*/
