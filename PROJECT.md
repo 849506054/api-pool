@@ -12,7 +12,7 @@
 
 本卡片截至 2026-11-09 的原业务待办均已完成。当前授权事项为项目资料规范试点：整理与验证完成，五类查找实测后的修正已复核，等待用户验收；交付说明在本地 `workspace/records/documentation-pilot-20261109/DELIVERY.md`，验收后提交。后续业务工作从用户批准的改动或实际故障样本进入。
 
-最近验收：2026-11-09 两项已部署并经用户实测验收——new-api 账号额度不足归入 `quota_out`（403 不再按 1 分钟短冻结反复重撞）；子组加入父组后新增本组停用 ⏸/▶，停用只退出该父组轮转，组内端点状态与其他父组不动。交付记录与回滚快照见 `workspace/records/subgroup-disable-and-quota-split-20261109/`。此前 2026-11-08 页面 gzip、ETag 条件 GET 与管理状态 JSON 压缩已验收；请求凭据脱敏已上线。
+最近验收：2026-11-09 三项已部署并经用户实测验收——new-api 账号额度不足归入 `quota_out`（403 不再按 1 分钟短冻结反复重撞）；子组加入父组后新增本组停用 ⏸/▶，停用只退出该父组轮转，组内端点状态与其他父组不动；子组整组冻结时池卡条目补 ⏰，逐个解除冻结成员（复用端点 clear-error）。交付记录与回滚快照见 `workspace/records/subgroup-disable-and-quota-split-20261109/`，⏰ 条目见 `workspace/records/subgroup-unfreeze-20261109/DELIVERY.md`。此前 2026-11-08 页面 gzip、ETag 条件 GET 与管理状态 JSON 压缩已验收；请求凭据脱敏已上线。
 
 ## 按任务路线
 

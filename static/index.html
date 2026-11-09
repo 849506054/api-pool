@@ -1132,7 +1132,8 @@ function joinedSubgroupCard(g,groupsInfo,maxP,parent){
       <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
         ${hit?`<span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="${escAttr(parent)} 当前正使用该子组的端点：${cur}">● 当前</span>`:''}
         ${subDis?`<span class="badge badge-disabled" style="font-size:10px;padding:1px 6px" title="已在本组停用：不参与 ${escAttr(parent)} 组轮转（其他父组与子组自身不受影响）">⏸本组停用</span>`:''}
-        ${frozen?`<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px" title="组内端点全部冻结，整组等待最早恢复的端点">⏳${fmtCdSec(frozenSec)}</span>`:''}
+        ${frozen?`<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px" title="组内端点全部冻结，整组等待最早恢复的端点">⏳${fmtCdSec(frozenSec)}</span>
+        <button class="btn btn-yellow btn-sm" style="padding:2px 5px;font-size:11px" title="解除整组冻结：逐个解除该子组端点的冷却与人工锁定（与端点卡片 ⏰ 同口径），随后按真实请求重新判定" onclick="clearSubgroupCooldown(${childArg})">⏰</button>`:''}
       </div>
     </div>
     <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
@@ -1146,6 +1147,22 @@ function joinedSubgroupCard(g,groupsInfo,maxP,parent){
       </div>
     </div>
   </div>`;
+}
+// 整组解冻（2026-11-09）：子组条目冻结时，按端点卡片 ⏰ 的同口径逐个解除组内端点的
+// 冷却与人工锁定；只处理处于冻结态的成员，健康端点不动。组级冻结是成员状态的派生值，
+// 因此复用既有 /clear-error，不另设组级接口。
+async function clearSubgroupCooldown(name){
+  const groupsOf=e=>((e.pool_groups&&e.pool_groups.length)?e.pool_groups:['main']);
+  const frozenEps=(poolSnapshot.endpoints||[]).filter(e=>e.in_pool&&groupsOf(e).includes(name)&&(e.in_cooldown||e.manual_unlock_required));
+  if(!frozenEps.length){toast('该子组没有冻结端点','error');return;}
+  let ok=0;const failed=[];
+  for(const e of frozenEps){
+    const r=await api('POST',`/api/endpoints/${encodeURIComponent(e.id)}/clear-error`);
+    if(r&&r.ok)ok++;else failed.push(e.name);
+  }
+  await refresh();
+  if(failed.length)toast(`已解除 ${ok} 个端点，${failed.length} 个失败：${failed.join('、')}`,'error');
+  else toast(`已解除整组冻结（${ok} 个端点）`,'success');
 }
 async function setSubgroupPriority(name,newPrio,group){
   newPrio=Number(newPrio);

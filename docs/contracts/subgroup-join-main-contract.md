@@ -30,7 +30,7 @@
 
 `_resolve_subgroup_current` 是下钻统一出口；`_display_pointer_id` 为端点列表、组摘要和聚合链提供同源当前成员。main 的服务子组由 `_main_serving_subgroup` 根据父组有效目标判断，`/api/chain` 的 `groups.main.current_subgroup` 驱动前端当前子组标记。候选存在时有效指针可回落，候选为空时才显示空态。
 
-合成聚合条目的 `pool_groups` 只包含所属父组，保持父组视图与子组直接成员视图隔离。池列表条目复用 `ep-item`，组名大写紫色，状态位置与原生端点一致；优先级、切换、编辑和移出在成员卡片，聚合链负责展示。
+合成聚合条目的 `pool_groups` 只包含所属父组，保持父组视图与子组直接成员视图隔离。池列表条目复用 `ep-item`，组名大写紫色，状态位置与原生端点一致；优先级、切换、编辑和移出在成员卡片，聚合链负责展示。整组冻结时条目在 ⏳ 右侧给出 ⏰，逐个对冻结成员调用端点 `clear-error`（组冻结是成员状态的派生值，不设组级接口）。
 
 ## 整组在本父组停用
 
@@ -52,4 +52,4 @@
 
 组 API 的 `join-group` / `leave-group` / `switch-group` / `toggle-group-disabled` 动作带目标组参数；main 的 `join-main` / `switch-main` 是兼容入口。端点手动切换与持久化见 [手动契约](manual-switch-cooldown-noop-2026-09-06.md)。
 
-正式入口：`test/test_parent_slot_failover.py`、`test/test_group_join_main.py`、`test/test_group_join_parent.py`、`test/test_group_management.py`、`test/test_retry_recovery_scope.py`、`test/test_reasoning_detected.py`、`test/test_business_stall_detection.py`、`test/test_group_membership_ui.js`、`test/test_subgroup_disabled_ui.js`。其中并发反例走真实 `chat()` 回调路径；具体选择见 [testing](../testing.md)。
+正式入口：`test/test_parent_slot_failover.py`、`test/test_group_join_main.py`、`test/test_group_join_parent.py`、`test/test_group_management.py`、`test/test_retry_recovery_scope.py`、`test/test_reasoning_detected.py`、`test/test_business_stall_detection.py`、`test/test_group_membership_ui.js`、`test/test_subgroup_disabled_ui.js`、`test/test_subgroup_unfreeze_ui.js`。其中并发反例走真实 `chat()` 回调路径；具体选择见 [testing](../testing.md)。
