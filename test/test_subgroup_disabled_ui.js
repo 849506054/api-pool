@@ -29,15 +29,16 @@ const groupDefs = [
   {name:'bg', type:'dedicated', model:'bg', priority_by_group:{main:2}, disabled_groups:['main']},
   {name:'ok', type:'dedicated', model:'ok', priority_by_group:{main:1}},
 ];
-const groups = {main:{current_subgroup:null}, bg:{disabled_groups:['main'], all_frozen_remaining:0, current_endpoint:'b1'},
-  ok:{disabled_groups:[], all_frozen_remaining:0, current_endpoint:'o1'}};
+// 真实形态（2026-11-09）：停用状态只在组实体上，/api/chain 的 groups 只带运行态
+const groups = {main:{current_subgroup:null}, bg:{all_frozen_remaining:0, current_endpoint:'b1'},
+  ok:{all_frozen_remaining:0, current_endpoint:'o1'}};
 ui.load({groupDefs, groups, endpoints:[]});
 const out = nodes.poolList.innerHTML;
 assert.match(out, /⏸本组停用/, 'disabled subgroup shows 本组停用 badge');
 assert.match(out, /toggleSubgroupDisabled\(&quot;bg&quot;, &quot;main&quot;\)">▶</, 'disabled subgroup offers ▶ to re-enable');
 assert.match(out, /toggleSubgroupDisabled\(&quot;ok&quot;, &quot;main&quot;\)">⏸</, 'active subgroup offers ⏸ to disable');
 assert.match(out, /已在本组停用：不参与 main 组轮转/, 'badge title states scope');
-assert.doesNotMatch(out, /switchGroupToSubgroup\(&quot;bg&quot;/, 'no manual switch while disabled');
+assert.match(out, /switchGroupToSubgroup\(&quot;bg&quot;, &quot;main&quot;\)">⚡</, 'manual switch stays available and clears the disable');
 assert.match(out, /当前端点：—（本组停用）/, 'disabled card explains why no current endpoint');
 // 按钮顺序与普通端点卡片一致：优先级 → 停用 → 编辑 → 切换 → 移出
 const posToggle = out.indexOf('toggleSubgroupDisabled(&quot;ok&quot;');

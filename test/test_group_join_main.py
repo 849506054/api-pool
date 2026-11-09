@@ -488,8 +488,11 @@ class GroupJoinMainTests(unittest.TestCase):
             self.assertIsNone(pool._axis_subgroup(b1, "main"))
             self.assertFalse(pool._ep_routable_in_group(b1, "main"))
             self.assertIn("b1", [ep.id for ep in pool._group_sticky_candidates("bg")[0]])
-            # 停用状态下不允许手动切到该子组整体
-            self.assertFalse(pool.switch_group_to_subgroup("bg", "main")[0])
+            # 手动切换 = 用户断言：自动解除本组停用并切过去（与端点 ⚡ 同口径）
+            self.assertTrue(pool.switch_group_to_subgroup("bg", "main")[0])
+            self.assertFalse(pool._sub_disabled_in("bg", "main"))
+            self.assertEqual(pool._get_current("main"), "bg")
+            self.assertTrue(pool.toggle_subgroup_disabled("bg", "main"))  # 再停用，继续验证恢复
 
             self.assertFalse(pool.toggle_subgroup_disabled("bg", "main"))
             self.assertIn("b1", [ep.id for ep in pool._group_sticky_candidates("main")[0]])

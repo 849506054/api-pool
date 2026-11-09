@@ -4962,7 +4962,13 @@ class APIPool:
             if sub not in self._joined_subgroups(group):
                 return False, f"子组 '{sub}' 未加入 '{group}'"
             if self._sub_disabled_in(sub, group):
-                return False, f"子组 '{sub}' 在 '{group}' 已停用，先启用再切换"
+                # 手动切换 = 用户断言该子组在本父组工作 → 自动解除本组停用（与端点 ⚡ 同口径）
+                gd = self._group_defs[sub]
+                rest = [g for g in (gd.get("disabled_groups") or []) if g != group]
+                if rest:
+                    gd["disabled_groups"] = rest
+                else:
+                    gd.pop("disabled_groups", None)
             for ep in self._endpoints:
                 if ep.enabled and ep.in_pool and sub in self._ep_groups(ep):
                     self._reset_endpoint_assertion_state(ep, defer_group=sub)
