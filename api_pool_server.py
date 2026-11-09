@@ -919,9 +919,30 @@ CHAT_LOGS_DB_PATH = os.path.join(_DB_DIR, "chat_logs.db")
 
 
 class TokenTracker:
+    # 写锁冲突（database is locked/busy）的短退避重试：INSERT 与端点改名共用。
+    WRITE_RETRY_ATTEMPTS = 4
+    WRITE_RETRY_BASE_DELAY = 0.05
+    # 端点改名按批提交：单批事务控制在毫秒级，避免长时间占住写锁。
+    RENAME_BATCH_SIZE = 500
+
     def __init__(self, db_path=TOKEN_STATS_DB_PATH):
         self.db_path = db_path
         self._init_db()
+
+    @staticmethod
+    def _is_lock_conflict(exc):
+        text = str(exc).lower()
+        return "locked" in text or "busy" in text
+
+    def _write_with_retry(self, action):
+        """执行一次写事务；命中瞬时写锁冲突时按 50/100/200ms 退避重试。"""
+        for index in range(self.WRITE_RETRY_ATTEMPTS):
+            try:
+                return action()
+            except sqlite3.OperationalError as exc:
+                if not self._is_lock_conflict(exc) or index == self.WRITE_RETRY_ATTEMPTS - 1:
+                    raise
+                time.sleep(self.WRITE_RETRY_BASE_DELAY * (2 ** index))
 
     def _connect(self, timeout=5):
         """建立连接并应用 WAL 配套 pragma（synchronous 是 per-connection 属性，每次连接都要设置）。"""
@@ -953,25 +974,55 @@ class TokenTracker:
                 conn.execute("ALTER TABLE token_usage ADD COLUMN cached_tokens INTEGER DEFAULT 0")
             except Exception:
                 pass
+            # 端点改名与按端点过滤统计都按 endpoint_name 定位；缺索引时 UPDATE 会全表扫描，
+            # 在慢盘上把写锁占过 busy_timeout，导致并发写报 database is locked（2026-11-09）。
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_endpoint_name ON token_usage(endpoint_name)")
+
+    def _insert_row(self, endpoint_name, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens):
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO token_usage (endpoint_name, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens) VALUES (?, ?, ?, ?, ?, ?)",
+                (endpoint_name, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens)
+            )
 
     def add_usage(self, endpoint_name, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens=0):
         def _do_insert():
             try:
-                with self._connect() as conn:
-                    conn.execute(
-                        "INSERT INTO token_usage (endpoint_name, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens) VALUES (?, ?, ?, ?, ?, ?)",
-                        (endpoint_name, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens)
-                    )
+                self._write_with_retry(
+                    lambda: self._insert_row(endpoint_name, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens)
+                )
             except Exception as e:
                 sys_log(f"记录 token 消耗失败: {e}", "WARN")
         threading.Thread(target=_do_insert, daemon=True).start()
 
+    def _rename_batch(self, old_name, new_name):
+        """改一批端点名并提交，返回本批行数；0 表示没有剩余行。"""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE token_usage SET endpoint_name = ? WHERE id IN "
+                "(SELECT id FROM token_usage WHERE endpoint_name = ? LIMIT ?)",
+                (new_name, old_name, self.RENAME_BATCH_SIZE),
+            )
+            return cursor.rowcount
+
     def rename_endpoint(self, old_name: str, new_name: str):
+        """分批把旧端点名的历史用量改到新名；每批单独提交，缩短写锁占用。"""
+        if old_name == new_name:
+            return
+        moved = 0
+        batches = 0
         try:
-            with self._connect() as conn:
-                conn.execute("UPDATE token_usage SET endpoint_name = ? WHERE endpoint_name = ?", (new_name, old_name))
+            while True:
+                changed = self._write_with_retry(lambda: self._rename_batch(old_name, new_name))
+                if changed <= 0:
+                    break
+                moved += changed
+                batches += 1
         except Exception as e:
             sys_log(f"重命名端点统计数据失败: {e}", "WARN")
+            return
+        if moved:
+            sys_log(f"端点统计改名完成：'{old_name}' → '{new_name}'，{moved} 行 / {batches} 批", "INFO")
 
     def get_stats(self, endpoint_filter=None):
         with self._connect() as conn:
@@ -6274,7 +6325,11 @@ class APIPool:
                 sys_log(f"端点 '{test_label}' 测试失败（非容量类）：仅记录观测态，不冷却、不计失败次数", "WARN")
 
     def test_endpoint(self, ep, message="你好", image=None, group=None):
-        """在不启用候选轮转的前提下测试主池中的指定端点。"""
+        """在不启用候选轮转的前提下测试主池中的指定端点。
+
+        单次出站（force_no_retry=True）：测试按钮只测「这一次请求成不成」，
+        不按端点 max_retries 重放，避免重试把一次失败拖成多次上游调用。
+        """
         self._guard_pool_outbound(ep)
         import uuid
         started = time.time()
@@ -6294,7 +6349,7 @@ class APIPool:
         try:
             result, error = self._try_endpoint(
                 ep, payload, timeout=ep.timeout, pool_group=test_group,
-                force_no_retry=False, request_id=request_id,
+                force_no_retry=True, request_id=request_id,
             )
         except PoolIdentityUnavailable:
             # 无可用身份 → 不发请求、不写回任何端点状态（伤害隔离）

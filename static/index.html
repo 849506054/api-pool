@@ -2262,7 +2262,13 @@ function readFormDraft(){
     return {name:document.getElementById('fName').value.trim(),site_name:document.getElementById('fSiteName').value.trim(),base_url:document.getElementById('fUrl').value.trim(),api_key:document.getElementById('fKey').value.trim(),model:document.getElementById('fModel').value.trim(),timeout:parseInt(document.getElementById('fTimeout').value)||60,max_retries:parseInt(document.getElementById('fRetries').value)||0,cooldown_minutes:Math.max(1,parseInt(document.getElementById('fCooldown').value)||1),deferrable:document.getElementById('fDeferrable').value==='true',max_context_k:parseInt(document.getElementById('fMaxContext').value)||0,use_proxy:document.getElementById('fProxy').value==='true',protocol:document.getElementById('fProtocol').value||'openai',client_profile:clientProfile,default_headers:ua?{'User-Agent':ua}:{},health_mode:document.getElementById('fHealthMode').value||'chat',billing_mode:document.getElementById('fBillingMode').value||'subscription',is_vision:document.getElementById('fVision').value==='true',check_fake_success:document.getElementById('fFakeCheck').value==='true',retry_on_rate_limit:document.getElementById('fRateRetry').value==='true',tool_call_id_prefix:document.getElementById('fToolCallPrefix').value.trim(),reasoning_policy:document.getElementById('fReasoningPolicy').value||'auto',preserved_thinking:document.getElementById('fPreservedThinking').value==='true',reasoning_effort_map:effortMapParse(document.getElementById('fEffortMap').value),thinking_disabled:document.getElementById('fThinkingDisabled').value==='true',stream_first_packet_timeout:parseInt(document.getElementById('fStreamFirstPacket').value)||0,stream_stall_timeout:parseInt(document.getElementById('fStreamStall').value)||0,stream_max_duration:parseInt(document.getElementById('fStreamMaxDuration').value)||0};
 }
 function sameVal(a,b){return JSON.stringify(a)===JSON.stringify(b);}
+// 端点保存：在途去重 + 即时按钮反馈（2026-11-09）
+// 之前点保存没有任何反馈，用户以为没点上就连点，后端同一秒收到多个 PUT，
+// 改名统计连同用量写入一起挤在 token_stats 的写锁上。这里点击即禁用按钮并显示「保存中…」，
+// 在途期间的重复点击直接丢弃。
+let _endpointSaveInFlight=false;
 async function saveEndpoint(){
+    if(_endpointSaveInFlight) return;
     const ep_id=document.getElementById('editName').value;
     const draft=readFormDraft();
     let d;
@@ -2279,12 +2285,19 @@ async function saveEndpoint(){
     if(d.base_url!==undefined&&!d.base_url){toast('填写 URL','error');return;}
     if(d.api_key!==undefined&&!d.api_key){toast('填写 Key','error');return;}
     if(d.model!==undefined&&!d.model){toast('选择模型','error');return;}
+    const btn=document.getElementById('singleAddBtn');
+    _endpointSaveInFlight=true;
+    if(btn){btn.dataset.idleLabel=btn.textContent;btn.disabled=true;btn.textContent='保存中…';}
     try{
       const r=ep_id?await api('PUT',`/api/endpoints/${encodeURIComponent(ep_id)}`,d):await api('POST','/api/endpoints',Object.assign(d,{enabled:true,in_pool:false,pool_groups:[]}));
       if(!r.ok){toast(`❌ ${r.error||'保存失败'}`,'error');return;}
       toast(ep_id?'已更新':'已添加','success');
       closeModal();refresh();
     }catch(err){toast(`❌ ${err?.message||'保存失败'}`,'error');}
+    finally{
+      _endpointSaveInFlight=false;
+      if(btn){btn.disabled=false;btn.textContent=btn.dataset.idleLabel||'保存';}
+    }
 }
 
 async function batchAddEndpoints(){
