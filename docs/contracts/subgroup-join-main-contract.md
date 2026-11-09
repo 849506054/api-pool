@@ -32,6 +32,12 @@
 
 合成聚合条目的 `pool_groups` 只包含所属父组，保持父组视图与子组直接成员视图隔离。池列表条目复用 `ep-item`，组名大写紫色，状态位置与原生端点一致；优先级、切换、编辑和移出在成员卡片，聚合链负责展示。
 
+## 整组在本父组停用
+
+`toggle_subgroup_disabled(子组, 父组)` 与端点组级停用同构：停用记录在子组定义的 `disabled_groups`，成员关系与父轴名次保持，只退出该父组的候选、归属与显示指针。`_sub_disabled_in` 是唯一判据，`_axis_subgroup`、`_group_sticky_candidates`、`_parent_slot_routes`、指针与展示解析按它跳过该档；子组自身与其他父组不受影响。停用态禁止手动切到该子组整体。
+
+停用时会清掉正在指向该子组（或其名下成员）的父组指针，下个请求重新解析。移出父组、改名与删除按 `_retire_group_key` 清理该键。池卡片以 `⏸` / `▶` 切换，停用时置灰并显示「本组停用」，聚合链合成条目带 `disabled_in_group`。
+
 组编辑的加入控件每次选择一个普通目标组；已加入目标置灰，空白选择保持普通编辑，移出后恢复可选。专用组筛选标记按 `type=dedicated` 判定。
 
 组的 `context_tokens` 保持各自显式声明，异构成员实际容量由上下文检查和客户端处理，父组声明保持配置原值。
@@ -44,6 +50,6 @@
 
 ## 接口与测试
 
-组 API 的 `join-group` / `leave-group` / `switch-group` 动作带目标组参数；main 的 `join-main` / `switch-main` 是兼容入口。端点手动切换与持久化见 [手动契约](manual-switch-cooldown-noop-2026-09-06.md)。
+组 API 的 `join-group` / `leave-group` / `switch-group` / `toggle-group-disabled` 动作带目标组参数；main 的 `join-main` / `switch-main` 是兼容入口。端点手动切换与持久化见 [手动契约](manual-switch-cooldown-noop-2026-09-06.md)。
 
-正式入口：`test/test_parent_slot_failover.py`、`test/test_group_join_main.py`、`test/test_group_join_parent.py`、`test/test_group_management.py`、`test/test_retry_recovery_scope.py`、`test/test_reasoning_detected.py`、`test/test_business_stall_detection.py`、`test/test_group_membership_ui.js`。其中并发反例走真实 `chat()` 回调路径；具体选择见 [testing](../testing.md)。
+正式入口：`test/test_parent_slot_failover.py`、`test/test_group_join_main.py`、`test/test_group_join_parent.py`、`test/test_group_management.py`、`test/test_retry_recovery_scope.py`、`test/test_reasoning_detected.py`、`test/test_business_stall_detection.py`、`test/test_group_membership_ui.js`、`test/test_subgroup_disabled_ui.js`。其中并发反例走真实 `chat()` 回调路径；具体选择见 [testing](../testing.md)。

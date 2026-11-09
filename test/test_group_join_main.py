@@ -467,6 +467,88 @@ class GroupJoinMainTests(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(pool._get_current("main"), "bg")
 
+    # ── 整组在本父组停用（2026-11-09，池卡 ⏸）──
+
+    def test_toggle_subgroup_disabled_exits_only_that_parent(self):
+        """停用后成员关系与名次保留，只退出该父组轮转；再点恢复。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            m1 = self.endpoint(module, "m1", 1, "glm-5.3")
+            b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
+            pool = self.make_pool(module, [m1, b1], {"bg": {"type": "dedicated", "model": "bg"}})
+            pool.set_main_priority("bg", 2)
+            self.assertIn("b1", [ep.id for ep in pool._group_sticky_candidates("main")[0]])
+
+            self.assertTrue(pool.toggle_subgroup_disabled("bg", "main"))
+            # 成员关系与名次保留（卡片仍在轴上，可随时启用）
+            self.assertEqual(pool._joined_subgroups(), {"bg": 2})
+            self.assertIn(("sub", "bg", 2), pool._group_axis_slots("main"))
+            # 该父组候选与归属都退出，子组自身不受影响
+            self.assertNotIn("b1", [ep.id for ep in pool._group_sticky_candidates("main")[0]])
+            self.assertIsNone(pool._axis_subgroup(b1, "main"))
+            self.assertFalse(pool._ep_routable_in_group(b1, "main"))
+            self.assertIn("b1", [ep.id for ep in pool._group_sticky_candidates("bg")[0]])
+            # 停用状态下不允许手动切到该子组整体
+            self.assertFalse(pool.switch_group_to_subgroup("bg", "main")[0])
+
+            self.assertFalse(pool.toggle_subgroup_disabled("bg", "main"))
+            self.assertIn("b1", [ep.id for ep in pool._group_sticky_candidates("main")[0]])
+            # 未加入该父组 → None
+            self.assertIsNone(pool.toggle_subgroup_disabled("bg", "other"))
+
+    def test_disable_clears_parent_pointer_at_subgroup(self):
+        """停用父组指针正指向的子组 → 清指针并回落到其他可用成员。"""
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            m1 = self.endpoint(module, "m1", 1, "glm-5.3")
+            b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
+            pool = self.make_pool(module, [m1, b1], {"bg": {"type": "dedicated", "model": "bg"}})
+            pool.set_main_priority("bg", 2)
+            self.assertTrue(pool.switch_main_to_subgroup("bg")[0])
+            self.assertEqual(pool._get_current("main"), "bg")
+
+            self.assertTrue(pool.toggle_subgroup_disabled("bg", "main"))
+            self.assertIsNone(pool._get_current("main"))
+            # 指针清空后按真实可用成员重新解析（m1 是该组唯一可用端点）
+            self.assertEqual([ep.id for ep in pool._group_sticky_candidates("main")[0]], ["m1"])
+
+    def test_subgroup_disabled_persists_and_reloads(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            m1 = self.endpoint(module, "m1", 1, "glm-5.3")
+            b1 = self.endpoint(module, "b1", 1, "ds", groups=["bg"])
+            pool = self.make_pool(module, [m1, b1], {"bg": {"type": "dedicated", "model": "bg"}})
+            module.pool = pool
+            pool.set_main_priority("bg", 2)
+            self.assertTrue(pool.toggle_subgroup_disabled("bg", "main"))
+            module._sync_to_config()
+            with open(module.CONFIG_FILE, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            defs = {d["name"]: d for d in saved["pool_group_defs"]}
+            self.assertEqual(defs["bg"]["disabled_groups"], ["main"])
+            pool2 = module.APIPool([])
+            pool2._load_group_defs(module.load_group_defs_config())
+            self.assertTrue(pool2._sub_disabled_in("bg", "main"))
+            # 停用标记在移出该父组时一并清理
+            self.assertTrue(pool.leave_main("bg")[0])
+            self.assertNotIn("disabled_groups", module.pool._group_defs["bg"])
+
+    def test_rest_toggle_group_disabled_route(self):
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            pool = self.make_pool(module, [self.endpoint(module, "m1", 1, "glm-5.3"),
+                                           self.endpoint(module, "b1", 1, "ds", groups=["bg"])],
+                                  {"bg": {"type": "dedicated", "model": "bg"}})
+            module.pool = pool
+            pool.set_main_priority("bg", 2)
+            status, response, _ = module.api_handler(
+                "POST", "/api/groups/bg/toggle-group-disabled", {"group": "main"})
+            self.assertEqual(status, 200, response)
+            self.assertTrue(pool._sub_disabled_in("bg", "main"))
+            status2, response2, _ = module.api_handler(
+                "POST", "/api/groups/bg/toggle-group-disabled", {"group": "nope"})
+            self.assertEqual(status2, 400, response2)
+
     # ── 零回归 ──
 
     def test_no_join_main_behaves_identically(self):

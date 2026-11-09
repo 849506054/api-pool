@@ -185,6 +185,34 @@ class RetryBoundaryTests(unittest.TestCase):
                 )
             self.assertEqual(module.APIPool._classify_capacity_error("HTTP 500: 后端故障"), "")
 
+    def test_newapi_user_quota_insufficient_is_quota_out(self):
+        """new-api 上游账号额度不足（预扣费失败）：按账号没钱处置，24 小时冷却，不做 1 分钟短冻结。"""
+        cases = (
+            "HTTP 403: " + json.dumps({"error": {
+                "message": "user quota is not enough (request id: 202611091432288781970434qkwlkrBT40h3)",
+                "type": "new_api_error", "param": "", "code": "insufficient_user_quota",
+            }}) + " (auth error)",
+            "HTTP 403: " + json.dumps({"error": {
+                "message": "预扣费额度失败, 用户剩余额度: ¥0.012822, 需要预扣费额度: ¥0.027038",
+                "type": "new_api_error", "code": "insufficient_user_quota",
+            }}, ensure_ascii=False) + " (auth error)",
+            "HTTP 403: " + json.dumps({"error": {"code": "insufficient_user_quota"}}),
+        )
+        with tempfile.TemporaryDirectory() as tmp_path:
+            module = load_module(tmp_path)
+            for text in cases:
+                self.assertEqual(module.APIPool._classify_capacity_error(text), "quota_out")
+            pool = module.APIPool()
+            ep = module.Endpoint(id="q", name="q", model="m", enabled=True, in_pool=True,
+                                 pool_groups=["main"])
+            kind, seconds = pool._set_capacity_cooldown(ep, cases[0])
+            self.assertEqual(kind, "quota_out")
+            self.assertEqual(seconds, 24 * 60 * 60)
+            self.assertFalse(ep._manual_unlock_required)
+            self.assertEqual(ep._cooldown_reason, "quota_out")
+            self.assertGreaterEqual(ep._cooldown_until, time.time() + 23 * 60 * 60)
+            self.assertIn("24 小时", ep._health_error)
+
     def test_image_translation_forwards_request_context(self):
         with tempfile.TemporaryDirectory() as tmp_path:
             module = load_module(tmp_path)

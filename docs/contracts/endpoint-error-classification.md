@@ -28,7 +28,7 @@
 
 ## 额度、配额与余额
 
-`quota_out` marker 包括 `额度耗尽`、`额度已用尽`、`额度不足`、`quota_exhausted`、`quota exhausted`、`quota has been exhausted`、`credit exhausted`、`no remaining credit`。`manual_unlock_required=false`，冷却到期自动走恢复链；`health_mode=none` 的端点到期直接恢复。
+`quota_out` marker 包括 `额度耗尽`、`额度已用尽`、`额度不足`、`quota_exhausted`、`quota exhausted`、`quota has been exhausted`、`credit exhausted`、`no remaining credit`，以及 new-api 系上游账号额度不足的 `insufficient_user_quota`、`user quota is not enough`、`预扣费额度失败`。`manual_unlock_required=false`，冷却到期自动走恢复链；`health_mode=none` 的端点到期直接恢复。
 
 `insufficient balance` 等余额类属于 `balance_insufficient`；`quota exceeded` / `daily limit reached` / `monthly limit reached` 等属于 `quota_exceeded`。数字 112 的真实报文含额度签名，按完整文案分类。
 

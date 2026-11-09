@@ -1112,7 +1112,10 @@ function joinedSubgroupCard(g,groupsInfo,maxP,parent){
   // 整组冻结时长取组内最早恢复的端点。
   const frozenSec=(gi.all_frozen_remaining||0)|0;
   const frozen=frozenSec>0;
+  // 组级停用（2026-11-09）：子组在该父组停用，成员关系与名次保留，只退出本组轮转
+  const subDis=(gi.disabled_groups||[]).includes(parent);
   let cls='ep-item in-pool subgroup-entry';
+  if(subDis)cls+=' disabled';
   if(hit)cls+=' current';
   if(frozen)cls+=' in-cooldown';
   const cur=esc(gi.current_endpoint_name||gi.current_endpoint||'—');
@@ -1127,15 +1130,17 @@ function joinedSubgroupCard(g,groupsInfo,maxP,parent){
       </div>
       <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
         ${hit?`<span class="badge badge-current" style="font-size:10px;padding:1px 6px" title="${escAttr(parent)} 当前正使用该子组的端点：${cur}">● 当前</span>`:''}
+        ${subDis?`<span class="badge badge-disabled" style="font-size:10px;padding:1px 6px" title="已在本组停用：不参与 ${escAttr(parent)} 组轮转（其他父组与子组自身不受影响）">⏸本组停用</span>`:''}
         ${frozen?`<span class="badge badge-cooldown" style="font-size:10px;padding:1px 6px" title="组内端点全部冻结，整组等待最早恢复的端点">⏳${fmtCdSec(frozenSec)}</span>`:''}
       </div>
     </div>
     <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap">
-      <span style="font-size:12px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0" title="${frozen?'组内端点全部冻结，整组等待最早恢复的端点':`该子组当前端点（整组作为 ${escAttr(parent)} 成员参与，按子组自身优先级选端点）`}">当前端点：${frozen?'—（整组冻结）':cur}</span>
+      <span style="font-size:12px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0" title="${frozen?'组内端点全部冻结，整组等待最早恢复的端点':`该子组当前端点（整组作为 ${escAttr(parent)} 成员参与，按子组自身优先级选端点）`}">当前端点：${subDis?'—（本组停用）':(frozen?'—（整组冻结）':cur)}</span>
       <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;flex-wrap:wrap">
         <select class="btn btn-ghost btn-sm" style="padding:2px 5px;cursor:pointer;font-size:11px;min-width:40px" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setSubgroupPriority(${childArg}, this.value, ${parentArg});this.blur()" title="修改该子组在 ${escAttr(parent)} 优先级轴上的名次">${options}</select>
+        <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="${subDis?`启用本组（恢复参与 ${escAttr(parent)} 组轮转）`:`停用本组（仅不参与 ${escAttr(parent)} 组轮转，其他父组与子组自身不受影响）`}" onclick="toggleSubgroupDisabled(${childArg}, ${parentArg})">${subDis?'▶':'⏸'}</button>
         <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="编辑该子组（切到子组视图）" onclick="setPoolGroupFilter(${childArg})">✏️</button>
-        ${(!hit&&!frozen)?`<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="手动切到该子组整体（${escAttr(parent)} 跟随子组当前端点）" onclick="switchGroupToSubgroup(${childArg}, ${parentArg})">⚡</button>`:''}
+        ${(!hit&&!frozen&&!subDis)?`<button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="手动切到该子组整体（${escAttr(parent)} 跟随子组当前端点）" onclick="switchGroupToSubgroup(${childArg}, ${parentArg})">⚡</button>`:''}
         <button class="btn btn-ghost btn-sm" style="padding:2px 5px;font-size:11px" title="移出 ${escAttr(parent)}（保留子组及其其他成员关系）" onclick="leaveGroup(${childArg}, ${parentArg})">📤</button>
       </div>
     </div>
@@ -1152,6 +1157,12 @@ async function switchGroupToSubgroup(name,group){
   const r=await api('POST',`/api/groups/${encodeURIComponent(name)}/switch-group`,{group});
   if(r.ok){toast(`已切到子组「${name.toUpperCase()}」`,'success');await refresh();}
   else{toast(r.error||'切换失败','error');}
+}
+async function toggleSubgroupDisabled(name,group){
+  const r=await api('POST',`/api/groups/${encodeURIComponent(name)}/toggle-group-disabled`,{group});
+  if(r.ok){toast(r.name||`已切换子组「${name.toUpperCase()}」在 ${group} 的参与状态`,'success');}
+  else{toast(r.error||'切换失败','error');}
+  await refresh();
 }
 async function leaveGroup(name,group){
   if(!confirm(`将子组「${name}」移出 ${group}？子组自身及其他成员关系保留。`))return;
@@ -1508,7 +1519,9 @@ function renderChain(chain){
     let cls='chain-item';
     if(isSub)cls+=' subgroup-entry';
     const gDis=(it.disabled_groups||[]).includes(chainGroupFilter);  // 组级停用 → 置灰，不参与本组轮转
-    if(gDis)cls+=' disabled';
+    // 子组级停用（2026-11-09）：整组条目在本父组停用，同样置灰
+    const sDis=!!(isSub&&it.disabled_in_group);
+    if(gDis||sDis)cls+=' disabled';
     if(it.manual_unlock_required)cls+=' failed';
     else if(it.in_cooldown)cls+=' cooldown';
     else if(_dsec>0)cls+=' deferred';
@@ -1526,7 +1539,7 @@ function renderChain(chain){
     const cerr=it.health==='bad'?(it.health_error||it.last_error||''):(it.last_error||'');
     const conn=i<chain.length-1?'<div class="chain-connector"></div>':'';
     const cp_=prioOf(it);
-    return`<div class="${cls}"><div class="chain-dot"></div><div class="chain-info"><div class="name"><span class="badge badge-priority">#${cp_}</span> ${nameHtml} ${gDis?'<span class="badge badge-disabled">本组停用</span> ':''}${st}</div>${modelLine}${cerr?`<div class="chain-err" title="${esc(cerr)}">⚠ ${esc(cerr)}</div>`:''}</div><div class="chain-right">${rh}</div></div>${conn}`;
+    return`<div class="${cls}"><div class="chain-dot"></div><div class="chain-info"><div class="name"><span class="badge badge-priority">#${cp_}</span> ${nameHtml} ${gDis||sDis?'<span class="badge badge-disabled">本组停用</span> ':''}${st}</div>${modelLine}${cerr?`<div class="chain-err" title="${esc(cerr)}">⚠ ${esc(cerr)}</div>`:''}</div><div class="chain-right">${rh}</div></div>${conn}`;
   }).join('');
 }
 

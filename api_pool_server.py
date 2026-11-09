@@ -4160,6 +4160,9 @@ class APIPool:
                 if rmem:
                     entry["rotate_members"] = rmem
                 entry["priority_by_group"] = self._membership_priorities(d)
+                raw_dis = d.get("disabled_groups")
+                if isinstance(raw_dis, list):
+                    entry["disabled_groups"] = [g for g in raw_dis if isinstance(g, str)]
                 if gtype == "mixed" and entry["priority_by_group"]:
                     raise ValueError(f"组 '{name}' 为 mixed；整组成员必须为专用 dedicated 组")
                 self._group_defs[name] = entry
@@ -4170,6 +4173,13 @@ class APIPool:
                 if self._valid_membership(name, group) and type(rank) is int and rank > 0
             }
             gd.pop("main_priority", None)
+            # 组级停用只对仍有效的成员关系有意义；失效条目在建组/改类型后自动清掉。
+            keep_dis = [g for g in (gd.get("disabled_groups") or [])
+                        if isinstance(g, str) and g in gd["priority_by_group"]]
+            if keep_dis:
+                gd["disabled_groups"] = keep_dis
+            else:
+                gd.pop("disabled_groups", None)
         return self._group_defs
 
     def _derive_group_defs(self):
@@ -4450,6 +4460,15 @@ class APIPool:
                 if new_group:
                     pbg[new_group] = rank
             ep.pop("main_priority", None)
+            # 组级停用键随改名跟随；键成历史时清掉（与端点 disabled_groups 同口径）。
+            if group in (ep.get("disabled_groups") or []):
+                rest = [g for g in ep["disabled_groups"] if g != group]
+                if new_group:
+                    rest.append(new_group)
+                if rest:
+                    ep["disabled_groups"] = rest
+                else:
+                    ep.pop("disabled_groups", None)
             return
         pbg = ep.priority_by_group
         if pbg and group in pbg:
@@ -4765,6 +4784,10 @@ class APIPool:
                 and self._group_defs.get(sub, {}).get("type") == "dedicated"
                 and self._group_defs.get(group, {}).get("type") == "mixed")
 
+    def _sub_disabled_in(self, sub, group):
+        """子组在该父组停用（2026-11-09）：成员关系与名次保留，只退出该父组轮转。"""
+        return group in (self._group_defs.get(sub, {}).get("disabled_groups") or [])
+
     def _joined_subgroups(self, group=None):
         """Dedicated children joined to a mixed parent, in membership order."""
         group = group or self.MAIN_GROUP
@@ -4842,7 +4865,7 @@ class APIPool:
         """Member rows and group summaries share one resolved endpoint identity."""
         if grp == self.MAIN_GROUP or self._joined_subgroups(grp):
             ptr = self._group_pointer_target(grp)
-            if ptr in self._joined_subgroups(grp):
+            if ptr in self._joined_subgroups(grp) and not self._sub_disabled_in(ptr, grp):
                 return self._resolve_subgroup_current(ptr, grp)
             return self._fallback_if_unroutable(grp, ptr)
         if self._membership_priorities(self._group_defs.get(grp, {})):
@@ -4880,7 +4903,7 @@ class APIPool:
     def _group_pointer_target(self, group):
         """Keep a healthy child pointer; otherwise display the parent fallback."""
         pointer = self._get_current(group)
-        if pointer in self._joined_subgroups(group):
+        if pointer in self._joined_subgroups(group) and not self._sub_disabled_in(pointer, group):
             if self._resolve_subgroup_current(pointer, group) is None:
                 cands, _ = self._group_sticky_candidates(group)
                 routes = self._parent_slot_routes(group, cands, pointer)
@@ -4895,7 +4918,7 @@ class APIPool:
         if not target:
             return None
         pointer = self._group_pointer_target(group)
-        if pointer in self._joined_subgroups(group):
+        if pointer in self._joined_subgroups(group) and not self._sub_disabled_in(pointer, group):
             return pointer
         ep = next((e for e in self._endpoints if e.id == target), None)
         return self._axis_subgroup(ep, group) if ep else None
@@ -4938,6 +4961,8 @@ class APIPool:
         with self._lock:
             if sub not in self._joined_subgroups(group):
                 return False, f"子组 '{sub}' 未加入 '{group}'"
+            if self._sub_disabled_in(sub, group):
+                return False, f"子组 '{sub}' 在 '{group}' 已停用，先启用再切换"
             for ep in self._endpoints:
                 if ep.enabled and ep.in_pool and sub in self._ep_groups(ep):
                     self._reset_endpoint_assertion_state(ep, defer_group=sub)
@@ -4949,6 +4974,43 @@ class APIPool:
 
     def set_main_priority(self, sub, priority):
         return self.set_subgroup_priority(sub, self.MAIN_GROUP, priority)
+
+    def toggle_subgroup_disabled(self, sub, group):
+        """子组在本父组停用/启用（池卡 ⏸，2026-11-09）：与端点组级停用同构。
+
+        成员关系与名次保留，只切该子组是否参与**该父组**业务；其他父组不受影响。
+        停用且该父组指针正指向该子组（或其名下端点）时清指针，下个请求重新解析。
+        返回停用后的状态（True=已在该父组停用）；无有效成员关系 → None。
+        """
+        with self._lock:
+            ranks = self._membership_priorities(self._group_defs.get(sub, {}))
+            if not self._valid_membership(sub, group) or group not in ranks:
+                return None
+            gd = self._group_defs[sub]
+            dg = [g for g in (gd.get("disabled_groups") or []) if isinstance(g, str)]
+            if group in dg:
+                dg.remove(group)
+            else:
+                dg.append(group)
+            disabled = group in dg
+            if dg:
+                gd["disabled_groups"] = dg
+            else:
+                gd.pop("disabled_groups", None)
+            if disabled:
+                cur = self._get_current(group)
+                cur_ep = next((e for e in self._endpoints if e.id == cur), None)
+                if cur == sub or (cur_ep is not None and sub in self._ep_groups(cur_ep)
+                                  and group not in self._ep_groups(cur_ep)):
+                    self._set_current(group, None)
+            self._invalidate_route(group)
+            sys_log(
+                f"子组 '{sub}' 在 '{group}' "
+                + ("停用（不参与该组轮转，其他父组不受影响）" if disabled
+                   else "启用（恢复参与该组轮转）"),
+                "INFO", group=group,
+            )
+            return disabled
 
     def set_subgroup_priority(self, sub, group, priority=None):
         """Join/reorder one parent axis; omitted priority is an idempotent append."""
@@ -4985,6 +5047,11 @@ class APIPool:
             ranks.pop(group)
             gd["priority_by_group"] = ranks
             gd.pop("main_priority", None)
+            rest_dis = [g for g in (gd.get("disabled_groups") or []) if g != group]
+            if rest_dis:
+                gd["disabled_groups"] = rest_dis
+            else:
+                gd.pop("disabled_groups", None)
             self._invalidate_route(group)
             for getter, setter in ((self._get_current, self._set_current),
                                    (self._get_persisted, self._set_persisted)):
@@ -5001,6 +5068,8 @@ class APIPool:
         seen = {ep.id for ep in self._endpoints
                 if ep.in_pool and group in self._ep_groups(ep)}
         for sub in joined:
+            if self._sub_disabled_in(sub, group):
+                continue
             for ep in self._subgroup_raw_available(sub):
                 if ep.id not in seen and not self._ep_disabled_in(ep, group):
                     seen.add(ep.id)
@@ -5417,6 +5486,8 @@ class APIPool:
                 "priority_by_group": {group: mp},
                 "is_current": _serving_sub == sub,
                 "current_groups": [group] if _serving_sub == sub else [],
+                # 组级停用（2026-11-09）：该子组在本父组停用，卡片置灰但仍列在轴上
+                "disabled_in_group": self._sub_disabled_in(sub, group),
                 # Only the owning parent displays this synthetic slot.
                 "pool_groups": [group],
                 "fail_count": 0,
@@ -5970,13 +6041,15 @@ class APIPool:
         if any(marker in text for marker in balance_markers):
             return "balance_insufficient"
 
-        # 额度耗尽（qoder 112 / pricingUrl 那一类）：账号没钱了，重试无效。
-        # 池侧处置是 24 小时内不再探活这个端点——短冷却只会让它反复被选中、反复 502，
-        # 而额度不会在几十分钟内回来。
+        # 额度耗尽（qoder 112 / pricingUrl、new-api 预扣费额度失败那一类）：账号没钱了，
+        # 重试无效。池侧处置是 24 小时内不再探活这个端点——短冷却只会让它反复被选中、
+        # 反复 403/502，而额度不会在几十分钟内回来。
         quota_out_markers = (
             "额度耗尽", "额度已用尽", "额度不足",
             "quota_exhausted", "quota exhausted", "quota has been exhausted",
             "credit exhausted", "no remaining credit",
+            # new-api 系上游账号额度不足：英文正文 + 错误码 + 中文预扣费文案
+            "insufficient_user_quota", "user quota is not enough", "预扣费额度失败",
         )
         if any(marker in text for marker in quota_out_markers):
             return "quota_out"
@@ -6063,7 +6136,7 @@ class APIPool:
             ep._cooldown_until = time.time() + seconds
             ep._cooldown_reason = kind
             ep._health = "bad"
-            ep._health_error = f"上游额度耗尽（112），{seconds // 3600} 小时后重新探活"
+            ep._health_error = f"上游额度耗尽，{seconds // 3600} 小时后重新探活"
             return kind, seconds
         if kind == "sensitive_words":
             ep._manual_unlock_required = True
@@ -6502,7 +6575,8 @@ class APIPool:
         if group in self._ep_groups(ep):
             return None
         return next((sub for sub in self._joined_subgroups(group)
-                     if sub in self._ep_groups(ep) and not self._ep_disabled_in(ep, sub)), None)
+                     if sub in self._ep_groups(ep) and not self._ep_disabled_in(ep, sub)
+                     and not self._sub_disabled_in(sub, group)), None)
 
     def _route_slot(self, ep, group):
         """Resolve legacy callers against the selected parent slot before membership."""
@@ -6530,6 +6604,9 @@ class APIPool:
             if kind == "ep":
                 members = [obj]
             else:
+                if self._sub_disabled_in(obj, group):
+                    # 子组在该父组停用：名次留在轴上，但不参与本次轮转。
+                    continue
                 members = sorted(
                     (ep for ep in self._endpoints if ep.in_pool and obj in self._ep_groups(ep)
                      and not self._ep_disabled_in(ep, obj)),
@@ -10511,6 +10588,8 @@ def api_handler(method, path, body):
                 # 加入 main 状态（2026-09-27）：main_priority>0 = 已作为 main 成员参与
                 "main_priority": pool._membership_priorities(gd).get(pool.MAIN_GROUP, 0),
                 "priority_by_group": pool._membership_priorities(gd),
+                # 组级停用（2026-11-09）：该子组在这些父组停用，成员关系与名次保留
+                "disabled_groups": list(gd.get("disabled_groups") or []),
                 "current_subgroup": pool._group_serving_subgroup(grp),
                 # 整组冻结最短剩余秒数（>0 = 组内无可用端点且全部冷却中）
                 "all_frozen_remaining": pool._group_all_frozen_remaining(grp),
@@ -10572,7 +10651,7 @@ def api_handler(method, path, body):
         return 200, {"ok": True}, False
     # Membership actions are scoped to the parent supplied in the body.
     if method == "POST" and cp.startswith("/api/groups/") and cp.rsplit("/", 1)[-1] in (
-            "join-group", "leave-group", "switch-group"):
+            "join-group", "leave-group", "switch-group", "toggle-group-disabled"):
         action = cp.rsplit("/", 1)[-1]
         child = unquote(cp[len("/api/groups/"):-(len(action) + 1)]).strip("/")
         parent = body.get("group")
@@ -10585,6 +10664,11 @@ def api_handler(method, path, body):
             ok, msg = pool.set_subgroup_priority(child, parent, body.get("priority"))
         elif action == "leave-group":
             ok, msg = pool.leave_group(child, parent)
+        elif action == "toggle-group-disabled":
+            disabled = pool.toggle_subgroup_disabled(child, parent)
+            if disabled is None:
+                return 400, {"error": f"子组 '{child}' 未加入 '{parent}'"}, False
+            ok, msg = True, (f"已在 {parent} 停用" if disabled else f"已启用（{parent}）")
         else:
             ok, msg = pool.switch_group_to_subgroup(child, parent)
         if not ok:
@@ -11093,6 +11177,8 @@ def _sync_to_config():
             if gd.get("rotate_members"):
                 entry["rotate_members"] = gd["rotate_members"]
             entry["priority_by_group"] = pool._membership_priorities(gd)
+            if gd.get("disabled_groups"):
+                entry["disabled_groups"] = [g for g in gd["disabled_groups"] if isinstance(g, str)]
             defs_list.append(entry)
     for entry in defs_list:
         entry["priority_by_group"] = pool._membership_priorities(entry)
