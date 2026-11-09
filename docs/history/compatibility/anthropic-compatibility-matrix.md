@@ -75,4 +75,4 @@ API Pool 按端点 `protocol: anthropic` 做双向转换。API Pool 不提供原
 
 - 端点协议转换：`api_pool_server.py` 的 `_try_endpoint()` Anthropic 分支
 - 流式 EOF 保护：Anthropic `stream_generator()` 的 `message_stop` 完整性判断
-- API Pool 运行实例：宿主 `/vol1/1000/tool/api-pool2/`，端口 `5200`
+- API Pool 运行实例：宿主 `<POOL_RUNTIME_DIR>/`，端口 `5200`

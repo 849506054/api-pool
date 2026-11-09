@@ -4,9 +4,9 @@
 （`/v1beta/models/{model}:generateContent`），把 `Soleapi-gemini`、
 `Soleapi-gemini-3.7-flash` 两个端点的 `protocol` 由 `openai`/`responses` 改成 `gemini`。
 
-状态：**仅方案**。工作区 `/opt/data/work/api-pool2/api_pool_server.py` 与生产逐字节一致
+状态：**仅方案**。工作区 `<POOL_WORKSPACE>/api_pool_server.py` 与生产逐字节一致
 （md5 `db05802e…`），此前那段未接线的草稿已回滚，存为
-`/opt/data/backups/gemini-bridge-draft-20260912.patch`（327 行，批准后可作起点）。
+`<LOCAL_PATH>`（327 行，批准后可作起点）。
 
 ---
 

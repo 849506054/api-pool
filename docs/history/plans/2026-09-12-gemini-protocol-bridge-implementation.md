@@ -1,8 +1,8 @@
 # Gemini 兼容协议适配 — 开发计划（2026-09-12）
 
 > 设计依据：`docs/gemini-protocol-bridge-plan-2026-09-12.md`（已认可）
-> 状态：**计划阶段，不写代码**。代码全部落在工作区 `/opt/data/work/api-pool2/`；
-> 生产 `/vol1/1000/tool/api-pool2/` 的写入与服务重启需单独批准（T7）。
+> 状态：**计划阶段，不写代码**。代码全部落在工作区 `<POOL_WORKSPACE>/`；
+> 生产 `<POOL_RUNTIME_DIR>/` 的写入与服务重启需单独批准（T7）。
 
 **目标**：API Pool 支持端点级 `protocol="gemini"`，让 soleapi 的 Gemini 系模型可用
 （入站 OpenAI 形态不变，出站走 `/v1beta/models/{m}:generateContent` 原生方言）。
@@ -38,7 +38,7 @@
   `_gemini_parts_from_content`、`_gemini_text_from_content`、`_gemini_tools_from_chat`、
   `_gemini_tool_config_from_chat`、`_gemini_parts_to_chat`、`_gemini_finish_reason`、
   `_gemini_usage_to_chat_usage`、`_gemini_remember_tool_call`、`_gemini_lookup_tool_call`
-  （草稿在 `/opt/data/backups/gemini-bridge-draft-20260912.patch`，可直接复用）
+  （草稿在 `<LOCAL_PATH>`，可直接复用）
 - `_try_endpoint` 请求构造（现 `~5280` / `~5397`）：`is_gemini` 分支 → URL + body；末尾条件改
   `elif not (is_responses or is_gemini):`
 - 出站鉴权：保留 `Authorization`，追加 `x-goog-api-key`

@@ -21,7 +21,7 @@ API Pool 2.0 是在 1.0 基础上，新增非 DeepSeek Endpoint 兼容能力的�
 
 | 事项 | 状态 |
 |------|------|
-| 独立目录 `/vol1/1000/tool/api-pool2` | ✅ |
+| 独立目录 `<POOL_RUNTIME_DIR>/` | ✅ |
 | 独立 systemd unit `api-pool2.service` | ✅ |
 | 端口 5200（1.0 继续 5100） | ✅ |
 | 配置由 1.0 快照初始化 | ✅ |
@@ -116,12 +116,12 @@ ep_model = model or ep.model  →  ep_model = ep.model
 
 | 目标 | 备份路径 |
 |------|---------|
-| `/opt/data/config.yaml` | `backups/config.yaml.bak.20260818_062927_apipool2_adapter` |
-| `/opt/data/cron/jobs.json` | `backups/jobs.json.bak.20260818_065607_apipool2_cron_migration` |
-| `/opt/data/cron/jobs.json` | `backups/jobs.json.bak.20260818_071736_provider_snapshot_fix` |
-| `/opt/data/cron/jobs.json` | `backups/jobs.json.bak.20260818_071900_knowledge_sync_fix` |
-| 宿主机 `api_pool_server.py`（模型绑定） | `/vol1/1000/tool/api-pool2/api_pool_server.py.bak.20260818_063431_hermes_adapter` |
-| 宿主机 `api_pool_server.py`（Anthropic 流式） | `/vol1/1000/tool/api-pool2/api_pool_server.py.bak.20260818_081818_anthropic_stream_fix` |
+| `<LOCAL_PATH>` | `backups/config.yaml.bak.20260818_062927_apipool2_adapter` |
+| `<LOCAL_PATH>` | `backups/jobs.json.bak.20260818_065607_apipool2_cron_migration` |
+| `<LOCAL_PATH>` | `backups/jobs.json.bak.20260818_071736_provider_snapshot_fix` |
+| `<LOCAL_PATH>` | `backups/jobs.json.bak.20260818_071900_knowledge_sync_fix` |
+| 宿主机 `api_pool_server.py`（模型绑定） | `<HOST_PATH>` |
+| 宿主机 `api_pool_server.py`（Anthropic 流式） | `<POOL_RUNTIME_DIR>/api_pool_server.py.bak.20260818_081818_anthropic_stream_fix` |
 | `PROJECT.md` | `backups/api-pool2-PROJECT.md.bak.20260818_070443` |
 | 工作区 `api_pool_server.py`（scope 收窄前） | `backups/api_pool2-api_pool_server.py.bak.20260818_080756_anthropic_scope_fix` |
 

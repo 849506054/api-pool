@@ -24,7 +24,7 @@
 - **手动切换（⚡）** — 端点卡片一键把目标端点设为该组当前工作端点，并按真实请求结果重新判定其状态（含解冻）
 - **延迟回迁（Deferred Failback）** — 上游恢复后可延迟回迁，减少切换造成的 prompt cache 损失；当前端点再次故障时，延迟回迁端点仍可作为故障转移目标；支持 Endpoint 级开关 `deferrable`
 - **上下文长度限制（Endpoint 可选）** — 配置 `max_context_k` 后，超出 Endpoint 上限的请求会跳过该 Endpoint
-- **多协议入口与上游桥接** — 入站支持 `/v1/chat/completions` 与 `/v1/responses`；上游 Endpoint 可按 `openai` / `anthropic` / `responses` 三种协议接入并在同一次请求内跨协议桥接。已验收文本、流式、工具调用、多轮工具结果、跨协议工具历史、base64 PNG 图片和 Hermes 实际工具循环，详见 [`docs/anthropic-compatibility-matrix.md`](docs/anthropic-compatibility-matrix.md)
+- **多协议入口与上游桥接** — 入站支持 `/v1/chat/completions` 与 `/v1/responses`；上游 Endpoint 可按 `openai` / `anthropic` / `responses` / `gemini` 四种协议接入并跨协议桥接。当前边界与测试见 [架构](docs/architecture.md) 和 [测试指南](docs/testing.md)；Anthropic 初版验收保留在 [历史兼容矩阵](docs/history/compatibility/anthropic-compatibility-matrix.md)。
 - **视觉池组** — 图片转译的候选来源是专用分组（`role: vision`，全池唯一），不再从请求所在组内任意抓取视觉端点；该分组无可用成员时图片原样转发
 - **工具调用兼容** — 支持 tool call 转换、工具结果回传，以及按 Endpoint 配置 `tool_call_id_prefix` 修正跨上游切换后的 ID 格式
 - **客户端特征（client_profile）** — 默认透传客户端真实请求头（本地透明网关），Endpoint 级可指定 profile 伪装成其他客户端；探活、端点测试与拉模型复用同一套出站头，用于通过上游的客户端指纹或 UA 白名单校验
@@ -48,7 +48,7 @@ python api_pool_server.py
 
 在管理面板添加 Endpoint 并点「📥」入池后，用分组入口模型名调用：main 组为 `api-pool`，其他分组的选择器见分组标签与 `GET /v1/models`。
 
-完整使用说明见 [Wiki](https://github.com/849506054/api-pool/wiki)。
+完整使用说明见 [Wiki](https://github.com/849506054/api-pool/wiki)。开发与维护从 [项目入口](PROJECT.md) 开始；[资料导航](docs/README.md) 按任务指向现行设计、契约、测试与历史。
 
 ## 按配置定向调用单端点
 
@@ -253,12 +253,12 @@ API Pool 2.0 对 Hermes 暴露 OpenAI-compatible 接口（Chat Completions 与 R
 model:
   default: api-pool
   provider: custom:api-pool2
-  base_url: http://192.168.5.6:5200/v1
+  base_url: http://<LAN_HOST>:5200/v1
   context_length: 1048576
 
 custom_providers:
   - name: api-pool2
-    base_url: http://192.168.5.6:5200/v1
+    base_url: http://<LAN_HOST>:5200/v1
     api_key: ${API_POOL2_API_KEY}
     model: api-pool
 ```
@@ -290,7 +290,7 @@ model:
 
 providers:
   api-pool2-responses:
-    base_url: http://192.168.5.6:5200/v1
+    base_url: http://<LAN_HOST>:5200/v1
     api_key: ${API_POOL2_API_KEY}
     model: api-pool
     api_mode: codex_responses
@@ -308,7 +308,7 @@ providers:
 fallback_providers:
   - provider: custom:api-pool2
     model: api-pool
-    base_url: http://192.168.5.6:5200/v1
+    base_url: http://<LAN_HOST>:5200/v1
     api_key: ${API_POOL2_API_KEY}
   - provider: deepseek
     model: deepseek-v4-flash
@@ -330,7 +330,7 @@ Hermes 会按列表顺序尝试。保留现有 fallback 顺序时，只把 API P
 ```yaml
 custom_providers:
   - name: api-pool2-deepseek
-    base_url: http://192.168.5.6:5200/v1
+    base_url: http://<LAN_HOST>:5200/v1
     api_key: ${API_POOL2_API_KEY}
     model: api-pool
     extra_body:
@@ -352,7 +352,7 @@ hermes fallback list
 从 Hermes 所在机器直接验证 API Pool 2 的入口：
 
 ```bash
-BASE_URL=http://192.168.5.6:5200/v1
+BASE_URL=http://<LAN_HOST>:5200/v1
 KEY="$API_POOL2_API_KEY"
 
 curl -sS "$BASE_URL/chat/completions" \\
@@ -385,7 +385,7 @@ curl -sS "$BASE_URL/chat/completions" \\
 ## 文档
 
 - [Wiki](https://github.com/849506054/api-pool/wiki)：快速开始、端点配置详解、分组与路由、管理面板、健康检测与故障转移、调用 API、部署与安全、FAQ
-- [`docs/`](docs/)：协议兼容矩阵、错误处置矩阵、设计与阶段文档
+- [资料导航](docs/README.md)：当前架构、接口与行为契约、测试指南和按角色区分的历史
 
 ## 堆栈
 
