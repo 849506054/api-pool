@@ -115,7 +115,7 @@ class VisionPoolGroupTests(unittest.TestCase):
                 {"name": "vision", "type": "mixed", "model": "api-pool-vision", "role": "vision"},
             ])
             self.assertNotIn("role", pool._group_defs["bg"])
-            self.assertEqual(pool._group_defs["vision"], {"type": "mixed", "model": "api-pool-vision"})
+            self.assertEqual(pool._group_defs["vision"], {"type": "mixed", "model": "api-pool-vision", "priority_by_group": {}})
             # 内置组恒在且次位：main → vision → 其余按配置顺序
             self.assertEqual(list(pool._group_defs)[:3], ["main", "vision", "bg"])
 
@@ -125,7 +125,7 @@ class VisionPoolGroupTests(unittest.TestCase):
             module._sync_to_config()
             raw = module.load_group_defs_config()
             self.assertFalse(any("role" in g for g in raw))
-            self.assertIn({"name": "vision", "type": "mixed", "model": "api-pool-vision"}, raw)
+            self.assertIn({"name": "vision", "type": "mixed", "model": "api-pool-vision", "priority_by_group": {}}, raw)
             restarted = load_module(tmp_path)
             self.assertEqual(restarted.pool._group_defs["vision"]["model"], "api-pool-vision")
 

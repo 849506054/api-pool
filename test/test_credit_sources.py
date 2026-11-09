@@ -140,10 +140,10 @@ class CreditSourceTests(unittest.TestCase):
                                    {"uid": "u2", "realm": "global", "credits": 0}]},
         ))
         out = self.module.APIPool._read_wkm_credits(self.pool)
-        # uid→realm 来自 /api/accounts；未登记 uid（u3）按既有口径回落 cn
+        # uid→realm 来自 /api/accounts；不在当前账号列表的 uid（u3）按现行口径跳过，不计入任何域
         self.assertEqual(out[WKM_KEY_POOL]["kind"], "pool")
         self.assertEqual(out[WKM_KEY_POOL]["realm"], "cn")
-        self.assertEqual(out[WKM_KEY_POOL]["remaining"], 107.0)
+        self.assertEqual(out[WKM_KEY_POOL]["remaining"], 100.0)
         # 限额 key：quota_credit - used_credit，kind=key
         self.assertEqual(out[WKM_KEY_LIMITED]["kind"], "key")
         self.assertEqual(out[WKM_KEY_LIMITED]["remaining"], 380.0)

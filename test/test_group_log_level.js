@@ -20,5 +20,5 @@ assert(/function addLogLine\(entry\) \{\n    if \(!logContainer\) return;\n    c
 assert(/currentChatLogs = \(res\.logs \|\| \[\]\);/.test(src), '对话日志列表直接采用服务端结果');
 // 级别变更后由服务端按新级别重新过滤
 assert(/function refreshLogViews\(\)/.test(src), '重置刷新函数存在');
-assert(/closeGroupModal\(\);refresh\(\);refreshLogViews\(\);/.test(src), '保存分组后清空并重拉');
+assert(/closeGroupModal\(\);await refresh\(\);refreshLogViews\(\);/.test(src), '保存分组后清空并重拉');
 console.log('OK: 组日志级别前端自检通过');

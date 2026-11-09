@@ -272,7 +272,7 @@ class ConcurrentHealthCheckTests(unittest.TestCase):
         endpoint = endpoints[0]
         before = time.time()
 
-        pool._rotate(endpoint, "HTTP 429: quota exhausted")
+        pool._rotate(endpoint, "HTTP 429: quota exceeded")
 
         self.assertEqual(endpoint._cooldown_reason, "quota_exceeded")
         self.assertGreaterEqual(endpoint._cooldown_until, before + 5 * 60 * 60 - 1)

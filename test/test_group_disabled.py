@@ -126,7 +126,7 @@ class GroupDisabledTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             module = load_module(tmp)
             pool, shared = self.make_pool(module)
-            pool._group_defs["bg"] = {"type": "mixed", "model": "bg"}
+            pool._group_defs["bg"] = {"type": "dedicated", "model": "bg"}
             self.assertTrue(pool.set_main_priority("bg", 2)[0])
 
             # b1 只属 bg：整组加入 main 后该名次沿用子组自身状态 → 在 bg 停用即不进 main 候选

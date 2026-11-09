@@ -89,7 +89,7 @@ class IdleBorrowTests(unittest.TestCase):
             lines = [c.args[0] for c in log.call_args_list if "挂延迟回切" in str(c.args[0])]
             self.assertEqual(len(lines), 1, lines)
             self.assertIn("shared", lines[0])
-            self.assertIn("main 当前端点", lines[0])
+            self.assertIn("被 main 占用", lines[0])
 
     def test_before_window_elapses_still_avoided(self):
         with tempfile.TemporaryDirectory() as tmp:

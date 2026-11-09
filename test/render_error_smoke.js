@@ -47,7 +47,7 @@ const MU_SRC=js.match(/function muInfo\(ep\)\{[\s\S]*?\n\}/)[0];
    与 epHost/epSiteAlias 同属「被同步调用但忘了进 FNS」型；连带其依赖的 WKM_COINS_SVG 常量。 */
 const CREDIT_SVG_SRC=js.match(/const WKM_COINS_SVG=[^\n]*\n/)[0];
 const CREDIT_SRC=js.match(/function wkmCreditBadge\(c\)\{[\s\S]*?\n\}/)[0];
-const FNS=[VENDOR_SRC,HOST_SRC,ALIAS_SRC,MU_SRC,CREDIT_SVG_SRC,CREDIT_SRC,js.match(/function epErr\(ep\)\{[^\n]*\}/)[0],js.match(/function applyEpFilter\(\)\{[^\n]*\}/)[0],js.match(/function setFilter\(f\)\{[^\n]*\}/)[0],js.match(/function setVendorFilter\(v\)\{[^\n]*\}/)[0],grab('renderStats'),grab('renderFilterBar'),grab('renderEndpoints'),grab('renderPoolList'),grab('renderChain')].join('\n');
+const FNS=[VENDOR_SRC,HOST_SRC,ALIAS_SRC,MU_SRC,CREDIT_SVG_SRC,CREDIT_SRC,js.match(/function epErr\(ep\)\{[^\n]*\}/)[0],js.match(/function applyEpFilter\(\)\{[^\n]*\}/)[0],js.match(/function setFilter\(f\)\{[^\n]*\}/)[0],js.match(/function setVendorFilter\(v\)\{[^\n]*\}/)[0],js.match(/function canJoinGroup\(g\)\{[^\n]*\}/)[0],js.match(/function isMixedParent\(g\)\{[^\n]*\}/)[0],grab('subgroupMemberships'),grab('joinedSubgroups'),grab('mergedGroupRows'),grab('renderStats'),grab('renderFilterBar'),grab('renderEndpoints'),grab('renderPoolList'),grab('renderChain')].join('\n');
 /* ── stub 覆盖静态自检（2026-10-04）──────────────────────────────────────
    页面新增 helper 后 FNS 必须同步带入，否则 eval 后第一次调用才 ReferenceError
    （epHost / epSiteAlias 各漏过一次）。这里在 eval 之前按「源码引用」比对：
