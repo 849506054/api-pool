@@ -15,6 +15,8 @@
 最近验收：2026-11-09 三项已部署并经用户实测验收——🧪 测试端点改为单次出站（不再按 `max_retries` 重放）；保存端点时 `token_stats` 的 `database is locked` 按「索引 + 改名分批 + 写锁冲突短退避重试」修复；保存按钮点击即禁用显示「保存中…」并在途去重。交付记录见 `workspace/records/test-noretry-token-lock-20261109/DELIVERY.md`。
 此前同日验收：new-api 账号额度不足归入 `quota_out`（403 不再按 1 分钟短冻结反复重撞）；子组加入父组后新增本组停用 ⏸/▶，停用只退出该父组轮转，组内端点状态与其他父组不动；子组整组冻结时池卡条目补 ⏰，逐个解除冻结成员（复用端点 clear-error）。交付记录与回滚快照见 `workspace/records/subgroup-disable-and-quota-split-20261109/`，⏰ 条目见 `workspace/records/subgroup-unfreeze-20261109/DELIVERY.md`。此前 2026-11-08 页面 gzip、ETag 条件 GET 与管理状态 JSON 压缩已验收；请求凭据脱敏已上线。
 
+2026-11-12 用户决定：出站凭据脱敏**保持关闭**，功能作为可选项保留，页面「请求脱敏」一处开关随时能开；理由是模型与本地工具共用凭据时，占位符带来的不便大于收益。当时实读 `GET /api/credential-redaction` 为 `enabled=false`。
+
 ## 按任务路线
 
 | 任务 | 入口 |
